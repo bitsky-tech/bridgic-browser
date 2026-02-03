@@ -1,0 +1,58 @@
+#!/bin/bash
+
+# Get the target branch name.
+while read local_ref local_sha remote_ref remote_sha; do
+    if [[ -n "$remote_ref" ]]; then
+        branch_name=${remote_ref#refs/heads/}
+
+        # Protect branches.
+        if [[ $branch_name =~ ^(main|dev)$ ]]; then
+            echo "❌ Error: You are not allowed to push a local branch to 'origin/$branch_name'!"
+            exit 1
+        fi
+
+        # Check branch name prefix.
+        if ! [[ $branch_name =~ ^(feature/|refactor/|bugfix/|release/|docs/).+ ]]; then
+            echo "❌ Error: Branch name '$branch_name' doesn't follow naming convention!"
+            echo "💡 Branch name must start with one of: feature/, refactor/, bugfix/, release/, docs/."
+            exit 1
+        fi
+
+        # Ensure the branch does not start/end with a hyphen or contain consecutive hyphens.
+        if [[ $branch_name =~ ^-|-$ ]] || [[ $branch_name =~ -- ]]; then
+            echo "❌ Error: Branch name '$branch_name' has incorrect hyphen usage!"
+            echo "💡 Branch name cannot start/end with hyphen or contain consecutive hyphens (--)."
+            exit 1
+        fi
+
+        # Only 'release' branches are allowed to have dots (.) for versioning; other branches are not.
+        if [[ $branch_name =~ ^release/ ]]; then
+            # For release branches, allow only letters, numbers, slashes, hyphens, and dots.
+            if ! [[ $branch_name =~ ^[a-zA-Z0-9/.-]+$ ]]; then
+                echo "❌ Error: Release branch name '$branch_name' contains invalid characters!"
+                echo "💡 Release branch name can only contain letters (a-zA-Z), numbers (0-9), hyphens (-), dots (.), and slashes (/)."
+                echo "   No spaces, underscores or other special characters allowed."
+                exit 1
+            fi
+        else
+            # In non-release branches, dots are not allowed.
+            if ! [[ $branch_name =~ ^[a-zA-Z0-9/-]+$ ]]; then
+                echo "❌ Error: Branch name '$branch_name' contains invalid characters!"
+                echo "💡 Branch name can only contain letters (a-zA-Z), numbers (0-9) and hyphens (-)."
+                echo "   No spaces, underscores, dots, or other special characters allowed."
+                exit 1
+            fi
+        fi
+    fi
+done
+
+# Run unit tests (quick mode for faster feedback).
+echo "🚦 Running unit tests..."
+make test-quick
+if [ $? -ne 0 ]; then
+    echo "❌ Unit tests failed. Please fix the tests before pushing."
+    exit 1
+fi
+
+echo "✅ All checks passed!"
+exit 0

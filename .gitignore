@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+eggs/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Distribution
+dist/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Documentation builds
+docs/site/
+docs/debug.log
+docs/docs/reference
+docs/mkdocs.yml
+
+# Cursor/Editor
+.cursor/
+
+# Environment and secrets
+.env
+.env.local
+uv.toml
+
+# Playwright
+test-results/
+playwright-report/
+
+# Temporary files
+*.tmp
+*.bak
+
+# Debug output files
+snapshot_*.yaml
+snapshot*.txt
+browser_use.txt
+system_prompt.txt

@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bridgic Browser Test Page</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { margin-bottom: 20px; color: #333; }
+        h2 { margin: 20px 0 10px; color: #555; border-bottom: 2px solid #007bff; padding-bottom: 5px; }
+
+        /* Feedback Panel */
+        #feedback-panel {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            width: 350px;
+            max-height: 300px;
+            overflow-y: auto;
+            background: #1a1a2e;
+            color: #0f0;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            z-index: 1000;
+        }
+        #feedback-panel h3 { color: #fff; margin-bottom: 10px; font-size: 14px; }
+        #feedback-log { max-height: 250px; overflow-y: auto; }
+        .log-entry {
+            padding: 3px 0;
+            border-bottom: 1px solid #333;
+            word-wrap: break-word;
+        }
+        .log-entry.click { color: #ff6b6b; }
+        .log-entry.input { color: #4ecdc4; }
+        .log-entry.hover { color: #ffe66d; }
+        .log-entry.focus { color: #a8e6cf; }
+        .log-entry.scroll { color: #88d8b0; }
+        .log-entry.key { color: #ffaaa5; }
+        .log-entry.mouse { color: #dcedc1; }
+        .log-entry.check { color: #ffd3b6; }
+
+        /* Sections */
+        .section {
+            background: white;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        /* Form Elements */
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: 500; color: #333; }
+        input[type="text"], input[type="email"], input[type="password"], textarea {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+        input:focus, textarea:focus {
+            border-color: #007bff;
+            outline: none;
+        }
+
+        /* Buttons */
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-right: 10px;
+            margin-bottom: 10px;
+            transition: all 0.3s;
+        }
+        .btn-primary { background: #007bff; color: white; }
+        .btn-primary:hover { background: #0056b3; }
+        .btn-success { background: #28a745; color: white; }
+        .btn-success:hover { background: #1e7e34; }
+        .btn-danger { background: #dc3545; color: white; }
+        .btn-danger:hover { background: #c82333; }
+        .btn-warning { background: #ffc107; color: #333; }
+        .btn-warning:hover { background: #e0a800; }
+
+        /* Checkboxes & Radios */
+        .checkbox-group, .radio-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+        .checkbox-item, .radio-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        input[type="checkbox"], input[type="radio"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }
+
+        /* Dropdown */
+        select {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            background: white;
+        }
+
+        /* File Upload */
+        input[type="file"] {
+            padding: 10px;
+            border: 2px dashed #ddd;
+            border-radius: 4px;
+            width: 100%;
+            cursor: pointer;
+        }
+
+        /* Draggable Elements */
+        .drag-container {
+            display: flex;
+            gap: 20px;
+            min-height: 150px;
+        }
+        .drag-zone {
+            flex: 1;
+            border: 2px dashed #ccc;
+            border-radius: 8px;
+            padding: 20px;
+            min-height: 120px;
+            background: #fafafa;
+        }
+        .drag-zone.dragover { background: #e3f2fd; border-color: #007bff; }
+        .draggable {
+            padding: 15px;
+            background: #007bff;
+            color: white;
+            border-radius: 4px;
+            cursor: grab;
+            margin-bottom: 10px;
+            user-select: none;
+        }
+        .draggable:active { cursor: grabbing; }
+
+        /* Hover Target */
+        .hover-target {
+            padding: 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            text-align: center;
+            border-radius: 8px;
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        .hover-target:hover {
+            transform: scale(1.05);
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
+        }
+
+        /* Scroll Container */
+        .scroll-container {
+            height: 200px;
+            overflow-y: auto;
+            border: 2px solid #ddd;
+            border-radius: 4px;
+            padding: 10px;
+        }
+        .scroll-content { padding: 10px; }
+        .scroll-marker {
+            padding: 20px;
+            margin: 20px 0;
+            background: #e3f2fd;
+            border-left: 4px solid #007bff;
+        }
+
+        /* Click Counter */
+        .click-counter {
+            display: inline-flex;
+            align-items: center;
+            gap: 15px;
+            padding: 15px 25px;
+            background: #f8f9fa;
+            border-radius: 8px;
+        }
+        .counter-value {
+            font-size: 32px;
+            font-weight: bold;
+            color: #007bff;
+            min-width: 60px;
+            text-align: center;
+        }
+
+        /* Links */
+        .link-list { list-style: none; }
+        .link-list li { margin-bottom: 10px; }
+        .link-list a {
+            color: #007bff;
+            text-decoration: none;
+            padding: 5px 10px;
+            border-radius: 4px;
+            transition: background 0.3s;
+        }
+        .link-list a:hover { background: #e3f2fd; }
+
+        /* Status Indicators */
+        .status-indicator {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .status-success { background: #d4edda; color: #155724; }
+        .status-warning { background: #fff3cd; color: #856404; }
+        .status-error { background: #f8d7da; color: #721c24; }
+
+        /* Double Click Area */
+        .double-click-area {
+            padding: 40px;
+            background: #fff3cd;
+            border: 2px solid #ffc107;
+            border-radius: 8px;
+            text-align: center;
+            cursor: pointer;
+        }
+
+        /* Keyboard Input Display */
+        .key-display {
+            font-family: 'Courier New', monospace;
+            font-size: 24px;
+            padding: 20px;
+            background: #1a1a2e;
+            color: #0f0;
+            border-radius: 8px;
+            min-height: 60px;
+            text-align: center;
+        }
+
+        /* Mouse Position */
+        .mouse-tracker {
+            padding: 15px;
+            background: #e9ecef;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+        }
+
+        /* Hidden/Visible Elements */
+        .visibility-demo {
+            padding: 20px;
+            background: #e3f2fd;
+            border-radius: 8px;
+            margin-top: 10px;
+        }
+        .hidden { display: none; }
+
+        /* Dialog Trigger */
+        .dialog-buttons { display: flex; gap: 10px; flex-wrap: wrap; }
+
+        /* Grid for elements */
+        .element-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 15px;
+        }
+        .grid-item {
+            cursor: pointer;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            text-align: center;
+            border: 2px solid transparent;
+            transition: border-color 0.3s;
+        }
+        .grid-item:hover { border-color: #007bff; }
+        .grid-item.selected { border-color: #28a745; background: #d4edda; }
+    </style>
+</head>
+<body>
+    <!-- Feedback Panel -->
+    <div id="feedback-panel">
+        <h3>📋 Action Log</h3>
+        <div id="feedback-log"></div>
+    </div>
+
+    <div class="container">
+        <h1>🧪 Bridgic Browser Test Page</h1>
+
+        <!-- Navigation Section -->
+        <div class="section" id="navigation-section">
+            <h2>🔗 Navigation & Links</h2>
+            <ul class="link-list">
+                <li><a href="#form-section" id="link-form">Go to Form Section</a></li>
+                <li><a href="#button-section" id="link-buttons">Go to Buttons Section</a></li>
+                <li><a href="#scroll-section" id="link-scroll">Go to Scroll Section</a></li>
+                <li><a href="https://example.com" id="link-external" target="_blank">External Link (example.com)</a></li>
+            </ul>
+        </div>
+
+        <!-- Form Section -->
+        <div class="section" id="form-section">
+            <h2>📝 Form Elements</h2>
+            <form id="test-form" onsubmit="return handleFormSubmit(event)">
+                <div class="form-group">
+                    <label for="username">Username</label>
+                    <input type="text" id="username" name="username" placeholder="Enter username"
+                           oninput="logAction('input', 'Username: ' + this.value)"
+                           onfocus="logAction('focus', 'Username field focused')">
+                </div>
+                <div class="form-group">
+                    <label for="email">Email</label>
+                    <input type="email" id="email" name="email" placeholder="Enter email"
+                           oninput="logAction('input', 'Email: ' + this.value)"
+                           onfocus="logAction('focus', 'Email field focused')">
+                </div>
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" placeholder="Enter password"
+                           oninput="logAction('input', 'Password: ' + '*'.repeat(this.value.length))"
+                           onfocus="logAction('focus', 'Password field focused')">
+                </div>
+                <div class="form-group">
+                    <label for="message">Message</label>
+                    <textarea id="message" name="message" rows="3" placeholder="Enter message"
+                              oninput="logAction('input', 'Message length: ' + this.value.length)"
+                              onfocus="logAction('focus', 'Message field focused')"></textarea>
+                </div>
+                <div class="form-group">
+                    <label for="country">Country</label>
+                    <select id="country" name="country" onchange="logAction('input', 'Country: ' + this.value)">
+                        <option value="">Select a country</option>
+                        <option value="us">United States</option>
+                        <option value="uk">United Kingdom</option>
+                        <option value="cn">China</option>
+                        <option value="jp">Japan</option>
+                        <option value="de">Germany</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="file-upload">File Upload</label>
+                    <input type="file" id="file-upload" name="file"
+                           onchange="logAction('input', 'File: ' + (this.files[0]?.name || 'none'))">
+                </div>
+                <button type="submit" class="btn btn-primary">Submit Form</button>
+                <button type="reset" class="btn btn-warning" onclick="logAction('click', 'Form reset')">Reset</button>
+            </form>
+        </div>
+
+        <!-- Checkbox & Radio Section -->
+        <div class="section" id="checkbox-section">
+            <h2>☑️ Checkboxes & Radio Buttons</h2>
+            <div class="form-group">
+                <label>Interests (Checkboxes)</label>
+                <div class="checkbox-group">
+                    <div class="checkbox-item">
+                        <input type="checkbox" id="interest-tech" name="interests" value="tech"
+                               onchange="logAction('check', 'Tech: ' + (this.checked ? 'checked' : 'unchecked'))">
+                        <label for="interest-tech">Technology</label>
+                    </div>
+                    <div class="checkbox-item">
+                        <input type="checkbox" id="interest-music" name="interests" value="music"
+                               onchange="logAction('check', 'Music: ' + (this.checked ? 'checked' : 'unchecked'))">
+                        <label for="interest-music">Music</label>
+                    </div>
+                    <div class="checkbox-item">
+                        <input type="checkbox" id="interest-sports" name="interests" value="sports"
+                               onchange="logAction('check', 'Sports: ' + (this.checked ? 'checked' : 'unchecked'))">
+                        <label for="interest-sports">Sports</label>
+                    </div>
+                    <div class="checkbox-item">
+                        <input type="checkbox" id="interest-art" name="interests" value="art"
+                               onchange="logAction('check', 'Art: ' + (this.checked ? 'checked' : 'unchecked'))">
+                        <label for="interest-art">Art</label>
+                    </div>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Gender (Radio)</label>
+                <div class="radio-group">
+                    <div class="radio-item">
+                        <input type="radio" id="gender-male" name="gender" value="male"
+                               onchange="logAction('check', 'Gender: male')">
+                        <label for="gender-male">Male</label>
+                    </div>
+                    <div class="radio-item">
+                        <input type="radio" id="gender-female" name="gender" value="female"
+                               onchange="logAction('check', 'Gender: female')">
+                        <label for="gender-female">Female</label>
+                    </div>
+                    <div class="radio-item">
+                        <input type="radio" id="gender-other" name="gender" value="other"
+                               onchange="logAction('check', 'Gender: other')">
+                        <label for="gender-other">Other</label>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Button Section -->
+        <div class="section" id="button-section">
+            <h2>🔘 Buttons & Click Actions</h2>
+            <div style="margin-bottom: 20px;">
+                <button class="btn btn-primary" id="btn-primary" onclick="logAction('click', 'Primary button clicked')">Primary</button>
+                <button class="btn btn-success" id="btn-success" onclick="logAction('click', 'Success button clicked')">Success</button>
+                <button class="btn btn-danger" id="btn-danger" onclick="logAction('click', 'Danger button clicked')">Danger</button>
+                <button class="btn btn-warning" id="btn-warning" onclick="logAction('click', 'Warning button clicked')">Warning</button>
+            </div>
+
+            <h3>Click Counter</h3>
+            <div class="click-counter">
+                <button class="btn btn-primary" id="btn-increment" onclick="updateCounter(1)">+1</button>
+                <span class="counter-value" id="counter-value">0</span>
+                <button class="btn btn-danger" id="btn-decrement" onclick="updateCounter(-1)">-1</button>
+                <button class="btn btn-warning" id="btn-reset-counter" onclick="resetCounter()">Reset</button>
+            </div>
+
+            <h3 style="margin-top: 20px;">Double Click Area</h3>
+            <div class="double-click-area" id="double-click-area" ondblclick="handleDoubleClick()">
+                Double-click me! (Count: <span id="double-click-count">0</span>)
+            </div>
+        </div>
+
+        <!-- Hover Section -->
+        <div class="section" id="hover-section">
+            <h2>🖱️ Hover & Mouse Tracking</h2>
+            <div class="hover-target" id="hover-target"
+                 onmouseenter="logAction('hover', 'Mouse entered hover target')"
+                 onmouseleave="logAction('hover', 'Mouse left hover target')">
+                Hover over me!
+            </div>
+            <div class="mouse-tracker" id="mouse-tracker" style="margin-top: 20px;">
+                Mouse Position: <span id="mouse-x">0</span>, <span id="mouse-y">0</span>
+            </div>
+        </div>
+
+        <!-- Keyboard Section -->
+        <div class="section" id="keyboard-section">
+            <h2>⌨️ Keyboard Input</h2>
+            <p>Click on the display below and press any key:</p>
+            <div class="key-display" id="key-display" tabindex="0"
+                 onkeydown="handleKeyDown(event)"
+                 onkeyup="handleKeyUp(event)"
+                 onfocus="logAction('focus', 'Key display focused')">
+                Press a key...
+            </div>
+            <p style="margin-top: 10px; color: #666;">Last key: <span id="last-key">none</span></p>
+        </div>
+
+        <!-- Drag & Drop Section -->
+        <div class="section" id="drag-section">
+            <h2>🔀 Drag & Drop</h2>
+            <div class="drag-container">
+                <div class="drag-zone" id="drag-source"
+                     ondragover="handleDragOver(event)"
+                     ondrop="handleDrop(event, 'source')">
+                    <h4>Source Zone</h4>
+                    <div class="draggable" id="draggable-1" draggable="true"
+                         ondragstart="handleDragStart(event)"
+                         ondragend="handleDragEnd(event)">
+                        Drag Item 1
+                    </div>
+                    <div class="draggable" id="draggable-2" draggable="true"
+                         ondragstart="handleDragStart(event)"
+                         ondragend="handleDragEnd(event)">
+                        Drag Item 2
+                    </div>
+                </div>
+                <div class="drag-zone" id="drag-target"
+                     ondragover="handleDragOver(event)"
+                     ondrop="handleDrop(event, 'target')">
+                    <h4>Target Zone</h4>
+                </div>
+            </div>
+        </div>
+
+        <!-- Scroll Section -->
+        <div class="section" id="scroll-section">
+            <h2>📜 Scroll Container</h2>
+            <div class="scroll-container" id="scroll-container" onscroll="handleScroll()">
+                <div class="scroll-content">
+                    <p>Scroll down to find the markers...</p>
+                    <div style="height: 100px;"></div>
+                    <div class="scroll-marker" id="marker-1">📍 Marker 1 - You found me!</div>
+                    <div style="height: 100px;"></div>
+                    <div class="scroll-marker" id="marker-2">📍 Marker 2 - Keep scrolling!</div>
+                    <div style="height: 100px;"></div>
+                    <div class="scroll-marker" id="marker-3">📍 Marker 3 - Almost there!</div>
+                    <div style="height: 100px;"></div>
+                    <div class="scroll-marker" id="marker-4">📍 Marker 4 - The end!</div>
+                    <div style="height: 50px;"></div>
+                </div>
+            </div>
+            <p style="margin-top: 10px;">Scroll Position: <span id="scroll-position">0</span>px</p>
+        </div>
+
+        <!-- Visibility Section -->
+        <div class="section" id="visibility-section">
+            <h2>👁️ Visibility Toggle</h2>
+            <button class="btn btn-primary" id="btn-toggle-visibility" onclick="toggleVisibility()">
+                Toggle Element
+            </button>
+            <span class="status-indicator" id="visibility-status">Visible</span>
+            <div class="visibility-demo" id="toggle-element">
+                This element can be shown/hidden. Current state: <strong id="element-state">Visible</strong>
+            </div>
+        </div>
+
+        <!-- Dialog Section -->
+        <div class="section" id="dialog-section">
+            <h2>💬 Dialogs & Alerts</h2>
+            <div class="dialog-buttons">
+                <button class="btn btn-primary" onclick="showAlert()">Show Alert</button>
+                <button class="btn btn-success" onclick="showConfirm()">Show Confirm</button>
+                <button class="btn btn-warning" onclick="showPrompt()">Show Prompt</button>
+            </div>
+            <p style="margin-top: 15px;">Last dialog result: <span id="dialog-result">none</span></p>
+        </div>
+
+        <!-- Grid Selection Section -->
+        <div class="section" id="grid-section">
+            <h2>🔲 Grid Selection</h2>
+            <div class="element-grid">
+                <div class="grid-item" id="grid-1" onclick="selectGridItem(this)">Item 1</div>
+                <div class="grid-item" id="grid-2" onclick="selectGridItem(this)">Item 2</div>
+                <div class="grid-item" id="grid-3" onclick="selectGridItem(this)">Item 3</div>
+                <div class="grid-item" id="grid-4" onclick="selectGridItem(this)">Item 4</div>
+                <div class="grid-item" id="grid-5" onclick="selectGridItem(this)">Item 5</div>
+                <div class="grid-item" id="grid-6" onclick="selectGridItem(this)">Item 6</div>
+            </div>
+            <p style="margin-top: 10px;">Selected: <span id="selected-items">none</span></p>
+        </div>
+
+        <!-- Disabled Elements Section -->
+        <div class="section" id="disabled-section">
+            <h2>🚫 Disabled Elements</h2>
+            <button class="btn btn-primary" id="btn-disabled" disabled>Disabled Button</button>
+            <input type="text" id="input-disabled" disabled value="Disabled Input" style="margin-left: 10px; padding: 10px;">
+            <button class="btn btn-success" id="btn-enable" onclick="toggleDisabled()">Toggle Disabled State</button>
+        </div>
+
+        <!-- Value Verification Section -->
+        <div class="section" id="verify-section">
+            <h2>✅ Value Verification</h2>
+            <div class="form-group">
+                <label for="verify-input">Type "hello" to verify:</label>
+                <input type="text" id="verify-input" placeholder="Type here..."
+                       oninput="verifyValue(this.value)">
+                <span class="status-indicator" id="verify-status" style="margin-left: 10px;">Waiting...</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Logging function
+        function logAction(type, message) {
+            const log = document.getElementById('feedback-log');
+            const entry = document.createElement('div');
+            entry.className = 'log-entry ' + type;
+            const time = new Date().toLocaleTimeString();
+            entry.textContent = `[${time}] ${message}`;
+            log.insertBefore(entry, log.firstChild);
+
+            // Keep only last 50 entries
+            while (log.children.length > 50) {
+                log.removeChild(log.lastChild);
+            }
+
+            // Also log to console
+            console.log(`[${type}] ${message}`);
+        }
+
+        // Form handling
+        function handleFormSubmit(event) {
+            event.preventDefault();
+            const formData = new FormData(event.target);
+            const data = Object.fromEntries(formData.entries());
+            logAction('click', 'Form submitted: ' + JSON.stringify(data));
+            return false;
+        }
+
+        // Counter
+        let counter = 0;
+        function updateCounter(delta) {
+            counter += delta;
+            document.getElementById('counter-value').textContent = counter;
+            logAction('click', 'Counter: ' + counter);
+        }
+        function resetCounter() {
+            counter = 0;
+            document.getElementById('counter-value').textContent = counter;
+            logAction('click', 'Counter reset');
+        }
+
+        // Double click
+        let doubleClickCount = 0;
+        function handleDoubleClick() {
+            doubleClickCount++;
+            document.getElementById('double-click-count').textContent = doubleClickCount;
+            logAction('click', 'Double-click count: ' + doubleClickCount);
+        }
+
+        // Mouse tracking
+        document.addEventListener('mousemove', (e) => {
+            document.getElementById('mouse-x').textContent = e.clientX;
+            document.getElementById('mouse-y').textContent = e.clientY;
+        });
+
+        // Keyboard handling
+        function handleKeyDown(event) {
+            const display = document.getElementById('key-display');
+            const keyInfo = `Key: ${event.key} | Code: ${event.code}`;
+            display.textContent = keyInfo;
+            document.getElementById('last-key').textContent = event.key;
+            logAction('key', 'Key down: ' + event.key);
+        }
+        function handleKeyUp(event) {
+            logAction('key', 'Key up: ' + event.key);
+        }
+
+        // Drag & Drop
+        let draggedElement = null;
+        function handleDragStart(event) {
+            draggedElement = event.target;
+            event.dataTransfer.effectAllowed = 'move';
+            logAction('mouse', 'Drag started: ' + event.target.id);
+        }
+        function handleDragEnd(event) {
+            logAction('mouse', 'Drag ended: ' + event.target.id);
+        }
+        function handleDragOver(event) {
+            event.preventDefault();
+            event.currentTarget.classList.add('dragover');
+        }
+        function handleDrop(event, zone) {
+            event.preventDefault();
+            event.currentTarget.classList.remove('dragover');
+            if (draggedElement) {
+                event.currentTarget.appendChild(draggedElement);
+                logAction('mouse', 'Dropped ' + draggedElement.id + ' in ' + zone);
+            }
+        }
+
+        // Scroll handling
+        function handleScroll() {
+            const container = document.getElementById('scroll-container');
+            const position = Math.round(container.scrollTop);
+            document.getElementById('scroll-position').textContent = position;
+            logAction('scroll', 'Scroll position: ' + position);
+        }
+
+        // Visibility toggle
+        let isVisible = true;
+        function toggleVisibility() {
+            isVisible = !isVisible;
+            const element = document.getElementById('toggle-element');
+            const status = document.getElementById('visibility-status');
+            const state = document.getElementById('element-state');
+
+            if (isVisible) {
+                element.classList.remove('hidden');
+                status.textContent = 'Visible';
+                status.className = 'status-indicator status-success';
+                state.textContent = 'Visible';
+            } else {
+                element.classList.add('hidden');
+                status.textContent = 'Hidden';
+                status.className = 'status-indicator status-warning';
+                state.textContent = 'Hidden';
+            }
+            logAction('click', 'Visibility toggled: ' + (isVisible ? 'visible' : 'hidden'));
+        }
+
+        // Dialog functions
+        function showAlert() {
+            alert('This is an alert dialog!');
+            document.getElementById('dialog-result').textContent = 'Alert shown';
+            logAction('click', 'Alert dialog shown');
+        }
+        function showConfirm() {
+            const result = confirm('Do you confirm this action?');
+            document.getElementById('dialog-result').textContent = 'Confirm: ' + result;
+            logAction('click', 'Confirm dialog: ' + result);
+        }
+        function showPrompt() {
+            const result = prompt('Enter your name:', 'Default');
+            document.getElementById('dialog-result').textContent = 'Prompt: ' + (result || 'cancelled');
+            logAction('click', 'Prompt dialog: ' + (result || 'cancelled'));
+        }
+
+        // Grid selection
+        const selectedItems = new Set();
+        function selectGridItem(element) {
+            if (element.classList.contains('selected')) {
+                element.classList.remove('selected');
+                selectedItems.delete(element.id);
+            } else {
+                element.classList.add('selected');
+                selectedItems.add(element.id);
+            }
+            const display = selectedItems.size > 0 ? Array.from(selectedItems).join(', ') : 'none';
+            document.getElementById('selected-items').textContent = display;
+            logAction('click', 'Grid selection: ' + display);
+        }
+
+        // Disabled toggle
+        function toggleDisabled() {
+            const btn = document.getElementById('btn-disabled');
+            const input = document.getElementById('input-disabled');
+            btn.disabled = !btn.disabled;
+            input.disabled = !input.disabled;
+            logAction('click', 'Disabled state: ' + btn.disabled);
+        }
+
+        // Value verification
+        function verifyValue(value) {
+            const status = document.getElementById('verify-status');
+            if (value === 'hello') {
+                status.textContent = 'Verified ✓';
+                status.className = 'status-indicator status-success';
+            } else if (value.length === 0) {
+                status.textContent = 'Waiting...';
+                status.className = 'status-indicator';
+            } else {
+                status.textContent = 'Not matched';
+                status.className = 'status-indicator status-error';
+            }
+        }
+
+        // Remove dragover class when leaving
+        document.querySelectorAll('.drag-zone').forEach(zone => {
+            zone.addEventListener('dragleave', () => {
+                zone.classList.remove('dragover');
+            });
+        });
+
+        // Initial log
+        logAction('click', 'Test page loaded');
+    </script>
+</body>
+</html>

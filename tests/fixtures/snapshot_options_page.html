@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Snapshot Options Test Page</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            margin: 0;
+            padding: 20px;
+        }
+        section {
+            margin-bottom: 40px;
+            padding: 20px;
+            border-radius: 8px;
+        }
+        #top-section {
+            background: #e3f2fd;
+        }
+        #spacer {
+            height: 2000px; /* Force content below viewport for typical 720px height */
+        }
+        #bottom-section {
+            background: #f1f8e9;
+        }
+        #hidden-section {
+            background: #ffebee;
+            margin-top: 20px;
+        }
+        /* Hidden container to test filter_invisible */
+        .hidden-container {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <!-- TOP visible section (always in viewport at initial position) -->
+    <section id="top-section">
+        <h1>Top Visible Section</h1>
+        <p>This section should always be inside the initial viewport.</p>
+        <button id="top-visible-button">Top Visible Button</button>
+    </section>
+
+    <!-- Large spacer to push following content below viewport -->
+    <div id="spacer"></div>
+
+    <!-- BOTTOM section (initially below viewport) -->
+    <section id="bottom-section">
+        <h2>Bottom Offscreen Section</h2>
+        <p>
+            This section starts below the initial viewport. It should:
+            <br>- be filtered out when <code>full_page=False</code>
+            <br>- be included when <code>full_page=True</code>
+        </p>
+        <button id="bottom-offscreen-button">Bottom Offscreen Button</button>
+    </section>
+
+    <!-- HIDDEN elements to test filter_invisible -->
+    <section id="hidden-section" aria-label="Hidden Elements Section">
+        <h2>Hidden Elements Section</h2>
+        <p>This section contains a hidden button to test filter_invisible.</p>
+        <div class="hidden-container" aria-hidden="true">
+            <button id="hidden-button">Hidden Button</button>
+        </div>
+        <p id="hidden-explanation">
+            The "Hidden Button" is inside a <code>display:none</code> container with <code>aria-hidden="true"</code>.
+            It should only appear in snapshots when <code>filter_invisible=False</code>.
+        </p>
+    </section>
+</body>
+</html>
+
