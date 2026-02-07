@@ -3,6 +3,9 @@ Browser console and network monitoring tools.
 
 This module provides tools for capturing console messages and monitoring
 network requests.
+
+Note: Uses module-level storage keyed by page ID. Call stop_console_capture()
+or stop_network_capture() when done to prevent memory leaks.
 """
 from __future__ import annotations
 import json
@@ -15,8 +18,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Storage for console messages and network requests per page
+# Keys are page IDs (str(id(page))), values are message/request lists
 _console_messages: dict = {}
 _network_requests: dict = {}
+
+# Track registered handlers for cleanup (page_key -> handler_func)
+_console_handlers: dict = {}
+_network_handlers: dict = {}
 
 
 def _get_page_key(page) -> str:
@@ -24,11 +32,19 @@ def _get_page_key(page) -> str:
     return str(id(page))
 
 
-async def start_console_capture(browser: "Browser") -> str:
-    """Start capturing console messages.
+def _cleanup_page_data(page_key: str) -> None:
+    """Clean up stored data for a page (internal helper)."""
+    _console_messages.pop(page_key, None)
+    _network_requests.pop(page_key, None)
+    _console_handlers.pop(page_key, None)
+    _network_handlers.pop(page_key, None)
 
-    Begin capturing console messages from the current page. Messages will
-    be stored until retrieved with get_console_messages.
+
+async def start_console_capture(browser: "Browser") -> str:
+    """Start capturing console messages from the current page.
+
+    Messages are stored until retrieved with get_console_messages().
+    Call stop_console_capture() when done to free memory.
 
     Parameters
     ----------
@@ -38,7 +54,13 @@ async def start_console_capture(browser: "Browser") -> str:
     Returns
     -------
     str
-        Operation result message.
+        "Console message capture started" or error message.
+
+    Notes
+    -----
+    - Only one capture session per page; calling again resets the capture
+    - Capture is page-specific; navigation to new page requires re-starting
+    - Use get_console_messages() to retrieve and optionally clear messages
     """
     try:
         logger.info("[start_console_capture] start")
@@ -48,16 +70,26 @@ async def start_console_capture(browser: "Browser") -> str:
             return "No active page available"
 
         page_key = _get_page_key(page)
+        
+        # Remove existing handler if any
+        if page_key in _console_handlers:
+            try:
+                page.remove_listener("console", _console_handlers[page_key])
+            except Exception:
+                pass
+        
         _console_messages[page_key] = []
 
         def handle_console(msg):
-            _console_messages[page_key].append({
-                "type": msg.type,
-                "text": msg.text,
-                "location": str(msg.location) if msg.location else None,
-            })
+            if page_key in _console_messages:
+                _console_messages[page_key].append({
+                    "type": msg.type,
+                    "text": msg.text,
+                    "location": str(msg.location) if msg.location else None,
+                })
 
         page.on("console", handle_console)
+        _console_handlers[page_key] = handle_console
 
         result = "Console message capture started"
         logger.info(f"[start_console_capture] done {result}")
@@ -124,11 +156,8 @@ async def get_console_messages(
         return error_msg
 
 
-async def start_network_capture(browser: "Browser") -> str:
-    """Start capturing network requests.
-
-    Begin capturing network requests from the current page. Requests will
-    be stored until retrieved with get_network_requests.
+async def stop_console_capture(browser: "Browser") -> str:
+    """Stop capturing console messages and clean up resources.
 
     Parameters
     ----------
@@ -138,14 +167,57 @@ async def start_network_capture(browser: "Browser") -> str:
     Returns
     -------
     str
-        Confirmation message that capture has started.
+        Operation result message.
+    """
+    try:
+        logger.info("[stop_console_capture] start")
+
+        page = await browser.get_current_page()
+        if page is None:
+            return "No active page available"
+
+        page_key = _get_page_key(page)
+        
+        if page_key in _console_handlers:
+            try:
+                page.remove_listener("console", _console_handlers[page_key])
+            except Exception:
+                pass
+            del _console_handlers[page_key]
+        
+        _console_messages.pop(page_key, None)
+
+        result = "Console capture stopped"
+        logger.info(f"[stop_console_capture] done {result}")
+        return result
+    except Exception as e:
+        error_msg = f"Failed to stop console capture: {str(e)}"
+        logger.error(f"[stop_console_capture] {error_msg}")
+        return error_msg
+
+
+async def start_network_capture(browser: "Browser") -> str:
+    """Start capturing network requests from the current page.
+
+    Requests are stored until retrieved with get_network_requests().
+    Call stop_network_capture() when done to free memory.
+
+    Parameters
+    ----------
+    browser : Browser
+        Browser instance to use.
+
+    Returns
+    -------
+    str
+        "Network request capture started" or error message.
 
     Notes
     -----
-    - Call before navigation to capture all requests
+    - Call BEFORE navigation to capture all requests from page load
     - POST data is truncated to first 500 characters
-    - Use get_network_requests to retrieve and optionally clear captured data
-    - Capture is page-specific; navigation may require re-starting capture
+    - Capture is page-specific; navigation to new page requires re-starting
+    - Use get_network_requests(include_static=False) to filter out images/CSS/JS
     """
     try:
         logger.info("[start_network_capture] start")
@@ -155,18 +227,28 @@ async def start_network_capture(browser: "Browser") -> str:
             return "No active page available"
 
         page_key = _get_page_key(page)
+        
+        # Remove existing handler if any
+        if page_key in _network_handlers:
+            try:
+                page.remove_listener("request", _network_handlers[page_key])
+            except Exception:
+                pass
+        
         _network_requests[page_key] = []
 
         def handle_request(request):
-            _network_requests[page_key].append({
-                "url": request.url,
-                "method": request.method,
-                "resource_type": request.resource_type,
-                "headers": dict(request.headers) if request.headers else {},
-                "post_data": request.post_data[:500] if request.post_data else None,
-            })
+            if page_key in _network_requests:
+                _network_requests[page_key].append({
+                    "url": request.url,
+                    "method": request.method,
+                    "resource_type": request.resource_type,
+                    "headers": dict(request.headers) if request.headers else {},
+                    "post_data": request.post_data[:500] if request.post_data else None,
+                })
 
         page.on("request", handle_request)
+        _network_handlers[page_key] = handle_request
 
         result = "Network request capture started"
         logger.info(f"[start_network_capture] done {result}")
@@ -174,6 +256,46 @@ async def start_network_capture(browser: "Browser") -> str:
     except Exception as e:
         error_msg = f"Failed to start network capture: {str(e)}"
         logger.error(f"[start_network_capture] {error_msg}")
+        return error_msg
+
+
+async def stop_network_capture(browser: "Browser") -> str:
+    """Stop capturing network requests and clean up resources.
+
+    Parameters
+    ----------
+    browser : Browser
+        Browser instance to use.
+
+    Returns
+    -------
+    str
+        Operation result message.
+    """
+    try:
+        logger.info("[stop_network_capture] start")
+
+        page = await browser.get_current_page()
+        if page is None:
+            return "No active page available"
+
+        page_key = _get_page_key(page)
+        
+        if page_key in _network_handlers:
+            try:
+                page.remove_listener("request", _network_handlers[page_key])
+            except Exception:
+                pass
+            del _network_handlers[page_key]
+        
+        _network_requests.pop(page_key, None)
+
+        result = "Network capture stopped"
+        logger.info(f"[stop_network_capture] done {result}")
+        return result
+    except Exception as e:
+        error_msg = f"Failed to stop network capture: {str(e)}"
+        logger.error(f"[stop_network_capture] {error_msg}")
         return error_msg
 
 

@@ -23,43 +23,29 @@ async def input_text_by_ref(
     slowly: bool = False,
     submit: bool = False,
 ) -> str:
-    """Input text into an element located by ref.
-
-    Locate an input element using its ref and input the specified text.
-    The ref is obtained from page snapshot refs (e.g., "e1", "e2").
+    """Input text into an element by ref.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     ref : str
-        Element ref obtained from snapshot refs (e.g., "e1", "e2").
+        Element ref from snapshot (e.g., "e1", "e2").
     text : str
-        Text to input into the element.
+        Text to input.
     clear : bool, optional
-        Whether to clear the input field first. Default is True.
+        Clear field first. Default True.
     is_secret : bool, optional
-        Whether this is sensitive information. Default is False.
-        When True, the success message will not include the text content.
+        Hide text in result message. Default False.
     slowly : bool, optional
-        Whether to type slowly with delays between keystrokes. Default is False.
-        When True, simulates real typing with key events instead of using fill().
+        Type with delays (simulates real typing). Default False.
     submit : bool, optional
-        Whether to press Enter after typing to submit. Default is False.
+        Press Enter after typing. Default False.
 
     Returns
     -------
     str
-        Operation result message. On success, returns a confirmation
-        message. On failure, returns an error message.
-
-    Notes
-    -----
-    If the element ref is no longer valid (page changed), the function
-    will return an error message suggesting to refresh the browser state.
-
-    When slowly=True, uses type() method which triggers keydown/keypress/keyup
-    events. This is useful when the page has special handlers for key events.
+        Result message.
     """
     try:
         # Get Locator by ref
@@ -103,23 +89,19 @@ async def input_text_by_ref(
 
 
 async def click_element_by_ref(browser: "Browser", ref: str) -> str:
-    """Click an element located by ref.
-
-    Locate an element using its ref and click it. The ref is obtained
-    from page snapshot refs (e.g., "e1", "e2").
+    """Click an element by ref.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     ref : str
-        Element ref obtained from snapshot refs (e.g., "e1", "e2").
+        Element ref from snapshot (e.g., "e1", "e2").
 
     Returns
     -------
     str
-        Operation result message. On success, returns a confirmation
-        message. On failure, returns an error message.
+        Result message.
     """
     try:
         # Get Locator by ref
@@ -145,29 +127,17 @@ async def click_element_by_ref(browser: "Browser", ref: str) -> str:
 async def get_dropdown_options_by_ref(browser: "Browser", ref: str) -> str:
     """Get all options from a dropdown/select element.
 
-    Retrieve all available options from a dropdown element for display
-    or selection. Use this before select_dropdown_option_by_ref to see
-    available choices.
-
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     ref : str
-        Element ref from snapshot (e.g., "e1", "e2").
+        Element ref from snapshot (e.g., "e1").
 
     Returns
     -------
     str
-        Numbered list of options in format:
-        "1. Option Text (value: option_value)"
-        "2. Another Option (value: another_value)"
-
-        Returns error message if element not found or has no options.
-
-    Examples
-    --------
-    Output: "1. United States (value: US)\\n2. Canada (value: CA)"
+        Numbered list: "1. Option Text (value: val)"
     """
     try:
         # Get Locator by ref
@@ -200,31 +170,21 @@ async def get_dropdown_options_by_ref(browser: "Browser", ref: str) -> str:
 
 
 async def select_dropdown_option_by_ref(browser: "Browser", ref: str, text: str) -> str:
-    """Select an option from a dropdown/select element.
-
-    Select an option by matching its visible text OR its value attribute.
-    Use get_dropdown_options_by_ref first to see available options.
+    """Select an option from a dropdown by visible text or value.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     ref : str
-        Element ref from snapshot (e.g., "e1", "e2").
+        Element ref from snapshot (e.g., "e1").
     text : str
-        The option to select. Can match either:
-        - The visible text (e.g., "United States")
-        - The value attribute (e.g., "US")
+        Option text or value to select.
 
     Returns
     -------
     str
-        Success message confirming selection, or error message on failure.
-
-    Examples
-    --------
-    By text: select_dropdown_option_by_ref(browser, "e5", "United States")
-    By value: select_dropdown_option_by_ref(browser, "e5", "US")
+        Result message.
     """
     try:
         # Get Locator by ref
@@ -248,23 +208,19 @@ async def select_dropdown_option_by_ref(browser: "Browser", ref: str, text: str)
 
 
 async def hover_element_by_ref(browser: "Browser", ref: str) -> str:
-    """Hover over an element located by ref.
-
-    Locate an element using its ref and hover the mouse over it.
-    The ref is obtained from page snapshot refs (e.g., "e1", "e2").
+    """Hover mouse over an element by ref.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     ref : str
-        Element ref obtained from snapshot refs (e.g., "e1", "e2").
+        Element ref from snapshot (e.g., "e1").
 
     Returns
     -------
     str
-        Operation result message. On success, returns a confirmation
-        message. On failure, returns an error message.
+        Result message.
     """
     try:
         # Get Locator by ref
@@ -288,23 +244,19 @@ async def hover_element_by_ref(browser: "Browser", ref: str) -> str:
 
 
 async def focus_element_by_ref(browser: "Browser", ref: str) -> str:
-    """Focus an element located by ref.
-
-    Locate an element using its ref and focus it. The ref is obtained
-    from page snapshot refs (e.g., "e1", "e2").
+    """Focus an element by ref.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     ref : str
-        Element ref obtained from snapshot refs (e.g., "e1", "e2").
+        Element ref from snapshot (e.g., "e1").
 
     Returns
     -------
     str
-        Operation result message. On success, returns a confirmation
-        message. On failure, returns an error message.
+        Result message.
     """
     try:
         # Get Locator by ref
@@ -328,33 +280,21 @@ async def focus_element_by_ref(browser: "Browser", ref: str) -> str:
 
 
 async def evaluate_javascript_on_ref(browser: "Browser", ref: str, code: str) -> str:
-    """Execute JavaScript code on an element located by ref.
-
-    Locate an element using its ref and execute JavaScript code on it.
-    The ref is obtained from page snapshot refs (e.g., "e1", "e2").
-    The code must be in arrow function format, with `this` pointing to
-    the element, e.g., "() => this.textContent".
+    """Execute JavaScript on an element. `this` refers to the element.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     ref : str
-        Element ref obtained from snapshot refs (e.g., "e1", "e2").
+        Element ref from snapshot (e.g., "e1").
     code : str
-        JavaScript code to execute. Must be in arrow function format,
-        with `this` pointing to the element, e.g., "() => this.textContent".
+        Arrow function, e.g., "() => this.textContent".
 
     Returns
     -------
     str
-        JavaScript execution result. Returns "null" if result is None.
-        Other types are converted to string representation.
-
-    Notes
-    -----
-    The code runs in the page context with the element as `this`.
-    See evaluate_javascript() for general JavaScript execution security notes.
+        Execution result as string.
     """
     try:
         # Get Locator by ref
@@ -385,37 +325,21 @@ async def evaluate_javascript_on_ref(browser: "Browser", ref: str, code: str) ->
 
 
 async def upload_file_by_ref(browser: "Browser", ref: str, file_path: str) -> str:
-    """Upload a file to a file input element located by ref.
-
-    Locate a file input element using its ref and upload the specified file.
-    The ref is obtained from page snapshot refs (e.g., "e1", "e2").
+    """Upload a file to a file input element by ref.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     ref : str
-        Element ref obtained from snapshot refs (e.g., "e1", "e2").
+        Element ref from snapshot (e.g., "e1").
     file_path : str
         Path to the file to upload.
 
     Returns
     -------
     str
-        Operation result message. On success, returns a confirmation
-        message. On failure, returns an error message.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the specified file does not exist.
-
-    Notes
-    -----
-    The function validates that:
-    1. The file exists
-    2. The element is an input element
-    3. The input element has type="file"
+        Result message.
     """
     try:
         import os
@@ -464,25 +388,21 @@ async def drag_element_by_ref(
     start_ref: str,
     end_ref: str,
 ) -> str:
-    """Drag an element from one location to another.
-
-    Drag the element at start_ref and drop it on the element at end_ref.
-    This simulates a drag-and-drop operation.
+    """Drag element from start_ref and drop on end_ref.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     start_ref : str
-        Element ref of the element to drag (e.g., "e1").
+        Element ref to drag (e.g., "e1").
     end_ref : str
-        Element ref of the drop target (e.g., "e2").
+        Element ref of drop target (e.g., "e2").
 
     Returns
     -------
     str
-        Operation result message. On success, returns a confirmation
-        message. On failure, returns an error message.
+        Result message.
     """
     try:
         logger.info(f'[drag_element_by_ref] start start_ref={start_ref} end_ref={end_ref}')
@@ -515,23 +435,19 @@ async def drag_element_by_ref(
 
 
 async def check_element_by_ref(browser: "Browser", ref: str) -> str:
-    """Check a checkbox or radio button located by ref.
-
-    Ensure that a checkbox or radio button element is checked.
-    If already checked, this is a no-op.
+    """Check a checkbox or radio button by ref.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     ref : str
-        Element ref obtained from snapshot refs (e.g., "e1", "e2").
+        Element ref from snapshot (e.g., "e1").
 
     Returns
     -------
     str
-        Operation result message. On success, returns a confirmation
-        message. On failure, returns an error message.
+        Result message.
     """
     try:
         logger.info(f'[check_element_by_ref] start ref={ref}')
@@ -555,23 +471,19 @@ async def check_element_by_ref(browser: "Browser", ref: str) -> str:
 
 
 async def uncheck_element_by_ref(browser: "Browser", ref: str) -> str:
-    """Uncheck a checkbox located by ref.
-
-    Ensure that a checkbox element is unchecked. If already unchecked,
-    this is a no-op.
+    """Uncheck a checkbox by ref.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     ref : str
-        Element ref obtained from snapshot refs (e.g., "e1", "e2").
+        Element ref from snapshot (e.g., "e1").
 
     Returns
     -------
     str
-        Operation result message. On success, returns a confirmation
-        message. On failure, returns an error message.
+        Result message.
     """
     try:
         logger.info(f'[uncheck_element_by_ref] start ref={ref}')
@@ -595,23 +507,19 @@ async def uncheck_element_by_ref(browser: "Browser", ref: str) -> str:
 
 
 async def double_click_element_by_ref(browser: "Browser", ref: str) -> str:
-    """Double-click an element located by ref.
-
-    Locate an element using its ref and double-click it.
-    The ref is obtained from page snapshot refs (e.g., "e1", "e2").
+    """Double-click an element by ref.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     ref : str
-        Element ref obtained from snapshot refs (e.g., "e1", "e2").
+        Element ref from snapshot (e.g., "e1").
 
     Returns
     -------
     str
-        Operation result message. On success, returns a confirmation
-        message. On failure, returns an error message.
+        Result message.
     """
     try:
         logger.info(f'[double_click_element_by_ref] start ref={ref}')
@@ -635,23 +543,19 @@ async def double_click_element_by_ref(browser: "Browser", ref: str) -> str:
 
 
 async def scroll_element_into_view_by_ref(browser: "Browser", ref: str) -> str:
-    """Scroll an element into view.
-
-    Scroll the page so that the element located by ref is visible
-    in the viewport.
+    """Scroll page to make element visible in viewport.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     ref : str
-        Element ref obtained from snapshot refs (e.g., "e1", "e2").
+        Element ref from snapshot (e.g., "e1").
 
     Returns
     -------
     str
-        Operation result message. On success, returns a confirmation
-        message. On failure, returns an error message.
+        Result message.
     """
     try:
         logger.info(f'[scroll_element_into_view_by_ref] start ref={ref}')

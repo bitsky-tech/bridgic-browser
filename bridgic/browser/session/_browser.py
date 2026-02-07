@@ -589,21 +589,30 @@ class Browser:
         Also cleans up temporary user data directory if one was created
         for stealth extensions.
         """
+        errors = []
+        
         # Close page
         if self._page:
             try:
                 await self._page.close()
-            except Exception:
-                pass
+            except Exception as e:
+                errors.append(f"page.close: {e}")
             self._page = None
+
+        # Detach download manager before context closes to remove handlers
+        if self._download_manager and self._context:
+            try:
+                self._download_manager.detach_from_context(self._context)
+            except Exception as e:
+                errors.append(f"download_manager.detach: {e}")
 
         # Close context
         # NOTE: In persistent context mode, closing context will auto close browser
         if self._context:
             try:
                 await self._context.close()
-            except Exception:
-                pass
+            except Exception as e:
+                errors.append(f"context.close: {e}")
             self._context = None
 
         # Close browser (only needed in normal launch mode, not persistent context)
@@ -611,16 +620,16 @@ class Browser:
         if self._browser:
             try:
                 await self._browser.close()
-            except Exception:
-                pass
+            except Exception as e:
+                errors.append(f"browser.close: {e}")
             self._browser = None
 
         # Stop playwright
         if self._playwright:
             try:
                 await self._playwright.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                errors.append(f"playwright.stop: {e}")
             self._playwright = None
 
         # Clean up temporary user data directory (created for stealth extensions)
@@ -629,11 +638,33 @@ class Browser:
                 import shutil
                 shutil.rmtree(self._temp_user_data_dir, ignore_errors=True)
                 logger.debug(f"Cleaned up temporary user data dir: {self._temp_user_data_dir}")
-            except Exception:
-                pass
+            except Exception as e:
+                errors.append(f"temp_dir cleanup: {e}")
             self._temp_user_data_dir = None
 
-        logger.info("Browser killed")
+        # Clear snapshot cache
+        self._last_snapshot = None
+        self._last_snapshot_url = None
+
+        if errors:
+            logger.warning(f"Browser killed with errors: {errors}")
+        else:
+            logger.info("Browser killed")
+
+    async def __aenter__(self) -> "Browser":
+        """Async context manager entry - starts the browser.
+        
+        Usage:
+            async with Browser(headless=True) as browser:
+                await browser.navigate_to("https://example.com")
+                # Browser is automatically closed when exiting the context
+        """
+        await self.start()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Async context manager exit - kills the browser."""
+        await self.kill()
     #########################################################
     # page level
     #########################################################
@@ -772,6 +803,7 @@ class Browser:
             return None
         # use CDP to get page size info
         if self._context:
+            cdp_session = None
             try:
                 # NOTE: CDP sessions are only supported on Chromium-based browsers.
                 # create cdp session for the page
@@ -779,8 +811,6 @@ class Browser:
                 # get page size info：more information see https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-getLayoutMetrics
                 result = await cdp_session.send("Page.getLayoutMetrics")
                 logger.debug(f"Page size info: {result}")
-                # detach cdp session
-                await cdp_session.detach()
                 # use modern css properties if available
                 layout_viewport = result.get('cssLayoutViewport') or result.get('layoutViewport', {})
                 content_size = result.get('cssContentSize') or result.get('contentSize', {})
@@ -821,6 +851,13 @@ class Browser:
                 )
             except Exception as e:
                 logger.debug(f"Failed to get page size info: {e}")
+            finally:
+                # Always detach CDP session to prevent resource leak
+                if cdp_session:
+                    try:
+                        await cdp_session.detach()
+                    except Exception:
+                        pass
 
         # fallback to js to get page size info
         try:
@@ -912,7 +949,6 @@ class Browser:
     async def get_full_page_info(self, 
         interactive: bool = False,
         full_page: bool = False,
-        filter_invisible: bool = True,
     ) -> Optional[FullPageInfo]:
         if not self._page:
             logger.warning("No page is open, can't get full page info")
@@ -921,7 +957,6 @@ class Browser:
             snapshot = await self.get_snapshot(
                 interactive=interactive,
                 full_page=full_page,
-                filter_invisible=filter_invisible
             )
             if snapshot is None:
                 logger.warning("Failed to get snapshot")
@@ -984,7 +1019,6 @@ class Browser:
         self,
         interactive: bool = False,
         full_page: bool = False,
-        filter_invisible: bool = True,
     ) -> Optional[EnhancedSnapshot]:
         """Get accessibility snapshot of the current page.
 
@@ -995,9 +1029,6 @@ class Browser:
         full_page : bool
             If True, include all elements regardless of viewport position.
             If False (default), only include elements within the viewport.
-        filter_invisible : bool
-            If True (default), filter out CSS-hidden elements.
-            If False, keep all elements regardless of visibility.
 
         Returns
         -------
@@ -1011,7 +1042,6 @@ class Browser:
             options = SnapshotOptions(
                 interactive=interactive,
                 full_page=full_page,
-                filter_invisible=filter_invisible,
             )
             if self._snapshot_generator is None:
                 self._snapshot_generator = SnapshotGenerator()

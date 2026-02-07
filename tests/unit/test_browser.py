@@ -291,6 +291,26 @@ class TestBrowserStartStop:
 
             assert browser._temp_user_data_dir is None
 
+    @pytest.mark.asyncio
+    async def test_async_context_manager_uses_start_and_kill(self, mock_playwright, mock_context, mock_page):
+        """Test that async context manager starts and kills browser."""
+        from bridgic.browser.session import Browser
+        from bridgic.browser.session import _browser as browser_module
+
+        with patch.object(browser_module, "async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            # Use async context manager
+            async with Browser(stealth=False) as browser:
+                # Inside context, browser should have active page
+                assert browser._page is not None
+
+            # After context exit, resources should be cleaned up
+            assert browser._playwright is None
+            assert browser._browser is None
+            assert browser._context is None
+            assert browser._page is None
+
 
 class TestBrowserNavigation:
     """Tests for Browser navigation methods."""

@@ -252,7 +252,7 @@ class TestPageControlTools:
         import time
 
         start = time.time()
-        result = await wait_for(mock_browser, time=0.5)
+        result = await wait_for(mock_browser, time_seconds=0.5)
         elapsed = time.time() - start
 
         assert elapsed >= 0.5
@@ -884,6 +884,35 @@ class TestNetworkTools:
         assert isinstance(result, str)
 
     @pytest.mark.asyncio
+    async def test_stop_console_capture(self, mock_browser):
+        """Test stopping console message capture."""
+        from bridgic.browser.tools._browser_network_tools import (
+            start_console_capture,
+            stop_console_capture,
+        )
+
+        # Start then stop to exercise cleanup path
+        await start_console_capture(mock_browser)
+        result = await stop_console_capture(mock_browser)
+
+        assert isinstance(result, str)
+        assert "stop" in result.lower() or "console" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_stop_network_capture(self, mock_browser):
+        """Test stopping network request capture."""
+        from bridgic.browser.tools._browser_network_tools import (
+            start_network_capture,
+            stop_network_capture,
+        )
+
+        await start_network_capture(mock_browser)
+        result = await stop_network_capture(mock_browser)
+
+        assert isinstance(result, str)
+        assert "stop" in result.lower() or "network" in result.lower()
+
+    @pytest.mark.asyncio
     async def test_wait_for_network_idle(self, mock_browser):
         """Test waiting for network to become idle."""
         from bridgic.browser.tools._browser_network_tools import wait_for_network_idle
@@ -1198,12 +1227,12 @@ class TestStateTools:
         assert "start_from_char" in result
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("interactive,full_page,filter_invisible", [
-        (True, False, True),
-        (False, True, True),
-        (True, True, False),
+    @pytest.mark.parametrize("interactive,full_page", [
+        (True, False),
+        (False, True),
+        (True, True),
     ])
-    async def test_get_llm_repr_options(self, mock_browser, interactive, full_page, filter_invisible):
+    async def test_get_llm_repr_options(self, mock_browser, interactive, full_page):
         """Test get_llm_repr with various options."""
         from bridgic.browser.tools._browser_state_tools import get_llm_repr
 
@@ -1215,13 +1244,11 @@ class TestStateTools:
             mock_browser,
             interactive=interactive,
             full_page=full_page,
-            filter_invisible=filter_invisible
         )
 
         mock_browser.get_snapshot.assert_called_once_with(
             interactive=interactive,
             full_page=full_page,
-            filter_invisible=filter_invisible,
         )
 
     @pytest.mark.asyncio

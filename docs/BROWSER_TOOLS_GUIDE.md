@@ -12,23 +12,59 @@ This guide helps you choose the right tools for different browser automation sce
 | Mouse (coordinate) | 6 | Precise mouse control |
 | Keyboard | 5 | Text input, shortcuts |
 | Screenshot | 2 | Capture visuals |
-| Network | 5 | Monitor requests/console |
+| Network | 7 | Monitor requests/console |
 | Dialog | 3 | Handle popups |
+| State | 1 | Page snapshot for LLM |
 | Storage | 5 | Cookies, state |
 | Verify | 6 | Assertions |
 | DevTools | 5 | Tracing, video |
 | Control | 3 | Browser lifecycle |
 
+## Page state and get_llm_repr
+
+**Call `get_llm_repr` first** to get element refs (e.g. `e1`, `e2`) before using ref-based action tools. It returns a string representation of the accessibility tree that you can pass to your LLM; refs in that string are stable for the current page and can be used with `click_element_by_ref`, `input_text_by_ref`, etc.
+
+### Parameters
+
+- **start_from_char** (int, default 0): Pagination offset. When the page state is long, the returned text may be truncated at ~30,000 characters. A `[notice]` at the end of the string tells you the **next_start_char** value to use for the next call to get the rest of the content.
+- **interactive** (bool, default False): If True, only clickable/editable elements are included (buttons, links, inputs, checkboxes, elements with `cursor:pointer`, etc.), with flattened output. Use for action-focused tasks.
+- **full_page** (bool, default False): If True, include elements outside the viewport; if False, only viewport content.
+
+### Truncation and pagination
+
+When the full tree exceeds the character limit, the tool returns a segment and appends a notice like:
+
+```
+[notice] Current page state text is too long, returned portion starting from character 0 (this segment length 30000 / total length 45000 characters). To continue getting subsequent content, use start_from_char=30000 to call get_llm_repr again.
+```
+
+Use the given `start_from_char` in the next call to continue reading.
+
+### Examples
+
+```python
+# First call – get initial page state
+state = await get_llm_repr(browser)
+# If state ends with [notice] and next_start_char=30000:
+# state_more = await get_llm_repr(browser, start_from_char=30000)
+
+# Only interactive elements (good for “what can I click?”)
+state = await get_llm_repr(browser, interactive=True)
+
+# Full page including off-viewport content
+state = await get_llm_repr(browser, full_page=True)
+```
+
 ## Ref-based vs Coordinate-based Tools
 
 ### When to Use Ref-based Tools
 
-**Ref-based tools** use element references (e.g., "e1", "e2") from the page snapshot:
+**Ref-based tools** use element references (e.g., "e1", "e2") from the page state:
 
 ```python
-# Get snapshot with element refs
-snapshot = await browser.get_snapshot()
-# Output: "- button 'Submit' [ref=e5]"
+# Get page state with element refs (from get_llm_repr or browser.get_snapshot())
+state = await get_llm_repr(browser)
+# Tree lines look like: "- button 'Submit' [ref=e5]"
 
 # Use ref to interact
 await click_element_by_ref(browser, "e5")
@@ -231,28 +267,28 @@ await mouse_drag(browser,
 
 ### `wait_for`
 
-Flexible waiting with multiple conditions:
+Flexible waiting with multiple conditions. Only one condition is used; priority is: **time_seconds** > **text** > **text_gone** > **selector**.
 
 ```python
-# Wait for time (seconds)
-await wait_for(browser, time=2.0)
+# Wait for time (seconds, max 60)
+await wait_for(browser, time_seconds=2.0)
 
-# Wait for text to appear
-await wait_for(browser, text="Loading complete", timeout=10000)
+# Wait for text to appear (timeout_ms in milliseconds)
+await wait_for(browser, text="Loading complete", timeout_ms=10000)
 
 # Wait for text to disappear
-await wait_for(browser, text_gone="Please wait...", timeout=10000)
+await wait_for(browser, text_gone="Please wait...", timeout_ms=10000)
 
 # Wait for element state
-await wait_for(browser, selector=".modal", state="visible", timeout=5000)
+await wait_for(browser, selector=".modal", state="visible", timeout_ms=5000)
 ```
 
 ### `wait_for_network_idle`
 
-Wait for network activity to settle:
+Wait for network activity to settle. **timeout** is in milliseconds.
 
 ```python
-await wait_for_network_idle(browser, timeout=30000)
+await wait_for_network_idle(browser, timeout=30000)  # 30 seconds
 ```
 
 ## Verification Tools

@@ -9,7 +9,7 @@ Quick Start
 >>> from bridgic.browser.session import Browser
 >>> from bridgic.browser.tools import BrowserToolSetBuilder, ToolPreset
 >>>
->>> browser = Browser(name="my_browser")
+>>> browser = Browser(headless=False)
 >>> await browser.start()
 >>>
 >>> # Choose a preset for your use case
@@ -54,6 +54,10 @@ All tools return a string message following a consistent format:
 **Verification tools** use special prefixes:
 - Success: "PASS: {description}"
 - Failure: "FAIL: {description} - {reason}"
+
+**get_llm_repr** returns the page state string (accessibility tree with refs). It may
+include a pagination notice when truncated; use start_from_char, interactive, and
+full_page to control pagination and scope (interactive-only or viewport-only).
 
 Tool Selection Guide
 --------------------
@@ -169,8 +173,10 @@ from ._browser_screenshot_tools import (
 # ==================== Network and Console Tools ====================
 from ._browser_network_tools import (
     start_console_capture,
+    stop_console_capture,
     get_console_messages,
     start_network_capture,
+    stop_network_capture,
     get_network_requests,
     wait_for_network_idle,
 )
@@ -270,8 +276,10 @@ BROWSER_SCREENSHOT_TOOLS = [
 
 BROWSER_NETWORK_TOOLS = [
     start_console_capture,
+    stop_console_capture,
     get_console_messages,
     start_network_capture,
+    stop_network_capture,
     get_network_requests,
     wait_for_network_idle,
 ]
@@ -501,8 +509,10 @@ __all__ = [
     "save_pdf",
     # Network tools
     "start_console_capture",
+    "stop_console_capture",
     "get_console_messages",
     "start_network_capture",
+    "stop_network_capture",
     "get_network_requests",
     "wait_for_network_idle",
     # Dialog tools

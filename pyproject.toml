@@ -1,6 +1,6 @@
 [project]
 name = "bridgic-browser"
-version = "0.0.1.dev2"
+version = "0.0.1.dev5"
 license = {text = "MIT"}
 classifiers = [
     "Programming Language :: Python :: 3.11",
@@ -26,9 +26,6 @@ dev = [
     "pytest>=8.4.0",
     "pytest-asyncio>=1.0.0",
     "pytest-cov>=4.0.0",
-]
-publish = [
-    "tomli>=2.0.0",
 ]
 
 [tool.pytest.ini_options]

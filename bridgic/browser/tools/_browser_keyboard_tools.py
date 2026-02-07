@@ -162,6 +162,12 @@ async def fill_form(
         List of field specifications. Each dict should have:
         - 'ref': Element ref from snapshot (e.g., "e1")
         - 'value': Value to fill into the field
+        Example:
+        [
+            {"ref": "e1", "value": "john@example.com"},
+            {"ref": "e2", "value": "password123"},
+            {"ref": "e3", "value": "United States"},
+        ]
     submit : bool, optional
         Whether to press Enter after filling the last field. Default is False.
 

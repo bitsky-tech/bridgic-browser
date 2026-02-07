@@ -63,6 +63,4 @@ playwright-report/
 
 # Debug output files
 snapshot_*.yaml
-snapshot*.txt
-browser_use.txt
-system_prompt.txt
+

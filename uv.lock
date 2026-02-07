@@ -163,7 +163,7 @@ wheels = [
 
 [[package]]
 name = "bridgic-browser"
-version = "0.0.1.dev2"
+version = "0.0.1.dev4"
 source = { editable = "." }
 dependencies = [
     { name = "bridgic-core" },
@@ -177,9 +177,6 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
-]
-publish = [
-    { name = "tomli" },
 ]
 
 [package.metadata]
@@ -196,7 +193,6 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=1.0.0" },
     { name = "pytest-cov", specifier = ">=4.0.0" },
 ]
-publish = [{ name = "tomli", specifier = ">=2.0.0" }]
 
 [[package]]
 name = "bridgic-core"

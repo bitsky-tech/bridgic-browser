@@ -24,27 +24,27 @@ class ToolPreset(str, Enum):
 
     # Core presets (minimal sets)
     MINIMAL = "minimal"
-    """Absolute minimum: navigate, click, input, snapshot (6 tools)"""
+    """Absolute minimum: navigate, click, input, snapshot (10 tools)"""
 
     NAVIGATION = "navigation"
     """Navigation only: search, navigate, back/forward (4 tools)"""
 
     # Scenario presets
     SCRAPING = "scraping"
-    """Web scraping: navigation + snapshot + scroll (10 tools)"""
+    """Web scraping: navigation + snapshot + scroll (13 tools)"""
 
     FORM_FILLING = "form_filling"
-    """Form automation: navigation + input + dropdown + checkbox (15 tools)"""
+    """Form automation: navigation + input + dropdown + checkbox (20 tools)"""
 
     TESTING = "testing"
-    """E2E testing: form_filling + verification + screenshot (25 tools)"""
+    """E2E testing: form_filling + verification + screenshot (28 tools)"""
 
     INTERACTIVE = "interactive"
-    """Full interaction: all action tools + mouse + keyboard (35 tools)"""
+    """Full interaction: all action tools + mouse + keyboard (40 tools)"""
 
     # Special presets
     DEVELOPER = "developer"
-    """Developer tools: network + console + tracing (15 tools)"""
+    """Developer tools: network + console + tracing (18 tools)"""
 
     COMPLETE = "complete"
     """All available tools (68 tools) - use sparingly"""
@@ -119,8 +119,8 @@ class BrowserToolSetBuilder(ToolSetBuilder):
             "take_screenshot", "save_pdf",
         ],
         "network": [
-            "start_console_capture", "get_console_messages",
-            "start_network_capture", "get_network_requests", "wait_for_network_idle",
+            "start_console_capture", "stop_console_capture", "get_console_messages",
+            "start_network_capture", "stop_network_capture", "get_network_requests", "wait_for_network_idle",
         ],
         "dialog": [
             "setup_dialog_handler", "handle_dialog", "remove_dialog_handler",
@@ -443,8 +443,8 @@ class BrowserToolSetBuilder(ToolSetBuilder):
         )
         from ._browser_screenshot_tools import take_screenshot, save_pdf
         from ._browser_network_tools import (
-            start_console_capture, get_console_messages,
-            start_network_capture, get_network_requests, wait_for_network_idle,
+            start_console_capture, stop_console_capture, get_console_messages,
+            start_network_capture, stop_network_capture, get_network_requests, wait_for_network_idle,
         )
         from ._browser_dialog_tools import (
             setup_dialog_handler, handle_dialog, remove_dialog_handler,
@@ -485,8 +485,8 @@ class BrowserToolSetBuilder(ToolSetBuilder):
             # Screenshot
             take_screenshot, save_pdf,
             # Network
-            start_console_capture, get_console_messages,
-            start_network_capture, get_network_requests, wait_for_network_idle,
+            start_console_capture, stop_console_capture, get_console_messages,
+            start_network_capture, stop_network_capture, get_network_requests, wait_for_network_idle,
             # Dialog
             setup_dialog_handler, handle_dialog, remove_dialog_handler,
             # Storage

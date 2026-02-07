@@ -241,6 +241,25 @@ class TestDownloadManagerAttach:
         # Should only be in attached list once
         assert len(manager._attached_contexts) == 1
 
+    def test_detach_from_context(self, temp_downloads_dir, mock_context, mock_page):
+        """Test detaching download handler from a context."""
+        manager = DownloadManager(downloads_path=temp_downloads_dir)
+
+        # Attach first
+        manager.attach_to_context(mock_context)
+
+        # Capture the handler that was registered on the context
+        context_handler = mock_context.on.call_args[0][1]
+
+        # Detach
+        manager.detach_from_context(mock_context)
+
+        # Should remove context-level listener
+        mock_context.remove_listener.assert_called_once_with("page", context_handler)
+
+        # Should attempt to remove page-level listener
+        mock_page.remove_listener.assert_called()
+
 
 class TestDownloadManagerHandleDownload:
     """Tests for DownloadManager download handling."""

@@ -25,7 +25,7 @@ init-dev:
 	@if [ -d .venv ]; then echo ".venv already exists, removing..."; rm -rf .venv; fi
 	@uv venv --python=python3.11 .venv && echo ".venv created."
 	@echo "\n==> Installing development dependencies for the project..."
-	@source .venv/bin/activate && uv sync --group dev --group publish
+	@source .venv/bin/activate && uv sync --group dev
 	@$(MAKE) playwright-install
 	@echo "\n==> Development environment ready!"
 
@@ -63,7 +63,7 @@ clean:
 # Publish package
 publish: build
 	@source $(SET_CREDENTIALS) && \
-	version=$$(uv run python -c "import tomli; print(tomli.load(open('pyproject.toml', 'rb'))['project']['version'])") && \
+	version=$$(uv run python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])") && \
 	uv run python $(VERSION_CHECK) --version "$$version" --repo "$(repo)" --package "$(package_name)" && \
 	$(MAKE) _publish_$(repo)
 

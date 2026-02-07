@@ -10,74 +10,37 @@ logger = logging.getLogger(__name__)
 
 MAX_CHAR_LIMIT = 30000
 
-async def get_llm_repr(browser: "Browser",  
-    start_from_char: int = 0, 
+async def get_llm_repr(browser: "Browser",
+    start_from_char: int = 0,
     interactive: bool = False,
     full_page: bool = False,
-    filter_invisible: bool = True
 ) -> str:
-    """Get LLM-friendly representation of current browser state.
+    """Get page accessibility tree with element refs for interaction.
 
-    Retrieves comprehensive state information about the browser's current
-    page, formatted for LLM consumption. The returned text includes:
-
-    1. Page statistics: link count, interactive element count, total
-       element count
-    2. Current tab information: current tab's URL
-    3. Page position information: pages above/below, total page count
-    4. DOM tree text representation: detailed description of all interactive
-       elements, each with a unique index identifier
-    5. Page position markers: "page start", "page end" markers added before
-       and after DOM text to help understand the visible area's position
-       within the entire page
-
-    For complex pages, the returned text may be very long. Use the
-    `start_from_char` parameter for pagination:
-    - First call uses default value 0, returns from the beginning
-    - If the returned content indicates truncation and provides
-      `next_start_char`, pass that value to `start_from_char` in the
-      next call to continue from that position
-
-    The returned text format is suitable for direct use with LLMs for
-    understanding and decision-making, containing all key information
-    needed for browser automation operations.
+    **Call this first** to get refs (e.g., e1, e2) before using action tools.
 
     Parameters
     ----------
     browser : Browser
-        The browser instance to get state from.
+        Browser instance.
     start_from_char : int, optional
-        Character offset for pagination. When page content exceeds 30000
-        characters, use the `next_start_char` value from the truncation
-        notice to continue reading. Default is 0 (start from beginning).
+        Pagination offset. Use `next_start_char` from truncation notice.
     interactive : bool, optional
-        If True, only include interactive elements (buttons, links, inputs)
-        with flattened output. Default is False (include all elements).
+        If True, only return clickable/editable elements (buttons, links,
+        inputs, checkboxes, elements with cursor:pointer, etc.).
     full_page : bool, optional
-        If True, include all elements regardless of viewport position.
-        If False (default), only include elements within the visible viewport.
-    filter_invisible : bool, optional
-        If True (default), filter out CSS-hidden elements (display:none,
-        visibility:hidden, opacity:0, aria-hidden="true").
-        If False, include all elements regardless of visibility.
+        If True, include elements outside viewport.
 
     Returns
     -------
     str
-        LLM-friendly page and DOM description, containing:
-        - Page statistics (link count, interactive element count, etc.)
-        - Current tab's URL
-        - Page position information (pages above/below/total)
-        - Interactive element list (indexed DOM tree text representation)
-        - Page position markers (page start/end markers)
-
-        Returns error message string on failure.
+        Tree with refs like: `- button "Submit" [ref=e1]`
+        Use refs with click_element_by_ref, input_text_by_ref, etc.
     """
     try:
         snapshot = await browser.get_snapshot(
             interactive=interactive,
             full_page=full_page,
-            filter_invisible=filter_invisible,
         )
         if snapshot is None:
             error_msg = "Failed to get interface information"
@@ -137,65 +100,38 @@ async def get_llm_repr(browser: "Browser",
         return error_msg
 
 
-if __name__ == "__main__":
-    import asyncio
-    import os
+# if __name__ == "__main__":
+#     """Manual test runner for get_llm_repr. Writes output to temp dir, not project root."""
+#     import asyncio
+#     import tempfile
+#     from pathlib import Path
 
-    async def main():
-        from bridgic.browser.session import Browser
+#     async def main():
+#         from bridgic.browser.session import Browser
 
-        # Test URLs - covering different ARIA patterns
-        test_urls = [
-            # 1. Button - tests button role with div/span elements
-            ("button", "https://www.w3.org/WAI/ARIA/apg/patterns/button/examples/button_idl/"),
-            # 2. Toolbar - tests toolbar, radio group
-            ("toolbar", "https://www.w3.org/WAI/ARIA/apg/patterns/toolbar/examples/toolbar/"),
-            # 3. Combobox - tests combobox, listbox, option
-            ("combobox", "https://www.w3.org/WAI/ARIA/apg/patterns/combobox/examples/combobox-autocomplete-both/"),
-            # 4. Tabs - tests tab, tablist, tabpanel
-            ("tabs", "https://www.w3.org/WAI/ARIA/apg/patterns/tabs/examples/tabs-automatic/"),
-            # 5. Dialog - tests dialog role
-            ("dialog", "https://www.w3.org/WAI/ARIA/apg/patterns/dialog-modal/examples/dialog/"),
-            # 6. Slider - tests slider role
-            ("slider", "https://www.w3.org/WAI/ARIA/apg/patterns/slider/examples/slider-color-viewer/"),
-        ]
+#         test_urls = [
+#             ("test_page", "http://192.168.0.5:8081/test_page.html"),
+#         ]
 
-        browser = Browser(
-            headless=False,
-            viewport={"width": 1440, "height": 900},
-        )
-        await browser.start()
+#         out_dir = Path(tempfile.gettempdir()) / "bridgic_get_llm_repr_out"
+#         out_dir.mkdir(parents=True, exist_ok=True)
+#         print(f"Writing snapshot YAML to: {out_dir}")
 
-        for name, url in test_urls:
-            print(f"\n{'='*60}")
-            print(f"Testing: {name}")
-            print(f"URL: {url}")
-            print(f"{'='*60}")
+#         browser = Browser(
+#             headless=True,
+#             viewport={"width": 1440, "height": 900},
+#         )
+#         await browser.start()
+#         try:
+#             for name, url in test_urls:
+#                 print(f"\n{'='*60}\nTesting: {name}\nURL: {url}\n{'='*60}")
+#                 await browser.navigate_to(url)
+#                 await asyncio.sleep(2)
+#                 result = await get_llm_repr(browser, interactive=False, full_page=False)
+#                 out_path = out_dir / f"{name}.yaml"
+#                 out_path.write_text(result, encoding="utf-8")
+#                 print(f"Wrote: {out_path}")
+#         finally:
+#             await browser.kill()
 
-            await browser.navigate_to(url)
-            await asyncio.sleep(2)
-
-            result = await get_llm_repr(browser, full_page=True)
-
-            # Copy generated files to named versions
-            if os.path.exists("snapshot_full.yaml"):
-                with open("snapshot_full.yaml", "r", encoding="utf-8") as sf:
-                    with open(f"snapshot_{name}_full.yaml", "w", encoding="utf-8") as f:
-                        f.write(sf.read())
-
-            if os.path.exists("snapshot_enhanced.yaml"):
-                with open("snapshot_enhanced.yaml", "r", encoding="utf-8") as se:
-                    with open(f"snapshot_{name}_enhanced.yaml", "w", encoding="utf-8") as f:
-                        f.write(se.read())
-
-            print(f"Result length: {len(result)} chars")
-            print(f"Saved: snapshot_{name}_full.yaml, snapshot_{name}_enhanced.yaml")
-
-        print(f"\n{'='*60}")
-        print("All tests completed!")
-        print(f"{'='*60}")
-
-        await asyncio.sleep(3)
-        await browser.kill()
-
-    asyncio.run(main())
+#     asyncio.run(main())

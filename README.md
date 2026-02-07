@@ -49,11 +49,11 @@ async def main():
         # Navigate to a URL
         await browser.navigate_to("https://example.com")
 
-        # Get page snapshot for LLM
+        # Get page snapshot for LLM (returns EnhancedSnapshot with .tree and .refs)
         snapshot = await browser.get_snapshot()
-        print(snapshot.tree)  # Accessible element tree with refs
+        print(snapshot.tree)  # Tree format: - role "name" [ref=e1]
 
-        # Interact with elements by ref
+        # Interact with elements by ref (use refs from the snapshot)
         element = await browser.get_element_by_ref("e1")
         if element:
             await element.click()
@@ -73,8 +73,9 @@ async def create_agent():
     browser = Browser(headless=False)
     await browser.start()
 
-    # Build tool set for your agent
+    # Build tool set for your agent (basic_tools = FORM_FILLING preset; prefer for_preset for control)
     tools = BrowserToolSetBuilder.basic_tools(browser)
+    # Or: tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)
 
     # Use tools with your LLM agent
     # tools include: navigate, click, input_text, scroll, etc.
@@ -116,6 +117,8 @@ browser = Browser(
 | `proxy` | dict | None | Proxy settings |
 | `downloads_path` | str/Path | None | Download directory |
 
+**Snapshot:** Use `get_snapshot(interactive=False, full_page=False)` to get an `EnhancedSnapshot` with `.tree` (accessibility tree string) and `.refs` (ref → locator data). Pass `interactive=True` for clickable/editable elements only (flattened output), or `full_page=True` to include elements outside the viewport. Use `get_element_by_ref(ref)` to get a Playwright Locator from a ref (e.g. `"e1"`) for click, fill, etc.
+
 #### StealthConfig
 
 Configure stealth mode for bypassing bot detection:
@@ -144,7 +147,7 @@ from bridgic.browser.session import DownloadManager, DownloadManagerConfig
 config = DownloadManagerConfig(
     downloads_path="./downloads",
     auto_save=True,
-    overwrite_existing=False,
+    overwrite=False,
 )
 
 manager = DownloadManager(config=config)
@@ -256,9 +259,9 @@ tools = (BrowserToolSetBuilder(browser)
 - `take_screenshot(type, filename)` - Capture screenshot
 - `save_pdf(filename)` - Save page as PDF
 
-**Network (5 tools):**
-- `start_console_capture()` / `get_console_messages()` - Console monitoring
-- `start_network_capture()` / `get_network_requests()` - Network monitoring
+**Network (7 tools):**
+- `start_console_capture()` / `stop_console_capture()` / `get_console_messages()` - Console monitoring
+- `start_network_capture()` / `stop_network_capture()` / `get_network_requests()` - Network monitoring
 - `wait_for_network_idle()` - Wait for network idle
 
 **Dialog (3 tools):**
@@ -285,10 +288,10 @@ tools = (BrowserToolSetBuilder(browser)
 **Control (3 tools):**
 - `browser_close()` - Close browser
 - `browser_resize(width, height)` - Resize viewport
-- `wait_for(time, text, text_gone)` - Wait for conditions
+- `wait_for(time_seconds, text, text_gone, selector, state, timeout_ms)` - Wait for conditions
 
 **State (1 tool):**
-- `get_llm_repr()` - Get page snapshot for LLM
+- `get_llm_repr(browser, start_from_char=0, interactive=False, full_page=False)` - Get page state string for LLM (accessibility tree with refs). Use **start_from_char** for pagination when the page is long: if the return value is truncated, a `[notice]` at the end gives **next_start_char** to call again. **interactive** and **full_page** match `get_snapshot` (interactive-only or viewport-only). Output is truncated at ~30k characters with a notice explaining how to continue.
 
 ### Stealth Mode
 
@@ -373,11 +376,11 @@ async def main():
         # 导航到 URL
         await browser.navigate_to("https://example.com")
 
-        # 获取页面快照供 LLM 使用
+        # 获取页面快照供 LLM 使用（返回 EnhancedSnapshot，含 .tree 和 .refs）
         snapshot = await browser.get_snapshot()
-        print(snapshot.tree)  # 带引用的可访问元素树
+        print(snapshot.tree)  # 树格式：- role "name" [ref=e1]
 
-        # 通过引用与元素交互
+        # 通过引用与元素交互（使用快照中的 ref）
         element = await browser.get_element_by_ref("e1")
         if element:
             await element.click()
@@ -397,8 +400,9 @@ async def create_agent():
     browser = Browser(headless=False)
     await browser.start()
 
-    # 为智能体构建工具集
+    # 为智能体构建工具集（basic_tools 等价于 FORM_FILLING 预设；推荐用 for_preset 更灵活）
     tools = BrowserToolSetBuilder.basic_tools(browser)
+    # 或：tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)
 
     # 将工具与 LLM 智能体配合使用
     # 工具包括：导航、点击、输入文本、滚动等
@@ -440,6 +444,8 @@ browser = Browser(
 | `proxy` | dict | None | 代理设置 |
 | `downloads_path` | str/Path | None | 下载目录 |
 
+**快照：** 使用 `get_snapshot(interactive=False, full_page=False)` 获取 `EnhancedSnapshot`，含 `.tree`（可访问性树字符串）和 `.refs`（ref → 定位数据）。`interactive=True` 仅包含可点击/可编辑元素（扁平输出），`full_page=True` 包含视口外元素。使用 `get_element_by_ref(ref)` 根据 ref（如 `"e1"`）获取 Playwright Locator 后进行 click、fill 等操作。
+
 #### StealthConfig
 
 配置隐身模式以绕过机器人检测：
@@ -468,7 +474,7 @@ from bridgic.browser.session import DownloadManager, DownloadManagerConfig
 config = DownloadManagerConfig(
     downloads_path="./downloads",
     auto_save=True,
-    overwrite_existing=False,
+    overwrite=False,
 )
 
 manager = DownloadManager(config=config)
@@ -580,9 +586,9 @@ tools = (BrowserToolSetBuilder(browser)
 - `take_screenshot(type, filename)` - 截取屏幕截图
 - `save_pdf(filename)` - 保存页面为 PDF
 
-**网络（5 个工具）：**
-- `start_console_capture()` / `get_console_messages()` - 控制台监控
-- `start_network_capture()` / `get_network_requests()` - 网络监控
+**网络（7 个工具）：**
+- `start_console_capture()` / `stop_console_capture()` / `get_console_messages()` - 控制台监控
+- `start_network_capture()` / `stop_network_capture()` / `get_network_requests()` - 网络监控
 - `wait_for_network_idle()` - 等待网络空闲
 
 **对话框（3 个工具）：**
@@ -609,10 +615,10 @@ tools = (BrowserToolSetBuilder(browser)
 **控制（3 个工具）：**
 - `browser_close()` - 关闭浏览器
 - `browser_resize(width, height)` - 调整视口大小
-- `wait_for(time, text, text_gone)` - 等待条件
+- `wait_for(time_seconds, text, text_gone, selector, state, timeout_ms)` - 等待条件
 
 **状态（1 个工具）：**
-- `get_llm_repr()` - 获取供 LLM 使用的页面快照
+- `get_llm_repr(browser, start_from_char=0, interactive=False, full_page=False)` - 获取供 LLM 使用的页面状态字符串（带 ref 的可访问性树）。长页面可用 **start_from_char** 分页：若返回值被截断，末尾会有 `[notice]` 给出 **next_start_char** 供再次调用。**interactive** 与 **full_page** 与 `get_snapshot` 一致（仅可交互或仅视口）。输出约 3 万字符处截断并附带续读说明。
 
 ### 隐身模式
 
@@ -656,8 +662,13 @@ MIT 许可证
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
+## More documentation
+
+- [Browser Tools Guide](docs/BROWSER_TOOLS_GUIDE.md) – Tool selection, ref vs coordinate, wait strategies, patterns.
+- [Snapshot and Page State](docs/SNAPSHOT_AND_STATE.md) – SnapshotOptions, EnhancedSnapshot, get_llm_repr, get_element_by_ref.
+- [API Summary](docs/API.md) – Session and DownloadManager API reference.
+
 ## Links
 
 - [GitHub Repository](https://github.com/bitsky-tech/bridgic-browser)
-- [Documentation](https://bridgic.dev)
 - [Issue Tracker](https://github.com/bitsky-tech/bridgic-browser/issues)

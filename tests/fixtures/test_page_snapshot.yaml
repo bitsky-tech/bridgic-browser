@@ -1,0 +1,72 @@
+- heading "📋 Action Log" [ref=e1] [level=3]
+- generic "[11:43:27 AM] Test page loaded" [ref=e2]: "[11:43:27 AM] Test page loaded"
+- heading "🧪 Bridgic Browser Test Page" [ref=e3] [level=1]
+- heading "🔗 Navigation & Links" [ref=e4] [level=2]
+- list:
+  - listitem [ref=e5]:
+    - link "Go to Form Section" [ref=e6] [cursor=pointer]:
+      - /url: "#form-section"
+  - listitem [ref=e7]:
+    - link "Go to Buttons Section" [ref=e8] [cursor=pointer]:
+      - /url: "#button-section"
+  - listitem [ref=e9]:
+    - link "Go to Scroll Section" [ref=e10] [cursor=pointer]:
+      - /url: "#scroll-section"
+  - listitem [ref=e11]:
+    - link "External Link (example.com)" [ref=e12] [cursor=pointer]:
+      - /url: https://example.com
+- heading "📝 Form Elements" [ref=e13] [level=2]
+- generic "Username" [ref=e14]: Username
+- textbox "Username" [ref=e15]:
+  - /placeholder: Enter username
+- generic "Email" [ref=e16]: Email
+- textbox "Email" [ref=e17]:
+  - /placeholder: Enter email
+- generic "Password" [ref=e18]: Password
+- textbox "Password" [ref=e19]:
+  - /placeholder: Enter password
+- generic "Message" [ref=e20]: Message
+- textbox "Message" [ref=e21]:
+  - /placeholder: Enter message
+- generic "Country" [ref=e22]: Country
+- generic "File Upload" [ref=e23]: File Upload
+- generic "Interests (Checkboxes)" [ref=e24]: Interests (Checkboxes)
+- generic "Technology" [ref=e25]: Technology
+- generic "Music" [ref=e26]: Music
+- generic "Sports" [ref=e27]: Sports
+- generic "Art" [ref=e28]: Art
+- generic "Gender (Radio)" [ref=e29]: Gender (Radio)
+- generic "Male" [ref=e30]: Male
+- generic "Female" [ref=e31]: Female
+- generic "Other" [ref=e32]: Other
+- generic "0" [ref=e33]: "0"
+- generic "Double-click me! (Count: 0)" [ref=e34] [cursor=pointer]: "Double-click me! (Count: 0)"
+- generic "Hover over me!" [ref=e35]: Hover over me!
+- generic "Mouse Position: 0, 0" [ref=e36]: "Mouse Position: 0, 0"
+- paragraph "Click on the display below and press any key:" [ref=e37]: "Click on the display below and press any key:"
+- generic "Press a key..." [ref=e38]: Press a key...
+- paragraph "Last key: none" [ref=e39]: "Last key: none"
+- generic "Drag Item 1" [ref=e40]: Drag Item 1
+- generic "Drag Item 2" [ref=e41]: Drag Item 2
+- paragraph "Scroll down to find the markers..." [ref=e42]: Scroll down to find the markers...
+- generic "📍 Marker 1 - You found me!" [ref=e43]: 📍 Marker 1 - You found me!
+- generic "📍 Marker 2 - Keep scrolling!" [ref=e44]: 📍 Marker 2 - Keep scrolling!
+- generic "📍 Marker 3 - Almost there!" [ref=e45]: 📍 Marker 3 - Almost there!
+- generic "📍 Marker 4 - The end!" [ref=e46]: 📍 Marker 4 - The end!
+- paragraph "Scroll Position: 0px" [ref=e47]: "Scroll Position: 0px"
+- generic "Visible" [ref=e48]: Visible
+- text "This element can be shown/hidden. Current state:" [ref=e49]: "This element can be shown/hidden. Current state:"
+- strong "Visible" [ref=e50]: Visible
+- paragraph "Last dialog result: none" [ref=e51]: "Last dialog result: none"
+- generic "Item 1" [ref=e52] [cursor=pointer]: Item 1
+- generic "Item 2" [ref=e53] [cursor=pointer]: Item 2
+- generic "Item 3" [ref=e54] [cursor=pointer]: Item 3
+- generic "Item 4" [ref=e55] [cursor=pointer]: Item 4
+- generic "Item 5" [ref=e56] [cursor=pointer]: Item 5
+- generic "Item 6" [ref=e57] [cursor=pointer]: Item 6
+- paragraph "Selected: none" [ref=e58]: "Selected: none"
+- textbox "Disabled Input" [ref=e59] [disabled]: Disabled Input
+- generic "Type \"hello\" to verify:" [ref=e60]: "Type \"hello\" to verify:"
+- textbox "Type \"hello\" to verify:" [ref=e61]:
+  - /placeholder: Type here...
+- generic "Waiting..." [ref=e62]: Waiting...

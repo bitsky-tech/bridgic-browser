@@ -21,29 +21,19 @@ logger = logging.getLogger(__name__)
 async def search(browser: "Browser", query: str, engine: str = "duckduckgo") -> str:
     """Search using a search engine.
 
-    Navigate to a search engine and perform a search query. Supported
-    search engines include DuckDuckGo, Google, and Bing.
-
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     query : str
         Search query string.
     engine : str, optional
-        Search engine to use. Options: "duckduckgo", "google", "bing".
-        Default is "duckduckgo".
+        "duckduckgo" (default), "google", or "bing".
 
     Returns
     -------
     str
-        Operation result message. On success, returns a confirmation
-        message. On failure, returns an error message.
-
-    Notes
-    -----
-    The query is URL-encoded to ensure safe transmission. The function
-    automatically handles query validation and URL construction.
+        Result message.
     """
     try:
         logger.info(f"[search] start engine={engine} query={query!r}")
@@ -91,31 +81,19 @@ async def search(browser: "Browser", query: str, engine: str = "duckduckgo") -> 
 
 
 async def navigate_to_url(browser: "Browser", url: str) -> str:
-    """Navigate to specified URL in the current page.
-
-    Navigate the browser to a given URL in the current page/tab.
-    To open a URL in a new tab instead, use new_tab(url).
+    """Navigate to URL in current tab. Use new_tab(url) for new tab.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     url : str
-        URL to navigate to. If not a complete URL (missing protocol),
-        "http://" will be prepended automatically.
+        URL to navigate to. Auto-prepends "http://" if missing protocol.
 
     Returns
     -------
     str
-        Operation result message. On success, returns a confirmation
-        message. On failure, returns an error message.
-
-    Notes
-    -----
-    The function performs basic URL validation and normalization.
-    Supported protocols: http://, https://, file://. If the URL
-    doesn't start with a protocol and is not an absolute path, it
-    will be treated as a domain name and "http://" will be prepended.
+        Result message.
     """
     try:
         logger.info(f"[navigate_to_url] start url={url}")
@@ -153,21 +131,17 @@ async def navigate_to_url(browser: "Browser", url: str) -> str:
 
 
 async def go_back(browser: "Browser") -> str:
-    """Navigate back to previous page.
-
-    Navigate the browser back to the previous page in the history.
+    """Navigate back to previous page in history.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
 
     Returns
     -------
     str
-        Operation result message. On success, returns a confirmation
-        message. If navigation is not possible (no history), returns
-        an informative message. On failure, returns an error message.
+        Result message.
     """
     try:
         logger.info(f"[go_back] start")
@@ -196,21 +170,17 @@ async def go_back(browser: "Browser") -> str:
 
 
 async def go_forward(browser: "Browser") -> str:
-    """Navigate forward to next page.
-
-    Navigate the browser forward to the next page in the history.
+    """Navigate forward to next page in history.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
 
     Returns
     -------
     str
-        Operation result message. On success, returns a confirmation
-        message. If navigation is not possible, returns an informative
-        message. On failure, returns an error message.
+        Result message.
     """
     try:
         logger.info(f"[go_forward] start")
@@ -231,18 +201,15 @@ async def go_forward(browser: "Browser") -> str:
 async def reload_page(browser: "Browser") -> str:
     """Reload the current page.
 
-    Reload the current page, waiting for network activity to complete.
-
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
 
     Returns
     -------
     str
-        Operation result message. On success, returns a confirmation
-        message. On failure, returns an error message.
+        Result message.
     """
     try:
         logger.info(f"[reload_page] start")
@@ -261,17 +228,17 @@ async def reload_page(browser: "Browser") -> str:
 
 
 async def get_current_page_info(browser: "Browser") -> str:
-    """Get information about the current page, including page size, title, URL, etc.
+    """Get current page info: URL, title, viewport size, scroll position.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
 
     Returns
     -------
     str
-        JSON string of page info, or error message on failure.
+        Page info string.
     """
     try:
         logger.info(f"[get_current_page_info] start")
@@ -300,29 +267,19 @@ async def get_current_page_info(browser: "Browser") -> str:
 
 
 async def press_key(browser: "Browser", key: str) -> str:
-    """Press a keyboard key.
-
-    Press a keyboard key or key combination on the current page.
-    Supports key combinations like "Control+A".
+    """Press a keyboard key or combination (e.g., "Enter", "Control+A").
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     key : str
-        Key name to press. Supports key combinations like "Control+A",
-        "Shift+Tab", etc.
+        Key name or combination (e.g., "Tab", "Control+C", "Shift+Tab").
 
     Returns
     -------
     str
-        Operation result message. On success, returns a confirmation
-        message. On failure, returns an error message.
-
-    Notes
-    -----
-    Uses Playwright's page.keyboard.press() method. See Playwright
-    documentation for supported key names and combinations.
+        Result message.
     """
     try:
         logger.info(f"[press_key] start key={key}")
@@ -347,19 +304,19 @@ async def press_key(browser: "Browser", key: str) -> str:
 
 
 async def scroll_to_text(browser: "Browser", text: str) -> str:
-    """Scroll to the specified text on the page.
+    """Scroll to make the specified text visible on page.
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     text : str
         Text to find and scroll to.
 
     Returns
     -------
     str
-        Operation result message.
+        Result message.
     """
     try:
         logger.info(f"[scroll_to_text] start text={text!r}")
@@ -400,38 +357,19 @@ async def scroll_to_text(browser: "Browser", text: str) -> str:
 # ==================== JavaScript Execution Tools ====================
 
 async def evaluate_javascript(browser: "Browser", code: str) -> str:
-    """Execute JavaScript code on the current page.
-
-    Execute JavaScript code in the page context and return the result.
-    The code must be in arrow function format, e.g., "() => document.title".
-    Note: Using index-based DOM element access is not supported.
+    """Execute JavaScript in page context. **Only run trusted code.**
 
     Parameters
     ----------
     browser : Browser
-        Browser instance to use.
+        Browser instance.
     code : str
-        JavaScript code to execute. Must be in arrow function format,
-        e.g., "() => document.title". Index-based DOM element access
-        is not supported.
+        Arrow function format, e.g., "() => document.title".
 
     Returns
     -------
     str
-        JavaScript execution result. Boolean values are converted to
-        strings "True" or "False". None values are returned as "None".
-        Other types are converted to their string representation.
-
-    Warnings
-    --------
-    Executing arbitrary JavaScript code can be a security risk. Only
-    execute code from trusted sources. The code runs in the page context
-    and has access to all page resources.
-
-    Notes
-    -----
-    Uses Playwright's page.evaluate() method. The code is executed in
-    the page context, not the Node.js context.
+        Execution result as string.
     """
     try:
         logger.info(f"[evaluate_javascript] start code_preview={code[:100] if code and len(code) > 100 else code!r}")
@@ -713,64 +651,57 @@ async def browser_resize(
 
 async def wait_for(
     browser: "Browser",
-    time: Optional[float] = None,
+    time_seconds: Optional[float] = None,
     text: Optional[str] = None,
     text_gone: Optional[str] = None,
     selector: Optional[str] = None,
     state: str = "visible",
-    timeout: float = 30000,
+    timeout_ms: float = 30000,
 ) -> str:
-    """Wait for a condition to be met.
+    """Wait for a condition: time delay, text appearance/disappearance, or element state.
 
-    Wait for a specified time, for text to appear, for text to disappear,
-    or for a selector to reach a certain state.
-
-    **Priority**: If multiple conditions are provided, only ONE is used in
-    this order: time > text > text_gone > selector.
+    **Priority**: Only ONE condition is used: time_seconds > text > text_gone > selector.
 
     Parameters
     ----------
     browser : Browser
         Browser instance to use.
-    time : float, optional
-        Time to wait in **SECONDS** (e.g., 5.0 = 5 seconds, max 60).
-        If provided, all other conditions are ignored.
+    time_seconds : float, optional
+        Fixed delay in SECONDS (e.g., 2.5 = 2.5 seconds, max 60).
+        If provided, ignores all other parameters.
     text : str, optional
-        Text to wait for on the page. Waits until text becomes visible.
+        Wait until this text appears and is visible on the page.
     text_gone : str, optional
-        Text to wait for disappearance. Waits until text becomes hidden.
+        Wait until this text disappears from the page.
     selector : str, optional
-        CSS selector to wait for (e.g., "#submit-btn", ".loading").
+        CSS selector to wait for (e.g., "#submit-btn", ".loading-spinner").
     state : str, optional
-        State to wait for when using selector. Options:
-        - "visible" (default): element is visible
-        - "hidden": element is hidden or removed
-        - "attached": element exists in DOM
-        - "detached": element removed from DOM
-    timeout : float, optional
-        Maximum wait time in **MILLISECONDS** (e.g., 30000 = 30 seconds).
-        Only applies to text/text_gone/selector conditions, not to `time`.
-        Default is 30000 (30 seconds).
+        Element state when using selector: "visible" (default), "hidden",
+        "attached", "detached".
+    timeout_ms : float, optional
+        Maximum wait time in MILLISECONDS for text/selector conditions.
+        Default is 30000 (30 seconds). Does not apply to time_seconds.
 
     Returns
     -------
     str
-        Success message describing what was waited for, or error message
-        if the condition was not met within the timeout.
+        Success: "Waited for X seconds" or "Text 'X' appeared on the page"
+        Failure: "Wait condition not met: {error}"
 
     Examples
     --------
-    Wait 5 seconds: wait_for(time=5.0)
-    Wait for text: wait_for(text="Loading complete", timeout=10000)
-    Wait for element: wait_for(selector=".modal", state="visible")
+    wait_for(time_seconds=3)  # Wait 3 seconds
+    wait_for(text="Success")  # Wait for "Success" to appear
+    wait_for(text_gone="Loading...")  # Wait for loading text to disappear
+    wait_for(selector=".modal", state="visible")  # Wait for modal
     """
     try:
-        logger.info(f"[wait_for] start time={time} text={text} text_gone={text_gone} selector={selector}")
+        logger.info(f"[wait_for] start time_seconds={time_seconds} text={text} text_gone={text_gone} selector={selector}")
 
         # Wait for time
-        if time is not None:
+        if time_seconds is not None:
             import asyncio
-            actual_seconds = min(max(float(time), 0), 60)
+            actual_seconds = min(max(float(time_seconds), 0), 60)
             await asyncio.sleep(actual_seconds)
             result = f"Waited for {actual_seconds} seconds"
             logger.info(f"[wait_for] done {result}")
@@ -783,7 +714,7 @@ async def wait_for(
         # Wait for text to appear
         if text is not None:
             locator = page.get_by_text(text, exact=False)
-            await locator.first.wait_for(state="visible", timeout=timeout)
+            await locator.first.wait_for(state="visible", timeout=timeout_ms)
             result = f"Text '{text}' appeared on the page"
             logger.info(f"[wait_for] done {result}")
             return result
@@ -791,7 +722,7 @@ async def wait_for(
         # Wait for text to disappear
         if text_gone is not None:
             locator = page.get_by_text(text_gone, exact=False)
-            await locator.first.wait_for(state="hidden", timeout=timeout)
+            await locator.first.wait_for(state="hidden", timeout=timeout_ms)
             result = f"Text '{text_gone}' disappeared from the page"
             logger.info(f"[wait_for] done {result}")
             return result
@@ -799,7 +730,7 @@ async def wait_for(
         # Wait for selector
         if selector is not None:
             locator = page.locator(selector)
-            await locator.first.wait_for(state=state, timeout=timeout)
+            await locator.first.wait_for(state=state, timeout=timeout_ms)
             result = f"Selector '{selector}' reached state '{state}'"
             logger.info(f"[wait_for] done {result}")
             return result
