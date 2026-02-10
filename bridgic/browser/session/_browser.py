@@ -946,9 +946,9 @@ class Browser:
         )
         return page_info
 
-    async def get_full_page_info(self, 
+    async def get_full_page_info(self,
         interactive: bool = False,
-        full_page: bool = False,
+        full_page: bool = True,
     ) -> Optional[FullPageInfo]:
         if not self._page:
             logger.warning("No page is open, can't get full page info")
@@ -1018,7 +1018,7 @@ class Browser:
     async def get_snapshot(
         self,
         interactive: bool = False,
-        full_page: bool = False,
+        full_page: bool = True,
     ) -> Optional[EnhancedSnapshot]:
         """Get accessibility snapshot of the current page.
 
@@ -1027,8 +1027,8 @@ class Browser:
         interactive : bool
             If True, only include interactive elements with flattened output.
         full_page : bool
-            If True, include all elements regardless of viewport position.
-            If False (default), only include elements within the viewport.
+            If True (default), include all elements regardless of viewport position.
+            If False, only include elements within the viewport.
 
         Returns
         -------

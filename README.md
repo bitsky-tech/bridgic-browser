@@ -117,7 +117,7 @@ browser = Browser(
 | `proxy` | dict | None | Proxy settings |
 | `downloads_path` | str/Path | None | Download directory |
 
-**Snapshot:** Use `get_snapshot(interactive=False, full_page=False)` to get an `EnhancedSnapshot` with `.tree` (accessibility tree string) and `.refs` (ref → locator data). Pass `interactive=True` for clickable/editable elements only (flattened output), or `full_page=True` to include elements outside the viewport. Use `get_element_by_ref(ref)` to get a Playwright Locator from a ref (e.g. `"e1"`) for click, fill, etc.
+**Snapshot:** Use `get_snapshot(interactive=False, full_page=True)` to get an `EnhancedSnapshot` with `.tree` (accessibility tree string) and `.refs` (ref → locator data). By default `full_page=True` includes all elements regardless of viewport position. Pass `interactive=True` for clickable/editable elements only (flattened output), or `full_page=False` to limit to viewport-only elements. Use `get_element_by_ref(ref)` to get a Playwright Locator from a ref (e.g. `"e1"`) for click, fill, etc.
 
 #### StealthConfig
 
@@ -291,7 +291,7 @@ tools = (BrowserToolSetBuilder(browser)
 - `wait_for(time_seconds, text, text_gone, selector, state, timeout_ms)` - Wait for conditions
 
 **State (1 tool):**
-- `get_llm_repr(browser, start_from_char=0, interactive=False, full_page=False)` - Get page state string for LLM (accessibility tree with refs). Use **start_from_char** for pagination when the page is long: if the return value is truncated, a `[notice]` at the end gives **next_start_char** to call again. **interactive** and **full_page** match `get_snapshot` (interactive-only or viewport-only). Output is truncated at ~30k characters with a notice explaining how to continue.
+- `get_llm_repr(browser, start_from_char=0, interactive=False, full_page=True)` - Get page state string for LLM (accessibility tree with refs). Use **start_from_char** for pagination when the page is long: if the return value is truncated, a `[notice]` at the end gives **next_start_char** to call again. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default). Output is truncated at ~30k characters with a notice explaining how to continue.
 
 ### Stealth Mode
 
@@ -444,7 +444,7 @@ browser = Browser(
 | `proxy` | dict | None | 代理设置 |
 | `downloads_path` | str/Path | None | 下载目录 |
 
-**快照：** 使用 `get_snapshot(interactive=False, full_page=False)` 获取 `EnhancedSnapshot`，含 `.tree`（可访问性树字符串）和 `.refs`（ref → 定位数据）。`interactive=True` 仅包含可点击/可编辑元素（扁平输出），`full_page=True` 包含视口外元素。使用 `get_element_by_ref(ref)` 根据 ref（如 `"e1"`）获取 Playwright Locator 后进行 click、fill 等操作。
+**快照：** 使用 `get_snapshot(interactive=False, full_page=True)` 获取 `EnhancedSnapshot`，含 `.tree`（可访问性树字符串）和 `.refs`（ref → 定位数据）。默认 `full_page=True` 包含所有元素（不限于视口）。`interactive=True` 仅包含可点击/可编辑元素（扁平输出），`full_page=False` 仅包含视口内元素。使用 `get_element_by_ref(ref)` 根据 ref（如 `"e1"`）获取 Playwright Locator 后进行 click、fill 等操作。
 
 #### StealthConfig
 
@@ -618,7 +618,7 @@ tools = (BrowserToolSetBuilder(browser)
 - `wait_for(time_seconds, text, text_gone, selector, state, timeout_ms)` - 等待条件
 
 **状态（1 个工具）：**
-- `get_llm_repr(browser, start_from_char=0, interactive=False, full_page=False)` - 获取供 LLM 使用的页面状态字符串（带 ref 的可访问性树）。长页面可用 **start_from_char** 分页：若返回值被截断，末尾会有 `[notice]` 给出 **next_start_char** 供再次调用。**interactive** 与 **full_page** 与 `get_snapshot` 一致（仅可交互或仅视口）。输出约 3 万字符处截断并附带续读说明。
+- `get_llm_repr(browser, start_from_char=0, interactive=False, full_page=True)` - 获取供 LLM 使用的页面状态字符串（带 ref 的可访问性树）。长页面可用 **start_from_char** 分页：若返回值被截断，末尾会有 `[notice]` 给出 **next_start_char** 供再次调用。**interactive** 与 **full_page** 与 `get_snapshot` 一致（默认全页面）。输出约 3 万字符处截断并附带续读说明。
 
 ### 隐身模式
 

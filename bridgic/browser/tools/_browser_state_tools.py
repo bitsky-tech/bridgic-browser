@@ -13,7 +13,7 @@ MAX_CHAR_LIMIT = 30000
 async def get_llm_repr(browser: "Browser",
     start_from_char: int = 0,
     interactive: bool = False,
-    full_page: bool = False,
+    full_page: bool = True,
 ) -> str:
     """Get page accessibility tree with element refs for interaction.
 
@@ -29,7 +29,7 @@ async def get_llm_repr(browser: "Browser",
         If True, only return clickable/editable elements (buttons, links,
         inputs, checkboxes, elements with cursor:pointer, etc.).
     full_page : bool, optional
-        If True, include elements outside viewport.
+        If True (default), include elements outside viewport.
 
     Returns
     -------

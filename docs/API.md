@@ -11,7 +11,7 @@ Short reference for the main session and download APIs. For tool lists and prese
 | `await browser.close()` | Close browser and release resources. |
 | `await browser.kill()` | Force kill the browser process. |
 | `await browser.navigate_to(url)` | Navigate current page to URL. |
-| `await browser.get_snapshot(interactive=False, full_page=False)` | Get `EnhancedSnapshot` (`.tree`, `.refs`). |
+| `await browser.get_snapshot(interactive=False, full_page=True)` | Get `EnhancedSnapshot` (`.tree`, `.refs`). |
 | `await browser.get_element_by_ref(ref)` | Get Playwright `Locator` for ref (e.g. `"e1"`); uses last snapshot. |
 | `await browser.get_current_page()` | Get current Playwright `Page` or None. |
 | `browser.get_current_page_url()` | Get current page URL string. |
@@ -29,4 +29,4 @@ Short reference for the main session and download APIs. For tool lists and prese
 
 - **SnapshotOptions**: `interactive`, `full_page`.
 - **EnhancedSnapshot**: `.tree`, `.refs` (ref id → RefData).
-- **get_llm_repr(browser, start_from_char=0, interactive=False, full_page=False)**: Page state string for LLM, with optional pagination.
+- **get_llm_repr(browser, start_from_char=0, interactive=False, full_page=True)**: Page state string for LLM, with optional pagination.

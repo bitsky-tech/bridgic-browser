@@ -28,7 +28,7 @@ This guide helps you choose the right tools for different browser automation sce
 
 - **start_from_char** (int, default 0): Pagination offset. When the page state is long, the returned text may be truncated at ~30,000 characters. A `[notice]` at the end of the string tells you the **next_start_char** value to use for the next call to get the rest of the content.
 - **interactive** (bool, default False): If True, only clickable/editable elements are included (buttons, links, inputs, checkboxes, elements with `cursor:pointer`, etc.), with flattened output. Use for action-focused tasks.
-- **full_page** (bool, default False): If True, include elements outside the viewport; if False, only viewport content.
+- **full_page** (bool, default True): If True (default), include all elements regardless of viewport position; if False, only viewport content.
 
 ### Truncation and pagination
 
@@ -51,8 +51,8 @@ state = await get_llm_repr(browser)
 # Only interactive elements (good for “what can I click?”)
 state = await get_llm_repr(browser, interactive=True)
 
-# Full page including off-viewport content
-state = await get_llm_repr(browser, full_page=True)
+# Viewport-only (override default full_page=True)
+state = await get_llm_repr(browser, full_page=False)
 ```
 
 ## Ref-based vs Coordinate-based Tools

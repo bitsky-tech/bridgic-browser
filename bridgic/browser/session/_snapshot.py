@@ -89,11 +89,11 @@ class SnapshotOptions:
         with flattened output (no indentation). Useful for getting a quick
         list of actionable elements on the page.
     full_page : bool
-        If False (default), only include elements within the viewport.
-        If True, include all elements regardless of viewport position.
+        If True (default), include all elements regardless of viewport position.
+        If False, only include elements within the viewport.
     """
     interactive: bool = False
-    full_page: bool = False
+    full_page: bool = True
 
 
 class RoleNameTracker:
@@ -1540,7 +1540,7 @@ class SnapshotGenerator:
 
         Options:
         - interactive: Only include interactive elements (flattened output)
-        - full_page: Include all elements regardless of viewport (default: False)
+        - full_page: Include all elements regardless of viewport (default: True)
 
         Parameters
         ----------

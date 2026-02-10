@@ -57,7 +57,7 @@ All tools return a string message following a consistent format:
 
 **get_llm_repr** returns the page state string (accessibility tree with refs). It may
 include a pagination notice when truncated; use start_from_char, interactive, and
-full_page to control pagination and scope (interactive-only or viewport-only).
+full_page to control pagination and scope (interactive-only or full-page by default).
 
 Tool Selection Guide
 --------------------

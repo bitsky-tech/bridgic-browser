@@ -15,21 +15,21 @@ Options for how the snapshot is generated (used by both `get_snapshot` and `get_
 | Option         | Type | Default | Description |
 |----------------|------|---------|-------------|
 | `interactive`  | bool | False   | If True, only include interactive elements (buttons, links, inputs, checkboxes, elements with cursor:pointer, etc.) and output a flattened list (no indentation). Best for “what can I click/type?”. |
-| `full_page`    | bool | False   | If False, only include elements within the viewport. If True, include all elements regardless of viewport position. |
+| `full_page`    | bool | True    | If True (default), include all elements regardless of viewport position. If False, only include elements within the viewport. |
 
 Example:
 
 ```python
 from bridgic.browser.session import Browser, SnapshotOptions
 
-# Viewport-only, all elements (default)
+# Full page, all elements (default)
 snapshot = await browser.get_snapshot()
 
 # Interactive elements only, flattened
 snapshot = await browser.get_snapshot(interactive=True)
 
-# Full page
-snapshot = await browser.get_snapshot(full_page=True)
+# Viewport-only
+snapshot = await browser.get_snapshot(full_page=False)
 ```
 
 ## EnhancedSnapshot
@@ -79,7 +79,7 @@ When using `Browser`, you typically use `browser.get_snapshot()` and `browser.ge
 
 Tool function used to supply the page state to an LLM. It calls `browser.get_snapshot(interactive=..., full_page=...)` and returns the tree string, with optional truncation and pagination.
 
-- **Signature**: `get_llm_repr(browser, start_from_char=0, interactive=False, full_page=False) -> str`
+- **Signature**: `get_llm_repr(browser, start_from_char=0, interactive=False, full_page=True) -> str`
 - **Returns**: The accessibility tree string. May be truncated at ~30,000 characters; if so, a `[notice]` at the end explains how to continue (see below).
 
 ### Parameters
@@ -88,7 +88,7 @@ Tool function used to supply the page state to an LLM. It calls `browser.get_sna
 |-------------------|------|---------|-------------|
 | `start_from_char` | int  | 0       | Character offset for pagination. Use the `next_start_char` from the truncation notice to get the next segment. |
 | `interactive`     | bool | False   | Same as `SnapshotOptions.interactive`: only interactive elements, flattened. |
-| `full_page`       | bool | False   | Same as `SnapshotOptions.full_page`: include elements outside the viewport. |
+| `full_page`       | bool | True    | Same as `SnapshotOptions.full_page`: include all elements regardless of viewport position. |
 
 ### Truncation and pagination
 
