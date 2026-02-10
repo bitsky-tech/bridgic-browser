@@ -57,7 +57,7 @@ class BrowserToolSetBuilder(ToolSetBuilder):
     Provides multiple ways to select tools:
     1. **Presets**: Pre-defined tool sets for common scenarios
     2. **Categories**: Select by tool category
-    3. **Individual**: Cherry-pick specific tools
+    3. **Individual**: Cherry-pick specific tools by function or name
     4. **Composable**: Combine any of the above
 
     Examples
@@ -86,6 +86,15 @@ class BrowserToolSetBuilder(ToolSetBuilder):
     >>> tools = BrowserToolSetBuilder.for_categories(
     ...     browser,
     ...     "navigation", "action", "screenshot"
+    ... )
+
+    Name-based selection:
+
+    >>> tools = BrowserToolSetBuilder.from_tool_names(
+    ...     browser,
+    ...     "search",
+    ...     "navigate_to_url",
+    ...     "click_element_by_ref",
     ... )
     """
 
@@ -272,6 +281,42 @@ class BrowserToolSetBuilder(ToolSetBuilder):
         """
         return cls(browser).with_tools(*funcs).build_specs()
 
+    @classmethod
+    def from_tool_names(
+        cls,
+        browser: "Browser",
+        *tool_names: str,
+        strict: bool = False,
+    ) -> List[BrowserToolSpec]:
+        """
+        Build tool specs from specific tool function names.
+
+        Parameters
+        ----------
+        browser : Browser
+            The Browser instance to bind tools to.
+        *tool_names : str
+            Tool function names to include.
+        strict : bool
+            When True, raise ValueError if any name is unknown.
+            When False (default), unknown names are ignored.
+
+        Returns
+        -------
+        List[BrowserToolSpec]
+            Tool specs for the specified tool names.
+
+        Examples
+        --------
+        >>> tools = BrowserToolSetBuilder.from_tool_names(
+        ...     browser,
+        ...     "search",
+        ...     "navigate_to_url",
+        ...     "click_element_by_ref",
+        ... )
+        """
+        return cls(browser).with_tool_names(*tool_names, strict=strict).build_specs()
+
     # ==================== Legacy API (backward compatible) ====================
 
     @classmethod
@@ -345,6 +390,40 @@ class BrowserToolSetBuilder(ToolSetBuilder):
                 self._selected_tools.add(tool.__name__)
             else:
                 self._selected_tools.add(tool)
+        return self
+
+    def with_tool_names(
+        self,
+        *tool_names: str,
+        strict: bool = False,
+    ) -> "BrowserToolSetBuilder":
+        """
+        Add specific tools by function names.
+
+        Parameters
+        ----------
+        *tool_names : str
+            Tool function names to add.
+        strict : bool
+            When True, raise ValueError if any name is unknown.
+            When False (default), unknown names are ignored.
+
+        Returns
+        -------
+        BrowserToolSetBuilder
+            Self for chaining.
+        """
+        self._selected_tools.update(tool_names)
+
+        if strict:
+            unknown_names = sorted(
+                name for name in tool_names if name not in self._get_all_tool_funcs()
+            )
+            if unknown_names:
+                raise ValueError(
+                    f"Unknown tool name(s): {', '.join(unknown_names)}"
+                )
+
         return self
 
     def without_tools(self, *tools: Union[Callable, str]) -> "BrowserToolSetBuilder":

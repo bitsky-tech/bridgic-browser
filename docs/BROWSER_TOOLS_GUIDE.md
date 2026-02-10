@@ -326,6 +326,43 @@ result = await verify_url(browser, expected_url="dashboard")
 | Debugging | DEVELOPER | 18 |
 | Full access | COMPLETE | 68 |
 
+## Picking by function names
+
+Use name-based APIs when your tool list comes from config files, prompts, or other runtime inputs:
+
+```python
+from bridgic.browser.tools import BrowserToolSetBuilder
+
+tools = BrowserToolSetBuilder.from_tool_names(
+    browser,
+    "search",
+    "navigate_to_url",
+    "click_element_by_ref",
+)
+```
+
+For fluent composition:
+
+```python
+tools = (
+    BrowserToolSetBuilder(browser)
+    .with_category("navigation")
+    .with_tool_names("click_element_by_ref", "verify_url")
+    .build_specs()
+)
+```
+
+Use `strict=True` to fail fast on unknown names (recommended in production):
+
+```python
+tools = BrowserToolSetBuilder.from_tool_names(
+    browser,
+    "search",
+    "navigate_to_url",
+    strict=True,
+)
+```
+
 ## Common Patterns
 
 ### Form Filling

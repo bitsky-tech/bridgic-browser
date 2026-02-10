@@ -20,10 +20,19 @@ Quick Start
 >>> # Or select by category
 >>> tools = BrowserToolSetBuilder.for_categories(browser, "navigation", "action")
 >>>
+>>> # Or select by tool function names
+>>> tools = BrowserToolSetBuilder.from_tool_names(
+...     browser,
+...     "search",
+...     "navigate_to_url",
+...     "click_element_by_ref",
+... )
+>>>
 >>> # Or use fluent builder for fine-grained control
 >>> tools = (BrowserToolSetBuilder(browser)
 ...     .with_preset(ToolPreset.MINIMAL)
 ...     .with_category("screenshot")
+...     .with_tool_names("verify_url")
 ...     .without_tools("go_forward")
 ...     .build_specs())
 
@@ -362,6 +371,15 @@ class ToolSet:
 
     >>> from bridgic.browser.tools import search, navigate_to_url
     >>> tools = BrowserToolSetBuilder.from_funcs(browser, search, navigate_to_url)
+
+    Or by tool function names:
+
+    >>> tools = BrowserToolSetBuilder.from_tool_names(
+    ...     browser,
+    ...     "search",
+    ...     "navigate_to_url",
+    ...     strict=True,
+    ... )
     """
 
     @staticmethod

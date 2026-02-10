@@ -198,6 +198,26 @@ tools = BrowserToolSetBuilder.for_categories(
 )
 ```
 
+#### Name-based Selection (by function name)
+
+```python
+# Select by tool function names
+tools = BrowserToolSetBuilder.from_tool_names(
+    browser,
+    "search",
+    "navigate_to_url",
+    "click_element_by_ref",
+)
+
+# Enable strict mode to catch typos early
+tools = BrowserToolSetBuilder.from_tool_names(
+    browser,
+    "search",
+    "navigate_to_url",
+    strict=True,
+)
+```
+
 #### Fluent Builder for Custom Selection
 
 ```python
@@ -207,6 +227,7 @@ tools = (BrowserToolSetBuilder(browser)
     .with_preset(ToolPreset.MINIMAL)
     .with_category("screenshot")
     .with_tools(verify_url)
+    .with_tool_names("verify_title")
     .without_tools("go_forward")
     .build_specs())
 ```
@@ -525,6 +546,26 @@ tools = BrowserToolSetBuilder.for_categories(
 )
 ```
 
+#### 按名称选择（按函数名）
+
+```python
+# 按工具函数名选择
+tools = BrowserToolSetBuilder.from_tool_names(
+    browser,
+    "search",
+    "navigate_to_url",
+    "click_element_by_ref",
+)
+
+# 开启 strict 模式，及时发现拼写错误
+tools = BrowserToolSetBuilder.from_tool_names(
+    browser,
+    "search",
+    "navigate_to_url",
+    strict=True,
+)
+```
+
 #### 流式构建器自定义选择
 
 ```python
@@ -534,6 +575,7 @@ tools = (BrowserToolSetBuilder(browser)
     .with_preset(ToolPreset.MINIMAL)
     .with_category("screenshot")
     .with_tools(verify_url)
+    .with_tool_names("verify_title")
     .without_tools("go_forward")
     .build_specs())
 ```

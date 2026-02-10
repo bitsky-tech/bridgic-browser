@@ -1352,6 +1352,43 @@ class TestBrowserToolSetBuilder:
 
         assert "search" in builder._selected_tools
 
+    def test_with_tool_names_adds_names(self):
+        """Test that with_tool_names adds tool function names."""
+        from bridgic.browser.tools import BrowserToolSetBuilder
+
+        builder = BrowserToolSetBuilder.__new__(BrowserToolSetBuilder)
+        builder._selected_tools = set()
+
+        builder.with_tool_names("search", "navigate_to_url")
+
+        assert "search" in builder._selected_tools
+        assert "navigate_to_url" in builder._selected_tools
+
+    def test_with_tool_names_strict_raises_on_unknown(self):
+        """Test strict mode raises when unknown tool names are provided."""
+        from bridgic.browser.tools import BrowserToolSetBuilder
+
+        builder = BrowserToolSetBuilder.__new__(BrowserToolSetBuilder)
+        builder._selected_tools = set()
+
+        with pytest.raises(ValueError, match="Unknown tool name"):
+            builder.with_tool_names("search", "not_a_real_tool", strict=True)
+
+    def test_from_tool_names_builds_specs(self):
+        """Test from_tool_names builds tool specs from names."""
+        from bridgic.browser.tools import BrowserToolSetBuilder
+
+        browser = MagicMock()
+        specs = BrowserToolSetBuilder.from_tool_names(
+            browser,
+            "search",
+            "navigate_to_url",
+        )
+
+        names = {spec.to_tool().name for spec in specs}
+        assert "search" in names
+        assert "navigate_to_url" in names
+
     def test_preset_categories_are_valid(self):
         """Test that all preset categories exist."""
         from bridgic.browser.tools._browser_tool_set_builder import BrowserToolSetBuilder, ToolPreset
