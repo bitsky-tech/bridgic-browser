@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Role Text Match Case</title>
+</head>
+<body>
+    <main>
+        <h1>Role Text Match Fixture</h1>
+
+        <section role="list" aria-label="Ticket List">
+            <div role="listitem">待处理</div>
+            <div role="listitem">处理中</div>
+            <div role="listitem">已完成</div>
+        </section>
+
+        <section role="table" aria-label="Task Table">
+            <div role="rowgroup">
+                <div role="row">
+                    <span role="columnheader">状态</span>
+                    <span role="columnheader">处理人</span>
+                </div>
+            </div>
+            <div role="rowgroup">
+                <div role="row">
+                    <span role="rowheader">任务A</span>
+                    <span role="cell">待处理</span>
+                </div>
+                <div role="row">
+                    <span role="rowheader">任务B</span>
+                    <span role="cell">处理中</span>
+                </div>
+            </div>
+        </section>
+
+        <section role="grid" aria-label="Result Grid">
+            <div role="row">
+                <div role="gridcell">G-100</div>
+                <div role="gridcell">Ready</div>
+            </div>
+            <div role="row">
+                <div role="gridcell">G-101</div>
+                <div role="gridcell">Done</div>
+            </div>
+        </section>
+    </main>
+</body>
+</html>

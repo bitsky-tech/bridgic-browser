@@ -11,8 +11,9 @@ Tests are organized by method/feature:
 
 from __future__ import annotations
 
+import re
 from typing import Dict, Optional, Tuple
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -153,6 +154,230 @@ class TestExtractOriginalRefsFromRaw:
         refs_info, _ = gen._extract_original_refs_from_raw(raw)
         assert len(refs_info) == 1
         assert "e1" in refs_info
+
+
+# ---------------------------------------------------------------------------
+# 1b. get_locator_from_ref_async
+# ---------------------------------------------------------------------------
+
+class TestGetLocatorFromRefAsync:
+    """Tests for ref -> Playwright locator reconstruction."""
+
+    def test_returns_none_for_invalid_ref_arg(self, gen: SnapshotGenerator) -> None:
+        page = Mock()
+        refs: Dict[str, RefData] = {}
+
+        locator = gen.get_locator_from_ref_async(page, "not-a-ref", refs)
+
+        assert locator is None
+
+    def test_returns_none_for_missing_ref(self, gen: SnapshotGenerator) -> None:
+        page = Mock()
+        refs: Dict[str, RefData] = {}
+
+        locator = gen.get_locator_from_ref_async(page, "e999", refs)
+
+        assert locator is None
+
+    @pytest.mark.parametrize(
+        ("role", "name"),
+        [
+            ("listitem", "待处理"),
+            ("cell", "cell text"),
+            ("gridcell", "gridcell text"),
+            ("columnheader", "Status"),
+            ("rowheader", "Order ID"),
+        ],
+    )
+    def test_role_text_match_roles_use_role_filter_with_exact_text(
+        self, gen: SnapshotGenerator, role: str, name: str
+    ) -> None:
+        page = Mock()
+        role_locator = Mock()
+        filtered_locator = Mock()
+        page.get_by_role.return_value = role_locator
+        role_locator.filter.return_value = filtered_locator
+
+        refs = {
+            "e1": RefData(
+                selector=f'get_by_role(\'{role}\', name="{name}", exact=True)',
+                role=role,
+                name=name,
+                nth=None,
+                text_content=None,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is filtered_locator
+        page.get_by_role.assert_called_once_with(role)
+        role_locator.filter.assert_called_once()
+        _, kwargs = role_locator.filter.call_args
+        assert "has_text" in kwargs
+        pattern = kwargs["has_text"]
+        assert isinstance(pattern, re.Pattern)
+        assert pattern.match(name)
+        assert not pattern.match(f"{name} extra")
+
+    def test_row_uses_role_exact_intersection_with_text_fallback(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        page = Mock()
+        row_role_locator = Mock()
+        row_text_locator = Mock()
+        intersect_locator = Mock()
+        fallback_row_locator = Mock()
+        combined_locator = Mock()
+        page.get_by_role.side_effect = [row_role_locator, fallback_row_locator]
+        page.get_by_text.return_value = row_text_locator
+        row_role_locator.and_.return_value = intersect_locator
+        fallback_row_locator.filter.return_value = fallback_row_locator
+        intersect_locator.or_.return_value = combined_locator
+
+        refs = {
+            "e1": RefData(
+                selector='get_by_role(\'row\', name="状态", exact=True)',
+                role="row",
+                name="状态",
+                nth=None,
+                text_content=None,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is combined_locator
+        assert page.get_by_role.call_count == 2
+        page.get_by_role.assert_any_call("row")
+        page.get_by_text.assert_called_once_with("状态", exact=True)
+        row_role_locator.and_.assert_called_once_with(row_text_locator)
+        fallback_row_locator.filter.assert_called_once()
+        _, kwargs = fallback_row_locator.filter.call_args
+        assert "has_text" in kwargs
+        pattern = kwargs["has_text"]
+        assert isinstance(pattern, re.Pattern)
+        assert pattern.search("状态 处理人")
+        intersect_locator.or_.assert_called_once_with(fallback_row_locator)
+
+    def test_role_text_match_blank_text_falls_back_to_role(self, gen: SnapshotGenerator) -> None:
+        page = Mock()
+        role_locator = Mock()
+        page.get_by_role.return_value = role_locator
+        refs = {
+            "e1": RefData(
+                selector="get_by_role('cell')",
+                role="cell",
+                name="   ",
+                nth=None,
+                text_content=None,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is role_locator
+        page.get_by_role.assert_called_once_with("cell")
+
+    def test_structural_noise_blank_text_falls_back_to_role(self, gen: SnapshotGenerator) -> None:
+        page = Mock()
+        role_locator = Mock()
+        page.get_by_role.return_value = role_locator
+        refs = {
+            "e1": RefData(
+                selector="get_by_role('generic')",
+                role="generic",
+                name="   ",
+                nth=None,
+                text_content=None,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is role_locator
+        page.get_by_role.assert_called_once_with("generic")
+
+    def test_listitem_named_with_nth_applies_nth(self, gen: SnapshotGenerator) -> None:
+        page = Mock()
+        role_locator = Mock()
+        filtered_locator = Mock()
+        nth_locator = Mock()
+        page.get_by_role.return_value = role_locator
+        role_locator.filter.return_value = filtered_locator
+        filtered_locator.nth.return_value = nth_locator
+
+        refs = {
+            "e2": RefData(
+                selector='get_by_role(\'listitem\', name="待处理", exact=True)',
+                role="listitem",
+                name="待处理",
+                nth=1,
+                text_content=None,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e2", refs)
+
+        filtered_locator.nth.assert_called_once_with(1)
+        assert locator is nth_locator
+
+    def test_named_button_keeps_get_by_role_name_path(self, gen: SnapshotGenerator) -> None:
+        page = Mock()
+        role_locator = Mock()
+        page.get_by_role.return_value = role_locator
+        refs = {
+            "e1": RefData(
+                selector='get_by_role(\'button\', name="Submit", exact=True)',
+                role="button",
+                name="Submit",
+                nth=None,
+                text_content=None,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is role_locator
+        page.get_by_role.assert_called_once_with("button", name="Submit", exact=True)
+
+    def test_named_option_keeps_get_by_role_name_path(self, gen: SnapshotGenerator) -> None:
+        page = Mock()
+        role_locator = Mock()
+        page.get_by_role.return_value = role_locator
+        refs = {
+            "e1": RefData(
+                selector='get_by_role(\'option\', name="United States", exact=True)',
+                role="option",
+                name="United States",
+                nth=None,
+                text_content=None,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is role_locator
+        page.get_by_role.assert_called_once_with("option", name="United States", exact=True)
+
+    def test_structural_noise_still_uses_get_by_text(self, gen: SnapshotGenerator) -> None:
+        page = Mock()
+        text_locator = Mock()
+        page.get_by_text.return_value = text_locator
+        refs = {
+            "e1": RefData(
+                selector='get_by_text("Username", exact=True)',
+                role="generic",
+                name="Username",
+                nth=None,
+                text_content=None,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is text_locator
+        page.get_by_text.assert_called_once_with("Username", exact=True)
 
 
 # ---------------------------------------------------------------------------

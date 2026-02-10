@@ -277,6 +277,18 @@ class SnapshotGenerator:
         'option',        # Select options (also in INTERACTIVE, but explicit here)
     }
 
+    # Roles where snapshot "name" can come from visible text while Playwright
+    # role-name matching relies on accessible name semantics.
+    # For these roles, prefer role-constrained exact text matching.
+    ROLE_TEXT_MATCH_ROLES: Set[str] = {
+        'listitem',
+        'row',
+        'cell',
+        'gridcell',
+        'columnheader',
+        'rowheader',
+    }
+
     # Landmark roles that provide semantic structure (always keep)
     # Note: 'search' is also in OTHER_INTERACTIVE_ROLES
     LANDMARK_ROLES: Set[str] = {
@@ -704,12 +716,47 @@ class SnapshotGenerator:
                     return el.textContent ? el.textContent.trim() : '';
                 }
 
+                function normalizeText(value) {
+                    if (!value) return '';
+                    return String(value).replace(/\\s+/g, ' ').trim();
+                }
+
                 function findElement(role, name, nth) {
                     const selector = IMPLICIT_ROLE_SELECTORS[role] || '[role="' + role + '"]';
                     const all = Array.from(document.querySelectorAll(selector));
                     if (!name) return all[nth] || null;
 
-                    const matching = all.filter(el => getAccessibleName(el) === name);
+                    const normalizedName = normalizeText(name);
+                    if (!normalizedName) return all[nth] || null;
+
+                    const roleTextMatchRoles = new Set([
+                        'listitem', 'row', 'cell', 'gridcell', 'columnheader', 'rowheader'
+                    ]);
+
+                    let matching = [];
+                    if (roleTextMatchRoles.has(role)) {
+                        if (role === 'row') {
+                            matching = all.filter(el => {
+                                const rowText = normalizeText(el.innerText || el.textContent || '');
+                                if (rowText === normalizedName) return true;
+
+                                // Row names can map to a single cell/header text. Check descendants.
+                                const descendants = [el, ...Array.from(el.querySelectorAll('*'))];
+                                return descendants.some(node =>
+                                    normalizeText(node.innerText || node.textContent || '') === normalizedName
+                                );
+                            });
+                        } else {
+                            matching = all.filter(el =>
+                                normalizeText(el.innerText || el.textContent || '') === normalizedName
+                            );
+                        }
+                    } else {
+                        matching = all.filter(
+                            el => normalizeText(getAccessibleName(el)) === normalizedName
+                        );
+                    }
+
                     return matching[nth] || null;
                 }
 
@@ -1634,7 +1681,35 @@ class SnapshotGenerator:
         if ref_data.role in self.STRUCTURAL_NOISE_ROLES and (ref_data.name or ref_data.text_content):
             # get_by_role('generic') doesn't match plain <div> elements in Playwright,
             # so use get_by_text for structural noise roles (generic, group, etc.)
-            locator = page.get_by_text(ref_data.name or ref_data.text_content, exact=True)
+            text = ref_data.name or ref_data.text_content
+            if text and text.strip():
+                locator = page.get_by_text(text.strip(), exact=True)
+            else:
+                # Empty/whitespace text would over-match with get_by_text(""), fallback conservatively.
+                locator = page.get_by_role(ref_data.role)
+        elif ref_data.role in self.ROLE_TEXT_MATCH_ROLES and (ref_data.name or ref_data.text_content):
+            # Some structural roles can expose text in snapshot names that does not
+            # reliably map to Playwright role accessible-name matching.
+            # Use role-constrained text filtering to avoid broad get_by_text.
+            text = ref_data.name or ref_data.text_content
+            if not text or not text.strip():
+                locator = page.get_by_role(ref_data.role)
+            elif ref_data.role == 'row':
+                normalized_text = text.strip()
+                # Rows are composite containers: snapshot name may come from a child
+                # cell/header, not the row's full text. Keep both primary and fallback
+                # locators constrained to role='row' to avoid matching child elements.
+                row_locator = page.get_by_role('row').and_(
+                    page.get_by_text(normalized_text, exact=True)
+                )
+                row_text_pattern = re.compile(re.escape(normalized_text))
+                locator = row_locator.or_(
+                    page.get_by_role('row').filter(has_text=row_text_pattern)
+                )
+            else:
+                normalized_text = text.strip()
+                text_pattern = re.compile(rf'^\s*{re.escape(normalized_text)}\s*$')
+                locator = page.get_by_role(ref_data.role).filter(has_text=text_pattern)
         elif ref_data.name:
             locator = page.get_by_role(ref_data.role, name=ref_data.name, exact=True)
         elif ref_data.text_content:

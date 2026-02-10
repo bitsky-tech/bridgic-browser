@@ -29,6 +29,7 @@ from bridgic.browser.tools import get_llm_repr
 
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures"
 TEST_PAGE_PATH = FIXTURES_DIR / "test_page.html"
+ROLE_TEXT_MATCH_CASE_PATH = FIXTURES_DIR / "role_text_match_case.html"
 
 
 # ==================== Helpers ====================
@@ -89,6 +90,17 @@ async def browser():
     b = Browser(headless=True, stealth=False, viewport={"width": 1280, "height": 720})
     await b.start()
     await b.navigate_to(f"file://{TEST_PAGE_PATH.absolute()}")
+    await asyncio.sleep(0.3)
+    yield b
+    await b.kill()
+
+
+@pytest_asyncio.fixture
+async def role_text_match_browser():
+    """Real browser on role_text_match_case.html."""
+    b = Browser(headless=True, stealth=False, viewport={"width": 1280, "height": 720})
+    await b.start()
+    await b.navigate_to(f"file://{ROLE_TEXT_MATCH_CASE_PATH.absolute()}")
     await asyncio.sleep(0.3)
     yield b
     await b.kill()
@@ -571,6 +583,98 @@ class TestLocatorResolution:
         assert tb_ref is not None
         result = await focus_element_by_ref(browser, tb_ref)
         assert "error" not in result.lower(), f"Focus failed: {result}"
+
+    @pytest.mark.asyncio
+    async def test_listitem_refs_resolve_to_elements(self, browser):
+        """Listitem refs from snapshot should resolve to real locators."""
+        snap = await get_llm_repr(browser, interactive=False, full_page=True)
+        refs = parse_snapshot(snap)
+
+        listitem_refs = [
+            ref for ref, info in refs.items() if info["type"].lower() == "listitem"
+        ]
+        assert listitem_refs, "Expected at least one listitem ref in snapshot"
+
+        # Validate several list items so nth disambiguation path is also exercised.
+        for ref in listitem_refs[:4]:
+            locator = await browser.get_element_by_ref(ref)
+            assert locator is not None, f"Failed to resolve listitem ref: {ref}"
+            count = await locator.count()
+            assert count > 0, f"Resolved locator for {ref} has count=0"
+
+    @pytest.mark.asyncio
+    async def test_option_refs_resolve_to_elements(self, browser):
+        """Option refs should keep role+name path and resolve correctly."""
+        snap = await get_llm_repr(browser, interactive=True, full_page=True)
+        refs = parse_snapshot(snap)
+
+        option_refs = [
+            ref for ref, info in refs.items() if info["type"].lower() == "option"
+        ]
+        assert option_refs, "Expected option refs in interactive snapshot"
+
+        for ref in option_refs:
+            locator = await browser.get_element_by_ref(ref)
+            assert locator is not None, f"Failed to resolve option ref: {ref}"
+            count = await locator.count()
+            assert count > 0, f"Resolved locator for {ref} has count=0"
+
+    @pytest.mark.asyncio
+    async def test_role_text_match_refs_resolve_from_dedicated_fixture(
+        self, role_text_match_browser
+    ):
+        """Text-matched structural roles should resolve when ref has a name."""
+        snapshot = await role_text_match_browser.get_snapshot(
+            interactive=False, full_page=True
+        )
+        assert snapshot is not None
+
+        target_roles = {
+            "listitem",
+            "row",
+            "cell",
+            "gridcell",
+            "columnheader",
+            "rowheader",
+        }
+        refs_by_role = {role: [] for role in target_roles}
+
+        for ref, ref_data in snapshot.refs.items():
+            if ref_data.role in target_roles and ref_data.name:
+                refs_by_role[ref_data.role].append(ref)
+
+        missing = [role for role, refs in refs_by_role.items() if not refs]
+        assert not missing, f"Fixture missing named refs for roles: {missing}"
+
+        for role, refs in refs_by_role.items():
+            for ref in refs:
+                locator = await role_text_match_browser.get_element_by_ref(ref)
+                assert locator is not None, f"Failed to resolve {role} ref: {ref}"
+                count = await locator.count()
+                assert count > 0, f"Resolved locator for {role} ref {ref} has count=0"
+
+    @pytest.mark.asyncio
+    async def test_role_text_match_refs_survive_prefilter_in_viewport_mode(
+        self, role_text_match_browser
+    ):
+        """Pre-filter path should keep refs resolvable for role-text-match roles."""
+        snapshot = await role_text_match_browser.get_snapshot(
+            interactive=False, full_page=False
+        )
+        assert snapshot is not None
+
+        target_roles = {"row", "listitem", "cell"}
+        refs = [
+            ref for ref, data in snapshot.refs.items()
+            if data.role in target_roles and data.name
+        ]
+        assert refs, "Expected named refs for row/listitem/cell in viewport snapshot"
+
+        for ref in refs:
+            locator = await role_text_match_browser.get_element_by_ref(ref)
+            assert locator is not None, f"Pre-filter lost resolvability for ref: {ref}"
+            count = await locator.count()
+            assert count > 0, f"Pre-filtered ref {ref} resolves with count=0"
 
 
 # ==================== Snapshot After State Changes ====================
