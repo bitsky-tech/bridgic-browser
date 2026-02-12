@@ -195,8 +195,10 @@ class TestGetLocatorFromRefAsync:
         page = Mock()
         role_locator = Mock()
         filtered_locator = Mock()
+        nth_locator = Mock()
         page.get_by_role.return_value = role_locator
         role_locator.filter.return_value = filtered_locator
+        filtered_locator.nth.return_value = nth_locator
 
         refs = {
             "e1": RefData(
@@ -210,7 +212,8 @@ class TestGetLocatorFromRefAsync:
 
         locator = gen.get_locator_from_ref_async(page, "e1", refs)
 
-        assert locator is filtered_locator
+        assert locator is nth_locator
+        filtered_locator.nth.assert_called_once_with(0)
         page.get_by_role.assert_called_once_with(role)
         role_locator.filter.assert_called_once()
         _, kwargs = role_locator.filter.call_args
@@ -229,11 +232,13 @@ class TestGetLocatorFromRefAsync:
         intersect_locator = Mock()
         fallback_row_locator = Mock()
         combined_locator = Mock()
+        nth_locator = Mock()
         page.get_by_role.side_effect = [row_role_locator, fallback_row_locator]
         page.get_by_text.return_value = row_text_locator
         row_role_locator.and_.return_value = intersect_locator
         fallback_row_locator.filter.return_value = fallback_row_locator
         intersect_locator.or_.return_value = combined_locator
+        combined_locator.nth.return_value = nth_locator
 
         refs = {
             "e1": RefData(
@@ -247,7 +252,8 @@ class TestGetLocatorFromRefAsync:
 
         locator = gen.get_locator_from_ref_async(page, "e1", refs)
 
-        assert locator is combined_locator
+        assert locator is nth_locator
+        combined_locator.nth.assert_called_once_with(0)
         assert page.get_by_role.call_count == 2
         page.get_by_role.assert_any_call("row")
         page.get_by_text.assert_called_once_with("状态", exact=True)
@@ -263,7 +269,9 @@ class TestGetLocatorFromRefAsync:
     def test_role_text_match_blank_text_falls_back_to_role(self, gen: SnapshotGenerator) -> None:
         page = Mock()
         role_locator = Mock()
+        nth_locator = Mock()
         page.get_by_role.return_value = role_locator
+        role_locator.nth.return_value = nth_locator
         refs = {
             "e1": RefData(
                 selector="get_by_role('cell')",
@@ -276,13 +284,16 @@ class TestGetLocatorFromRefAsync:
 
         locator = gen.get_locator_from_ref_async(page, "e1", refs)
 
-        assert locator is role_locator
+        assert locator is nth_locator
+        role_locator.nth.assert_called_once_with(0)
         page.get_by_role.assert_called_once_with("cell")
 
     def test_structural_noise_blank_text_falls_back_to_role(self, gen: SnapshotGenerator) -> None:
         page = Mock()
         role_locator = Mock()
+        nth_locator = Mock()
         page.get_by_role.return_value = role_locator
+        role_locator.nth.return_value = nth_locator
         refs = {
             "e1": RefData(
                 selector="get_by_role('generic')",
@@ -295,7 +306,8 @@ class TestGetLocatorFromRefAsync:
 
         locator = gen.get_locator_from_ref_async(page, "e1", refs)
 
-        assert locator is role_locator
+        assert locator is nth_locator
+        role_locator.nth.assert_called_once_with(0)
         page.get_by_role.assert_called_once_with("generic")
 
     def test_listitem_named_with_nth_applies_nth(self, gen: SnapshotGenerator) -> None:
@@ -322,10 +334,13 @@ class TestGetLocatorFromRefAsync:
         filtered_locator.nth.assert_called_once_with(1)
         assert locator is nth_locator
 
-    def test_named_button_keeps_get_by_role_name_path(self, gen: SnapshotGenerator) -> None:
+    def test_named_button_gets_nth0_by_default(self, gen: SnapshotGenerator) -> None:
+        """Named roles with nth=None get forced to nth(0) to prevent strict mode."""
         page = Mock()
         role_locator = Mock()
+        nth_locator = Mock()
         page.get_by_role.return_value = role_locator
+        role_locator.nth.return_value = nth_locator
         refs = {
             "e1": RefData(
                 selector='get_by_role(\'button\', name="Submit", exact=True)',
@@ -338,13 +353,17 @@ class TestGetLocatorFromRefAsync:
 
         locator = gen.get_locator_from_ref_async(page, "e1", refs)
 
-        assert locator is role_locator
+        assert locator is nth_locator
         page.get_by_role.assert_called_once_with("button", name="Submit", exact=True)
+        role_locator.nth.assert_called_once_with(0)
 
-    def test_named_option_keeps_get_by_role_name_path(self, gen: SnapshotGenerator) -> None:
+    def test_named_option_gets_nth0_by_default(self, gen: SnapshotGenerator) -> None:
+        """Named roles with nth=None get forced to nth(0) to prevent strict mode."""
         page = Mock()
         role_locator = Mock()
+        nth_locator = Mock()
         page.get_by_role.return_value = role_locator
+        role_locator.nth.return_value = nth_locator
         refs = {
             "e1": RefData(
                 selector='get_by_role(\'option\', name="United States", exact=True)',
@@ -357,13 +376,17 @@ class TestGetLocatorFromRefAsync:
 
         locator = gen.get_locator_from_ref_async(page, "e1", refs)
 
-        assert locator is role_locator
+        assert locator is nth_locator
         page.get_by_role.assert_called_once_with("option", name="United States", exact=True)
+        role_locator.nth.assert_called_once_with(0)
 
-    def test_structural_noise_still_uses_get_by_text(self, gen: SnapshotGenerator) -> None:
+    def test_structural_noise_uses_get_by_text_with_nth0(self, gen: SnapshotGenerator) -> None:
+        """STRUCTURAL_NOISE_ROLES with text use get_by_text and force nth(0) for safety."""
         page = Mock()
         text_locator = Mock()
+        nth_locator = Mock()
         page.get_by_text.return_value = text_locator
+        text_locator.nth.return_value = nth_locator
         refs = {
             "e1": RefData(
                 selector='get_by_text("Username", exact=True)',
@@ -376,8 +399,163 @@ class TestGetLocatorFromRefAsync:
 
         locator = gen.get_locator_from_ref_async(page, "e1", refs)
 
-        assert locator is text_locator
+        assert locator is nth_locator
         page.get_by_text.assert_called_once_with("Username", exact=True)
+        text_locator.nth.assert_called_once_with(0)
+        assert refs["e1"].nth == 0
+
+    def test_structural_noise_with_explicit_nth_preserves_it(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """When nth is already set for a STRUCTURAL_NOISE_ROLES element, keep it."""
+        page = Mock()
+        text_locator = Mock()
+        nth_locator = Mock()
+        page.get_by_text.return_value = text_locator
+        text_locator.nth.return_value = nth_locator
+        refs = {
+            "e1": RefData(
+                selector='get_by_text("自动检测", exact=True)',
+                role="generic",
+                name="自动检测",
+                nth=2,
+                text_content=None,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is nth_locator
+        text_locator.nth.assert_called_once_with(2)
+        assert refs["e1"].nth == 2
+
+    @pytest.mark.parametrize("role", ["generic", "group", "none", "presentation"])
+    def test_all_structural_noise_roles_force_nth0(
+        self, gen: SnapshotGenerator, role: str
+    ) -> None:
+        """All STRUCTURAL_NOISE_ROLES with text and nth=None get forced to nth(0)."""
+        page = Mock()
+        text_locator = Mock()
+        nth_locator = Mock()
+        page.get_by_text.return_value = text_locator
+        text_locator.nth.return_value = nth_locator
+        refs = {
+            "e1": RefData(
+                selector=f'get_by_text("label", exact=True)',
+                role=role,
+                name="label",
+                nth=None,
+                text_content=None,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is nth_locator
+        text_locator.nth.assert_called_once_with(0)
+
+    def test_structural_noise_text_content_fallback_forces_nth0(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """STRUCTURAL_NOISE_ROLES using text_content (not name) also force nth(0)."""
+        page = Mock()
+        text_locator = Mock()
+        nth_locator = Mock()
+        page.get_by_text.return_value = text_locator
+        text_locator.nth.return_value = nth_locator
+        refs = {
+            "e1": RefData(
+                selector='get_by_text("自动检测", exact=True)',
+                role="generic",
+                name=None,
+                nth=None,
+                text_content="自动检测",
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is nth_locator
+        page.get_by_text.assert_called_once_with("自动检测", exact=True)
+        text_locator.nth.assert_called_once_with(0)
+
+    def test_bare_text_content_fallback_forces_nth0(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Elements with only text_content (no name, non-noise role) also force nth(0).
+
+        This covers the elif ref_data.text_content branch (line ~1718).
+        """
+        page = Mock()
+        text_locator = Mock()
+        nth_locator = Mock()
+        page.get_by_text.return_value = text_locator
+        text_locator.nth.return_value = nth_locator
+        refs = {
+            "e1": RefData(
+                selector='get_by_text("自动检测", exact=True)',
+                role="button",
+                name=None,
+                nth=None,
+                text_content="自动检测",
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is nth_locator
+        page.get_by_text.assert_called_once_with("自动检测", exact=True)
+        text_locator.nth.assert_called_once_with(0)
+        assert refs["e1"].nth == 0
+
+    def test_bare_text_content_with_explicit_nth_preserves_it(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """When nth is already set on the text_content fallback path, keep it."""
+        page = Mock()
+        text_locator = Mock()
+        nth_locator = Mock()
+        page.get_by_text.return_value = text_locator
+        text_locator.nth.return_value = nth_locator
+        refs = {
+            "e1": RefData(
+                selector='get_by_text("Click me", exact=True)',
+                role="button",
+                name=None,
+                nth=3,
+                text_content="Click me",
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is nth_locator
+        text_locator.nth.assert_called_once_with(3)
+        assert refs["e1"].nth == 3
+
+    def test_bare_role_no_name_gets_nth0(self, gen: SnapshotGenerator) -> None:
+        """Bare get_by_role() with no name/text also gets nth(0) safety net."""
+        page = Mock()
+        role_locator = Mock()
+        nth_locator = Mock()
+        page.get_by_role.return_value = role_locator
+        role_locator.nth.return_value = nth_locator
+        refs = {
+            "e1": RefData(
+                selector="get_by_role('separator')",
+                role="separator",
+                name=None,
+                nth=None,
+                text_content=None,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is nth_locator
+        page.get_by_role.assert_called_once_with("separator")
+        role_locator.nth.assert_called_once_with(0)
+        assert refs["e1"].nth == 0
 
 
 # ---------------------------------------------------------------------------

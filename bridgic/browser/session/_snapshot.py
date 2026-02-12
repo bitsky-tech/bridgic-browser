@@ -1717,10 +1717,15 @@ class SnapshotGenerator:
         else:
             locator = page.get_by_role(ref_data.role)
 
-        # If an nth index is stored (for disambiguation), use it
-        if ref_data.nth is not None:
-            locator = locator.nth(ref_data.nth)
-        
+        # Snapshot may see one element for a (role, name) pair while the live
+        # DOM contains duplicates (hidden/off-viewport elements).  To prevent
+        # Playwright strict-mode violations, default to nth(0) when the
+        # RoleNameTracker didn't assign an explicit index.
+        if ref_data.nth is None:
+            ref_data.nth = 0
+
+        locator = locator.nth(ref_data.nth)
+
         return locator
     
     def get_snapshot_stats(
