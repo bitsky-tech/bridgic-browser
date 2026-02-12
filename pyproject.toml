@@ -1,6 +1,6 @@
 [project]
 name = "bridgic-browser"
-version = "0.0.1.dev9"
+version = "0.0.1.dev10"
 license = {text = "MIT"}
 classifiers = [
     "Programming Language :: Python :: 3.11",

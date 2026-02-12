@@ -317,6 +317,10 @@ class SnapshotGenerator:
         'generic', 'group', 'none', 'presentation'
     }
 
+    # Pseudo-roles used by Playwright snapshotForAI that are NOT valid ARIA roles.
+    # These must use get_by_text() instead of get_by_role().
+    TEXT_LEAF_ROLES: Set[str] = {'text'}
+
     # Pre-compiled regex patterns (avoid recompilation per call)
     # Pattern for _process_page_snapshot_for_ai: matches any snapshot line
     _LINE_PATTERN = re.compile(
@@ -379,6 +383,8 @@ class SnapshotGenerator:
         if name:
             # Escape all double quotes (matching TS version: name.replace(/"/g, '\\"'))
             escaped_name = name.replace('"', '\\"')
+            if role in self.TEXT_LEAF_ROLES:
+                return f"get_by_text(\"{escaped_name}\", exact=True)"
             return f"get_by_role('{role}', name=\"{escaped_name}\", exact=True)"
         if text_content:
             escaped_text = text_content.replace('"', '\\"')
@@ -1678,7 +1684,15 @@ class SnapshotGenerator:
             return None
         
         # Build locator with exact=True to avoid substring matches
-        if ref_data.role in self.STRUCTURAL_NOISE_ROLES and (ref_data.name or ref_data.text_content):
+        if ref_data.role in self.TEXT_LEAF_ROLES and (ref_data.name or ref_data.text_content):
+            # 'text' is a pseudo-role from Playwright's snapshotForAI, not a valid
+            # ARIA role.  get_by_role('text') matches nothing, so use get_by_text().
+            text = ref_data.name or ref_data.text_content
+            if text and text.strip():
+                locator = page.get_by_text(text.strip(), exact=True)
+            else:
+                locator = page.get_by_role(ref_data.role)
+        elif ref_data.role in self.STRUCTURAL_NOISE_ROLES and (ref_data.name or ref_data.text_content):
             # get_by_role('generic') doesn't match plain <div> elements in Playwright,
             # so use get_by_text for structural noise roles (generic, group, etc.)
             text = ref_data.name or ref_data.text_content

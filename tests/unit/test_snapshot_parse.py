@@ -557,6 +557,124 @@ class TestGetLocatorFromRefAsync:
         role_locator.nth.assert_called_once_with(0)
         assert refs["e1"].nth == 0
 
+    def test_text_role_with_name_uses_get_by_text(self, gen: SnapshotGenerator) -> None:
+        """'text' pseudo-role with name uses get_by_text, not get_by_role."""
+        page = Mock()
+        text_locator = Mock()
+        nth_locator = Mock()
+        page.get_by_text.return_value = text_locator
+        text_locator.nth.return_value = nth_locator
+        refs = {
+            "e1": RefData(
+                selector='get_by_text("Hello", exact=True)',
+                role="text",
+                name="Hello",
+                nth=None,
+                text_content=None,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is nth_locator
+        page.get_by_text.assert_called_once_with("Hello", exact=True)
+        page.get_by_role.assert_not_called()
+        text_locator.nth.assert_called_once_with(0)
+
+    def test_text_role_with_text_content_uses_get_by_text(self, gen: SnapshotGenerator) -> None:
+        """'text' pseudo-role with only text_content also uses get_by_text."""
+        page = Mock()
+        text_locator = Mock()
+        nth_locator = Mock()
+        page.get_by_text.return_value = text_locator
+        text_locator.nth.return_value = nth_locator
+        refs = {
+            "e1": RefData(
+                selector='get_by_text("some content", exact=True)',
+                role="text",
+                name=None,
+                nth=None,
+                text_content="some content",
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is nth_locator
+        page.get_by_text.assert_called_once_with("some content", exact=True)
+        page.get_by_role.assert_not_called()
+        text_locator.nth.assert_called_once_with(0)
+
+    def test_text_role_with_explicit_nth(self, gen: SnapshotGenerator) -> None:
+        """'text' pseudo-role preserves explicit nth value."""
+        page = Mock()
+        text_locator = Mock()
+        nth_locator = Mock()
+        page.get_by_text.return_value = text_locator
+        text_locator.nth.return_value = nth_locator
+        refs = {
+            "e1": RefData(
+                selector='get_by_text("Label", exact=True)',
+                role="text",
+                name="Label",
+                nth=3,
+                text_content=None,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is nth_locator
+        text_locator.nth.assert_called_once_with(3)
+        assert refs["e1"].nth == 3
+
+    def test_text_role_with_nth_none_defaults_to_0(self, gen: SnapshotGenerator) -> None:
+        """'text' pseudo-role defaults nth to 0 when not set."""
+        page = Mock()
+        text_locator = Mock()
+        nth_locator = Mock()
+        page.get_by_text.return_value = text_locator
+        text_locator.nth.return_value = nth_locator
+        refs = {
+            "e1": RefData(
+                selector='get_by_text("Label", exact=True)',
+                role="text",
+                name="Label",
+                nth=None,
+                text_content=None,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is nth_locator
+        text_locator.nth.assert_called_once_with(0)
+        assert refs["e1"].nth == 0
+
+    def test_text_role_chinese_text(self, gen: SnapshotGenerator) -> None:
+        """'text' pseudo-role works with Chinese text like '订单ID' (the original bug)."""
+        page = Mock()
+        text_locator = Mock()
+        nth_locator = Mock()
+        page.get_by_text.return_value = text_locator
+        text_locator.nth.return_value = nth_locator
+        refs = {
+            "e29": RefData(
+                selector='get_by_text("订单ID", exact=True)',
+                role="text",
+                name="订单ID",
+                nth=None,
+                text_content=None,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e29", refs)
+
+        assert locator is nth_locator
+        page.get_by_text.assert_called_once_with("订单ID", exact=True)
+        page.get_by_role.assert_not_called()
+        text_locator.nth.assert_called_once_with(0)
+
 
 # ---------------------------------------------------------------------------
 # 2. _batch_get_elements_info — element routing
