@@ -140,7 +140,9 @@ class TestNavigationTools:
 
         result = await navigate_to_url(mock_browser, "https://example.com")
 
-        mock_browser.navigate_to.assert_called_once_with("https://example.com")
+        mock_browser.navigate_to.assert_called_once_with(
+            "https://example.com", wait_until="domcontentloaded", timeout=None
+        )
         assert "Navigated to" in result
 
     @pytest.mark.asyncio
@@ -150,7 +152,9 @@ class TestNavigationTools:
 
         result = await navigate_to_url(mock_browser, "example.com")
 
-        mock_browser.navigate_to.assert_called_once_with("http://example.com")
+        mock_browser.navigate_to.assert_called_once_with(
+            "http://example.com", wait_until="domcontentloaded", timeout=None
+        )
 
     @pytest.mark.asyncio
     async def test_navigate_to_url_empty(self, mock_browser):
@@ -327,7 +331,9 @@ class TestTabManagementTools:
 
         result = await new_tab(mock_browser, "https://example.com")
 
-        mock_browser.new_page.assert_called_once_with("https://example.com")
+        mock_browser.new_page.assert_called_once_with(
+            "https://example.com", wait_until="domcontentloaded", timeout=None
+        )
 
     @pytest.mark.asyncio
     async def test_get_tabs(self, mock_browser):

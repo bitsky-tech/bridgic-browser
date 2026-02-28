@@ -4,6 +4,7 @@ Unit tests for the Browser class.
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -404,3 +405,279 @@ class TestBrowserPageManagement:
             title = await browser.get_current_page_title()
 
             assert title == "Example Page"
+
+
+class TestBrowserRefResolution:
+    """Tests for ref -> locator resolution behavior."""
+
+    @pytest.mark.asyncio
+    async def test_get_element_by_ref_prefers_only_visible_match(self):
+        """When multiple matches exist, pick the unique visible candidate."""
+        browser = Browser(stealth=False)
+        browser._page = MagicMock()
+        browser._last_snapshot = MagicMock(
+            refs={"e7": SimpleNamespace(role="generic", name=None, nth=None)}
+        )
+        browser._snapshot_generator = MagicMock()
+
+        locator = MagicMock()
+        locator.count = AsyncMock(return_value=2)
+        locator.first = MagicMock()
+
+        hidden_match = MagicMock()
+        hidden_match.is_visible = AsyncMock(return_value=False)
+        visible_match = MagicMock()
+        visible_match.is_visible = AsyncMock(return_value=True)
+
+        locator.nth.side_effect = [hidden_match, visible_match]
+        browser._snapshot_generator.get_locator_from_ref_async.return_value = locator
+
+        result = await browser.get_element_by_ref("e7")
+
+        assert result is visible_match
+
+    @pytest.mark.asyncio
+    async def test_get_element_by_ref_falls_back_to_first_when_no_visible_match(self):
+        """When ambiguity remains, fall back to the first locator match."""
+        browser = Browser(stealth=False)
+        browser._page = MagicMock()
+        browser._last_snapshot = MagicMock(
+            refs={"e7": SimpleNamespace(role="generic", name=None, nth=None)}
+        )
+        browser._snapshot_generator = MagicMock()
+
+        locator = MagicMock()
+        locator.count = AsyncMock(return_value=2)
+        fallback_first = MagicMock()
+        locator.first = fallback_first
+
+        match_1 = MagicMock()
+        match_1.is_visible = AsyncMock(return_value=False)
+        match_2 = MagicMock()
+        match_2.is_visible = AsyncMock(return_value=False)
+
+        locator.nth.side_effect = [match_1, match_2]
+        browser._snapshot_generator.get_locator_from_ref_async.return_value = locator
+
+        result = await browser.get_element_by_ref("e7")
+
+        assert result is fallback_first
+
+    @pytest.mark.asyncio
+    async def test_get_element_by_ref_recovers_with_role_name_when_ambiguous(self):
+        """Prefer role+name re-resolution before visibility-based fallback."""
+        browser = Browser(stealth=False)
+        browser._page = MagicMock()
+        browser._snapshot_generator = MagicMock()
+        browser._last_snapshot = MagicMock(
+            refs={"e7": SimpleNamespace(role="button", name="自动检测", nth=None)}
+        )
+
+        ambiguous_locator = MagicMock()
+        ambiguous_locator.count = AsyncMock(return_value=2)
+        browser._snapshot_generator.get_locator_from_ref_async.return_value = ambiguous_locator
+
+        role_name_locator = MagicMock()
+        role_name_locator.count = AsyncMock(return_value=1)
+        browser._page.get_by_role.return_value = role_name_locator
+
+        result = await browser.get_element_by_ref("e7")
+
+        assert result is role_name_locator
+        browser._page.get_by_role.assert_called_once_with(
+            "button",
+            name="自动检测",
+            exact=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_element_by_ref_structural_role_skips_role_name_recovery(self):
+        """Structural noise roles should not use role+name recovery path."""
+        browser = Browser(stealth=False)
+        browser._page = MagicMock()
+        browser._snapshot_generator = MagicMock()
+        browser._last_snapshot = MagicMock(
+            refs={"e7": SimpleNamespace(role="generic", name="自动检测", nth=None)}
+        )
+
+        ambiguous_locator = MagicMock()
+        ambiguous_locator.count = AsyncMock(return_value=2)
+        first_visible = MagicMock()
+        first_visible.is_visible = AsyncMock(return_value=True)
+        second_visible = MagicMock()
+        second_visible.is_visible = AsyncMock(return_value=True)
+        ambiguous_locator.nth.side_effect = [first_visible, second_visible]
+        browser._snapshot_generator.get_locator_from_ref_async.return_value = ambiguous_locator
+
+        result = await browser.get_element_by_ref("e7")
+
+        assert result is first_visible
+        browser._page.get_by_role.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_element_by_ref_prefers_snapshot_nth_when_available(self):
+        """Use snapshot nth to keep deterministic selection for ambiguous refs."""
+        browser = Browser(stealth=False)
+        browser._page = MagicMock()
+        browser._snapshot_generator = MagicMock()
+        browser._last_snapshot = MagicMock(
+            refs={"e7": SimpleNamespace(role="button", name=None, nth=1)}
+        )
+
+        ambiguous_locator = MagicMock()
+        ambiguous_locator.count = AsyncMock(return_value=3)
+        nth_locator = MagicMock()
+        ambiguous_locator.nth.return_value = nth_locator
+        browser._snapshot_generator.get_locator_from_ref_async.return_value = ambiguous_locator
+
+        result = await browser.get_element_by_ref("e7")
+
+        assert result is nth_locator
+        ambiguous_locator.nth.assert_called_once_with(1)
+
+
+class TestBrowserChildFallback:
+    """Tests for count=0 child-ref fallback behavior."""
+
+    @pytest.mark.asyncio
+    async def test_fallback_picks_best_child_when_container_fails(self):
+        """When unnamed container ref fails (count=0), fall back to best child."""
+        from bridgic.browser.session._snapshot import RefData
+
+        browser = Browser(stealth=False)
+        browser._page = MagicMock()
+        browser._snapshot_generator = MagicMock()
+        browser._last_snapshot = MagicMock(refs={
+            "e6": RefData(
+                selector="get_by_role('generic')",
+                role="generic",
+                name=None,
+                nth=0,
+                text_content=None,
+                parent_ref=None,
+            ),
+            "e7": RefData(
+                selector='get_by_text("自动检测", exact=True)',
+                role="generic",
+                name="自动检测",
+                nth=None,
+                text_content=None,
+                parent_ref="e6",
+            ),
+            "e8": RefData(
+                selector="get_by_role('generic')",
+                role="generic",
+                name=None,
+                nth=1,
+                text_content=None,
+                parent_ref="e6",
+            ),
+        })
+
+        failed_locator = MagicMock()
+        failed_locator.count = AsyncMock(return_value=0)
+
+        child_locator = MagicMock()
+        child_locator.count = AsyncMock(return_value=1)
+
+        def mock_get_locator(page, ref_arg, refs):
+            if ref_arg == "e6":
+                return failed_locator
+            if ref_arg == "e7":
+                return child_locator
+            return None
+
+        browser._snapshot_generator.get_locator_from_ref_async.side_effect = mock_get_locator
+
+        result = await browser.get_element_by_ref("e6")
+
+        assert result is child_locator
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_for_named_container(self):
+        """Named containers should NOT trigger child fallback."""
+        from bridgic.browser.session._snapshot import RefData
+
+        browser = Browser(stealth=False)
+        browser._page = MagicMock()
+        browser._snapshot_generator = MagicMock()
+        browser._last_snapshot = MagicMock(refs={
+            "e6": RefData(
+                selector='get_by_text("Menu", exact=True)',
+                role="generic",
+                name="Menu",
+                nth=None,
+                text_content=None,
+                parent_ref=None,
+            ),
+        })
+
+        failed_locator = MagicMock()
+        failed_locator.count = AsyncMock(return_value=0)
+        browser._snapshot_generator.get_locator_from_ref_async.return_value = failed_locator
+
+        result = await browser.get_element_by_ref("e6")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_for_non_noise_role(self):
+        """Non-noise roles (e.g. button) should NOT trigger child fallback."""
+        from bridgic.browser.session._snapshot import RefData
+
+        browser = Browser(stealth=False)
+        browser._page = MagicMock()
+        browser._snapshot_generator = MagicMock()
+        browser._last_snapshot = MagicMock(refs={
+            "e1": RefData(
+                selector="get_by_role('button')",
+                role="button",
+                name=None,
+                nth=None,
+                text_content=None,
+                parent_ref=None,
+            ),
+        })
+
+        failed_locator = MagicMock()
+        failed_locator.count = AsyncMock(return_value=0)
+        browser._snapshot_generator.get_locator_from_ref_async.return_value = failed_locator
+
+        result = await browser.get_element_by_ref("e1")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_fallback_returns_none_when_no_scorable_children(self):
+        """Fallback returns None when all children are unnamed noise roles."""
+        from bridgic.browser.session._snapshot import RefData
+
+        browser = Browser(stealth=False)
+        browser._page = MagicMock()
+        browser._snapshot_generator = MagicMock()
+        browser._last_snapshot = MagicMock(refs={
+            "e6": RefData(
+                selector="get_by_role('generic')",
+                role="generic",
+                name=None,
+                nth=0,
+                text_content=None,
+                parent_ref=None,
+            ),
+            "e8": RefData(
+                selector="get_by_role('generic')",
+                role="generic",
+                name=None,
+                nth=1,
+                text_content=None,
+                parent_ref="e6",
+            ),
+        })
+
+        failed_locator = MagicMock()
+        failed_locator.count = AsyncMock(return_value=0)
+        browser._snapshot_generator.get_locator_from_ref_async.return_value = failed_locator
+
+        result = await browser.get_element_by_ref("e6")
+
+        assert result is None

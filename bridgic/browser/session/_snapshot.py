@@ -69,6 +69,7 @@ class RefData:
     name: Optional[str] = None
     nth: Optional[int] = None
     text_content: Optional[str] = None
+    parent_ref: Optional[str] = None
 
 
 @dataclass
@@ -948,7 +949,7 @@ class SnapshotGenerator:
             return True
 
         # 4. Search-related check (Section 5.3)
-        class_and_id = info.get('classAndId', '')
+        class_and_id = info.get('classAndId') or ''
         if any(keyword in class_and_id for keyword in self.SEARCH_KEYWORDS):
             return True
 
@@ -977,8 +978,8 @@ class SnapshotGenerator:
 
         # 9. Small icon check (Section 5.7)
         # Size within 10-50px range + has semantic attributes
-        width = info.get('width', 0)
-        height = info.get('height', 0)
+        width = info.get('width') or 0
+        height = info.get('height') or 0
         if 10 <= width <= 50 and 10 <= height <= 50:
             # Check for semantic attributes: class, role, data-action, aria-label
             # Note: hasEventHandler already checked in rule 2, dataAction implies interactivity
@@ -1081,11 +1082,12 @@ class SnapshotGenerator:
         result: List[str] = []
         tracker = RoleNameTracker()
 
-        # Track the stack of (original_depth, kept, effective_depth)
+        # Track the stack of (original_depth, kept, effective_depth, ref_or_none)
         # - original_depth: the depth in the original tree
         # - kept: whether this element was kept in output
         # - effective_depth: the depth in the output tree
-        depth_stack: List[Tuple[int, bool, int]] = []
+        # - ref_or_none: the ref assigned to this element (if any)
+        depth_stack: List[Tuple[int, bool, int, Optional[str]]] = []
 
         line_pattern = self._LINE_PATTERN
         ref_pattern = self._REF_CLEAN_PATTERN
@@ -1093,12 +1095,18 @@ class SnapshotGenerator:
 
         def get_effective_depth(original_depth: int) -> int:
             """Calculate effective depth based on kept parents."""
-            # Find the nearest kept parent
             effective = 0
-            for orig_d, kept, eff_d in depth_stack:
+            for orig_d, kept, eff_d, _ in depth_stack:
                 if orig_d < original_depth and kept:
                     effective = eff_d + 1
             return effective
+
+        def get_nearest_parent_ref(original_depth: int) -> Optional[str]:
+            """Find the ref of the nearest ancestor that has one."""
+            for orig_d, kept, _, ref_id in reversed(depth_stack):
+                if orig_d < original_depth and kept and ref_id is not None:
+                    return ref_id
+            return None
 
         for line in lines:
             # Skip empty lines
@@ -1131,7 +1139,7 @@ class SnapshotGenerator:
                 if options.interactive:
                     # Only keep metadata lines (like /url:, /placeholder:) for kept parents
                     if stripped.startswith('- /'):
-                        has_kept_parent = any(kept for _, kept, _ in depth_stack)
+                        has_kept_parent = any(kept for _, kept, _, _ in depth_stack)
                         if has_kept_parent:
                             eff_depth = get_effective_depth(original_depth)
                             content = stripped[2:]
@@ -1141,7 +1149,7 @@ class SnapshotGenerator:
                     continue
 
                 # Non-interactive mode: keep text and metadata if there's a kept parent
-                has_kept_parent = any(kept for _, kept, _ in depth_stack)
+                has_kept_parent = any(kept for _, kept, _, _ in depth_stack)
                 if has_kept_parent or not depth_stack:
                     # Calculate effective depth and re-indent
                     eff_depth = get_effective_depth(original_depth)
@@ -1167,7 +1175,7 @@ class SnapshotGenerator:
 
             # Handle metadata lines (like /url:, /placeholder:)
             if role.startswith('/'):
-                has_kept_parent = any(kept for _, kept, _ in depth_stack)
+                has_kept_parent = any(kept for _, kept, _, _ in depth_stack)
                 if has_kept_parent or not depth_stack:
                     eff_depth = get_effective_depth(original_depth)
                     new_line = '  ' * eff_depth + f'- {role}{suffix}'
@@ -1267,10 +1275,11 @@ class SnapshotGenerator:
             # Calculate effective depth for this element
             effective_depth = get_effective_depth(original_depth)
 
-            # Track this element in the stack
-            depth_stack.append((original_depth, should_keep, effective_depth))
+            # Determine current element's ref (filled below if should_have_ref).
+            current_ref: Optional[str] = None
 
             if not should_keep:
+                depth_stack.append((original_depth, False, effective_depth, None))
                 # In interactive mode, skip filtered elements entirely (no inline text)
                 # In non-interactive mode, preserve inline text from filtered elements
                 if not options.interactive:
@@ -1303,6 +1312,7 @@ class SnapshotGenerator:
 
             if should_have_ref:
                 ref = self._next_ref()
+                current_ref = ref
                 nth = tracker.get_next_index(role_lower, name)
                 tracker.track_ref(role_lower, name, ref)
 
@@ -1313,12 +1323,15 @@ class SnapshotGenerator:
                     if text_match:
                         text_content = text_match.group(1).strip()
 
+                parent_ref = get_nearest_parent_ref(original_depth)
+
                 refs[ref] = RefData(
                     selector=self._build_selector(role_lower, name, text_content),
                     role=role_lower,
                     name=name,
                     nth=nth,
                     text_content=text_content,
+                    parent_ref=parent_ref,
                 )
 
                 enhanced += f" [ref={ref}]"
@@ -1326,6 +1339,9 @@ class SnapshotGenerator:
                 # For unnamed elements, ref alone is sufficient for identification
                 if nth > 0 and name:
                     enhanced += f" [nth={nth}]"
+
+            # Track this element in the stack (after ref assignment).
+            depth_stack.append((original_depth, should_keep, effective_depth, current_ref))
 
             # Re-add clean suffix (like [level=1] for headings, or trailing colon)
             if clean_suffix:
@@ -1682,63 +1698,62 @@ class SnapshotGenerator:
         ref_data = refs.get(ref)
         if not ref_data:
             return None
-        
-        # Build locator with exact=True to avoid substring matches
-        if ref_data.role in self.TEXT_LEAF_ROLES and (ref_data.name or ref_data.text_content):
-            # 'text' is a pseudo-role from Playwright's snapshotForAI, not a valid
-            # ARIA role.  get_by_role('text') matches nothing, so use get_by_text().
-            text = ref_data.name or ref_data.text_content
-            if text and text.strip():
-                locator = page.get_by_text(text.strip(), exact=True)
+
+        # Normalize once so all branches share consistent empty-text handling.
+        normalized_name = ref_data.name.strip() if ref_data.name and ref_data.name.strip() else None
+        normalized_text = (
+            ref_data.text_content.strip()
+            if ref_data.text_content and ref_data.text_content.strip()
+            else None
+        )
+        match_text = normalized_name or normalized_text
+
+        def text_pattern(value: str, exact: bool) -> re.Pattern:
+            """Build a whitespace-tolerant regex for snapshot text matching."""
+            parts = [re.escape(p) for p in re.split(r"\s+", value.strip()) if p]
+            joined = r"\s+".join(parts) if parts else ""
+            if exact:
+                return re.compile(rf"^\s*{joined}\s*$")
+            return re.compile(joined)
+
+        # Build locator by signal strength:
+        # 1) Semantic role+name
+        # 2) Role-constrained text match for structural roles
+        # 3) Text fallback for pseudo/noise roles
+        # 4) Bare role fallback
+        if (
+            normalized_name
+            and ref_data.role not in self.ROLE_TEXT_MATCH_ROLES
+            and ref_data.role not in self.STRUCTURAL_NOISE_ROLES
+            and ref_data.role not in self.TEXT_LEAF_ROLES
+        ):
+            locator = page.get_by_role(ref_data.role, name=normalized_name, exact=True)
+        elif ref_data.role in self.ROLE_TEXT_MATCH_ROLES and match_text:
+            if ref_data.role == 'row':
+                # Row text usually includes descendant cell text; use role-constrained
+                # contains matching and avoid locator.or_ expansion.
+                row_text_pattern = text_pattern(match_text, exact=False)
+                locator = page.get_by_role('row').filter(has_text=row_text_pattern)
             else:
-                locator = page.get_by_role(ref_data.role)
-        elif ref_data.role in self.STRUCTURAL_NOISE_ROLES and (ref_data.name or ref_data.text_content):
-            # get_by_role('generic') doesn't match plain <div> elements in Playwright,
-            # so use get_by_text for structural noise roles (generic, group, etc.)
-            text = ref_data.name or ref_data.text_content
-            if text and text.strip():
-                locator = page.get_by_text(text.strip(), exact=True)
-            else:
-                # Empty/whitespace text would over-match with get_by_text(""), fallback conservatively.
-                locator = page.get_by_role(ref_data.role)
-        elif ref_data.role in self.ROLE_TEXT_MATCH_ROLES and (ref_data.name or ref_data.text_content):
-            # Some structural roles can expose text in snapshot names that does not
-            # reliably map to Playwright role accessible-name matching.
-            # Use role-constrained text filtering to avoid broad get_by_text.
-            text = ref_data.name or ref_data.text_content
-            if not text or not text.strip():
-                locator = page.get_by_role(ref_data.role)
-            elif ref_data.role == 'row':
-                normalized_text = text.strip()
-                # Rows are composite containers: snapshot name may come from a child
-                # cell/header, not the row's full text. Keep both primary and fallback
-                # locators constrained to role='row' to avoid matching child elements.
-                row_locator = page.get_by_role('row').and_(
-                    page.get_by_text(normalized_text, exact=True)
-                )
-                row_text_pattern = re.compile(re.escape(normalized_text))
-                locator = row_locator.or_(
-                    page.get_by_role('row').filter(has_text=row_text_pattern)
-                )
-            else:
-                normalized_text = text.strip()
-                text_pattern = re.compile(rf'^\s*{re.escape(normalized_text)}\s*$')
-                locator = page.get_by_role(ref_data.role).filter(has_text=text_pattern)
-        elif ref_data.name:
-            locator = page.get_by_role(ref_data.role, name=ref_data.name, exact=True)
-        elif ref_data.text_content:
-            locator = page.get_by_text(ref_data.text_content, exact=True)
+                exact_text_pattern = text_pattern(match_text, exact=True)
+                locator = page.get_by_role(ref_data.role).filter(has_text=exact_text_pattern)
+        elif ref_data.role in self.TEXT_LEAF_ROLES and match_text:
+            # 'text' is a snapshot pseudo-role (not a valid ARIA role).
+            locator = page.get_by_text(match_text, exact=True)
+        elif ref_data.role in self.STRUCTURAL_NOISE_ROLES and match_text:
+            # generic/group/none/presentation have weak role semantics in Playwright;
+            # use text as primary anchor.
+            locator = page.get_by_text(match_text, exact=True)
+        elif normalized_name:
+            locator = page.get_by_role(ref_data.role, name=normalized_name, exact=True)
+        elif normalized_text:
+            locator = page.get_by_text(normalized_text, exact=True)
         else:
             locator = page.get_by_role(ref_data.role)
 
-        # Snapshot may see one element for a (role, name) pair while the live
-        # DOM contains duplicates (hidden/off-viewport elements).  To prevent
-        # Playwright strict-mode violations, default to nth(0) when the
-        # RoleNameTracker didn't assign an explicit index.
-        if ref_data.nth is None:
-            ref_data.nth = 0
-
-        locator = locator.nth(ref_data.nth)
+        # Only apply nth when the snapshot explicitly captured disambiguation.
+        if ref_data.nth is not None:
+            locator = locator.nth(ref_data.nth)
 
         return locator
     

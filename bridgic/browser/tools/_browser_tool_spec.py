@@ -219,6 +219,5 @@ class BrowserToolSpec(ToolSpec):
         return (
             f"<BrowserToolSpec("
             f"tool_name={self._tool_name!r}, "
-            f"browser={self._browser.name!r}"
             f")>"
         )

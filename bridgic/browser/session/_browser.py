@@ -5,7 +5,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Union
 
 if TYPE_CHECKING:
-    from bridgic.llms.openai import OpenAILlm
+    try:
+        from bridgic.llms.openai import OpenAILlm  # pyright: ignore[reportMissingImports]
+    except ModuleNotFoundError:  # pragma: no cover - optional dependency
+        OpenAILlm = Any  # type: ignore[misc,assignment]
 
 from playwright.async_api import (
     async_playwright,
@@ -668,36 +671,55 @@ class Browser:
     #########################################################
     # page level
     #########################################################
-    async def navigate_to(self, url: str) -> None:
+    async def navigate_to(
+        self,
+        url: str,
+        wait_until: Literal["domcontentloaded", "load", "networkidle", "commit"] = "domcontentloaded",
+        timeout: Optional[float] = None,
+    ) -> None:
         """Navigate current page to the specified URL.
 
         Parameters
         ----------
         url : str
             The URL to navigate to.
+        wait_until : str, default "domcontentloaded"
+            When to consider navigation complete.
+            - "domcontentloaded": DOM is parsed (fast, recommended for SPAs).
+            - "load": Full page load including images/styles.
+            - "networkidle": No network activity for 500ms (may timeout on SPAs).
+            - "commit": Response received from server.
+        timeout : float, optional
+            Maximum time in milliseconds. Defaults to Playwright's 30000ms.
         """
         if not self._page:
             logger.warning("No page is open, creating a new page")
-            # If context exists, create new page in existing context;
-            # otherwise start browser and create initial page
             if self._context:
                 self._page = await self._context.new_page()
             else:
                 await self.start()
 
         logger.info(f"Navigating to {url}")
-        await self._page.goto(url, wait_until="networkidle")
+        kwargs: Dict[str, Any] = {"wait_until": wait_until}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        await self._page.goto(url, **kwargs)
         # Update cache
         self._last_snapshot = None
         self._last_snapshot_url = None
 
-    async def new_page(self, url: Optional[str] = None) -> Optional[Page]:
+    async def new_page(
+        self,
+        url: Optional[str] = None,
+        wait_until: Literal["domcontentloaded", "load", "networkidle", "commit"] = "domcontentloaded",
+        timeout: Optional[float] = None,
+    ) -> Optional[Page]:
         if not self._context:
             logger.warning("No context is open, starting playwright")
             await self.start()
         self._page = await self._context.new_page()
         if url:
-            await self.navigate_to(url)
+            await self.navigate_to(url, wait_until=wait_until, timeout=timeout)
         return self._page
 
     async def get_page_desc(self, page: Optional[Page] = None) -> Optional[PageDesc]:
@@ -817,19 +839,19 @@ class Browser:
                 visual_viewport = result.get('cssVisualViewport') or result.get('visualViewport')
                 # viewport size (visualViewport is more accurate, considering zoom)
                 if visual_viewport:
-                    viewport_width = int(visual_viewport.get('clientWidth', 0))
-                    viewport_height = int(visual_viewport.get('clientHeight', 0))
+                    viewport_width = int(visual_viewport.get('clientWidth') or 0)
+                    viewport_height = int(visual_viewport.get('clientHeight') or 0)
                 else:
-                    viewport_width = int(layout_viewport.get('clientWidth', 0))
-                    viewport_height = int(layout_viewport.get('clientHeight', 0))
+                    viewport_width = int(layout_viewport.get('clientWidth') or 0)
+                    viewport_height = int(layout_viewport.get('clientHeight') or 0)
 
                 # scroll position (get pageX/pageY from layoutViewport)
-                scroll_x = int(layout_viewport.get('pageX', 0))
-                scroll_y = int(layout_viewport.get('pageY', 0))
+                scroll_x = int(layout_viewport.get('pageX') or 0)
+                scroll_y = int(layout_viewport.get('pageY') or 0)
 
                 # page total size (contentSize contains all scrollable content)
-                page_width = int(content_size.get('width', viewport_width))
-                page_height = int(content_size.get('height', viewport_height))
+                page_width = int(content_size.get('width') or viewport_width)
+                page_height = int(content_size.get('height') or viewport_height)
 
                 # calculate scrollable distance
                 pixels_above = scroll_y
@@ -1050,10 +1072,10 @@ class Browser:
             self._last_snapshot_url = current_url
             return self._last_snapshot
         except Exception as e:
-            logger.debug(f"Failed to get snapshot: {e}")
+            logger.warning("Failed to get snapshot: %s", e, exc_info=True)
             return None
     
-    async def get_element_by_ref(self, ref: str) -> Optional[Locator]:
+    async def get_element_by_ref(self, ref: str, _fallback_depth: int = 0) -> Optional[Locator]:
         if not self._page:
             logger.warning("No page is open, can't get element by ref")
             return None
@@ -1068,19 +1090,167 @@ class Browser:
                 self._page, ref, self._last_snapshot.refs
             )
             if locator:
-                # validate locator
+                # Validate locator and expose ambiguity explicitly for debugging.
                 count = await locator.count()
-                if count > 0:
+                if count == 1:
                     return locator
+                elif count > 1:
+                    ref_data = self._last_snapshot.refs.get(ref)
+                    can_recover_by_role_name = (
+                        bool(ref_data and ref_data.name)
+                        and ref_data.role not in SnapshotGenerator.ROLE_TEXT_MATCH_ROLES
+                        and ref_data.role not in SnapshotGenerator.STRUCTURAL_NOISE_ROLES
+                        and ref_data.role not in SnapshotGenerator.TEXT_LEAF_ROLES
+                    )
+                    if can_recover_by_role_name and ref_data:
+                        role_name_locator = self._page.get_by_role(
+                            ref_data.role,
+                            name=ref_data.name,
+                            exact=True,
+                        )
+                        role_name_count = await role_name_locator.count()
+                        if role_name_count == 1:
+                            logger.warning(
+                                "Ref %s resolved to %d elements; recovered unique locator via role+name",
+                                ref,
+                                count,
+                            )
+                            return role_name_locator
+                        if (
+                            role_name_count > 1
+                            and ref_data.nth is not None
+                            and ref_data.nth < role_name_count
+                        ):
+                            logger.warning(
+                                "Ref %s resolved to %d elements; recovered locator via role+name nth=%d",
+                                ref,
+                                count,
+                                ref_data.nth,
+                            )
+                            return role_name_locator.nth(ref_data.nth)
+
+                    if (
+                        ref_data
+                        and ref_data.nth is not None
+                        and ref_data.nth < count
+                    ):
+                        logger.warning(
+                            "Ref %s resolved to %d elements; using snapshot nth=%d",
+                            ref,
+                            count,
+                            ref_data.nth,
+                        )
+                        return locator.nth(ref_data.nth)
+
+                    visible_matches: List[Locator] = []
+                    for idx in range(count):
+                        candidate = locator.nth(idx)
+                        try:
+                            if await candidate.is_visible():
+                                visible_matches.append(candidate)
+                        except Exception:
+                            # Ignore transient visibility failures and keep probing.
+                            continue
+
+                    if len(visible_matches) == 1:
+                        logger.warning(
+                            "Ref %s resolved to %d elements; using the only visible match",
+                            ref,
+                            count,
+                        )
+                        return visible_matches[0]
+                    if len(visible_matches) > 1:
+                        logger.warning(
+                            "Ref %s resolved to %d elements (%d visible); using first visible match",
+                            ref,
+                            count,
+                            len(visible_matches),
+                        )
+                        return visible_matches[0]
+
+                    logger.warning(
+                        "Ref %s resolved to %d elements with no visible match; using first match",
+                        ref,
+                        count,
+                    )
+                    return locator.first
                 else:
-                    logger.warning(f"No element found by ref: {ref}")
+                    logger.warning("No element found by ref: %s (count=0)", ref)
+                    if _fallback_depth == 0:
+                        return await self._fallback_to_child_ref(ref)
                     return None
             else:
                 logger.warning(f"Failed to get locator by ref: {ref}")
+                if _fallback_depth == 0:
+                    return await self._fallback_to_child_ref(ref)
                 return None
         except Exception as e:
             logger.debug(f"Failed to get element by ref: {e}")
             return None
+
+    async def _fallback_to_child_ref(self, parent_ref: str) -> Optional[Locator]:
+        """Try to find a usable child ref when the parent ref's locator fails.
+
+        Only activates for structural noise roles (generic, group, etc.)
+        without name/text, where the locator is inherently fragile.
+        """
+        if self._last_snapshot is None:
+            return None
+        refs = self._last_snapshot.refs
+        parent_data = refs.get(parent_ref)
+        if not parent_data:
+            return None
+
+        has_text_signal = bool(parent_data.name or parent_data.text_content)
+        if parent_data.role not in SnapshotGenerator.STRUCTURAL_NOISE_ROLES or has_text_signal:
+            return None
+
+        children = [
+            (child_ref, child_data)
+            for child_ref, child_data in refs.items()
+            if child_data.parent_ref == parent_ref
+        ]
+        if not children:
+            return None
+
+        def _score(data) -> int:
+            """Higher = better candidate for interaction."""
+            s = 0
+            if data.role in SnapshotGenerator.INTERACTIVE_ROLES:
+                s += 10
+            if data.name:
+                s += 5
+            elif data.text_content:
+                s += 3
+            if data.role not in SnapshotGenerator.STRUCTURAL_NOISE_ROLES:
+                s += 2
+            return s
+
+        children.sort(key=lambda c: _score(c[1]), reverse=True)
+        best_ref, best_data = children[0]
+
+        if _score(best_data) == 0:
+            return None
+
+        if len(children) > 1 and _score(children[0][1]) == _score(children[1][1]):
+            candidates = ", ".join(
+                f"{r} ({d.name or d.text_content or d.role})"
+                for r, d in children
+                if _score(d) == _score(children[0][1])
+            )
+            logger.warning(
+                "Ref %s (container) failed; multiple child candidates with equal priority: %s",
+                parent_ref,
+                candidates,
+            )
+
+        logger.info(
+            "Ref %s (container) failed; falling back to child ref %s (%s)",
+            parent_ref,
+            best_ref,
+            best_data.name or best_data.text_content or best_data.role,
+        )
+        return await self.get_element_by_ref(best_ref, _fallback_depth=1)
 
     async def get_element_by_prompt(self, prompt: str, llm: "OpenAILlm") -> Optional[Locator]:
         """Find element by natural language prompt and return Locator.
@@ -1097,12 +1267,29 @@ class Browser:
         Optional[Locator]
             Found element Locator, or None if not found
         """
-        from bridgic.core.model.protocols import PydanticModel
-        from bridgic.core.model.types import Message, Role
+        try:
+            from bridgic.core.model.protocols import PydanticModel  # pyright: ignore[reportMissingImports]
+            from bridgic.core.model.types import Message, Role  # pyright: ignore[reportMissingImports]
+        except ModuleNotFoundError as exc:
+            logger.warning(
+                "get_element_by_prompt unavailable: missing module '%s'; "
+                "install bridgic-core to enable prompt-based lookup.",
+                exc.name or "bridgic.core",
+            )
+            return None
+        except ImportError as exc:
+            logger.warning(
+                "get_element_by_prompt unavailable: failed to import bridgic.core model types: %s",
+                exc,
+            )
+            return None
         
         snapshot = await self.get_snapshot()
         if snapshot is None:
-            logger.warning("No snapshot is available, can't get element by prompt")
+            logger.warning(
+                "get_element_by_prompt aborted: snapshot unavailable (prompt_len=%d)",
+                len(prompt),
+            )
             return None
         browser_state = snapshot.tree
         

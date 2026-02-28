@@ -8,7 +8,7 @@ BrowserToolSpec when the tool is called by an LLM.
 """
 from __future__ import annotations
 import logging
-from typing import TYPE_CHECKING, Optional, List
+from typing import TYPE_CHECKING, Any, Dict, Optional, List
 from ..utils import model_to_llm_string
 
 if TYPE_CHECKING:
@@ -18,7 +18,13 @@ logger = logging.getLogger(__name__)
 
 # ==================== Navigation and Browser Control Tools ====================
 
-async def search(browser: "Browser", query: str, engine: str = "duckduckgo") -> str:
+async def search(
+    browser: "Browser",
+    query: str,
+    engine: str = "duckduckgo",
+    wait_until: str = "domcontentloaded",
+    timeout: Optional[float] = None,
+) -> str:
     """Search using a search engine.
 
     Parameters
@@ -29,6 +35,14 @@ async def search(browser: "Browser", query: str, engine: str = "duckduckgo") -> 
         Search query string.
     engine : str, optional
         "duckduckgo" (default), "google", or "bing".
+    wait_until : str, default "domcontentloaded"
+        When to consider navigation complete:
+        - "domcontentloaded": DOM parsed (fast, good for modern SPAs).
+        - "load": Full page load including images/styles.
+        - "networkidle": No network activity for 500ms (may timeout on SPAs).
+        - "commit": Response received from server.
+    timeout : float, optional
+        Maximum time in milliseconds. Defaults to Playwright's 30000ms.
 
     Returns
     -------
@@ -66,7 +80,7 @@ async def search(browser: "Browser", query: str, engine: str = "duckduckgo") -> 
 
         # Navigate to search URL using Playwright
         try:
-            await browser.navigate_to(search_url)
+            await browser.navigate_to(search_url, wait_until=wait_until, timeout=timeout)
             result = f"Searched on {engine.title()}: '{query}'"
             logger.info(f"[search] done {result}")
             return result
@@ -80,7 +94,12 @@ async def search(browser: "Browser", query: str, engine: str = "duckduckgo") -> 
         return error_msg
 
 
-async def navigate_to_url(browser: "Browser", url: str) -> str:
+async def navigate_to_url(
+    browser: "Browser",
+    url: str,
+    wait_until: str = "domcontentloaded",
+    timeout: Optional[float] = None,
+) -> str:
     """Navigate to URL in current tab. Use new_tab(url) for new tab.
 
     Parameters
@@ -89,6 +108,14 @@ async def navigate_to_url(browser: "Browser", url: str) -> str:
         Browser instance.
     url : str
         URL to navigate to. Auto-prepends "http://" if missing protocol.
+    wait_until : str, default "domcontentloaded"
+        When to consider navigation complete:
+        - "domcontentloaded": DOM parsed (fast, good for modern SPAs).
+        - "load": Full page load including images/styles.
+        - "networkidle": No network activity for 500ms (may timeout on SPAs).
+        - "commit": Response received from server.
+    timeout : float, optional
+        Maximum time in milliseconds. Defaults to Playwright's 30000ms.
 
     Returns
     -------
@@ -98,13 +125,11 @@ async def navigate_to_url(browser: "Browser", url: str) -> str:
     try:
         logger.info(f"[navigate_to_url] start url={url}")
 
-        # Parameter validation
         if not url or not url.strip():
             return "URL cannot be empty"
 
         url = url.strip()
 
-        # Security: Block dangerous URL schemes that could execute code or access local files
         blocked_schemes = ["javascript:", "data:", "vbscript:", "about:"]
         url_lower = url.lower()
         for scheme in blocked_schemes:
@@ -113,13 +138,11 @@ async def navigate_to_url(browser: "Browser", url: str) -> str:
                 logger.warning(f"[navigate_to_url] blocked: {error_msg}")
                 return error_msg
 
-        # Basic URL format validation
         if not (url.startswith("http://") or url.startswith("https://") or url.startswith("file://")):
-            # If not a complete URL, try adding http://
             if not url.startswith("/"):
                 url = f"http://{url}"
 
-        await browser.navigate_to(url)
+        await browser.navigate_to(url, wait_until=wait_until, timeout=timeout)
         result = f"Navigated to: {url}"
 
         logger.info(f"[navigate_to_url] done {result}")
@@ -198,13 +221,25 @@ async def go_forward(browser: "Browser") -> str:
         return error_msg
 
 
-async def reload_page(browser: "Browser") -> str:
+async def reload_page(
+    browser: "Browser",
+    wait_until: str = "domcontentloaded",
+    timeout: Optional[float] = None,
+) -> str:
     """Reload the current page.
 
     Parameters
     ----------
     browser : Browser
         Browser instance.
+    wait_until : str, default "domcontentloaded"
+        When to consider reload complete:
+        - "domcontentloaded": DOM parsed (fast, good for modern SPAs).
+        - "load": Full page load including images/styles.
+        - "networkidle": No network activity for 500ms (may timeout on SPAs).
+        - "commit": Response received from server.
+    timeout : float, optional
+        Maximum time in milliseconds. Defaults to Playwright's 30000ms.
 
     Returns
     -------
@@ -212,12 +247,15 @@ async def reload_page(browser: "Browser") -> str:
         Result message.
     """
     try:
-        logger.info(f"[reload_page] start")
+        logger.info("[reload_page] start")
 
         page = await browser.get_current_page()
         if page is None:
             return "No active page available"
-        await page.reload(wait_until="networkidle")
+        kwargs: Dict[str, Any] = {"wait_until": wait_until}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        await page.reload(**kwargs)
         result = "Page reloaded"
         logger.info(f"[reload_page] done {result}")
         return result
@@ -413,7 +451,12 @@ async def evaluate_javascript(browser: "Browser", code: str) -> str:
 
 # ==================== Tab Management Tools ====================
 
-async def new_tab(browser: "Browser", url: Optional[str] = None) -> str:
+async def new_tab(
+    browser: "Browser",
+    url: Optional[str] = None,
+    wait_until: str = "domcontentloaded",
+    timeout: Optional[float] = None,
+) -> str:
     """Create a new tab.
 
     Parameters
@@ -422,6 +465,14 @@ async def new_tab(browser: "Browser", url: Optional[str] = None) -> str:
         Browser instance to use.
     url : Optional[str], optional
         URL to open. If None or empty, creates a blank tab.
+    wait_until : str, default "domcontentloaded"
+        When to consider navigation complete (only used when url is provided):
+        - "domcontentloaded": DOM parsed (fast, good for modern SPAs).
+        - "load": Full page load including images/styles.
+        - "networkidle": No network activity for 500ms (may timeout on SPAs).
+        - "commit": Response received from server.
+    timeout : float, optional
+        Maximum time in milliseconds. Defaults to Playwright's 30000ms.
 
     Returns
     -------
@@ -431,19 +482,17 @@ async def new_tab(browser: "Browser", url: Optional[str] = None) -> str:
     try:
         logger.info(f"[new_tab] start url={url}")
 
-        # Handle URL: treat empty string as None
         if url is not None:
             url = url.strip()
             if not url:
                 url = None
 
-        # Validate and fix URL format if provided
         if url:
             if not (url.startswith("http://") or url.startswith("https://") or url.startswith("file://")):
                 if not url.startswith("/"):
                     url = f"http://{url}"
 
-        await browser.new_page(url)
+        await browser.new_page(url, wait_until=wait_until, timeout=timeout)
         if url:
             result = f"Opened new tab with URL: {url}"
         else:
