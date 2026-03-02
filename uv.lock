@@ -163,11 +163,12 @@ wheels = [
 
 [[package]]
 name = "bridgic-browser"
-version = "0.0.1.dev14"
+version = "0.0.1.dev16"
 source = { editable = "." }
 dependencies = [
     { name = "bridgic-core" },
     { name = "bridgic-llms-openai" },
+    { name = "click" },
     { name = "playwright" },
     { name = "pydantic" },
 ]
@@ -183,8 +184,9 @@ dev = [
 requires-dist = [
     { name = "bridgic-core", specifier = ">=0.3.0b1,<0.4.0" },
     { name = "bridgic-llms-openai", specifier = ">=0.1.1,<0.2.0" },
-    { name = "playwright", specifier = ">=1.57.0" },
-    { name = "pydantic", specifier = ">=2.11.10" },
+    { name = "click", specifier = ">=8.0" },
+    { name = "playwright", specifier = ">=1.57.0,<1.58.0" },
+    { name = "pydantic", specifier = ">=2.11.10,<2.12.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -249,6 +251,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/a2/8c/58f469717fa48465e4a50c014a0400602d3c437d7c0c468e17ada824da3a/certifi-2025.11.12.tar.gz", hash = "sha256:d8ab5478f2ecd78af242878415affce761ca6bc54a22a27e026d7c25357c3316", size = 160538, upload-time = "2025-11-12T02:54:51.517Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/70/7d/9bc192684cea499815ff478dfcdc13835ddf401365057044fb721ec6bddb/certifi-2025.11.12-py3-none-any.whl", hash = "sha256:97de8790030bbd5c2d96b7ec782fc2f7820ef8dba6db909ccf95449f2d062d4b", size = 159438, upload-time = "2025-11-12T02:54:49.735Z" },
+]
+
+[[package]]
+name = "click"
+version = "8.3.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3d/fa/656b739db8587d7b5dfa22e22ed02566950fbfbcdc20311993483657a5c0/click-8.3.1.tar.gz", hash = "sha256:12ff4785d337a1bb490bb7e9c2b1ee5da3112e94a8622f26a6c77f5d2fc6842a", size = 295065, upload-time = "2025-11-15T20:45:42.706Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/98/78/01c019cdb5d6498122777c1a43056ebb3ebfeef2076d9d026bfe15583b2b/click-8.3.1-py3-none-any.whl", hash = "sha256:981153a64e25f12d547d3426c367a4857371575ee7ad18df2a6183ab0545b2a6", size = 108274, upload-time = "2025-11-15T20:45:41.139Z" },
 ]
 
 [[package]]

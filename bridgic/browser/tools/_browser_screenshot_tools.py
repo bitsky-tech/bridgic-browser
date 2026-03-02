@@ -3,7 +3,6 @@ Browser screenshot and PDF tools.
 
 This module provides tools for capturing screenshots and saving pages as PDFs.
 """
-from __future__ import annotations
 import base64
 import logging
 import os

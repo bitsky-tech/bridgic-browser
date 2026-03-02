@@ -4,7 +4,6 @@ Browser verification and assertion tools.
 This module provides tools for verifying page state, element visibility,
 and content. Useful for testing and validation scenarios.
 """
-from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional, Literal
 

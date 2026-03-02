@@ -7,7 +7,6 @@ network requests.
 Note: Uses module-level storage keyed by page ID. Call stop_console_capture()
 or stop_network_capture() when done to prevent memory leaks.
 """
-from __future__ import annotations
 import json
 import logging
 from typing import TYPE_CHECKING, List, Optional, Literal

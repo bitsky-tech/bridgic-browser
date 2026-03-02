@@ -82,6 +82,71 @@ async def create_agent():
     return browser, tools
 ```
 
+### CLI Tool
+
+`bridgic-browser` ships with a command-line interface for controlling a browser from the terminal without writing Python. A persistent daemon process holds the browser; each CLI invocation connects over a Unix socket and exits immediately.
+
+```bash
+bridgic-browser open https://example.com   # auto-starts daemon
+bridgic-browser snapshot                    # print accessibility tree
+bridgic-browser click @e2
+bridgic-browser fill @e3 "hello@example.com"
+bridgic-browser screenshot page.png
+bridgic-browser close                       # stop the daemon
+```
+
+#### Configuration
+
+Browser options are read at daemon startup from the following sources, in priority order (highest last wins):
+
+| Source | Example |
+|--------|---------|
+| Defaults | `headless=True` |
+| `~/.bridgic/bridgic-browser.json` | User-level persistent config |
+| `./bridgic-browser.json` | Project-local config (in cwd at daemon start) |
+| `BRIDGIC_BROWSER_JSON` env var | Full JSON override for any `Browser` parameter |
+| `BRIDGIC_HEADLESS` env var | `0` = show window, any other value = headless |
+
+The JSON sources accept any `Browser` constructor parameter:
+
+```json
+{
+  "headless": false,
+  "channel": "chrome",
+  "proxy": {"server": "http://proxy:8080", "username": "u", "password": "p"},
+  "viewport": {"width": 1280, "height": 720},
+  "locale": "zh-CN",
+  "timezone_id": "Asia/Shanghai"
+}
+```
+
+```bash
+# One-shot env override
+BRIDGIC_BROWSER_JSON='{"channel":"chrome","headless":false}' bridgic-browser open URL
+```
+
+#### Commands
+
+| Category | Commands |
+|----------|----------|
+| Navigation | `open`, `navigate`, `back`, `forward`, `reload`, `search`, `info` |
+| Snapshot | `snapshot [--interactive]` |
+| Element | `click`, `double-click`, `hover`, `focus`, `fill`, `select`, `check`, `uncheck`, `get text` |
+| Keyboard | `press`, `type` |
+| Mouse | `scroll [--dy N] [--dx N]` |
+| Wait | `wait SECONDS`, `wait-for TEXT [--gone]` |
+| Tabs | `tabs`, `new-tab`, `switch-tab`, `close-tab` |
+| Capture | `screenshot PATH [--full-page]`, `pdf PATH` |
+| Developer | `eval CODE` |
+| Lifecycle | `close` |
+
+Use `-h` or `--help` on any command for details:
+
+```bash
+bridgic-browser -h
+bridgic-browser scroll -h
+```
+
 ### Core Components
 
 #### Browser
@@ -428,6 +493,71 @@ async def create_agent():
     # 将工具与 LLM 智能体配合使用
     # 工具包括：导航、点击、输入文本、滚动等
     return browser, tools
+```
+
+### CLI 工具
+
+`bridgic-browser` 内置了命令行界面，无需编写 Python 代码即可从终端控制浏览器。一个持久化 daemon 进程持有浏览器实例，每次 CLI 调用通过 Unix socket 连接后立即退出。
+
+```bash
+bridgic-browser open https://example.com   # 自动启动 daemon
+bridgic-browser snapshot                    # 打印可访问性树
+bridgic-browser click @e2
+bridgic-browser fill @e3 "hello@example.com"
+bridgic-browser screenshot page.png
+bridgic-browser close                       # 停止 daemon
+```
+
+#### 配置
+
+浏览器参数在 daemon 启动时从以下来源读取，优先级从低到高：
+
+| 来源 | 示例 |
+|------|------|
+| 默认值 | `headless=True` |
+| `~/.bridgic/bridgic-browser.json` | 用户级持久配置 |
+| `./bridgic-browser.json` | 项目本地配置（daemon 启动时的工作目录） |
+| `BRIDGIC_BROWSER_JSON` 环境变量 | 完整 JSON，支持所有 `Browser` 参数 |
+| `BRIDGIC_HEADLESS` 环境变量 | `0` = 显示窗口，其他值 = 无头模式 |
+
+JSON 来源支持所有 `Browser` 构造参数：
+
+```json
+{
+  "headless": false,
+  "channel": "chrome",
+  "proxy": {"server": "http://proxy:8080", "username": "u", "password": "p"},
+  "viewport": {"width": 1280, "height": 720},
+  "locale": "zh-CN",
+  "timezone_id": "Asia/Shanghai"
+}
+```
+
+```bash
+# 单次环境变量覆盖
+BRIDGIC_BROWSER_JSON='{"channel":"chrome","headless":false}' bridgic-browser open URL
+```
+
+#### 命令列表
+
+| 类别 | 命令 |
+|------|------|
+| 导航 | `open`、`navigate`、`back`、`forward`、`reload`、`search`、`info` |
+| 快照 | `snapshot [--interactive]` |
+| 元素交互 | `click`、`double-click`、`hover`、`focus`、`fill`、`select`、`check`、`uncheck`、`get text` |
+| 键盘 | `press`、`type` |
+| 鼠标 | `scroll [--dy N] [--dx N]` |
+| 等待 | `wait SECONDS`、`wait-for TEXT [--gone]` |
+| 标签页 | `tabs`、`new-tab`、`switch-tab`、`close-tab` |
+| 截图 | `screenshot PATH [--full-page]`、`pdf PATH` |
+| 开发者 | `eval CODE` |
+| 生命周期 | `close` |
+
+使用 `-h` 或 `--help` 查看任意命令的详细说明：
+
+```bash
+bridgic-browser -h
+bridgic-browser scroll -h
 ```
 
 ### 核心组件

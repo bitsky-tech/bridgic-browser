@@ -4,7 +4,6 @@ Browser mouse coordinate-based tools.
 This module provides tools for mouse operations using screen coordinates,
 complementing the ref-based tools in _browser_action_tools.py.
 """
-from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Literal
 
