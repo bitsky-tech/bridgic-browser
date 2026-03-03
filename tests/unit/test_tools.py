@@ -375,17 +375,54 @@ class TestElementInteractionTools:
 
     @pytest.mark.asyncio
     async def test_click_element_by_ref(self, mock_browser):
-        """Test click_element_by_ref."""
+        """Test click_element_by_ref — element not covered (bounding_box returns None → direct click)."""
         from bridgic.browser.tools._browser_action_tools import click_element_by_ref
 
         mock_locator = MagicMock()
         mock_locator.click = AsyncMock()
+        mock_locator.bounding_box = AsyncMock(return_value=None)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
         result = await click_element_by_ref(mock_browser, "e1")
 
         mock_browser.get_element_by_ref.assert_called_once_with("e1")
         mock_locator.click.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_click_element_by_ref_not_covered(self, mock_browser):
+        """Test click_element_by_ref — element visible and not covered → direct click."""
+        from bridgic.browser.tools._browser_action_tools import click_element_by_ref
+
+        mock_locator = MagicMock()
+        mock_locator.click = AsyncMock()
+        mock_locator.bounding_box = AsyncMock(return_value={"x": 10, "y": 20, "width": 100, "height": 40})
+        mock_locator.evaluate = AsyncMock(return_value=False)  # not covered
+        mock_browser.get_element_by_ref.return_value = mock_locator
+
+        result = await click_element_by_ref(mock_browser, "e1")
+
+        mock_locator.click.assert_called_once()
+        assert "Clicked" in result
+
+    @pytest.mark.asyncio
+    async def test_click_element_by_ref_covered_uses_elementFromPoint(self, mock_browser):
+        """Test click_element_by_ref — element covered by overlay → elementFromPoint click."""
+        from bridgic.browser.tools._browser_action_tools import click_element_by_ref
+
+        mock_page = AsyncMock()
+        mock_browser.get_current_page = AsyncMock(return_value=mock_page)
+
+        mock_locator = MagicMock()
+        mock_locator.click = AsyncMock()
+        mock_locator.bounding_box = AsyncMock(return_value={"x": 10, "y": 20, "width": 100, "height": 40})
+        mock_locator.evaluate = AsyncMock(return_value=True)  # covered by overlay
+        mock_browser.get_element_by_ref.return_value = mock_locator
+
+        result = await click_element_by_ref(mock_browser, "e1")
+
+        mock_locator.click.assert_not_called()
+        mock_page.evaluate.assert_called_once()
+        assert "Clicked" in result
 
     @pytest.mark.asyncio
     async def test_click_element_by_ref_not_found(self, mock_browser):
@@ -430,11 +467,12 @@ class TestElementInteractionTools:
 
     @pytest.mark.asyncio
     async def test_hover_element_by_ref(self, mock_browser):
-        """Test hover_element_by_ref."""
+        """Test hover_element_by_ref — not covered (bounding_box None → direct hover)."""
         from bridgic.browser.tools._browser_action_tools import hover_element_by_ref
 
         mock_locator = MagicMock()
         mock_locator.hover = AsyncMock()
+        mock_locator.bounding_box = AsyncMock(return_value=None)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
         result = await hover_element_by_ref(mock_browser, "e1")
@@ -532,11 +570,12 @@ class TestElementInteractionTools:
 
     @pytest.mark.asyncio
     async def test_check_element_by_ref(self, mock_browser):
-        """Test checking a checkbox."""
+        """Test checking a checkbox — element not covered (bounding_box None → direct check)."""
         from bridgic.browser.tools._browser_action_tools import check_element_by_ref
 
         mock_locator = MagicMock()
         mock_locator.check = AsyncMock()
+        mock_locator.bounding_box = AsyncMock(return_value=None)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
         result = await check_element_by_ref(mock_browser, ref="e1")
@@ -546,11 +585,12 @@ class TestElementInteractionTools:
 
     @pytest.mark.asyncio
     async def test_uncheck_element_by_ref(self, mock_browser):
-        """Test unchecking a checkbox."""
+        """Test unchecking a checkbox — not covered (bounding_box None → direct uncheck)."""
         from bridgic.browser.tools._browser_action_tools import uncheck_element_by_ref
 
         mock_locator = MagicMock()
         mock_locator.uncheck = AsyncMock()
+        mock_locator.bounding_box = AsyncMock(return_value=None)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
         result = await uncheck_element_by_ref(mock_browser, ref="e1")
@@ -559,12 +599,53 @@ class TestElementInteractionTools:
         assert "uncheck" in result.lower()
 
     @pytest.mark.asyncio
+    async def test_uncheck_element_by_ref_covered_uses_elementFromPoint(self, mock_browser):
+        """Test uncheck — element covered by overlay → elementFromPoint click."""
+        from bridgic.browser.tools._browser_action_tools import uncheck_element_by_ref
+
+        mock_page = AsyncMock()
+        mock_browser.get_current_page = AsyncMock(return_value=mock_page)
+
+        mock_locator = MagicMock()
+        mock_locator.uncheck = AsyncMock()
+        mock_locator.bounding_box = AsyncMock(return_value={"x": 10, "y": 20, "width": 100, "height": 40})
+        mock_locator.evaluate = AsyncMock(return_value=True)
+        mock_browser.get_element_by_ref.return_value = mock_locator
+
+        result = await uncheck_element_by_ref(mock_browser, ref="e1")
+
+        mock_locator.uncheck.assert_not_called()
+        mock_page.evaluate.assert_called_once()
+        assert "Unchecked" in result
+
+    @pytest.mark.asyncio
+    async def test_hover_element_by_ref_covered_uses_mouse_move(self, mock_browser):
+        """Test hover — element covered → mouse.move to coordinates instead of locator.hover."""
+        from bridgic.browser.tools._browser_action_tools import hover_element_by_ref
+
+        mock_page = AsyncMock()
+        mock_browser.get_current_page = AsyncMock(return_value=mock_page)
+
+        mock_locator = MagicMock()
+        mock_locator.hover = AsyncMock()
+        mock_locator.bounding_box = AsyncMock(return_value={"x": 10, "y": 20, "width": 100, "height": 40})
+        mock_locator.evaluate = AsyncMock(return_value=True)
+        mock_browser.get_element_by_ref.return_value = mock_locator
+
+        result = await hover_element_by_ref(mock_browser, ref="e1")
+
+        mock_locator.hover.assert_not_called()
+        mock_page.mouse.move.assert_called_once_with(60.0, 40.0)
+        assert "Hovered" in result
+
+    @pytest.mark.asyncio
     async def test_double_click_element_by_ref(self, mock_browser):
-        """Test double-clicking an element."""
+        """Test double-clicking an element — element not covered (bounding_box None → direct dblclick)."""
         from bridgic.browser.tools._browser_action_tools import double_click_element_by_ref
 
         mock_locator = MagicMock()
         mock_locator.dblclick = AsyncMock()
+        mock_locator.bounding_box = AsyncMock(return_value=None)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
         result = await double_click_element_by_ref(mock_browser, ref="e1")

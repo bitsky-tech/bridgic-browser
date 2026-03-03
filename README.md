@@ -106,6 +106,7 @@ Browser options are read at daemon startup from the following sources, in priori
 | `./bridgic-browser.json` | Project-local config (in cwd at daemon start) |
 | `BRIDGIC_BROWSER_JSON` env var | Full JSON override for any `Browser` parameter |
 | `BRIDGIC_HEADLESS` env var | `0` = show window, any other value = headless |
+| `BRIDGIC_MAX_CHARS` env var | Max characters per `snapshot`/`get_llm_repr` response before pagination (default `30000`) |
 
 The JSON sources accept any `Browser` constructor parameter:
 
@@ -130,7 +131,7 @@ BRIDGIC_BROWSER_JSON='{"channel":"chrome","headless":false}' bridgic-browser ope
 | Category | Commands |
 |----------|----------|
 | Navigation | `open`, `navigate`, `back`, `forward`, `reload`, `search`, `info` |
-| Snapshot | `snapshot [--interactive]` |
+| Snapshot | `snapshot [-i] [-f\|-F] [-s N]` |
 | Element | `click`, `double-click`, `hover`, `focus`, `fill`, `select`, `check`, `uncheck`, `get text` |
 | Keyboard | `press`, `type` |
 | Mouse | `scroll [--dy N] [--dx N]` |
@@ -377,7 +378,7 @@ tools = (BrowserToolSetBuilder(browser)
 - `wait_for(time_seconds, text, text_gone, selector, state, timeout_ms)` - Wait for conditions
 
 **State (1 tool):**
-- `get_llm_repr(browser, start_from_char=0, interactive=False, full_page=True)` - Get page state string for LLM (accessibility tree with refs). Use **start_from_char** for pagination when the page is long: if the return value is truncated, a `[notice]` at the end gives **next_start_char** to call again. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default). Output is truncated at ~30k characters with a notice explaining how to continue.
+- `get_llm_repr(browser, start_from_char=0, interactive=False, full_page=True)` - Get page state string for LLM (accessibility tree with refs). Use **start_from_char** for pagination when the page is long: if the return value is truncated, a `[notice]` at the end gives **next_start_char** to call again. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default). Output is truncated at the `BRIDGIC_MAX_CHARS` limit (default 30,000 chars) with a notice explaining how to continue.
 
 ### Stealth Mode
 
@@ -519,6 +520,7 @@ bridgic-browser close                       # 停止 daemon
 | `./bridgic-browser.json` | 项目本地配置（daemon 启动时的工作目录） |
 | `BRIDGIC_BROWSER_JSON` 环境变量 | 完整 JSON，支持所有 `Browser` 参数 |
 | `BRIDGIC_HEADLESS` 环境变量 | `0` = 显示窗口，其他值 = 无头模式 |
+| `BRIDGIC_MAX_CHARS` 环境变量 | `snapshot`/`get_llm_repr` 每次响应的最大字符数（超出则分页，默认 `30000`） |
 
 JSON 来源支持所有 `Browser` 构造参数：
 
@@ -543,7 +545,7 @@ BRIDGIC_BROWSER_JSON='{"channel":"chrome","headless":false}' bridgic-browser ope
 | 类别 | 命令 |
 |------|------|
 | 导航 | `open`、`navigate`、`back`、`forward`、`reload`、`search`、`info` |
-| 快照 | `snapshot [--interactive]` |
+| 快照 | `snapshot [-i] [-f\|-F] [-s N]` |
 | 元素交互 | `click`、`double-click`、`hover`、`focus`、`fill`、`select`、`check`、`uncheck`、`get text` |
 | 键盘 | `press`、`type` |
 | 鼠标 | `scroll [--dy N] [--dx N]` |
@@ -790,7 +792,7 @@ tools = (BrowserToolSetBuilder(browser)
 - `wait_for(time_seconds, text, text_gone, selector, state, timeout_ms)` - 等待条件
 
 **状态（1 个工具）：**
-- `get_llm_repr(browser, start_from_char=0, interactive=False, full_page=True)` - 获取供 LLM 使用的页面状态字符串（带 ref 的可访问性树）。长页面可用 **start_from_char** 分页：若返回值被截断，末尾会有 `[notice]` 给出 **next_start_char** 供再次调用。**interactive** 与 **full_page** 与 `get_snapshot` 一致（默认全页面）。输出约 3 万字符处截断并附带续读说明。
+- `get_llm_repr(browser, start_from_char=0, interactive=False, full_page=True)` - 获取供 LLM 使用的页面状态字符串（带 ref 的可访问性树）。长页面可用 **start_from_char** 分页：若返回值被截断，末尾会有 `[notice]` 给出 **next_start_char** 供再次调用。**interactive** 与 **full_page** 与 `get_snapshot` 一致（默认全页面）。输出在 `BRIDGIC_MAX_CHARS` 上限处（默认 3 万字符）截断并附带续读说明。
 
 ### 隐身模式
 

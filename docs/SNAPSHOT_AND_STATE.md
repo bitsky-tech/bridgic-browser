@@ -92,13 +92,15 @@ Tool function used to supply the page state to an LLM. It calls `browser.get_sna
 
 ### Truncation and pagination
 
-When the full tree is longer than the limit (~30k characters), the returned string is cut at a natural break (e.g. paragraph or sentence) and a notice is appended, for example:
+When the full tree is longer than the limit (default 30,000 characters), the returned string is cut at a natural break (e.g. paragraph or sentence) and a notice is appended, for example:
 
 ```
 [notice] Current page state text is too long, returned portion starting from character 0 (this segment length 30000 / total length 45000 characters). To continue getting subsequent content, use start_from_char=30000 to call get_llm_repr again.
 ```
 
 Use the given `start_from_char` (e.g. `30000`) in the next call to get the rest.
+
+The character limit can be adjusted via the `BRIDGIC_MAX_CHARS` environment variable (default `30000`).
 
 ### Relation to get_snapshot
 
@@ -119,3 +121,34 @@ Typical flow:
 4. Interact: `el = await browser.get_element_by_ref("e5")` then e.g. `await el.click()` or use tools like `click_element_by_ref(browser, "e5")`.
 
 If the page changes (e.g. after navigation or dynamic update), take a new snapshot or call `get_llm_repr` again so refs stay valid.
+
+## CLI: bridgic-browser snapshot
+
+The `snapshot` command is the CLI equivalent of `get_llm_repr`. It shares the same parameters and delegates to the same implementation (truncation, pagination, and all).
+
+```
+bridgic-browser snapshot [OPTIONS]
+
+Options:
+  -i, --interactive          Only show clickable/editable elements.
+  -f, --full-page            Include elements outside the viewport (default).
+  -F, --no-full-page         Limit to viewport-only elements.
+  -s, --start-from-char INT  Pagination offset (use next_start_char from the
+                             truncation notice). Default: 0.
+```
+
+Examples:
+
+```bash
+bridgic-browser snapshot                  # full tree
+bridgic-browser snapshot -i               # interactive elements only
+bridgic-browser snapshot -F               # viewport-only
+bridgic-browser snapshot -s 30000         # page 2 of a long snapshot
+bridgic-browser snapshot -i -F -s 10000  # combined
+```
+
+### Environment variables
+
+| Variable           | Default | Description |
+|--------------------|---------|-------------|
+| `BRIDGIC_MAX_CHARS` | `30000` | Max characters returned per `snapshot`/`get_llm_repr` call before pagination kicks in. |

@@ -1103,7 +1103,12 @@ class Browser:
                         and ref_data.role not in SnapshotGenerator.TEXT_LEAF_ROLES
                     )
                     if can_recover_by_role_name and ref_data:
-                        role_name_locator = self._page.get_by_role(
+                        frame_nth = getattr(ref_data, 'frame_nth', None)
+                        if frame_nth is not None:
+                            scope = self._page.frame_locator("iframe").nth(frame_nth)
+                        else:
+                            scope = self._page
+                        role_name_locator = scope.get_by_role(
                             ref_data.role,
                             name=ref_data.name,
                             exact=True,

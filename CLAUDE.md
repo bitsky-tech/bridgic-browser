@@ -134,10 +134,12 @@ bridgic-browser click @e2
 Key implementation details:
 - **`_client.py`**: `send_command()` auto-starts the daemon if no socket exists. `_spawn_daemon()` uses `select.select()` + `os.read()` for the 30-second ready timeout (avoids blocking `proc.stdout.read()`). `start_if_needed=False` prevents auto-start for the `close` command.
 - **`_daemon.py`**: `run_daemon()` calls `_build_browser_kwargs()` then launches `Browser(**kwargs)`, writes `BRIDGIC_DAEMON_READY` to stdout, and serves one JSON command per connection. `asyncio.wait_for(reader.readline(), timeout=60)` prevents hanging on idle connections. Signal handling uses `loop.add_signal_handler()` (asyncio-safe).
-- **`_commands.py`**: 25 Click commands in 10 sections via `SectionedGroup`. `scroll` uses `--dy`/`--dx` options (not positional) to support negative values. `screenshot`/`pdf` call `os.path.abspath()` in the client before sending (daemon cwd may differ).
+- **`_commands.py`**: 25 Click commands in 10 sections via `SectionedGroup`. `scroll` uses `--dy`/`--dx` options (not positional) to support negative values. `screenshot`/`pdf` call `os.path.abspath()` in the client before sending (daemon cwd may differ). `snapshot` supports `-i`/`--interactive`, `-f/-F`/`--full-page/--no-full-page`, and `-s`/`--start-from-char`; it delegates to `get_llm_repr` (which adds truncation/pagination).
 - **`_build_browser_kwargs()`** priority chain (lowest → highest): defaults → `~/.bridgic/bridgic-browser.json` → `./bridgic-browser.json` → `BRIDGIC_BROWSER_JSON` env var → `BRIDGIC_HEADLESS` env var.
 
 Socket path: `BRIDGIC_SOCKET` env var (default `/tmp/bridgic-browser.sock`).
+
+Snapshot truncation limit: `BRIDGIC_MAX_CHARS` env var (default `30000`).
 
 ## Testing notes
 
@@ -145,7 +147,7 @@ Socket path: `BRIDGIC_SOCKET` env var (default `/tmp/bridgic-browser.sock`).
 - `@pytest.mark.integration` tests require a real browser and are excluded from `make test-quick`.
 - `@pytest.mark.slow` tests can be skipped with `-m "not slow"`.
 - The `tests/conftest.py` provides `event_loop` (session-scoped) and `temp_dir` fixtures.
-- CLI unit tests in `tests/unit/test_cli.py` (91 tests, no real browser required).
+- CLI unit tests in `tests/unit/test_cli.py` (no real browser required).
 
 ## Namespace packaging
 

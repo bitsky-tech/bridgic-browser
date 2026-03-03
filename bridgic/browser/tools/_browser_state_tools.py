@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -8,7 +9,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-MAX_CHAR_LIMIT = 30000
+MAX_CHAR_LIMIT = int(os.environ.get("BRIDGIC_MAX_CHARS", "30000"))
 
 async def get_llm_repr(browser: "Browser",
     start_from_char: int = 0,
@@ -80,7 +81,7 @@ async def get_llm_repr(browser: "Browser",
 
             text = text[:truncate_at]
             truncated = True
-            next_start_char = (start_from_char or 0) + truncate_at
+            next_start_char = start_from_char + truncate_at
 
         # If truncation occurred, add a notice at the end to help caller continue pagination
         if truncated and next_start_char is not None:

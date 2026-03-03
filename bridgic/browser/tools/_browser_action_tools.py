@@ -6,7 +6,8 @@ element references (refs) obtained from page snapshots.
 """
 from __future__ import annotations
 import logging
-from typing import TYPE_CHECKING, Optional
+import os
+from typing import TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
 
@@ -111,8 +112,31 @@ async def click_element_by_ref(browser: "Browser", ref: str) -> str:
             logger.warning(f'[click_element_by_ref] {msg}')
             return msg
 
-        # Click element
-        await locator.click()
+        # Pre-check: if another element sits on top of the target at its center point,
+        # click that intercepting element directly. This avoids Playwright's 30-second
+        # retry loop which only gives up after the full timeout has elapsed.
+        # (Common pattern: Stripe accordion buttons covering radio inputs.)
+        bbox = await locator.bounding_box()
+        if bbox is not None:
+            cx = bbox["x"] + bbox["width"] / 2
+            cy = bbox["y"] + bbox["height"] / 2
+            covered = await locator.evaluate(
+                f"(el) => {{ if (window.frameElement !== null) return false; "
+                f"const t = document.elementFromPoint({cx}, {cy}); "
+                f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
+            )
+            if covered:
+                logger.debug("[click_element_by_ref] covered at (%.1f, %.1f), clicking intercepting element", cx, cy)
+                page = await browser.get_current_page()
+                if page:
+                    await page.evaluate(f"document.elementFromPoint({cx}, {cy})?.click()")
+                else:
+                    await locator.evaluate("el => el.click()")
+            else:
+                await locator.click()
+        else:
+            # bounding_box is None when element is off-screen; let Playwright handle it
+            await locator.click()
 
         msg = f'Clicked element {ref}'
         logger.info(f'[click_element_by_ref] {msg}')
@@ -230,9 +254,29 @@ async def hover_element_by_ref(browser: "Browser", ref: str) -> str:
             logger.warning(f'[hover_element_by_ref] {msg}')
             return msg
 
-        # Hover element
-        await locator.hover()
-        
+        # If element is covered, move the mouse to those coordinates so the visible
+        # overlay receives the hover events (tooltips, dropdowns, etc.).
+        bbox = await locator.bounding_box()
+        if bbox is not None:
+            cx = bbox["x"] + bbox["width"] / 2
+            cy = bbox["y"] + bbox["height"] / 2
+            covered = await locator.evaluate(
+                f"(el) => {{ if (window.frameElement !== null) return false; "
+                f"const t = document.elementFromPoint({cx}, {cy}); "
+                f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
+            )
+            if covered:
+                logger.debug("[hover_element_by_ref] covered at (%.1f, %.1f), moving mouse to coordinates", cx, cy)
+                page = await browser.get_current_page()
+                if page:
+                    await page.mouse.move(cx, cy)
+                else:
+                    await locator.hover(force=True)
+            else:
+                await locator.hover()
+        else:
+            await locator.hover()
+
         msg = f'Hovered over element ref {ref}'
         logger.info(f'[hover_element_by_ref] {msg}')
         return msg
@@ -342,8 +386,6 @@ async def upload_file_by_ref(browser: "Browser", ref: str, file_path: str) -> st
         Result message.
     """
     try:
-        import os
-
         # Check if file exists
         if not os.path.exists(file_path):
             msg = f'File {file_path} does not exist'
@@ -458,7 +500,30 @@ async def check_element_by_ref(browser: "Browser", ref: str) -> str:
             logger.warning(f'[check_element_by_ref] {msg}')
             return msg
 
-        await locator.check()
+        bbox = await locator.bounding_box()
+        if bbox is not None:
+            cx = bbox["x"] + bbox["width"] / 2
+            cy = bbox["y"] + bbox["height"] / 2
+            covered = await locator.evaluate(
+                f"(el) => {{ if (window.frameElement !== null) return false; "
+                f"const t = document.elementFromPoint({cx}, {cy}); "
+                f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
+            )
+            if covered:
+                logger.debug("[check_element_by_ref] covered at (%.1f, %.1f), clicking intercepting element", cx, cy)
+                # Only click the covering element if the target is not already checked,
+                # to keep the operation idempotent (avoid toggling a checked checkbox off).
+                already_checked = await locator.evaluate("el => el.checked === true")
+                if not already_checked:
+                    page = await browser.get_current_page()
+                    if page:
+                        await page.evaluate(f"document.elementFromPoint({cx}, {cy})?.click()")
+                    else:
+                        await locator.check(force=True)
+            else:
+                await locator.check()
+        else:
+            await locator.check()
 
         msg = f'Checked element {ref}'
         logger.info(f'[check_element_by_ref] {msg}')
@@ -494,7 +559,30 @@ async def uncheck_element_by_ref(browser: "Browser", ref: str) -> str:
             logger.warning(f'[uncheck_element_by_ref] {msg}')
             return msg
 
-        await locator.uncheck()
+        bbox = await locator.bounding_box()
+        if bbox is not None:
+            cx = bbox["x"] + bbox["width"] / 2
+            cy = bbox["y"] + bbox["height"] / 2
+            covered = await locator.evaluate(
+                f"(el) => {{ if (window.frameElement !== null) return false; "
+                f"const t = document.elementFromPoint({cx}, {cy}); "
+                f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
+            )
+            if covered:
+                logger.debug("[uncheck_element_by_ref] covered at (%.1f, %.1f), clicking intercepting element", cx, cy)
+                # Only click the covering element if the target is currently checked,
+                # to keep the operation idempotent (avoid toggling an unchecked checkbox on).
+                already_checked = await locator.evaluate("el => el.checked === true")
+                if already_checked:
+                    page = await browser.get_current_page()
+                    if page:
+                        await page.evaluate(f"document.elementFromPoint({cx}, {cy})?.click()")
+                    else:
+                        await locator.uncheck(force=True)
+            else:
+                await locator.uncheck()
+        else:
+            await locator.uncheck()
 
         msg = f'Unchecked element {ref}'
         logger.info(f'[uncheck_element_by_ref] {msg}')
@@ -530,7 +618,31 @@ async def double_click_element_by_ref(browser: "Browser", ref: str) -> str:
             logger.warning(f'[double_click_element_by_ref] {msg}')
             return msg
 
-        await locator.dblclick()
+        bbox = await locator.bounding_box()
+        if bbox is not None:
+            cx = bbox["x"] + bbox["width"] / 2
+            cy = bbox["y"] + bbox["height"] / 2
+            covered = await locator.evaluate(
+                f"(el) => {{ if (window.frameElement !== null) return false; "
+                f"const t = document.elementFromPoint({cx}, {cy}); "
+                f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
+            )
+            if covered:
+                logger.debug("[double_click_element_by_ref] covered at (%.1f, %.1f), dispatching dblclick on intercepting element", cx, cy)
+                page = await browser.get_current_page()
+                if page:
+                    await page.evaluate(
+                        f"(function(){{"
+                        f"const el=document.elementFromPoint({cx},{cy});"
+                        f"if(el)el.dispatchEvent(new MouseEvent('dblclick',{{bubbles:true,cancelable:true,view:window}}));"
+                        f"}})()"
+                    )
+                else:
+                    await locator.dblclick(force=True)
+            else:
+                await locator.dblclick()
+        else:
+            await locator.dblclick()
 
         msg = f'Double-clicked element {ref}'
         logger.info(f'[double_click_element_by_ref] {msg}')

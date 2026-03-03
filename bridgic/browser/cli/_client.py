@@ -16,12 +16,13 @@ import sys
 import time
 from typing import Any, Dict, Optional
 
-from ._daemon import SOCKET_PATH, READY_SIGNAL
+from ._daemon import SOCKET_PATH, READY_SIGNAL, STREAM_LIMIT
 
 
 # ---------------------------------------------------------------------------
 # Low-level socket helpers
 # ---------------------------------------------------------------------------
+
 
 async def _send_command_async(command: str, args: Dict[str, Any]) -> str:
     """Connect to the daemon, send one command, return the result string.
@@ -29,7 +30,7 @@ async def _send_command_async(command: str, args: Dict[str, Any]) -> str:
     Raises ``ConnectionRefusedError`` / ``FileNotFoundError`` if the socket
     is not available.
     """
-    reader, writer = await asyncio.open_unix_connection(SOCKET_PATH)
+    reader, writer = await asyncio.open_unix_connection(SOCKET_PATH, limit=STREAM_LIMIT)
     try:
         req = json.dumps({"command": command, "args": args}) + "\n"
         writer.write(req.encode())

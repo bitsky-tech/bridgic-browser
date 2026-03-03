@@ -1357,3 +1357,675 @@ class TestExtractAndProcessPipeline:
         assert refs[nav_ref].parent_ref is None
         assert refs[listitem_ref].parent_ref == nav_ref
         assert refs[link_ref].parent_ref == listitem_ref
+
+
+# ---------------------------------------------------------------------------
+# 7. iframe handling — frame_nth assignment & locator scoping
+# ---------------------------------------------------------------------------
+
+class TestIframeHandling:
+    """Tests for the iframe frame_nth tracking and frame-scoped locator building.
+
+    Covers:
+    - `_process_page_snapshot_for_ai`: frame_nth populated on iframe children
+    - `_process_page_snapshot_for_ai`: Playwright internal frame refs stripped from output
+    - `get_locator_from_ref_async`: frame_locator used when frame_nth is set
+    - Both interactive and non-interactive snapshot modes
+    """
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _process(
+        self,
+        gen: SnapshotGenerator,
+        raw: str,
+        *,
+        interactive: bool = False,
+        interactive_map: Optional[Dict[str, bool]] = None,
+    ) -> Tuple[str, Dict[str, RefData]]:
+        gen._reset_refs()
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=interactive, full_page=True)
+        result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
+        return result, refs
+
+    # ------------------------------------------------------------------
+    # _process_page_snapshot_for_ai: frame_nth assignment
+    # ------------------------------------------------------------------
+
+    def test_iframe_children_get_frame_nth_zero(self, gen: SnapshotGenerator) -> None:
+        """Elements directly inside an iframe get frame_nth=0."""
+        raw = (
+            '- heading "Page" [ref=e1] [level=2]\n'
+            '- iframe:\n'
+            '  - button "Go" [ref=f1e2] [cursor=pointer]'
+        )
+        _, refs = self._process(gen, raw)
+
+        button_ref = next(r for r, d in refs.items() if d.name == "Go")
+        assert refs[button_ref].frame_nth == 0
+
+    def test_main_frame_elements_have_no_frame_nth(self, gen: SnapshotGenerator) -> None:
+        """Elements in the main frame have frame_nth=None."""
+        raw = (
+            '- button "Submit" [ref=e1] [cursor=pointer]\n'
+            '- iframe:\n'
+            '  - button "Inner" [ref=f1e3] [cursor=pointer]'
+        )
+        _, refs = self._process(gen, raw)
+
+        submit_ref = next(r for r, d in refs.items() if d.name == "Submit")
+        inner_ref = next(r for r, d in refs.items() if d.name == "Inner")
+        assert refs[submit_ref].frame_nth is None
+        assert refs[inner_ref].frame_nth == 0
+
+    def test_element_after_iframe_has_no_frame_nth(self, gen: SnapshotGenerator) -> None:
+        """A button appearing after (sibling of) the iframe has frame_nth=None."""
+        raw = (
+            '- iframe:\n'
+            '  - button "Inside" [ref=f1e2] [cursor=pointer]\n'
+            '- button "Outside" [ref=e3] [cursor=pointer]'
+        )
+        _, refs = self._process(gen, raw)
+
+        inside_ref = next(r for r, d in refs.items() if d.name == "Inside")
+        outside_ref = next(r for r, d in refs.items() if d.name == "Outside")
+        assert refs[inside_ref].frame_nth == 0
+        assert refs[outside_ref].frame_nth is None
+
+    def test_multiple_iframes_get_sequential_frame_nth(self, gen: SnapshotGenerator) -> None:
+        """Two sibling iframes produce frame_nth=0 and frame_nth=1 respectively."""
+        raw = (
+            '- iframe:\n'
+            '  - button "First" [ref=f1e2] [cursor=pointer]\n'
+            '- iframe:\n'
+            '  - button "Second" [ref=f2e2] [cursor=pointer]'
+        )
+        _, refs = self._process(gen, raw)
+
+        first_ref = next(r for r, d in refs.items() if d.name == "First")
+        second_ref = next(r for r, d in refs.items() if d.name == "Second")
+        assert refs[first_ref].frame_nth == 0
+        assert refs[second_ref].frame_nth == 1
+
+    def test_multiple_elements_in_same_iframe_same_frame_nth(self, gen: SnapshotGenerator) -> None:
+        """Multiple interactive elements inside one iframe all share the same frame_nth."""
+        raw = (
+            '- iframe:\n'
+            '  - textbox "Name" [ref=f1e2]:\n'
+            '    - /placeholder: Enter name\n'
+            '  - button "Save" [ref=f1e4] [cursor=pointer]'
+        )
+        _, refs = self._process(gen, raw)
+
+        name_ref = next(r for r, d in refs.items() if d.name == "Name")
+        save_ref = next(r for r, d in refs.items() if d.name == "Save")
+        assert refs[name_ref].frame_nth == 0
+        assert refs[save_ref].frame_nth == 0
+
+    def test_interactive_mode_iframe_children_get_frame_nth(self, gen: SnapshotGenerator) -> None:
+        """In interactive mode the iframe container is filtered out, but its interactive
+        children still receive the correct frame_nth."""
+        raw = (
+            '- button "Main" [ref=e1] [cursor=pointer]\n'
+            '- iframe:\n'
+            '  - button "iframe 按钮" [ref=f1e3] [cursor=pointer]'
+        )
+        result, refs = self._process(gen, raw, interactive=True)
+
+        assert "iframe 按钮" in result
+        assert "Main" in result
+
+        iframe_ref = next(r for r, d in refs.items() if d.name == "iframe 按钮")
+        main_ref = next(r for r, d in refs.items() if d.name == "Main")
+        assert refs[iframe_ref].frame_nth == 0
+        assert refs[main_ref].frame_nth is None
+
+    def test_interactive_mode_multiple_iframes_frame_nth(self, gen: SnapshotGenerator) -> None:
+        """Interactive mode: two iframes → frame_nth=0 and frame_nth=1."""
+        raw = (
+            '- iframe:\n'
+            '  - button "A" [ref=f1e2] [cursor=pointer]\n'
+            '- iframe:\n'
+            '  - button "B" [ref=f2e2] [cursor=pointer]'
+        )
+        _, refs = self._process(gen, raw, interactive=True)
+
+        ref_a = next(r for r, d in refs.items() if d.name == "A")
+        ref_b = next(r for r, d in refs.items() if d.name == "B")
+        assert refs[ref_a].frame_nth == 0
+        assert refs[ref_b].frame_nth == 1
+
+    def test_iframe_with_main_frame_element_ref_has_no_frame_nth(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """When iframe itself has a Playwright main-frame ref, it is not inside an iframe."""
+        raw = (
+            '- button "Before" [ref=e1] [cursor=pointer]\n'
+            '- iframe [ref=e2]:\n'
+            '  - button "Inside" [ref=f1e3] [cursor=pointer]\n'
+            '- button "After" [ref=e4] [cursor=pointer]'
+        )
+        _, refs = self._process(gen, raw)
+
+        before_ref = next(r for r, d in refs.items() if d.name == "Before")
+        after_ref = next(r for r, d in refs.items() if d.name == "After")
+        inside_ref = next(r for r, d in refs.items() if d.name == "Inside")
+        assert refs[before_ref].frame_nth is None
+        assert refs[after_ref].frame_nth is None
+        assert refs[inside_ref].frame_nth == 0
+
+    # ------------------------------------------------------------------
+    # _process_page_snapshot_for_ai: Playwright frame refs stripped
+    # ------------------------------------------------------------------
+
+    def test_playwright_frame_ref_not_in_output(self, gen: SnapshotGenerator) -> None:
+        """Playwright's internal frame refs (e.g. [ref=f1e3]) must not appear in output."""
+        raw = (
+            '- iframe:\n'
+            '  - button "Go" [ref=f1e3] [cursor=pointer]'
+        )
+        result, _ = self._process(gen, raw)
+
+        assert "[ref=f1e3]" not in result
+        assert "Go" in result
+
+    def test_playwright_frame_ref_with_mixed_content(self, gen: SnapshotGenerator) -> None:
+        """Both main-frame and iframe Playwright refs are fully stripped from output."""
+        raw = (
+            '- button "Main" [ref=e5] [cursor=pointer]\n'
+            '- iframe:\n'
+            '  - textbox "Search" [ref=f2e3]:\n'
+            '    - /placeholder: Search...\n'
+            '  - button "Find" [ref=f2e7] [cursor=pointer]'
+        )
+        result, _ = self._process(gen, raw)
+
+        # No raw Playwright refs in output
+        assert "[ref=e5]" not in result
+        assert "[ref=f2e3]" not in result
+        assert "[ref=f2e7]" not in result
+        # But our assigned eN refs are present
+        assert re.search(r'\[ref=e\d+\]', result) is not None
+        # Content is preserved
+        assert "Main" in result
+        assert "Search" in result
+        assert "/placeholder: Search..." in result
+        assert "Find" in result
+
+    # ------------------------------------------------------------------
+    # get_locator_from_ref_async: frame_locator scoping
+    # ------------------------------------------------------------------
+
+    def test_locator_uses_frame_locator_for_iframe_element(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """frame_nth=0 → page.frame_locator('iframe').nth(0).get_by_role(...)."""
+        page = Mock()
+        frame_locator_obj = Mock()
+        nth_frame = Mock()
+        scoped_locator = Mock()
+
+        page.frame_locator.return_value = frame_locator_obj
+        frame_locator_obj.nth.return_value = nth_frame
+        nth_frame.get_by_role.return_value = scoped_locator
+
+        refs: Dict[str, RefData] = {
+            "e1": RefData(
+                selector="get_by_role('button', name=\"Go\", exact=True)",
+                role="button",
+                name="Go",
+                nth=None,
+                text_content=None,
+                frame_nth=0,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is scoped_locator
+        page.frame_locator.assert_called_once_with("iframe")
+        frame_locator_obj.nth.assert_called_once_with(0)
+        nth_frame.get_by_role.assert_called_once_with("button", name="Go", exact=True)
+        page.get_by_role.assert_not_called()
+
+    def test_locator_uses_page_for_main_frame_element(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """frame_nth=None → page.get_by_role(...) directly, no frame_locator."""
+        page = Mock()
+        role_locator = Mock()
+        page.get_by_role.return_value = role_locator
+
+        refs: Dict[str, RefData] = {
+            "e1": RefData(
+                selector="get_by_role('button', name=\"Submit\", exact=True)",
+                role="button",
+                name="Submit",
+                nth=None,
+                text_content=None,
+                frame_nth=None,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is role_locator
+        page.get_by_role.assert_called_once_with("button", name="Submit", exact=True)
+        page.frame_locator.assert_not_called()
+
+    def test_second_iframe_uses_nth_1(self, gen: SnapshotGenerator) -> None:
+        """frame_nth=1 → page.frame_locator('iframe').nth(1)."""
+        page = Mock()
+        frame_locator_obj = Mock()
+        nth_frame = Mock()
+        scoped_locator = Mock()
+
+        page.frame_locator.return_value = frame_locator_obj
+        frame_locator_obj.nth.return_value = nth_frame
+        nth_frame.get_by_role.return_value = scoped_locator
+
+        refs: Dict[str, RefData] = {
+            "e1": RefData(
+                selector="get_by_role('textbox', name=\"Input\", exact=True)",
+                role="textbox",
+                name="Input",
+                nth=None,
+                text_content=None,
+                frame_nth=1,
+            )
+        }
+
+        gen.get_locator_from_ref_async(page, "e1", refs)
+
+        page.frame_locator.assert_called_once_with("iframe")
+        frame_locator_obj.nth.assert_called_once_with(1)
+
+    def test_iframe_text_leaf_role_uses_frame_get_by_text(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """TEXT_LEAF_ROLES inside an iframe use scope.get_by_text(), not get_by_role()."""
+        page = Mock()
+        frame_locator_obj = Mock()
+        nth_frame = Mock()
+        text_locator = Mock()
+
+        page.frame_locator.return_value = frame_locator_obj
+        frame_locator_obj.nth.return_value = nth_frame
+        nth_frame.get_by_text.return_value = text_locator
+
+        refs: Dict[str, RefData] = {
+            "e1": RefData(
+                selector='get_by_text("Hello", exact=True)',
+                role="text",
+                name="Hello",
+                nth=None,
+                text_content=None,
+                frame_nth=0,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is text_locator
+        nth_frame.get_by_text.assert_called_once_with("Hello", exact=True)
+        page.get_by_text.assert_not_called()
+
+    def test_iframe_element_with_nth_disambiguation(self, gen: SnapshotGenerator) -> None:
+        """frame_nth + nth: frame_locator is used AND nth() is called on the result."""
+        page = Mock()
+        frame_locator_obj = Mock()
+        nth_frame = Mock()
+        base_locator = Mock()
+        nth_locator = Mock()
+
+        page.frame_locator.return_value = frame_locator_obj
+        frame_locator_obj.nth.return_value = nth_frame
+        nth_frame.get_by_role.return_value = base_locator
+        base_locator.nth.return_value = nth_locator
+
+        refs: Dict[str, RefData] = {
+            "e1": RefData(
+                selector="get_by_role('button', name=\"OK\", exact=True)",
+                role="button",
+                name="OK",
+                nth=2,
+                text_content=None,
+                frame_nth=0,
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is nth_locator
+        page.frame_locator.assert_called_once_with("iframe")
+        frame_locator_obj.nth.assert_called_once_with(0)
+        nth_frame.get_by_role.assert_called_once_with("button", name="OK", exact=True)
+        base_locator.nth.assert_called_once_with(2)
+
+    # ------------------------------------------------------------------
+    # Full pipeline: _process + locator reconstruction
+    # ------------------------------------------------------------------
+
+    def test_pipeline_iframe_non_interactive(self, gen: SnapshotGenerator) -> None:
+        """Non-interactive pipeline: iframe children assigned refs + frame_nth, no leaked refs."""
+        raw = (
+            '- heading "Page" [ref=e1] [level=2]\n'
+            '- iframe:\n'
+            '  - textbox "Name" [ref=f1e4]:\n'
+            '    - /placeholder: Enter name\n'
+            '  - button "Save" [ref=f1e6] [cursor=pointer]'
+        )
+        result, refs = self._process(gen, raw)
+
+        # Playwright frame refs must not appear in output
+        assert "[ref=f1e4]" not in result
+        assert "[ref=f1e6]" not in result
+
+        # Content preserved
+        assert 'textbox "Name"' in result
+        assert 'button "Save"' in result
+        assert '/placeholder: Enter name' in result
+
+        # frame_nth set for iframe children
+        name_ref = next(r for r, d in refs.items() if d.role == "textbox" and d.name == "Name")
+        save_ref = next(r for r, d in refs.items() if d.name == "Save")
+        assert refs[name_ref].frame_nth == 0
+        assert refs[save_ref].frame_nth == 0
+
+        # Main-frame heading has no frame context
+        heading_ref = next(r for r, d in refs.items() if d.role == "heading")
+        assert refs[heading_ref].frame_nth is None
+
+    def test_pipeline_iframe_interactive(self, gen: SnapshotGenerator) -> None:
+        """Interactive pipeline: iframe children get frame_nth even though iframe is filtered."""
+        raw = (
+            '- button "Main" [ref=e1] [cursor=pointer]\n'
+            '- iframe:\n'
+            '  - button "iframe 按钮" [ref=f1e3] [cursor=pointer]'
+        )
+        result, refs = self._process(gen, raw, interactive=True)
+
+        assert "iframe 按钮" in result
+        assert "Main" in result
+        # iframe itself must not appear as a separate line
+        assert result.count("- iframe") == 0
+
+        iframe_ref = next(r for r, d in refs.items() if d.name == "iframe 按钮")
+        main_ref = next(r for r, d in refs.items() if d.name == "Main")
+        assert refs[iframe_ref].frame_nth == 0
+        assert refs[main_ref].frame_nth is None
+
+    def test_pipeline_mixed_main_and_iframe_elements(self, gen: SnapshotGenerator) -> None:
+        """Realistic page: main elements, one iframe, then more main elements."""
+        raw = (
+            '- button "Top" [ref=e1] [cursor=pointer]\n'
+            '- iframe:\n'
+            '  - textbox "Search" [ref=f1e2]:\n'
+            '    - /placeholder: Search...\n'
+            '  - button "Find" [ref=f1e4] [cursor=pointer]\n'
+            '- button "Bottom" [ref=e5] [cursor=pointer]'
+        )
+        _, refs = self._process(gen, raw)
+
+        top_ref = next(r for r, d in refs.items() if d.name == "Top")
+        search_ref = next(r for r, d in refs.items() if d.name == "Search")
+        find_ref = next(r for r, d in refs.items() if d.name == "Find")
+        bottom_ref = next(r for r, d in refs.items() if d.name == "Bottom")
+
+        assert refs[top_ref].frame_nth is None
+        assert refs[search_ref].frame_nth == 0
+        assert refs[find_ref].frame_nth == 0
+        assert refs[bottom_ref].frame_nth is None
+
+    def test_pipeline_two_iframes_with_elements_between(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Two iframes with a main-frame button in between get correct frame_nth values."""
+        raw = (
+            '- iframe:\n'
+            '  - button "Alpha" [ref=f1e2] [cursor=pointer]\n'
+            '- button "Middle" [ref=e3] [cursor=pointer]\n'
+            '- iframe:\n'
+            '  - button "Beta" [ref=f2e2] [cursor=pointer]'
+        )
+        _, refs = self._process(gen, raw)
+
+        alpha_ref = next(r for r, d in refs.items() if d.name == "Alpha")
+        middle_ref = next(r for r, d in refs.items() if d.name == "Middle")
+        beta_ref = next(r for r, d in refs.items() if d.name == "Beta")
+
+        assert refs[alpha_ref].frame_nth == 0
+        assert refs[middle_ref].frame_nth is None
+        assert refs[beta_ref].frame_nth == 1
+
+    # ------------------------------------------------------------------
+    # _batch_get_elements_info: iframe goes through batch JS (not suffix-only)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_iframe_goes_through_batch_js_not_suffix_only(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """iframe is not a structural noise role so it goes through batch JS evaluate."""
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(return_value={
+            "e5": {
+                "rect": {"x": 0, "y": 60, "right": 800, "bottom": 300},
+                "tagName": "iframe",
+                "cursor": "default",
+                "isEditable": False,
+                "isDisabled": False,
+                "hasEventHandler": False,
+                "tabindex": None,
+                "classAndId": "",
+                "dataAction": None,
+                "ariaRequired": False,
+                "ariaAutocomplete": None,
+                "ariaKeyshortcuts": None,
+                "ariaHidden": False,
+                "ariaDisabled": False,
+                "isContentEditable": False,
+                "role": None,
+            }
+        })
+        refs_info = {"e5": ("iframe", None, 0)}
+        ref_suffixes = {"e5": "[ref=e5]:"}
+
+        visible, _ = await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        # evaluate must be called (batch path, not suffix-only)
+        mock_page.evaluate.assert_called_once()
+        assert "e5" in visible
+
+    @pytest.mark.asyncio
+    async def test_iframe_in_viewport_included_in_visible_refs(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """When JS returns a valid in-viewport rect for iframe, it's in visible_refs."""
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(return_value={
+            "e5": {
+                "rect": {"x": 0, "y": 60, "right": 800, "bottom": 300},
+                "tagName": "iframe",
+                "cursor": "default",
+                "isEditable": False,
+                "isDisabled": False,
+                "hasEventHandler": False,
+                "tabindex": None,
+                "classAndId": "",
+                "dataAction": None,
+                "ariaRequired": False,
+                "ariaAutocomplete": None,
+                "ariaKeyshortcuts": None,
+                "ariaHidden": False,
+                "ariaDisabled": False,
+                "isContentEditable": False,
+                "role": None,
+            }
+        })
+        refs_info = {"e5": ("iframe", None, 0)}
+        ref_suffixes = {"e5": "[ref=e5]:"}
+
+        visible, _ = await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=True, viewport_width=1280, viewport_height=720,
+        )
+
+        assert "e5" in visible
+
+    @pytest.mark.asyncio
+    async def test_iframe_below_viewport_excluded_from_visible_refs(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """When the iframe rect is below the viewport, it's excluded from visible_refs."""
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(return_value={
+            "e5": {
+                "rect": {"x": 0, "y": 3000, "right": 800, "bottom": 3300},
+                "tagName": "iframe",
+                "cursor": "default",
+                "isEditable": False,
+                "isDisabled": False,
+                "hasEventHandler": False,
+                "tabindex": None,
+                "classAndId": "",
+                "dataAction": None,
+                "ariaRequired": False,
+                "ariaAutocomplete": None,
+                "ariaKeyshortcuts": None,
+                "ariaHidden": False,
+                "ariaDisabled": False,
+                "isContentEditable": False,
+                "role": None,
+            }
+        })
+        refs_info = {"e5": ("iframe", None, 0)}
+        ref_suffixes = {"e5": "[ref=e5]:"}
+
+        visible, _ = await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=True, viewport_width=1280, viewport_height=720,
+        )
+
+        assert "e5" not in visible
+
+    # ------------------------------------------------------------------
+    # _pre_filter_raw_snapshot: viewport filtering with iframe (full_page=False)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_pre_filter_keeps_iframe_and_children_when_in_viewport(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """full_page=False: iframe in viewport → iframe element and its children kept."""
+        raw = (
+            '- button "Above" [ref=e1] [cursor=pointer]\n'
+            '- iframe [ref=e2]:\n'
+            '  - button "Inside" [ref=f1e3] [cursor=pointer]\n'
+            '- button "Below" [ref=e3] [cursor=pointer]'
+        )
+        _iframe_info = {
+            "rect": {"x": 0, "y": 60, "right": 800, "bottom": 300},
+            "tagName": "iframe",
+            "cursor": "default",
+            "isEditable": False,
+            "isDisabled": False,
+            "hasEventHandler": False,
+            "tabindex": None,
+            "classAndId": "",
+            "dataAction": None,
+            "ariaRequired": False,
+            "ariaAutocomplete": None,
+            "ariaKeyshortcuts": None,
+            "ariaHidden": False,
+            "ariaDisabled": False,
+            "isContentEditable": False,
+            "role": None,
+        }
+        _btn_info = {
+            "rect": {"x": 0, "y": 10, "right": 100, "bottom": 50},
+            "tagName": "button",
+            "cursor": "pointer",
+            "isEditable": False,
+            "isDisabled": False,
+            "hasEventHandler": False,
+            "tabindex": None,
+            "classAndId": "",
+            "dataAction": None,
+            "ariaRequired": False,
+            "ariaAutocomplete": None,
+            "ariaKeyshortcuts": None,
+            "ariaHidden": False,
+            "ariaDisabled": False,
+            "isContentEditable": False,
+            "role": None,
+        }
+        mock_page = AsyncMock()
+        mock_page.viewport_size = {"width": 1280, "height": 720}
+        mock_page.evaluate = AsyncMock(return_value={
+            "e1": _btn_info,
+            "e2": _iframe_info,
+            "e3": {**_btn_info, "rect": {"x": 0, "y": 310, "right": 100, "bottom": 350}},
+        })
+        options = SnapshotOptions(interactive=False, full_page=False)
+
+        filtered, _ = await gen._pre_filter_raw_snapshot(raw, mock_page, options)
+
+        assert "iframe" in filtered
+        assert "Inside" in filtered
+        assert "Above" in filtered
+        assert "Below" in filtered
+
+    @pytest.mark.asyncio
+    async def test_pre_filter_drops_iframe_and_children_when_out_of_viewport(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """full_page=False: iframe below viewport → iframe and ALL children removed."""
+        raw = (
+            '- button "Above" [ref=e1] [cursor=pointer]\n'
+            '- iframe [ref=e2]:\n'
+            '  - button "Inside" [ref=f1e3] [cursor=pointer]\n'
+            '- button "Below" [ref=e3] [cursor=pointer]'
+        )
+        _btn_info = {
+            "rect": {"x": 0, "y": 10, "right": 100, "bottom": 50},
+            "tagName": "button",
+            "cursor": "pointer",
+            "isEditable": False,
+            "isDisabled": False,
+            "hasEventHandler": False,
+            "tabindex": None,
+            "classAndId": "",
+            "dataAction": None,
+            "ariaRequired": False,
+            "ariaAutocomplete": None,
+            "ariaKeyshortcuts": None,
+            "ariaHidden": False,
+            "ariaDisabled": False,
+            "isContentEditable": False,
+            "role": None,
+        }
+        mock_page = AsyncMock()
+        mock_page.viewport_size = {"width": 1280, "height": 720}
+        # e2 (iframe) is missing → treated as out-of-viewport / unfindable
+        mock_page.evaluate = AsyncMock(return_value={
+            "e1": _btn_info,
+            # e2 not present → info=None → excluded in viewport mode
+            "e3": {**_btn_info, "rect": {"x": 0, "y": 310, "right": 100, "bottom": 350}},
+        })
+        options = SnapshotOptions(interactive=False, full_page=False)
+
+        filtered, _ = await gen._pre_filter_raw_snapshot(raw, mock_page, options)
+
+        # iframe element itself and its child both removed
+        assert "iframe" not in filtered
+        assert "Inside" not in filtered
+        # Main-frame buttons before and after iframe are still present
+        assert "Above" in filtered
+        assert "Below" in filtered

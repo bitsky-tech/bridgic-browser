@@ -57,7 +57,7 @@ import logging
 import time
 from typing import Dict, Optional, Set, List, Tuple, Any
 from dataclasses import dataclass
-from playwright.async_api import Page as AsyncPage, Locator as AsyncLocator
+from playwright.async_api import FrameLocator as AsyncFrameLocator, Page as AsyncPage, Locator as AsyncLocator
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,7 @@ class RefData:
     nth: Optional[int] = None
     text_content: Optional[str] = None
     parent_ref: Optional[str] = None
+    frame_nth: Optional[int] = None  # 0-based index of containing iframe; None = main frame
 
 
 @dataclass
@@ -330,8 +331,9 @@ class SnapshotGenerator:
         r'(?:\s+"((?:[^"\\]|\\.)*)")?'  # optional name in quotes (handles escaped quotes)
         r'(.*)$'                   # suffix (attributes, colon, etc.)
     )
-    # Pattern for cleaning existing refs from suffix
-    _REF_CLEAN_PATTERN = re.compile(r'\s*\[ref=e\d+\]')
+    # Pattern for cleaning existing refs from suffix (matches both our eN refs and
+    # Playwright's internal frame refs like f2e7, f1e5, etc.)
+    _REF_CLEAN_PATTERN = re.compile(r'\s*\[ref=[a-zA-Z0-9]+\]')
     # Pattern to extract ref ID from a line or suffix
     _REF_EXTRACT_PATTERN = re.compile(r'\[ref=(e\d+)\]')
     # Pattern for _extract_original_refs_from_raw: matches lines with refs
@@ -684,6 +686,7 @@ class SnapshotGenerator:
                     'time': 'time, [role="time"]',
                     'complementary': 'aside, [role="complementary"]',
                     'form': 'form[aria-label], form[aria-labelledby], [role="form"]',
+                    'iframe': 'iframe',
                     'feed': '[role="feed"]',
                     'document': '[role="document"]',
                     'caption': 'caption, figcaption, [role="caption"]',
@@ -714,9 +717,10 @@ class SnapshotGenerator:
                     const title = el.getAttribute('title');
                     if (title) return title.trim();
 
-                    // For inputs: check value/placeholder as accessible name fallbacks
-                    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName)) {
-                        if (el.value) return el.value;
+                    // For inputs: placeholder is a valid accessible name source (W3C accname-1.2).
+                    // Do NOT use el.value — it holds user-typed content, not the accessible name,
+                    // and would cause findElement to fail after the user fills the field.
+                    if (['INPUT', 'TEXTAREA'].includes(el.tagName)) {
                         if (el.placeholder) return el.placeholder;
                     }
 
@@ -1089,6 +1093,11 @@ class SnapshotGenerator:
         # - ref_or_none: the ref assigned to this element (if any)
         depth_stack: List[Tuple[int, bool, int, Optional[str]]] = []
 
+        # Track iframe nesting: list of (iframe_depth, iframe_nth_0based)
+        # so that child elements can be scoped to the correct frame_locator.
+        iframe_stack: List[Tuple[int, int]] = []
+        iframe_counter = 0
+
         line_pattern = self._LINE_PATTERN
         ref_pattern = self._REF_CLEAN_PATTERN
         ref_extract_pattern = self._REF_EXTRACT_PATTERN
@@ -1128,6 +1137,10 @@ class SnapshotGenerator:
             # Pop elements from stack that are at same or deeper level
             while depth_stack and depth_stack[-1][0] >= original_depth:
                 depth_stack.pop()
+
+            # Pop iframe contexts that are no longer enclosing the current element
+            while iframe_stack and iframe_stack[-1][0] >= original_depth:
+                iframe_stack.pop()
 
             match = line_pattern.match(line)
 
@@ -1280,6 +1293,11 @@ class SnapshotGenerator:
 
             if not should_keep:
                 depth_stack.append((original_depth, False, effective_depth, None))
+                # Even when filtered, iframes must be pushed onto the iframe_stack so
+                # that their interactive children still get the correct frame_nth.
+                if role_lower == 'iframe':
+                    iframe_stack.append((original_depth, iframe_counter))
+                    iframe_counter += 1
                 # In interactive mode, skip filtered elements entirely (no inline text)
                 # In non-interactive mode, preserve inline text from filtered elements
                 if not options.interactive:
@@ -1324,6 +1342,7 @@ class SnapshotGenerator:
                         text_content = text_match.group(1).strip()
 
                 parent_ref = get_nearest_parent_ref(original_depth)
+                current_frame_nth = iframe_stack[-1][1] if iframe_stack else None
 
                 refs[ref] = RefData(
                     selector=self._build_selector(role_lower, name, text_content),
@@ -1332,6 +1351,7 @@ class SnapshotGenerator:
                     nth=nth,
                     text_content=text_content,
                     parent_ref=parent_ref,
+                    frame_nth=current_frame_nth,
                 )
 
                 enhanced += f" [ref={ref}]"
@@ -1342,6 +1362,11 @@ class SnapshotGenerator:
 
             # Track this element in the stack (after ref assignment).
             depth_stack.append((original_depth, should_keep, effective_depth, current_ref))
+
+            # If this element is an iframe, future children will be scoped to it.
+            if role_lower == 'iframe':
+                iframe_stack.append((original_depth, iframe_counter))
+                iframe_counter += 1
 
             # Re-add clean suffix (like [level=1] for headings, or trailing colon)
             if clean_suffix:
@@ -1716,6 +1741,14 @@ class SnapshotGenerator:
                 return re.compile(rf"^\s*{joined}\s*$")
             return re.compile(joined)
 
+        # Determine the search scope: either the main page or an iframe's frame locator.
+        # Elements inside iframes have frame_nth set to the 0-based iframe index.
+        scope: "AsyncPage | AsyncFrameLocator" = (
+            page.frame_locator("iframe").nth(ref_data.frame_nth)
+            if ref_data.frame_nth is not None
+            else page
+        )
+
         # Build locator by signal strength:
         # 1) Semantic role+name
         # 2) Role-constrained text match for structural roles
@@ -1727,29 +1760,29 @@ class SnapshotGenerator:
             and ref_data.role not in self.STRUCTURAL_NOISE_ROLES
             and ref_data.role not in self.TEXT_LEAF_ROLES
         ):
-            locator = page.get_by_role(ref_data.role, name=normalized_name, exact=True)
+            locator = scope.get_by_role(ref_data.role, name=normalized_name, exact=True)
         elif ref_data.role in self.ROLE_TEXT_MATCH_ROLES and match_text:
             if ref_data.role == 'row':
                 # Row text usually includes descendant cell text; use role-constrained
                 # contains matching and avoid locator.or_ expansion.
                 row_text_pattern = text_pattern(match_text, exact=False)
-                locator = page.get_by_role('row').filter(has_text=row_text_pattern)
+                locator = scope.get_by_role('row').filter(has_text=row_text_pattern)
             else:
                 exact_text_pattern = text_pattern(match_text, exact=True)
-                locator = page.get_by_role(ref_data.role).filter(has_text=exact_text_pattern)
+                locator = scope.get_by_role(ref_data.role).filter(has_text=exact_text_pattern)
         elif ref_data.role in self.TEXT_LEAF_ROLES and match_text:
             # 'text' is a snapshot pseudo-role (not a valid ARIA role).
-            locator = page.get_by_text(match_text, exact=True)
+            locator = scope.get_by_text(match_text, exact=True)
         elif ref_data.role in self.STRUCTURAL_NOISE_ROLES and match_text:
             # generic/group/none/presentation have weak role semantics in Playwright;
             # use text as primary anchor.
-            locator = page.get_by_text(match_text, exact=True)
+            locator = scope.get_by_text(match_text, exact=True)
         elif normalized_name:
-            locator = page.get_by_role(ref_data.role, name=normalized_name, exact=True)
+            locator = scope.get_by_role(ref_data.role, name=normalized_name, exact=True)
         elif normalized_text:
-            locator = page.get_by_text(normalized_text, exact=True)
+            locator = scope.get_by_text(normalized_text, exact=True)
         else:
-            locator = page.get_by_role(ref_data.role)
+            locator = scope.get_by_role(ref_data.role)
 
         # Only apply nth when the snapshot explicitly captured disambiguation.
         if ref_data.nth is not None:

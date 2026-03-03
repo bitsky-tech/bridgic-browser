@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -35,6 +34,7 @@ from bridgic.browser.cli._daemon import (
     _handle_search,
     _handle_close_tab,
     _handle_pdf,
+    _is_browser_closed_error,
 )
 
 
@@ -157,10 +157,8 @@ class TestSectionedGroupHelp:
 
     def test_unlisted_command_appears_in_other(self):
         """Commands added outside SECTIONS fall into an 'Other' section."""
-        import click
-
         @cli.command("_test_unlisted_cmd", hidden=False)
-        def _test_cmd():
+        def _():
             """Unlisted test command."""
 
         try:
@@ -224,11 +222,27 @@ class TestCliCommandRouting:
 
     def test_snapshot_default(self):
         _, sc = invoke(["snapshot"])
-        sc.assert_called_once_with("snapshot", {"interactive": False})
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": True, "start_from_char": 0})
 
     def test_snapshot_interactive(self):
         _, sc = invoke(["snapshot", "--interactive"])
-        sc.assert_called_once_with("snapshot", {"interactive": True})
+        sc.assert_called_once_with("snapshot", {"interactive": True, "full_page": True, "start_from_char": 0})
+
+    def test_snapshot_interactive_short(self):
+        _, sc = invoke(["snapshot", "-i"])
+        sc.assert_called_once_with("snapshot", {"interactive": True, "full_page": True, "start_from_char": 0})
+
+    def test_snapshot_no_full_page(self):
+        _, sc = invoke(["snapshot", "--no-full-page"])
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": False, "start_from_char": 0})
+
+    def test_snapshot_no_full_page_short(self):
+        _, sc = invoke(["snapshot", "-F"])
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": False, "start_from_char": 0})
+
+    def test_snapshot_start_from_char(self):
+        _, sc = invoke(["snapshot", "-s", "5000"])
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": True, "start_from_char": 5000})
 
     # ── Element interaction ───────────────────────────────────────────────────
 
@@ -440,6 +454,59 @@ class TestDaemonDispatch:
         assert resp["status"] == "error"
         assert "boom" in resp["result"]
 
+    async def test_browser_closed_error_returns_hint(self):
+        """Playwright 'browser has been closed' errors surface the recovery hint."""
+        browser = make_browser()
+        with patch(
+            "bridgic.browser.tools._browser_tools.navigate_to_url",
+            new=AsyncMock(side_effect=Exception(
+                "Page.goto: Target page, context or browser has been closed"
+            )),
+        ):
+            resp = await _dispatch(browser, "open", {"url": "x"})
+        assert resp["status"] == "error"
+        assert "bridgic-browser close" in resp["result"]
+        assert "bridgic-browser open" in resp["result"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _is_browser_closed_error + _handle_snapshot (None guard)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBrowserClosedDetection:
+    def test_detects_playwright_target_closed(self):
+        exc = Exception("Page.goto: Target page, context or browser has been closed")
+        assert _is_browser_closed_error(exc) is True
+
+    def test_detects_browser_has_been_closed(self):
+        assert _is_browser_closed_error(Exception("Browser has been closed")) is True
+
+    def test_detects_connection_closed(self):
+        assert _is_browser_closed_error(Exception("Connection closed")) is True
+
+    def test_detects_target_closed(self):
+        assert _is_browser_closed_error(Exception("Target closed")) is True
+
+    def test_ignores_unrelated_errors(self):
+        assert _is_browser_closed_error(Exception("Element not found")) is False
+        assert _is_browser_closed_error(Exception("Timeout exceeded")) is False
+
+    async def test_snapshot_none_returns_hint(self):
+        """When get_snapshot() returns None (browser gone), return a failure message."""
+        browser = make_browser()
+        browser.get_snapshot = AsyncMock(return_value=None)
+        result = await _handle_snapshot(browser, {})
+        assert "Failed to get interface information" in result
+
+    async def test_snapshot_ok_returns_tree(self):
+        """Normal snapshot path still returns the tree string."""
+        browser = make_browser()
+        snap = MagicMock()
+        snap.tree = "- button [ref=e1]"
+        browser.get_snapshot = AsyncMock(return_value=snap)
+        result = await _handle_snapshot(browser, {})
+        assert result == "- button [ref=e1]"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # _handle_connection
@@ -559,7 +626,7 @@ class TestDaemonHandlers:
 
         result = await _handle_snapshot(browser, {})
 
-        browser.get_snapshot.assert_awaited_once_with(interactive=False)
+        browser.get_snapshot.assert_awaited_once_with(interactive=False, full_page=True)
         assert result == snap.tree
 
     async def test_handle_snapshot_interactive(self):
@@ -569,7 +636,26 @@ class TestDaemonHandlers:
 
         await _handle_snapshot(browser, {"interactive": True})
 
-        browser.get_snapshot.assert_awaited_once_with(interactive=True)
+        browser.get_snapshot.assert_awaited_once_with(interactive=True, full_page=True)
+
+    async def test_handle_snapshot_full_page_false(self):
+        browser = make_browser()
+        snap = MagicMock(tree="- button [ref=e1]")
+        browser.get_snapshot = AsyncMock(return_value=snap)
+
+        await _handle_snapshot(browser, {"full_page": False})
+
+        browser.get_snapshot.assert_awaited_once_with(interactive=False, full_page=False)
+
+    async def test_handle_snapshot_start_from_char(self):
+        browser = make_browser()
+        snap = MagicMock()
+        snap.tree = "A" * 100
+        browser.get_snapshot = AsyncMock(return_value=snap)
+
+        result = await _handle_snapshot(browser, {"start_from_char": 10})
+
+        assert result == "A" * 90
 
     async def test_handle_click_calls_tool(self):
         browser = make_browser()
@@ -747,7 +833,7 @@ class TestBuildBrowserKwargs:
         assert kwargs["headless"] is False
         assert kwargs["channel"] == "chrome"
 
-    def test_local_config_overrides_user_config(self, tmp_path):
+    def test_local_config_overrides_user_config(self):
         """./bridgic-browser.json overrides ~/.bridgic/bridgic-browser.json."""
         user_json = json.dumps({"headless": False, "channel": "chrome"})
         local_json = json.dumps({"channel": "msedge"})
@@ -772,7 +858,7 @@ class TestBuildBrowserKwargs:
         assert kwargs["channel"] == "msedge"   # local overrides user
         assert kwargs["headless"] is False      # from user config (not overridden)
 
-    def test_env_json_overrides_config_files(self, tmp_path):
+    def test_env_json_overrides_config_files(self):
         """BRIDGIC_BROWSER_JSON overrides both config files."""
         user_json = json.dumps({"channel": "chrome", "headless": False})
         env_json = json.dumps({"channel": "chromium", "locale": "zh-CN"})

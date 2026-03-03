@@ -187,12 +187,20 @@ def cmd_info() -> None:
 # ── Snapshot ──────────────────────────────────────────────────────────────────
 
 @cli.command("snapshot", context_settings=CONTEXT_SETTINGS)
-@click.option("--interactive", is_flag=True, default=False,
+@click.option("-i", "--interactive", is_flag=True, default=False,
               help="Only show clickable/editable elements.")
-def cmd_snapshot(interactive: bool) -> None:
+@click.option("-f/-F", "--full-page/--no-full-page", default=True,
+              help="Include elements outside the viewport (default: true). -F = viewport only.")
+@click.option("-s", "--start-from-char", default=0, type=int,
+              help="Pagination offset. Use next_start_char from the truncation notice.")
+def cmd_snapshot(interactive: bool, full_page: bool, start_from_char: int) -> None:
     """Print the current accessibility tree snapshot."""
     try:
-        _ok(send_command("snapshot", {"interactive": interactive}))
+        _ok(send_command("snapshot", {
+            "interactive": interactive,
+            "full_page": full_page,
+            "start_from_char": start_from_char,
+        }))
     except Exception as exc:
         _err(str(exc))
 

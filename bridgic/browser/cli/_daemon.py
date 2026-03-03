@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 SOCKET_PATH = os.environ.get("BRIDGIC_SOCKET", "/tmp/bridgic-browser.sock")
 READY_SIGNAL = "BRIDGIC_DAEMON_READY\n"
+STREAM_LIMIT = 16 * 1024 * 1024  # 16 MB — handles large snapshots and fill/eval payloads
 
 
 async def _handle_open(browser: Any, args: Dict[str, Any]) -> str:
@@ -38,9 +39,33 @@ async def _handle_navigate(browser: Any, args: Dict[str, Any]) -> str:
     return await navigate_to_url(browser, url)
 
 
+_BROWSER_CLOSED_HINT = (
+    "Browser window was closed. "
+    "Run: bridgic-browser close && bridgic-browser open <url>"
+)
+
+# Substrings from Playwright that indicate the browser/page is gone
+_BROWSER_CLOSED_PATTERNS = (
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "connection closed",
+    "target closed",
+)
+
+
+def _is_browser_closed_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(pat in msg for pat in _BROWSER_CLOSED_PATTERNS)
+
+
 async def _handle_snapshot(browser: Any, args: Dict[str, Any]) -> str:
-    snapshot = await browser.get_snapshot(interactive=args.get("interactive", False))
-    return snapshot.tree
+    from bridgic.browser.tools._browser_state_tools import get_llm_repr
+    return await get_llm_repr(
+        browser,
+        start_from_char=args.get("start_from_char", 0),
+        interactive=args.get("interactive", False),
+        full_page=args.get("full_page", True),
+    )
 
 
 async def _handle_click(browser: Any, args: Dict[str, Any]) -> str:
@@ -223,6 +248,8 @@ async def _dispatch(browser: Any, command: str, args: Dict[str, Any]) -> Dict[st
         result = await handler(browser, args)
         return {"status": "ok", "result": result}
     except Exception as exc:
+        if _is_browser_closed_error(exc):
+            return {"status": "error", "result": _BROWSER_CLOSED_HINT}
         logger.exception("[daemon] command=%s error", command)
         return {"status": "error", "result": str(exc)}
 
@@ -335,7 +362,7 @@ async def run_daemon() -> None:
     if os.path.exists(SOCKET_PATH):
         os.unlink(SOCKET_PATH)
 
-    server = await asyncio.start_unix_server(connection_cb, path=SOCKET_PATH)
+    server = await asyncio.start_unix_server(connection_cb, path=SOCKET_PATH, limit=STREAM_LIMIT)
 
     # Signal ready to parent process
     sys.stdout.write(READY_SIGNAL)

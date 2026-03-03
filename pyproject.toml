@@ -1,15 +1,16 @@
 [project]
 name = "bridgic-browser"
-version = "0.0.1.dev16"
+version = "0.0.1.dev19"
 license = {text = "MIT"}
 classifiers = [
+    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
 description = "LLM-driven browser automation library built on Playwright with built-in stealth mode"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 authors = [
     { name = "Tielei Zhang", email = "zhangtl04@gmail.com" },
 ]
