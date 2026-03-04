@@ -83,10 +83,13 @@ async def _handle_fill(browser: Any, args: Dict[str, Any]) -> str:
 
 async def _handle_get_text(browser: Any, args: Dict[str, Any]) -> str:
     ref = args.get("ref", "")
-    locator = await browser.get_element_by_ref(ref)
-    if locator is None:
-        return f"Element ref {ref!r} not found — page may have changed, try snapshot first"
-    return await locator.inner_text()
+    try:
+        locator = await browser.get_element_by_ref(ref)
+        if locator is None:
+            return f"Element ref {ref} is not available - page may have changed. Please try refreshing browser state."
+        return await locator.inner_text()
+    except Exception as e:
+        return f"Failed to get text from element {ref}: {e}"
 
 
 async def _handle_screenshot(browser: Any, args: Dict[str, Any]) -> str:

@@ -1754,6 +1754,11 @@ class SnapshotGenerator:
         # 2) Role-constrained text match for structural roles
         # 3) Text fallback for pseudo/noise roles
         # 4) Bare role fallback
+        #
+        # skip_nth is set to True in branches where the locator key space differs
+        # from the role:name key space used to compute ref_data.nth.
+        skip_nth = False
+
         if (
             normalized_name
             and ref_data.role not in self.ROLE_TEXT_MATCH_ROLES
@@ -1777,15 +1782,49 @@ class SnapshotGenerator:
             # generic/group/none/presentation have weak role semantics in Playwright;
             # use text as primary anchor.
             locator = scope.get_by_text(match_text, exact=True)
-        elif normalized_name:
-            locator = scope.get_by_role(ref_data.role, name=normalized_name, exact=True)
+        elif ref_data.role in self.STRUCTURAL_NOISE_ROLES:
+            # Unnamed and no stored text — scan text-leaf children as inner text anchor.
+            # e.g. generic "" [ref=e28]:
+            #        text "ID" [ref=e29, parent_ref=e28]
+            # get_by_role('generic') returns 0 results in Playwright, so this is the only
+            # reliable fallback.
+            #
+            # NOTE: only child refs (parent_ref == this ref) are considered.  Sibling-text
+            # strategies (same parent_ref, next ref by number) were evaluated but rejected:
+            # they search the entire page scope and can match unrelated elements that
+            # happen to share the same adjacent text, causing silent false positives.
+            # When an unnamed generic has only a sibling text (not a child), the sibling
+            # text ref itself (e.g. e29) is always independently locatable and should be
+            # used directly instead.
+            child_text = next(
+                (
+                    d.name.strip()
+                    for d in refs.values()
+                    if d.parent_ref == ref
+                    and d.role in self.TEXT_LEAF_ROLES
+                    and d.name and d.name.strip()
+                ),
+                None,
+            )
+            if child_text:
+                locator = scope.get_by_text(child_text, exact=True)
+                # The stored nth was computed in the 'generic:' key space (counting all
+                # unnamed generic/group/etc. elements), but get_by_text counts only
+                # elements containing this specific text — a completely different space.
+                # Applying the wrong nth would select a different element or throw an
+                # out-of-bounds error, so we skip it here.
+                skip_nth = True
+            else:
+                locator = scope.get_by_role(ref_data.role)
         elif normalized_text:
             locator = scope.get_by_text(normalized_text, exact=True)
         else:
             locator = scope.get_by_role(ref_data.role)
 
-        # Only apply nth when the snapshot explicitly captured disambiguation.
-        if ref_data.nth is not None:
+        # Only apply nth when the snapshot explicitly captured disambiguation,
+        # and when the locator key space matches the role:name key space used
+        # to compute the nth index.
+        if not skip_nth and ref_data.nth is not None:
             locator = locator.nth(ref_data.nth)
 
         return locator

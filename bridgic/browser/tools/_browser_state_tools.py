@@ -70,14 +70,18 @@ async def get_llm_repr(browser: "Browser",
         if len(text) > MAX_CHAR_LIMIT:
             truncate_at = MAX_CHAR_LIMIT
 
-            # Try to truncate at natural breakpoints (paragraphs, sentences) to avoid breaking sentences
+            # Prefer a paragraph break (\n\n) as the cut point — separates major sections.
             paragraph_break = text.rfind("\n\n", MAX_CHAR_LIMIT - 500, MAX_CHAR_LIMIT)
             if paragraph_break > 0:
                 truncate_at = paragraph_break
             else:
-                sentence_break = text.rfind(".", MAX_CHAR_LIMIT - 200, MAX_CHAR_LIMIT)
-                if sentence_break > 0:
-                    truncate_at = sentence_break + 1
+                # Fall back to any line boundary (\n). Accessibility tree elements are
+                # separated by single newlines, so this always produces a complete line.
+                # Never use '.' as a fallback: URLs and element names contain dots and
+                # would cause mid-line truncation.
+                line_break = text.rfind("\n", 0, MAX_CHAR_LIMIT)
+                if line_break > 0:
+                    truncate_at = line_break + 1  # include the trailing \n
 
             text = text[:truncate_at]
             truncated = True
@@ -88,8 +92,9 @@ async def get_llm_repr(browser: "Browser",
             notice = (
                 "\n\n[notice] Current page state text is too long, returned portion starting "
                 f"from character {start_from_char} (this segment length {len(text)} / total "
-                f"length {total_length} characters). To continue getting subsequent content, "
-                f"use start_from_char={next_start_char} to call get_llm_repr again."
+                f"length {total_length} characters). To continue getting subsequent content: "
+                f"call get_llm_repr(browser, start_from_char={next_start_char}) "
+                f"or run: bridgic-browser snapshot -s {next_start_char}"
             )
             text = f"{text}{notice}"
 

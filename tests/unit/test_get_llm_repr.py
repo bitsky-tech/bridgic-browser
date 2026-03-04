@@ -147,7 +147,8 @@ async def test_get_llm_repr_truncates_and_adds_notice_with_next_start_char(monke
     result = await get_llm_repr(mock_browser, start_from_char=0)
 
     assert "[notice]" in result
-    assert "use start_from_char=" in result
+    assert "start_from_char=250" in result
+    assert "bridgic-browser snapshot -s 250" in result
 
 
 @pytest.mark.asyncio

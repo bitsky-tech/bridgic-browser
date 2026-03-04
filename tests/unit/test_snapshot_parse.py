@@ -282,6 +282,99 @@ class TestGetLocatorFromRefAsync:
         page.get_by_role.assert_called_once_with("generic")
         role_locator.nth.assert_not_called()
 
+    def test_unnamed_generic_falls_back_to_text_child(self, gen: SnapshotGenerator) -> None:
+        """Unnamed generic with a text child should locate via the child's text."""
+        page = Mock()
+        text_locator = Mock()
+        page.get_by_text.return_value = text_locator
+        refs = {
+            "e28": RefData(
+                selector="get_by_role('generic')",
+                role="generic",
+                name=None,
+                nth=None,
+                text_content=None,
+                parent_ref=None,
+            ),
+            "e29": RefData(
+                selector='get_by_text("ID", exact=True)',
+                role="text",
+                name="ID",
+                nth=None,
+                text_content=None,
+                parent_ref="e28",
+            ),
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e28", refs)
+
+        assert locator is text_locator
+        page.get_by_text.assert_called_once_with("ID", exact=True)
+        page.get_by_role.assert_not_called()
+
+    def test_unnamed_generic_with_nth_does_not_apply_nth_to_text_locator(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """nth stored on an unnamed generic must NOT be applied to the child-text locator.
+
+        The stored nth was computed in the 'generic:' key space (all unnamed generics).
+        The child-text locator ('get_by_text') operates in a different count space —
+        applying the wrong nth would throw an out-of-bounds error or select the wrong element.
+        """
+        page = Mock()
+        text_locator = Mock()
+        page.get_by_text.return_value = text_locator
+        refs = {
+            "e28": RefData(
+                selector="get_by_role('generic')",
+                role="generic",
+                name=None,
+                # nth=1 means this is the 2nd unnamed generic on the page — but there
+                # may be only ONE element containing "ID" text, so applying .nth(1)
+                # to get_by_text("ID") would be wrong.
+                nth=1,
+                text_content=None,
+                parent_ref=None,
+            ),
+            "e29": RefData(
+                selector='get_by_text("ID", exact=True)',
+                role="text",
+                name="ID",
+                nth=None,
+                text_content=None,
+                parent_ref="e28",
+            ),
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e28", refs)
+
+        assert locator is text_locator
+        page.get_by_text.assert_called_once_with("ID", exact=True)
+        # .nth() must NOT be called on the text_locator — the stored nth is in
+        # the wrong key space for a text-based locator.
+        text_locator.nth.assert_not_called()
+
+    def test_unnamed_generic_no_text_child_falls_back_to_role(self, gen: SnapshotGenerator) -> None:
+        """Unnamed generic with no text children still falls back to get_by_role."""
+        page = Mock()
+        role_locator = Mock()
+        page.get_by_role.return_value = role_locator
+        refs = {
+            "e28": RefData(
+                selector="get_by_role('generic')",
+                role="generic",
+                name=None,
+                nth=None,
+                text_content=None,
+                parent_ref=None,
+            ),
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e28", refs)
+
+        assert locator is role_locator
+        page.get_by_role.assert_called_once_with("generic")
+
     def test_explicit_nth_is_applied_for_role_text_match(self, gen: SnapshotGenerator) -> None:
         page = Mock()
         role_locator = Mock()

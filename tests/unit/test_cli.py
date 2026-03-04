@@ -639,52 +639,84 @@ class TestDaemonHandlers:
         browser.get_snapshot.assert_awaited_once_with(interactive=True, full_page=True)
 
     async def test_handle_snapshot_full_page_false(self):
+        """full_page=False is passed through to get_llm_repr."""
         browser = make_browser()
-        snap = MagicMock(tree="- button [ref=e1]")
-        browser.get_snapshot = AsyncMock(return_value=snap)
+        call_args = []
 
-        await _handle_snapshot(browser, {"full_page": False})
+        async def mock_get_llm_repr(browser, start_from_char=0, interactive=False, full_page=True):
+            call_args.append((start_from_char, interactive, full_page))
+            return "- button [ref=e1]"
 
-        browser.get_snapshot.assert_awaited_once_with(interactive=False, full_page=False)
+        with patch(
+            "bridgic.browser.tools._browser_state_tools.get_llm_repr",
+            mock_get_llm_repr,
+        ):
+            result = await _handle_snapshot(browser, {"full_page": False})
+        assert call_args == [(0, False, False)]
+        assert result == "- button [ref=e1]"
 
     async def test_handle_snapshot_start_from_char(self):
+        """start_from_char is passed through to get_llm_repr."""
         browser = make_browser()
-        snap = MagicMock()
-        snap.tree = "A" * 100
-        browser.get_snapshot = AsyncMock(return_value=snap)
-
-        result = await _handle_snapshot(browser, {"start_from_char": 10})
-
+        with patch(
+            "bridgic.browser.tools._browser_state_tools.get_llm_repr",
+            new_callable=AsyncMock,
+            return_value="A" * 90,
+        ) as mock_repr:
+            result = await _handle_snapshot(browser, {"start_from_char": 10})
+        mock_repr.assert_awaited_once_with(
+            browser, start_from_char=10, interactive=False, full_page=True
+        )
         assert result == "A" * 90
 
     async def test_handle_click_calls_tool(self):
         browser = make_browser()
+        call_args = []
+
+        async def mock_click_element(browser, ref):
+            call_args.append((browser, ref))
+            return "Clicked e2"
+
         with patch(
             "bridgic.browser.tools._browser_action_tools.click_element_by_ref",
-            new=AsyncMock(return_value="Clicked e2"),
-        ) as mock_click:
+            mock_click_element,
+        ):
             result = await _handle_click(browser, {"ref": "e2"})
-        mock_click.assert_awaited_once_with(browser, "e2")
+        assert call_args == [(browser, "e2")]
         assert result == "Clicked e2"
 
     async def test_handle_fill_calls_tool(self):
         browser = make_browser()
+        call_args = []
+
+        async def mock_input_text(browser, ref, text):
+            call_args.append((browser, ref, text))
+            return "Input text 'hello'"
+
         with patch(
             "bridgic.browser.tools._browser_action_tools.input_text_by_ref",
-            new=AsyncMock(return_value="Input text 'hello'"),
-        ) as mock_fill:
+            mock_input_text,
+        ):
             result = await _handle_fill(browser, {"ref": "e3", "text": "hello"})
-        mock_fill.assert_awaited_once_with(browser, "e3", "hello")
+        assert call_args == [(browser, "e3", "hello")]
         assert "hello" in result
 
     async def test_handle_screenshot_passes_full_page(self):
         browser = make_browser()
+        call_args = []
+
+        async def mock_take_screenshot(browser, filename=None, full_page=False):
+            call_args.append((browser, filename, full_page))
+            return "Screenshot saved to: /tmp/x.png"
+
         with patch(
             "bridgic.browser.tools._browser_screenshot_tools.take_screenshot",
-            new=AsyncMock(return_value="Screenshot saved to: /tmp/x.png"),
-        ) as mock_ss:
+            mock_take_screenshot,
+        ):
             await _handle_screenshot(browser, {"path": "/tmp/x.png", "full_page": True})
-        mock_ss.assert_awaited_once_with(browser, filename="/tmp/x.png", full_page=True)
+        assert len(call_args) == 1
+        assert call_args[0][1] == "/tmp/x.png"
+        assert call_args[0][2] is True
 
     async def test_handle_screenshot_default_full_page_false(self):
         browser = make_browser()
@@ -769,23 +801,31 @@ class TestClientSendCommand:
                 send_command("close", start_if_needed=False)
 
     def test_start_if_needed_false_proceeds_when_socket_present(self):
-        """When socket file exists, proceed to asyncio.run (mock the coroutine)."""
+        """When socket file exists, proceed to send command (don't spawn daemon)."""
         from bridgic.browser.cli._client import send_command
+
+        async def mock_send_command(_cmd: str, _args: dict) -> str:
+            return "Daemon shutting down"
 
         with patch("bridgic.browser.cli._client.os.path.exists", return_value=True):
             with patch(
-                "bridgic.browser.cli._client.asyncio.run",
-                return_value="Daemon shutting down",
-            ) as mock_run:
+                "bridgic.browser.cli._client._send_command_async",
+                mock_send_command,
+            ):
                 result = send_command("close", start_if_needed=False)
-        mock_run.assert_called_once()
         assert result == "Daemon shutting down"
 
     def test_start_if_needed_true_calls_ensure_daemon(self):
         from bridgic.browser.cli._client import send_command
 
+        async def mock_send_command(_cmd: str, _args: dict) -> str:
+            return "ok"
+
         with patch("bridgic.browser.cli._client.ensure_daemon_running") as mock_ensure:
-            with patch("bridgic.browser.cli._client.asyncio.run", return_value="ok"):
+            with patch(
+                "bridgic.browser.cli._client._send_command_async",
+                mock_send_command,
+            ):
                 send_command("snapshot")
         mock_ensure.assert_called_once()
 

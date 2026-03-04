@@ -1,6 +1,6 @@
 [project]
 name = "bridgic-browser"
-version = "0.0.1.dev19"
+version = "0.0.1.dev20"
 license = {text = "MIT"}
 classifiers = [
     "Programming Language :: Python :: 3.10",
@@ -45,6 +45,8 @@ addopts = [
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::pytest.PytestUnraisableExceptionWarning",
+    # unittest.mock AsyncMock can leak unawaited coroutines (Python cpython#81432)
+    "ignore:coroutine .* was never awaited:RuntimeWarning",
 ]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
