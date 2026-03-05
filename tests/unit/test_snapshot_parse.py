@@ -1498,7 +1498,7 @@ class TestIframeHandling:
         _, refs = self._process(gen, raw)
 
         button_ref = next(r for r, d in refs.items() if d.name == "Go")
-        assert refs[button_ref].frame_nth == 0
+        assert refs[button_ref].frame_path == [0]
 
     def test_main_frame_elements_have_no_frame_nth(self, gen: SnapshotGenerator) -> None:
         """Elements in the main frame have frame_nth=None."""
@@ -1511,8 +1511,8 @@ class TestIframeHandling:
 
         submit_ref = next(r for r, d in refs.items() if d.name == "Submit")
         inner_ref = next(r for r, d in refs.items() if d.name == "Inner")
-        assert refs[submit_ref].frame_nth is None
-        assert refs[inner_ref].frame_nth == 0
+        assert refs[submit_ref].frame_path is None
+        assert refs[inner_ref].frame_path == [0]
 
     def test_element_after_iframe_has_no_frame_nth(self, gen: SnapshotGenerator) -> None:
         """A button appearing after (sibling of) the iframe has frame_nth=None."""
@@ -1525,8 +1525,8 @@ class TestIframeHandling:
 
         inside_ref = next(r for r, d in refs.items() if d.name == "Inside")
         outside_ref = next(r for r, d in refs.items() if d.name == "Outside")
-        assert refs[inside_ref].frame_nth == 0
-        assert refs[outside_ref].frame_nth is None
+        assert refs[inside_ref].frame_path == [0]
+        assert refs[outside_ref].frame_path is None
 
     def test_multiple_iframes_get_sequential_frame_nth(self, gen: SnapshotGenerator) -> None:
         """Two sibling iframes produce frame_nth=0 and frame_nth=1 respectively."""
@@ -1540,8 +1540,8 @@ class TestIframeHandling:
 
         first_ref = next(r for r, d in refs.items() if d.name == "First")
         second_ref = next(r for r, d in refs.items() if d.name == "Second")
-        assert refs[first_ref].frame_nth == 0
-        assert refs[second_ref].frame_nth == 1
+        assert refs[first_ref].frame_path == [0]
+        assert refs[second_ref].frame_path == [1]
 
     def test_multiple_elements_in_same_iframe_same_frame_nth(self, gen: SnapshotGenerator) -> None:
         """Multiple interactive elements inside one iframe all share the same frame_nth."""
@@ -1555,8 +1555,8 @@ class TestIframeHandling:
 
         name_ref = next(r for r, d in refs.items() if d.name == "Name")
         save_ref = next(r for r, d in refs.items() if d.name == "Save")
-        assert refs[name_ref].frame_nth == 0
-        assert refs[save_ref].frame_nth == 0
+        assert refs[name_ref].frame_path == [0]
+        assert refs[save_ref].frame_path == [0]
 
     def test_interactive_mode_iframe_children_get_frame_nth(self, gen: SnapshotGenerator) -> None:
         """In interactive mode the iframe container is filtered out, but its interactive
@@ -1573,8 +1573,8 @@ class TestIframeHandling:
 
         iframe_ref = next(r for r, d in refs.items() if d.name == "iframe 按钮")
         main_ref = next(r for r, d in refs.items() if d.name == "Main")
-        assert refs[iframe_ref].frame_nth == 0
-        assert refs[main_ref].frame_nth is None
+        assert refs[iframe_ref].frame_path == [0]
+        assert refs[main_ref].frame_path is None
 
     def test_interactive_mode_multiple_iframes_frame_nth(self, gen: SnapshotGenerator) -> None:
         """Interactive mode: two iframes → frame_nth=0 and frame_nth=1."""
@@ -1588,8 +1588,8 @@ class TestIframeHandling:
 
         ref_a = next(r for r, d in refs.items() if d.name == "A")
         ref_b = next(r for r, d in refs.items() if d.name == "B")
-        assert refs[ref_a].frame_nth == 0
-        assert refs[ref_b].frame_nth == 1
+        assert refs[ref_a].frame_path == [0]
+        assert refs[ref_b].frame_path == [1]
 
     def test_iframe_with_main_frame_element_ref_has_no_frame_nth(
         self, gen: SnapshotGenerator
@@ -1606,9 +1606,9 @@ class TestIframeHandling:
         before_ref = next(r for r, d in refs.items() if d.name == "Before")
         after_ref = next(r for r, d in refs.items() if d.name == "After")
         inside_ref = next(r for r, d in refs.items() if d.name == "Inside")
-        assert refs[before_ref].frame_nth is None
-        assert refs[after_ref].frame_nth is None
-        assert refs[inside_ref].frame_nth == 0
+        assert refs[before_ref].frame_path is None
+        assert refs[after_ref].frame_path is None
+        assert refs[inside_ref].frame_path == [0]
 
     # ------------------------------------------------------------------
     # _process_page_snapshot_for_ai: Playwright frame refs stripped
@@ -1672,7 +1672,7 @@ class TestIframeHandling:
                 name="Go",
                 nth=None,
                 text_content=None,
-                frame_nth=0,
+                frame_path=[0],
             )
         }
 
@@ -1699,7 +1699,7 @@ class TestIframeHandling:
                 name="Submit",
                 nth=None,
                 text_content=None,
-                frame_nth=None,
+                frame_path=None,
             )
         }
 
@@ -1727,7 +1727,7 @@ class TestIframeHandling:
                 name="Input",
                 nth=None,
                 text_content=None,
-                frame_nth=1,
+                frame_path=[1],
             )
         }
 
@@ -1756,7 +1756,7 @@ class TestIframeHandling:
                 name="Hello",
                 nth=None,
                 text_content=None,
-                frame_nth=0,
+                frame_path=[0],
             )
         }
 
@@ -1786,7 +1786,7 @@ class TestIframeHandling:
                 name="OK",
                 nth=2,
                 text_content=None,
-                frame_nth=0,
+                frame_path=[0],
             )
         }
 
@@ -1825,12 +1825,12 @@ class TestIframeHandling:
         # frame_nth set for iframe children
         name_ref = next(r for r, d in refs.items() if d.role == "textbox" and d.name == "Name")
         save_ref = next(r for r, d in refs.items() if d.name == "Save")
-        assert refs[name_ref].frame_nth == 0
-        assert refs[save_ref].frame_nth == 0
+        assert refs[name_ref].frame_path == [0]
+        assert refs[save_ref].frame_path == [0]
 
         # Main-frame heading has no frame context
         heading_ref = next(r for r, d in refs.items() if d.role == "heading")
-        assert refs[heading_ref].frame_nth is None
+        assert refs[heading_ref].frame_path is None
 
     def test_pipeline_iframe_interactive(self, gen: SnapshotGenerator) -> None:
         """Interactive pipeline: iframe children get frame_nth even though iframe is filtered."""
@@ -1848,8 +1848,8 @@ class TestIframeHandling:
 
         iframe_ref = next(r for r, d in refs.items() if d.name == "iframe 按钮")
         main_ref = next(r for r, d in refs.items() if d.name == "Main")
-        assert refs[iframe_ref].frame_nth == 0
-        assert refs[main_ref].frame_nth is None
+        assert refs[iframe_ref].frame_path == [0]
+        assert refs[main_ref].frame_path is None
 
     def test_pipeline_mixed_main_and_iframe_elements(self, gen: SnapshotGenerator) -> None:
         """Realistic page: main elements, one iframe, then more main elements."""
@@ -1868,10 +1868,10 @@ class TestIframeHandling:
         find_ref = next(r for r, d in refs.items() if d.name == "Find")
         bottom_ref = next(r for r, d in refs.items() if d.name == "Bottom")
 
-        assert refs[top_ref].frame_nth is None
-        assert refs[search_ref].frame_nth == 0
-        assert refs[find_ref].frame_nth == 0
-        assert refs[bottom_ref].frame_nth is None
+        assert refs[top_ref].frame_path is None
+        assert refs[search_ref].frame_path == [0]
+        assert refs[find_ref].frame_path == [0]
+        assert refs[bottom_ref].frame_path is None
 
     def test_pipeline_two_iframes_with_elements_between(
         self, gen: SnapshotGenerator
@@ -1890,9 +1890,9 @@ class TestIframeHandling:
         middle_ref = next(r for r, d in refs.items() if d.name == "Middle")
         beta_ref = next(r for r, d in refs.items() if d.name == "Beta")
 
-        assert refs[alpha_ref].frame_nth == 0
-        assert refs[middle_ref].frame_nth is None
-        assert refs[beta_ref].frame_nth == 1
+        assert refs[alpha_ref].frame_path == [0]
+        assert refs[middle_ref].frame_path is None
+        assert refs[beta_ref].frame_path == [1]
 
     # ------------------------------------------------------------------
     # _batch_get_elements_info: iframe goes through batch JS (not suffix-only)
@@ -1971,6 +1971,61 @@ class TestIframeHandling:
         )
 
         assert "e5" in visible
+
+    def test_nested_iframe_gets_chained_frame_path(self, gen: SnapshotGenerator) -> None:
+        """An element inside a nested iframe (iframe-in-iframe) gets frame_path=[0, 0],
+        not frame_path=[1]. Regression test for the YouTube-in-TinyMCE bug."""
+        raw = (
+            '- iframe:\n'
+            '  - button "Outer" [ref=f1e1] [cursor=pointer]\n'
+            '  - iframe:\n'
+            '    - button "Inner" [ref=f2e2] [cursor=pointer]\n'
+            '- button "Main" [ref=e3] [cursor=pointer]\n'
+        )
+        _, refs = self._process(gen, raw)
+
+        outer_ref = next(r for r, d in refs.items() if d.name == "Outer")
+        inner_ref = next(r for r, d in refs.items() if d.name == "Inner")
+        main_ref = next(r for r, d in refs.items() if d.name == "Main")
+
+        assert refs[outer_ref].frame_path == [0]       # in the 1st top-level iframe
+        assert refs[inner_ref].frame_path == [0, 0]    # in the 1st iframe inside the 1st iframe
+        assert refs[main_ref].frame_path is None       # main frame
+
+    def test_nested_iframe_locator_chains_frame_locator(self, gen: SnapshotGenerator) -> None:
+        """frame_path=[0, 0] → page.frame_locator('iframe').nth(0).frame_locator('iframe').nth(0)."""
+        page = Mock()
+        outer_fl = Mock()
+        outer_nth = Mock()
+        inner_fl = Mock()
+        inner_nth = Mock()
+        scoped_locator = Mock()
+
+        page.frame_locator.return_value = outer_fl
+        outer_fl.nth.return_value = outer_nth
+        outer_nth.frame_locator.return_value = inner_fl
+        inner_fl.nth.return_value = inner_nth
+        inner_nth.get_by_role.return_value = scoped_locator
+
+        refs: Dict[str, RefData] = {
+            "e1": RefData(
+                selector="get_by_role('button', name=\"Play\", exact=True)",
+                role="button",
+                name="Play",
+                nth=None,
+                text_content=None,
+                frame_path=[0, 0],
+            )
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+
+        assert locator is scoped_locator
+        page.frame_locator.assert_called_once_with("iframe")
+        outer_fl.nth.assert_called_once_with(0)
+        outer_nth.frame_locator.assert_called_once_with("iframe")
+        inner_fl.nth.assert_called_once_with(0)
+        inner_nth.get_by_role.assert_called_once_with("button", name="Play", exact=True)
 
     @pytest.mark.asyncio
     async def test_iframe_below_viewport_excluded_from_visible_refs(

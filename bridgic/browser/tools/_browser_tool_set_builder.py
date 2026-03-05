@@ -24,14 +24,14 @@ class ToolPreset(str, Enum):
 
     # Core presets (minimal sets)
     MINIMAL = "minimal"
-    """Absolute minimum: navigate, click, input, snapshot (10 tools)"""
+    """Absolute minimum: navigate, click, input, snapshot (11 tools)"""
 
     NAVIGATION = "navigation"
     """Navigation only: search, navigate, back/forward (4 tools)"""
 
     # Scenario presets
     SCRAPING = "scraping"
-    """Web scraping: navigation + snapshot + scroll (13 tools)"""
+    """Web scraping: navigation + snapshot + scroll (14 tools)"""
 
     FORM_FILLING = "form_filling"
     """Form automation: navigation + input + dropdown + checkbox (20 tools)"""
@@ -40,14 +40,14 @@ class ToolPreset(str, Enum):
     """E2E testing: form_filling + verification + screenshot (28 tools)"""
 
     INTERACTIVE = "interactive"
-    """Full interaction: all action tools + mouse + keyboard (40 tools)"""
+    """Full interaction: all action tools + mouse + keyboard (39 tools)"""
 
     # Special presets
     DEVELOPER = "developer"
-    """Developer tools: network + console + tracing (18 tools)"""
+    """Developer tools: network + console + tracing (22 tools)"""
 
     COMPLETE = "complete"
-    """All available tools (68 tools) - use sparingly"""
+    """All available tools (69 tools) - use sparingly"""
 
 
 class BrowserToolSetBuilder(ToolSetBuilder):
@@ -593,14 +593,14 @@ class BrowserToolSetBuilder(ToolSetBuilder):
             Preset name -> description mapping.
         """
         return {
-            "MINIMAL": "Absolute minimum: navigate, click, input, snapshot (10 tools)",
+            "MINIMAL": "Absolute minimum: navigate, click, input, snapshot (11 tools)",
             "NAVIGATION": "Navigation only: search, navigate, back/forward (4 tools)",
-            "SCRAPING": "Web scraping: navigation + snapshot + scroll (13 tools)",
+            "SCRAPING": "Web scraping: navigation + snapshot + scroll (14 tools)",
             "FORM_FILLING": "Form automation: navigation + input + dropdown + checkbox (20 tools)",
             "TESTING": "E2E testing: form_filling + verification + screenshot (28 tools)",
-            "INTERACTIVE": "Full interaction: all action tools + mouse + keyboard (40 tools)",
-            "DEVELOPER": "Developer tools: network + console + tracing (18 tools)",
-            "COMPLETE": "All available tools (68 tools)",
+            "INTERACTIVE": "Full interaction: all action tools + mouse + keyboard (39 tools)",
+            "DEVELOPER": "Developer tools: network + console + tracing (22 tools)",
+            "COMPLETE": "All available tools (69 tools)",
         }
 
     @classmethod

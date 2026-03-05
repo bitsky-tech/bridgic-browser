@@ -668,6 +668,10 @@ class Browser:
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         """Async context manager exit - kills the browser."""
         await self.kill()
+
+    async def close(self) -> None:
+        """Close the browser and clean up all resources. Alias for kill()."""
+        await self.kill()
     #########################################################
     # page level
     #########################################################
@@ -1103,11 +1107,11 @@ class Browser:
                         and ref_data.role not in SnapshotGenerator.TEXT_LEAF_ROLES
                     )
                     if can_recover_by_role_name and ref_data:
-                        frame_nth = getattr(ref_data, 'frame_nth', None)
-                        if frame_nth is not None:
-                            scope = self._page.frame_locator("iframe").nth(frame_nth)
-                        else:
-                            scope = self._page
+                        frame_path = getattr(ref_data, 'frame_path', None)
+                        scope = self._page
+                        if frame_path:
+                            for local_nth in frame_path:
+                                scope = scope.frame_locator("iframe").nth(local_nth)
                         role_name_locator = scope.get_by_role(
                             ref_data.role,
                             name=ref_data.name,

@@ -70,7 +70,7 @@ class RefData:
     nth: Optional[int] = None
     text_content: Optional[str] = None
     parent_ref: Optional[str] = None
-    frame_nth: Optional[int] = None  # 0-based index of containing iframe; None = main frame
+    frame_path: Optional[List[int]] = None  # per-level local iframe indices, outermost→innermost; None = main frame
 
 
 @dataclass
@@ -1093,10 +1093,12 @@ class SnapshotGenerator:
         # - ref_or_none: the ref assigned to this element (if any)
         depth_stack: List[Tuple[int, bool, int, Optional[str]]] = []
 
-        # Track iframe nesting: list of (iframe_depth, iframe_nth_0based)
-        # so that child elements can be scoped to the correct frame_locator.
-        iframe_stack: List[Tuple[int, int]] = []
-        iframe_counter = 0
+        # Track iframe nesting: list of (iframe_depth, path_to_iframe)
+        # path_to_iframe = list of per-level local indices, e.g. [0, 1] means
+        # "the 2nd iframe inside the 1st top-level iframe".
+        iframe_stack: List[Tuple[int, List[int]]] = []
+        # Per-parent counter: key = tuple(parent_path), value = iframes seen so far at that level.
+        _iframe_local_counters: Dict[tuple, int] = {}
 
         line_pattern = self._LINE_PATTERN
         ref_pattern = self._REF_CLEAN_PATTERN
@@ -1294,10 +1296,12 @@ class SnapshotGenerator:
             if not should_keep:
                 depth_stack.append((original_depth, False, effective_depth, None))
                 # Even when filtered, iframes must be pushed onto the iframe_stack so
-                # that their interactive children still get the correct frame_nth.
+                # that their interactive children still get the correct frame_path.
                 if role_lower == 'iframe':
-                    iframe_stack.append((original_depth, iframe_counter))
-                    iframe_counter += 1
+                    parent_path = tuple(iframe_stack[-1][1]) if iframe_stack else ()
+                    local_idx = _iframe_local_counters.get(parent_path, 0)
+                    _iframe_local_counters[parent_path] = local_idx + 1
+                    iframe_stack.append((original_depth, list(parent_path) + [local_idx]))
                 # In interactive mode, skip filtered elements entirely (no inline text)
                 # In non-interactive mode, preserve inline text from filtered elements
                 if not options.interactive:
@@ -1342,7 +1346,7 @@ class SnapshotGenerator:
                         text_content = text_match.group(1).strip()
 
                 parent_ref = get_nearest_parent_ref(original_depth)
-                current_frame_nth = iframe_stack[-1][1] if iframe_stack else None
+                current_frame_path = iframe_stack[-1][1] if iframe_stack else None
 
                 refs[ref] = RefData(
                     selector=self._build_selector(role_lower, name, text_content),
@@ -1351,7 +1355,7 @@ class SnapshotGenerator:
                     nth=nth,
                     text_content=text_content,
                     parent_ref=parent_ref,
-                    frame_nth=current_frame_nth,
+                    frame_path=current_frame_path,
                 )
 
                 enhanced += f" [ref={ref}]"
@@ -1365,8 +1369,10 @@ class SnapshotGenerator:
 
             # If this element is an iframe, future children will be scoped to it.
             if role_lower == 'iframe':
-                iframe_stack.append((original_depth, iframe_counter))
-                iframe_counter += 1
+                parent_path = tuple(iframe_stack[-1][1]) if iframe_stack else ()
+                local_idx = _iframe_local_counters.get(parent_path, 0)
+                _iframe_local_counters[parent_path] = local_idx + 1
+                iframe_stack.append((original_depth, list(parent_path) + [local_idx]))
 
             # Re-add clean suffix (like [level=1] for headings, or trailing colon)
             if clean_suffix:
@@ -1741,13 +1747,12 @@ class SnapshotGenerator:
                 return re.compile(rf"^\s*{joined}\s*$")
             return re.compile(joined)
 
-        # Determine the search scope: either the main page or an iframe's frame locator.
-        # Elements inside iframes have frame_nth set to the 0-based iframe index.
-        scope: "AsyncPage | AsyncFrameLocator" = (
-            page.frame_locator("iframe").nth(ref_data.frame_nth)
-            if ref_data.frame_nth is not None
-            else page
-        )
+        # Determine the search scope: chain frame_locator calls for each level of iframe nesting.
+        # frame_path = [i0, i1, ...] means the element is in the i1-th iframe inside the i0-th iframe.
+        scope: "AsyncPage | AsyncFrameLocator" = page
+        if ref_data.frame_path:
+            for local_nth in ref_data.frame_path:
+                scope = scope.frame_locator("iframe").nth(local_nth)
 
         # Build locator by signal strength:
         # 1) Semantic role+name
