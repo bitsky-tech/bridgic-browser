@@ -335,12 +335,12 @@ class SnapshotGenerator:
     # Playwright's internal frame refs like f2e7, f1e5, etc.)
     _REF_CLEAN_PATTERN = re.compile(r'\s*\[ref=[a-zA-Z0-9]+\]')
     # Pattern to extract ref ID from a line or suffix
-    _REF_EXTRACT_PATTERN = re.compile(r'\[ref=(e\d+)\]')
+    _REF_EXTRACT_PATTERN = re.compile(r'\[ref=([a-zA-Z0-9]+)\]')
     # Pattern for _extract_original_refs_from_raw: matches lines with refs
     _REF_LINE_PATTERN = re.compile(
         r'^\s*-\s*(\w+)'           # role
         r'(?:\s+"((?:[^"\\]|\\.)*)")?'  # optional name (handles escaped quotes)
-        r'(.*\[ref=(e\d+)\].*)$'   # suffix containing ref
+        r'(.*\[ref=([a-zA-Z0-9]+)\].*)$'   # suffix containing ref
     )
 
     # Container structural roles (keep for tree structure)
@@ -696,6 +696,29 @@ class SnapshotGenerator:
                     'generic': 'div, span, [role="generic"]',
                 };
 
+                function getAssociatedLabelText(el) {
+                    if (!el) return '';
+
+                    // Prefer the browser's label association when available.
+                    if (el.labels && el.labels.length > 0) {
+                        const texts = Array.from(el.labels)
+                            .map(label => (label.textContent || '').trim())
+                            .filter(Boolean);
+                        if (texts.length) return texts.join(' ');
+                    }
+
+                    if (el.id) {
+                        const explicitLabels = Array.from(
+                            document.querySelectorAll('label[for="' + el.id + '"]')
+                        )
+                            .map(label => (label.textContent || '').trim())
+                            .filter(Boolean);
+                        if (explicitLabels.length) return explicitLabels.join(' ');
+                    }
+
+                    return '';
+                }
+
                 function getAccessibleName(el) {
                     const ariaLabel = el.getAttribute('aria-label');
                     if (ariaLabel) return ariaLabel.trim();
@@ -709,9 +732,25 @@ class SnapshotGenerator:
                         if (parts.length) return parts.join(' ');
                     }
 
-                    if (el.id) {
-                        const label = document.querySelector('label[for="' + el.id + '"]');
-                        if (label) return label.textContent.trim();
+                    const associatedLabel = getAssociatedLabelText(el);
+                    if (associatedLabel) return associatedLabel;
+
+                    const tagName = el.tagName.toUpperCase();
+                    if (tagName === 'IMG') {
+                        const alt = el.getAttribute('alt');
+                        if (alt) return alt.trim();
+                    }
+
+                    if (tagName === 'INPUT') {
+                        const inputType = (el.getAttribute('type') || '').toLowerCase();
+                        if (['button', 'submit', 'reset'].includes(inputType)) {
+                            const valueAttr = el.getAttribute('value');
+                            if (valueAttr) return valueAttr.trim();
+                        }
+                        if (inputType === 'image') {
+                            const alt = el.getAttribute('alt');
+                            if (alt) return alt.trim();
+                        }
                     }
 
                     const title = el.getAttribute('title');
@@ -720,8 +759,10 @@ class SnapshotGenerator:
                     // For inputs: placeholder is a valid accessible name source (W3C accname-1.2).
                     // Do NOT use el.value — it holds user-typed content, not the accessible name,
                     // and would cause findElement to fail after the user fills the field.
-                    if (['INPUT', 'TEXTAREA'].includes(el.tagName)) {
+                    if (['INPUT', 'TEXTAREA'].includes(tagName)) {
                         if (el.placeholder) return el.placeholder;
+                        const ariaPlaceholder = el.getAttribute('aria-placeholder');
+                        if (ariaPlaceholder) return ariaPlaceholder.trim();
                     }
 
                     return el.textContent ? el.textContent.trim() : '';
@@ -847,14 +888,21 @@ class SnapshotGenerator:
             info = batch_results.get(ref)
 
             if info is None:
-                if check_viewport:
-                    # Can't verify viewport position — exclude from viewport-only modes
+                role = refs_info[ref][0]
+                if check_viewport and role.lower() == 'iframe' and not ref.startswith('f'):
+                    # In viewport mode, unresolved MAIN-FRAME iframes (e-prefixed ref) are
+                    # treated as off-screen to avoid leaking their entire subtrees.
+                    # Nested iframes inside other frames have f-prefixed refs and cannot be
+                    # located via main-frame page.evaluate() at all — they fall through to
+                    # the fallback below so their children remain accessible in the snapshot.
                     interactive_map[ref] = False
                     continue
-                # Full-page mode: include with suffix-based interactivity
+
+                # Can't reliably re-find this element in page.evaluate().
+                # This happens for iframe-contained nodes and some accname edge cases.
+                # Keep it with suffix-based interactivity instead of silently dropping.
                 visible_refs.add(ref)
                 suffix = ref_suffixes.get(ref, '')
-                role = refs_info[ref][0]
                 is_interactive = role.lower() in self.INTERACTIVE_ROLES
                 if not is_interactive and '[cursor=pointer]' in suffix:
                     is_interactive = True
@@ -1572,7 +1620,13 @@ class SnapshotGenerator:
             if ref_match:
                 ref = ref_match.group(1)
                 if ref not in visible_refs:
-                    # This element is invisible/out-of-viewport, mark depth to skip children
+                    # Preserve iframe lines even when filtered out, so frame_path local
+                    # indices remain aligned with real DOM iframe order.
+                    if re.match(r'^\s*-\s*iframe\b', line, flags=re.IGNORECASE):
+                        result.append(line)
+                        invisible_depth = depth
+                        continue
+                    # This element is invisible/out-of-viewport, mark depth to skip children.
                     invisible_depth = depth
                     continue
 

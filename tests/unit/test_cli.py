@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import stat
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -35,6 +37,8 @@ from bridgic.browser.cli._daemon import (
     _handle_close_tab,
     _handle_pdf,
     _is_browser_closed_error,
+    _default_socket_path,
+    _safe_remove_socket,
 )
 
 
@@ -432,6 +436,8 @@ class TestDaemonDispatch:
         browser = make_browser()
         resp = await _dispatch(browser, "nonexistent", {})
         assert resp["status"] == "error"
+        assert resp["success"] is False
+        assert resp["error_code"] == "UNKNOWN_COMMAND"
         assert "nonexistent" in resp["result"]
 
     async def test_known_command_returns_ok(self):
@@ -442,7 +448,71 @@ class TestDaemonDispatch:
         ):
             resp = await _dispatch(browser, "open", {"url": "https://example.com"})
         assert resp["status"] == "ok"
+        assert resp["success"] is True
+        assert resp["error_code"] is None
         assert resp["result"] == "Navigated"
+
+    async def test_known_command_business_failure_returns_error(self):
+        browser = make_browser()
+        with patch(
+            "bridgic.browser.tools._browser_tools.navigate_to_url",
+            new=AsyncMock(return_value="Navigation failed: timeout"),
+        ):
+            resp = await _dispatch(browser, "open", {"url": "https://example.com"})
+        assert resp["status"] == "error"
+        assert resp["success"] is False
+        assert resp["error_code"] == "NAVIGATION_FAILED"
+        assert "Navigation failed" in resp["result"]
+
+    async def test_eval_command_keeps_ok_for_arbitrary_string(self):
+        browser = make_browser()
+        with patch(
+            "bridgic.browser.tools._browser_tools.evaluate_javascript",
+            new=AsyncMock(return_value="Failed to load widget title"),
+        ):
+            resp = await _dispatch(browser, "eval", {"code": "() => 'x'"})
+        assert resp["status"] == "ok"
+        assert resp["success"] is True
+        assert resp["error_code"] is None
+        assert "Failed to load widget title" in resp["result"]
+
+    async def test_get_text_literal_error_prefix_is_not_misclassified(self):
+        browser = make_browser()
+        locator = MagicMock()
+        literal_text = "Failed to get text from element e1: this is normal page text"
+        locator.inner_text = AsyncMock(return_value=literal_text)
+        browser.get_element_by_ref = AsyncMock(return_value=locator)
+
+        resp = await _dispatch(browser, "get_text", {"ref": "e1"})
+
+        assert resp["status"] == "ok"
+        assert resp["success"] is True
+        assert resp["error_code"] is None
+        assert resp["result"] == literal_text
+
+    async def test_get_text_runtime_failure_returns_specific_code(self):
+        browser = make_browser()
+        locator = MagicMock()
+        locator.inner_text = AsyncMock(side_effect=RuntimeError("boom"))
+        browser.get_element_by_ref = AsyncMock(return_value=locator)
+
+        resp = await _dispatch(browser, "get_text", {"ref": "e1"})
+
+        assert resp["status"] == "error"
+        assert resp["success"] is False
+        assert resp["error_code"] == "GET_TEXT_FAILED"
+        assert "boom" in resp["result"]
+
+    async def test_get_text_missing_ref_returns_ref_not_available(self):
+        browser = make_browser()
+        browser.get_element_by_ref = AsyncMock(return_value=None)
+
+        resp = await _dispatch(browser, "get_text", {"ref": "e404"})
+
+        assert resp["status"] == "error"
+        assert resp["success"] is False
+        assert resp["error_code"] == "REF_NOT_AVAILABLE"
+        assert "not available" in resp["result"]
 
     async def test_handler_exception_returns_error(self):
         browser = make_browser()
@@ -452,6 +522,8 @@ class TestDaemonDispatch:
         ):
             resp = await _dispatch(browser, "open", {"url": "x"})
         assert resp["status"] == "error"
+        assert resp["success"] is False
+        assert resp["error_code"] == "HANDLER_EXCEPTION"
         assert "boom" in resp["result"]
 
     async def test_browser_closed_error_returns_hint(self):
@@ -465,6 +537,8 @@ class TestDaemonDispatch:
         ):
             resp = await _dispatch(browser, "open", {"url": "x"})
         assert resp["status"] == "error"
+        assert resp["success"] is False
+        assert resp["error_code"] == "BROWSER_CLOSED"
         assert "bridgic-browser close" in resp["result"]
         assert "bridgic-browser open" in resp["result"]
 
@@ -509,6 +583,91 @@ class TestBrowserClosedDetection:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# socket path and cleanup helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDaemonSocketSecurity:
+    def test_default_socket_path_is_user_scoped(self, tmp_path):
+        with patch("bridgic.browser.cli._daemon.Path.home", return_value=tmp_path):
+            path = _default_socket_path()
+        assert path == str(tmp_path / ".bridgic" / "run" / "bridgic-browser.sock")
+
+    def test_safe_remove_socket_removes_owned_socket(self):
+        mock_path = MagicMock()
+        mock_path.exists.return_value = True
+        mock_path.stat.return_value = SimpleNamespace(
+            st_mode=stat.S_IFSOCK | 0o600,
+            st_uid=1000,
+        )
+
+        with patch("bridgic.browser.cli._daemon.Path", return_value=mock_path):
+            with patch("bridgic.browser.cli._daemon.os.getuid", return_value=1000):
+                _safe_remove_socket("/tmp/test.sock")
+
+        mock_path.unlink.assert_called_once()
+
+    def test_safe_remove_socket_rejects_non_socket_path(self):
+        mock_path = MagicMock()
+        mock_path.exists.return_value = True
+        mock_path.stat.return_value = SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600,
+            st_uid=1000,
+        )
+
+        with patch("bridgic.browser.cli._daemon.Path", return_value=mock_path):
+            with patch("bridgic.browser.cli._daemon.os.getuid", return_value=1000):
+                with pytest.raises(RuntimeError, match="non-socket"):
+                    _safe_remove_socket("/tmp/not-a-socket")
+
+    def test_safe_remove_socket_rejects_foreign_owner(self, monkeypatch):
+        if not hasattr(os, "getuid"):
+            pytest.skip("uid ownership checks are unavailable on this platform")
+
+        mock_path = MagicMock()
+        mock_path.exists.return_value = True
+        mock_path.stat.return_value = SimpleNamespace(
+            st_mode=stat.S_IFSOCK | 0o600,
+            st_uid=1000,
+        )
+
+        with patch("bridgic.browser.cli._daemon.Path", return_value=mock_path):
+            monkeypatch.setattr("bridgic.browser.cli._daemon.os.getuid", lambda: 1001)
+            with pytest.raises(PermissionError, match="owned by uid"):
+                _safe_remove_socket("/tmp/foreign.sock")
+
+        mock_path.unlink.assert_not_called()
+
+    def test_safe_remove_socket_noop_when_path_missing(self):
+        mock_path = MagicMock()
+        mock_path.stat.side_effect = FileNotFoundError
+
+        with patch("bridgic.browser.cli._daemon.Path", return_value=mock_path):
+            _safe_remove_socket("/tmp/missing.sock")
+
+        mock_path.unlink.assert_not_called()
+
+    def test_safe_remove_socket_noop_when_stat_races_with_delete(self):
+        mock_path = MagicMock()
+        mock_path.stat.side_effect = FileNotFoundError("raced")
+
+        with patch("bridgic.browser.cli._daemon.Path", return_value=mock_path):
+            _safe_remove_socket("/tmp/raced.sock")
+
+        mock_path.unlink.assert_not_called()
+
+    def test_safe_remove_socket_noop_when_unlink_races_with_delete(self):
+        mock_path = MagicMock()
+        mock_path.stat.return_value = SimpleNamespace(
+            st_mode=stat.S_IFSOCK | 0o600,
+            st_uid=1000,
+        )
+        mock_path.unlink.side_effect = FileNotFoundError("raced")
+
+        with patch("bridgic.browser.cli._daemon.Path", return_value=mock_path):
+            with patch("bridgic.browser.cli._daemon.os.getuid", return_value=1000):
+                _safe_remove_socket("/tmp/raced.sock")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # _handle_connection
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -520,7 +679,14 @@ class TestDaemonConnection:
 
         with patch(
             "bridgic.browser.cli._daemon._dispatch",
-            new=AsyncMock(return_value={"status": "ok", "result": "went back"}),
+            new=AsyncMock(return_value={
+                "status": "ok",
+                "success": True,
+                "result": "went back",
+                "error_code": None,
+                "data": None,
+                "meta": {},
+            }),
         ):
             reader = make_reader(req)
             writer = make_writer()
@@ -529,6 +695,8 @@ class TestDaemonConnection:
         written = b"".join(call.args[0] for call in writer.write.call_args_list)
         resp = json.loads(written.decode().strip())
         assert resp["status"] == "ok"
+        assert resp["success"] is True
+        assert resp["error_code"] is None
         assert resp["result"] == "went back"
 
     async def test_invalid_json_writes_error(self):
@@ -542,6 +710,8 @@ class TestDaemonConnection:
         written = b"".join(call.args[0] for call in writer.write.call_args_list)
         resp = json.loads(written.decode().strip())
         assert resp["status"] == "error"
+        assert resp["success"] is False
+        assert resp["error_code"] == "INVALID_JSON"
         assert "Invalid JSON" in resp["result"]
 
     async def test_eof_returns_silently(self):
@@ -584,6 +754,8 @@ class TestDaemonConnection:
         written = b"".join(call.args[0] for call in writer.write.call_args_list)
         resp = json.loads(written.decode().strip())
         assert resp["status"] == "ok"
+        assert resp["success"] is True
+        assert resp["error_code"] is None
 
     async def test_writer_always_closed(self):
         """writer.close() must be called even when an exception occurs."""
@@ -828,6 +1000,64 @@ class TestClientSendCommand:
             ):
                 send_command("snapshot")
         mock_ensure.assert_called_once()
+
+    def test_ensure_daemon_running_removes_stale_socket_then_spawns(self):
+        from bridgic.browser.cli import _client
+
+        with patch("bridgic.browser.cli._client.os.path.exists", return_value=True):
+            with patch(
+                "bridgic.browser.cli._client._probe_socket",
+                new=AsyncMock(side_effect=RuntimeError("stale socket")),
+            ):
+                with patch("bridgic.browser.cli._client._safe_remove_socket") as mock_remove:
+                    with patch("bridgic.browser.cli._client._spawn_daemon") as mock_spawn:
+                        _client.ensure_daemon_running()
+
+        mock_remove.assert_called_once()
+        mock_spawn.assert_called_once()
+
+    def test_ensure_daemon_running_raises_when_stale_socket_is_unsafe(self):
+        from bridgic.browser.cli import _client
+
+        with patch("bridgic.browser.cli._client.os.path.exists", return_value=True):
+            with patch(
+                "bridgic.browser.cli._client._probe_socket",
+                new=AsyncMock(side_effect=RuntimeError("stale socket")),
+            ):
+                with patch(
+                    "bridgic.browser.cli._client._safe_remove_socket",
+                    side_effect=PermissionError("owned by another user"),
+                ):
+                    with pytest.raises(RuntimeError, match="cannot remove it safely"):
+                        _client.ensure_daemon_running()
+
+    @pytest.mark.asyncio
+    async def test_send_command_async_uses_success_field_when_present(self):
+        from bridgic.browser.cli._client import _send_command_async
+
+        reader = make_reader(b'{"status":"ok","success":false,"result":"x"}\n')
+        writer = make_writer()
+
+        with patch(
+            "bridgic.browser.cli._client.asyncio.open_unix_connection",
+            new=AsyncMock(return_value=(reader, writer)),
+        ):
+            with pytest.raises(RuntimeError, match="x"):
+                await _send_command_async("snapshot", {})
+
+    @pytest.mark.asyncio
+    async def test_send_command_async_falls_back_to_status_for_legacy_responses(self):
+        from bridgic.browser.cli._client import _send_command_async
+
+        reader = make_reader(b'{"status":"error","result":"legacy error"}\n')
+        writer = make_writer()
+
+        with patch(
+            "bridgic.browser.cli._client.asyncio.open_unix_connection",
+            new=AsyncMock(return_value=(reader, writer)),
+        ):
+            with pytest.raises(RuntimeError, match="legacy error"):
+                await _send_command_async("snapshot", {})
 
 
 # ─────────────────────────────────────────────────────────────────────────────

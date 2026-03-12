@@ -35,7 +35,7 @@ class BrowserToolSpec(ToolSpec):
     ...     await browser.navigate_to(f"https://google.com/search?q={query}")
     ...     return f"Searched for: {query}"
     >>>
-    >>> browser = Browser(name="my_browser")
+    >>> browser = Browser()
     >>> tool_spec = BrowserToolSpec.from_raw(search, browser)
     >>> # The resulting tool schema only has `query` parameter, not `browser`
     """
@@ -199,7 +199,8 @@ class BrowserToolSpec(ToolSpec):
         """
         state_dict = super().dump_to_dict()
         state_dict["func"] = self._func.__module__ + "." + self._func.__qualname__
-        state_dict["browser_name"] = self._browser.name
+        state_dict["browser_name"] = getattr(self._browser, "name", self._browser.__class__.__name__)
+        state_dict["browser_id"] = str(id(self._browser))
         return state_dict
 
     @override

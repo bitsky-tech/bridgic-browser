@@ -16,15 +16,66 @@ import json
 import logging
 import os
 import signal
+import stat
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-SOCKET_PATH = os.environ.get("BRIDGIC_SOCKET", "/tmp/bridgic-browser.sock")
+
+class _DaemonCommandError(RuntimeError):
+    """Expected command-level failure with stable machine-readable code."""
+
+    def __init__(self, message: str, error_code: str):
+        super().__init__(message)
+        self.error_code = error_code
+
+
+def _default_socket_path() -> str:
+    """Return per-user default socket path."""
+    return str(Path.home() / ".bridgic" / "run" / "bridgic-browser.sock")
+
+
+SOCKET_PATH = os.environ.get("BRIDGIC_SOCKET", _default_socket_path())
 READY_SIGNAL = "BRIDGIC_DAEMON_READY\n"
 STREAM_LIMIT = 16 * 1024 * 1024  # 16 MB — handles large snapshots and fill/eval payloads
+
+
+def _ensure_socket_parent_dir(path: str) -> None:
+    """Create socket parent dir with private permissions when possible."""
+    parent = Path(path).parent
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(parent, 0o700)
+    except OSError:
+        # Custom socket directories (e.g. /tmp) may not be chmod-able by us.
+        pass
+
+
+def _safe_remove_socket(path: str) -> None:
+    """Remove a socket file only if it is owned by the current user."""
+    socket_path = Path(path)
+    try:
+        st = socket_path.stat()
+    except FileNotFoundError:
+        return
+
+    if not stat.S_ISSOCK(st.st_mode):
+        raise RuntimeError(f"Refusing to remove non-socket path: {path}")
+
+    if hasattr(os, "getuid"):
+        current_uid = os.getuid()
+        if st.st_uid != current_uid:
+            raise PermissionError(
+                f"Socket path {path} is owned by uid={st.st_uid}, current uid={current_uid}"
+            )
+
+    try:
+        socket_path.unlink()
+    except FileNotFoundError:
+        # Another process may remove the socket between stat() and unlink().
+        return
 
 
 async def _handle_open(browser: Any, args: Dict[str, Any]) -> str:
@@ -58,6 +109,77 @@ def _is_browser_closed_error(exc: BaseException) -> bool:
     return any(pat in msg for pat in _BROWSER_CLOSED_PATTERNS)
 
 
+def _response(
+    *,
+    success: bool,
+    result: str,
+    error_code: Optional[str] = None,
+    data: Any = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build a machine-readable daemon response."""
+    return {
+        "status": "ok" if success else "error",
+        "success": success,
+        "result": result,
+        "error_code": error_code,
+        "data": data,
+        "meta": meta or {},
+    }
+
+
+def _is_command_result_error(command: str, result: Any) -> bool:
+    """Infer business-level failures from handler return values.
+
+    Most tool handlers return string messages instead of raising exceptions.
+    This keeps CLI output human-friendly but makes machine-level success/failure
+    ambiguous unless we classify known error signatures here.
+    """
+    if not isinstance(result, str):
+        return False
+
+    msg = result.strip().lower()
+    if not msg:
+        return False
+
+    # eval() and get_text() can legitimately return any string; do not infer errors.
+    # get_text() returns raw inner_text() which may start with "Failed to ..." as page content.
+    if command in {"eval", "get_text"}:
+        return False
+
+    generic_prefixes = (
+        "failed to ",
+        "navigation failed",
+        "search failed",
+        "wait condition not met",
+        "url cannot be empty",
+        "search query cannot be empty",
+        "unsupported search engine",
+        "url scheme ",
+        "no active page available",
+        "no context is open",
+        "cannot navigate",
+        "unknown command:",
+        "invalid json:",
+        "could not hover element ",
+    )
+    if msg.startswith(generic_prefixes):
+        return True
+
+    if " is not available - page may have changed" in msg:
+        return True
+    if " does not exist" in msg and msg.startswith("file "):
+        return True
+    if " not found" in msg and "page_id" in msg:
+        return True
+
+    # Snapshot pagination overflow should surface as an error status.
+    if command == "snapshot" and msg.startswith("start_from_char ("):
+        return True
+
+    return False
+
+
 async def _handle_snapshot(browser: Any, args: Dict[str, Any]) -> str:
     from bridgic.browser.tools._browser_state_tools import get_llm_repr
     return await get_llm_repr(
@@ -83,13 +205,19 @@ async def _handle_fill(browser: Any, args: Dict[str, Any]) -> str:
 
 async def _handle_get_text(browser: Any, args: Dict[str, Any]) -> str:
     ref = args.get("ref", "")
+    locator = await browser.get_element_by_ref(ref)
+    if locator is None:
+        raise _DaemonCommandError(
+            f"Element ref {ref} is not available - page may have changed. Please try refreshing browser state.",
+            "REF_NOT_AVAILABLE",
+        )
     try:
-        locator = await browser.get_element_by_ref(ref)
-        if locator is None:
-            return f"Element ref {ref} is not available - page may have changed. Please try refreshing browser state."
         return await locator.inner_text()
-    except Exception as e:
-        return f"Failed to get text from element {ref}: {e}"
+    except Exception as exc:
+        raise _DaemonCommandError(
+            f"Failed to get text from element {ref}: {exc}",
+            "GET_TEXT_FAILED",
+        ) from exc
 
 
 async def _handle_screenshot(browser: Any, args: Dict[str, Any]) -> str:
@@ -243,18 +371,81 @@ _HANDLERS = {
 }
 
 
-async def _dispatch(browser: Any, command: str, args: Dict[str, Any]) -> Dict[str, str]:
+def _infer_error_code(command: str, result: Any) -> Optional[str]:
+    """Infer a coarse error_code from legacy string-based tool results."""
+    if not _is_command_result_error(command, result):
+        return None
+
+    msg = str(result).strip().lower()
+    if " is not available - page may have changed" in msg:
+        return "REF_NOT_AVAILABLE"
+    if msg.startswith("start_from_char ("):
+        return "INVALID_PAGINATION_OFFSET"
+    if "url scheme" in msg:
+        return "URL_SCHEME_BLOCKED"
+    if "url cannot be empty" in msg:
+        return "URL_EMPTY"
+    if "search query cannot be empty" in msg:
+        return "QUERY_EMPTY"
+    if "unsupported search engine" in msg:
+        return "UNSUPPORTED_SEARCH_ENGINE"
+    if "no active page available" in msg:
+        return "NO_ACTIVE_PAGE"
+    if "no context is open" in msg:
+        return "NO_CONTEXT"
+    if "not found" in msg and "page_id" in msg:
+        return "TAB_NOT_FOUND"
+    if command == "wait":
+        return "WAIT_CONDITION_NOT_MET"
+    if command in {"open", "navigate", "search"}:
+        return "NAVIGATION_FAILED"
+    if command == "snapshot":
+        return "SNAPSHOT_FAILED"
+    return "TOOL_ERROR"
+
+
+async def _dispatch(browser: Any, command: str, args: Dict[str, Any]) -> Dict[str, Any]:
     handler = _HANDLERS.get(command)
     if handler is None:
-        return {"status": "error", "result": f"Unknown command: {command!r}"}
+        return _response(
+            success=False,
+            result=f"Unknown command: {command!r}",
+            error_code="UNKNOWN_COMMAND",
+        )
     try:
         result = await handler(browser, args)
-        return {"status": "ok", "result": result}
+        error_code = _infer_error_code(command, result)
+        return _response(
+            success=error_code is None,
+            result=str(result),
+            error_code=error_code,
+        )
+    except _DaemonCommandError as exc:
+        cause = exc.__cause__
+        if cause is not None and _is_browser_closed_error(cause):
+            return _response(
+                success=False,
+                result=_BROWSER_CLOSED_HINT,
+                error_code="BROWSER_CLOSED",
+            )
+        return _response(
+            success=False,
+            result=str(exc),
+            error_code=exc.error_code,
+        )
     except Exception as exc:
         if _is_browser_closed_error(exc):
-            return {"status": "error", "result": _BROWSER_CLOSED_HINT}
+            return _response(
+                success=False,
+                result=_BROWSER_CLOSED_HINT,
+                error_code="BROWSER_CLOSED",
+            )
         logger.exception("[daemon] command=%s error", command)
-        return {"status": "error", "result": str(exc)}
+        return _response(
+            success=False,
+            result=str(exc),
+            error_code="HANDLER_EXCEPTION",
+        )
 
 
 _READ_TIMEOUT = 60.0  # seconds to wait for a command line from the client
@@ -277,7 +468,11 @@ async def _handle_connection(
         try:
             req = json.loads(raw.decode())
         except json.JSONDecodeError as exc:
-            resp = {"status": "error", "result": f"Invalid JSON: {exc}"}
+            resp = _response(
+                success=False,
+                result=f"Invalid JSON: {exc}",
+                error_code="INVALID_JSON",
+            )
             writer.write((json.dumps(resp) + "\n").encode())
             await writer.drain()
             return
@@ -286,7 +481,7 @@ async def _handle_connection(
         args = req.get("args", {})
 
         if command == "close":
-            resp = {"status": "ok", "result": "Daemon shutting down"}
+            resp = _response(success=True, result="Daemon shutting down")
             writer.write((json.dumps(resp) + "\n").encode())
             await writer.drain()
             stop_event.set()
@@ -362,10 +557,16 @@ async def run_daemon() -> None:
         await _handle_connection(browser, reader, writer, stop_event)
 
     # Remove stale socket if it exists
+    _ensure_socket_parent_dir(SOCKET_PATH)
     if os.path.exists(SOCKET_PATH):
-        os.unlink(SOCKET_PATH)
+        _safe_remove_socket(SOCKET_PATH)
 
     server = await asyncio.start_unix_server(connection_cb, path=SOCKET_PATH, limit=STREAM_LIMIT)
+    try:
+        os.chmod(SOCKET_PATH, 0o600)
+    except OSError:
+        # Best effort; if chmod is unsupported we still proceed.
+        pass
 
     # Signal ready to parent process
     sys.stdout.write(READY_SIGNAL)
@@ -387,7 +588,10 @@ async def run_daemon() -> None:
         pass
 
     if os.path.exists(SOCKET_PATH):
-        os.unlink(SOCKET_PATH)
+        try:
+            _safe_remove_socket(SOCKET_PATH)
+        except Exception as exc:
+            logger.warning("[daemon] failed to remove socket %s: %s", SOCKET_PATH, exc)
 
 
 def main() -> None:

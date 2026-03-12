@@ -2,6 +2,8 @@
 
 This document describes how page snapshots and the LLM-facing page state work in Bridgic Browser: options, data structures, and the typical flow from snapshot to element interaction.
 
+For standards-level constraints and priority rules (W3C accessibility tree + Playwright locator/actionability), see [W3C_PLAYWRIGHT_PRIORITY_REFERENCE.md](W3C_PLAYWRIGHT_PRIORITY_REFERENCE.md).
+
 ## Overview
 
 - **Snapshot** (programmatic): `Browser.get_snapshot()` returns an `EnhancedSnapshot` with a tree string and a refs map. Used when you need structured access to both the tree and ref metadata.
@@ -52,6 +54,8 @@ Stored in `EnhancedSnapshot.refs`. Used internally to build a Playwright locator
 | `name`          | str, optional | Accessible name. |
 | `nth`           | int, optional | Occurrence index for disambiguation. |
 | `text_content`  | str, optional | Text content snippet. |
+| `parent_ref`    | str, optional | Ref of the nearest ancestor element that has a ref. |
+| `frame_path`    | List[int], optional | Per-level local iframe indices for nested iframes. `None` = main frame; `[0]` = 1st top-level iframe; `[0, 0]` = 1st iframe inside the 1st iframe. Used to build the `frame_locator(...).nth(n)` chain in `get_element_by_ref`. |
 
 You normally do not need to use `RefData` directly; `get_element_by_ref(ref)` uses it under the hood.
 

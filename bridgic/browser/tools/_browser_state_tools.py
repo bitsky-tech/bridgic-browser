@@ -89,12 +89,21 @@ async def get_llm_repr(browser: "Browser",
 
         # If truncation occurred, add a notice at the end to help caller continue pagination
         if truncated and next_start_char is not None:
+            cli_flags = []
+            if interactive:
+                cli_flags.append("-i")
+            if not full_page:
+                cli_flags.append("-F")
+            cli_flags.append(f"-s {next_start_char}")
+            cli_cmd = "bridgic-browser snapshot " + " ".join(cli_flags)
+
             notice = (
                 "\n\n[notice] Current page state text is too long, returned portion starting "
                 f"from character {start_from_char} (this segment length {len(text)} / total "
                 f"length {total_length} characters). To continue getting subsequent content: "
-                f"call get_llm_repr(browser, start_from_char={next_start_char}) "
-                f"or run: bridgic-browser snapshot -s {next_start_char}"
+                f"call get_llm_repr(browser, start_from_char={next_start_char}, "
+                f"interactive={interactive}, full_page={full_page}) "
+                f"or run: {cli_cmd}"
             )
             text = f"{text}{notice}"
 

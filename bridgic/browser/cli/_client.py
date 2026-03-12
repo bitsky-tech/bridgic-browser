@@ -16,7 +16,12 @@ import sys
 import time
 from typing import Any, Dict, Optional
 
-from ._daemon import SOCKET_PATH, READY_SIGNAL, STREAM_LIMIT
+from ._daemon import (
+    SOCKET_PATH,
+    READY_SIGNAL,
+    STREAM_LIMIT,
+    _safe_remove_socket,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -41,9 +46,15 @@ async def _send_command_async(command: str, args: Dict[str, Any]) -> str:
             raise RuntimeError("Daemon closed connection without a response")
 
         resp = json.loads(raw.decode())
-        if resp.get("status") == "error":
+        # Prefer machine-readable "success" when present; fall back to legacy status.
+        if "success" in resp:
+            is_success = bool(resp.get("success"))
+        else:
+            is_success = resp.get("status") != "error"
+
+        if not is_success:
             raise RuntimeError(resp.get("result", "Unknown error from daemon"))
-        return resp.get("result", "")
+        return str(resp.get("result", ""))
     finally:
         writer.close()
         try:
@@ -143,9 +154,11 @@ def ensure_daemon_running() -> None:
         except Exception:
             # Stale socket — remove it and respawn
             try:
-                os.unlink(SOCKET_PATH)
-            except OSError:
-                pass
+                _safe_remove_socket(SOCKET_PATH)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Found stale socket at {SOCKET_PATH}, but cannot remove it safely: {exc}"
+                ) from exc
 
     _spawn_daemon()
 

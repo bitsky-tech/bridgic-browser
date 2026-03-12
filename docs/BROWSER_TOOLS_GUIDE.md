@@ -8,9 +8,11 @@ This guide helps you choose the right tools for different browser automation sce
 |----------|-------------|------------------|
 | Navigation | 4 | Page navigation, search |
 | Page | 9 | Page control, tabs |
-| Action (ref-based) | 13 | Element interaction |
+| Action (ref-based) | 6 | Click, hover, focus, scroll-into-view, input |
+| Form (ref-based) | 7 | Inputs, dropdowns, checkboxes, file upload (`input_text_by_ref` shared with Action) |
+| Advanced (ref-based) | 2 | JS evaluation on element, drag-and-drop |
 | Mouse (coordinate) | 6 | Precise mouse control |
-| Keyboard | 5 | Text input, shortcuts |
+| Keyboard | 4 | Text input, shortcuts |
 | Screenshot | 2 | Capture visuals |
 | Network | 7 | Monitor requests/console |
 | Dialog | 3 | Handle popups |
@@ -318,13 +320,13 @@ result = await verify_url(browser, expected_url="dashboard")
 
 | Scenario | Recommended Preset | Tools Count |
 |----------|-------------------|-------------|
-| Simple navigation | MINIMAL | 10 |
-| Data scraping | SCRAPING | 13 |
+| Simple navigation | MINIMAL | 11 |
+| Data scraping | SCRAPING | 14 |
 | Form automation | FORM_FILLING | 20 |
 | E2E testing | TESTING | 28 |
-| Complex interactions | INTERACTIVE | 40 |
-| Debugging | DEVELOPER | 18 |
-| Full access | COMPLETE | 68 |
+| Complex interactions | INTERACTIVE | 39 |
+| Debugging | DEVELOPER | 22 |
+| Full access | COMPLETE | 69 |
 
 ## Picking by function names
 

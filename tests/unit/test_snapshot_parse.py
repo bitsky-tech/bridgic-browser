@@ -54,6 +54,17 @@ class TestExtractOriginalRefsFromRaw:
         assert name == "Submit"
         assert nth == 0
 
+    def test_internal_frame_style_ref_is_parsed(self, gen: SnapshotGenerator) -> None:
+        """Playwright raw refs may be f1e7/f2e3; parser must not drop them."""
+        raw = '- button "Inside iframe" [ref=f2e7] [cursor=pointer]'
+        refs_info, _ = gen._extract_original_refs_from_raw(raw)
+
+        assert "f2e7" in refs_info
+        role, name, nth = refs_info["f2e7"]
+        assert role == "button"
+        assert name == "Inside iframe"
+        assert nth == 0
+
     def test_unnamed_element(self, gen: SnapshotGenerator) -> None:
         raw = "- generic [ref=e5]"
         refs_info, _ref_suffixes = gen._extract_original_refs_from_raw(raw)
@@ -747,8 +758,8 @@ class TestBatchViewportFiltering:
         assert "e1" in visible
 
     @pytest.mark.asyncio
-    async def test_info_none_excluded_in_viewport_mode(self, gen: SnapshotGenerator) -> None:
-        """Elements with info=None (unfindable in DOM) are excluded in viewport mode."""
+    async def test_info_none_included_in_viewport_mode(self, gen: SnapshotGenerator) -> None:
+        """Elements with info=None are retained to avoid false-negative filtering."""
         mock_page = AsyncMock()
         mock_page.evaluate = AsyncMock(return_value={
             # e1 not in results → info=None
@@ -762,8 +773,8 @@ class TestBatchViewportFiltering:
             check_viewport=True, viewport_width=1280, viewport_height=720,
         )
 
-        assert "e1" not in visible
-        assert interactive["e1"] is False
+        assert "e1" in visible
+        assert interactive["e1"] is True
 
     @pytest.mark.asyncio
     async def test_info_none_included_in_full_page_mode(self, gen: SnapshotGenerator) -> None:
@@ -2131,10 +2142,10 @@ class TestIframeHandling:
         assert "Below" in filtered
 
     @pytest.mark.asyncio
-    async def test_pre_filter_drops_iframe_and_children_when_out_of_viewport(
+    async def test_pre_filter_keeps_iframe_line_but_drops_children_when_out_of_viewport(
         self, gen: SnapshotGenerator
     ) -> None:
-        """full_page=False: iframe below viewport → iframe and ALL children removed."""
+        """full_page=False: keep iframe line for frame-path alignment, drop subtree."""
         raw = (
             '- button "Above" [ref=e1] [cursor=pointer]\n'
             '- iframe [ref=e2]:\n'
@@ -2171,8 +2182,8 @@ class TestIframeHandling:
 
         filtered, _ = await gen._pre_filter_raw_snapshot(raw, mock_page, options)
 
-        # iframe element itself and its child both removed
-        assert "iframe" not in filtered
+        # Keep iframe line to preserve local iframe index order.
+        assert "iframe" in filtered
         assert "Inside" not in filtered
         # Main-frame buttons before and after iframe are still present
         assert "Above" in filtered

@@ -381,6 +381,7 @@ class TestElementInteractionTools:
         mock_locator = MagicMock()
         mock_locator.click = AsyncMock()
         mock_locator.bounding_box = AsyncMock(return_value=None)
+        mock_locator.is_visible = AsyncMock(return_value=True)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
         result = await click_element_by_ref(mock_browser, "e1")
@@ -396,6 +397,7 @@ class TestElementInteractionTools:
         mock_locator = MagicMock()
         mock_locator.click = AsyncMock()
         mock_locator.bounding_box = AsyncMock(return_value={"x": 10, "y": 20, "width": 100, "height": 40})
+        mock_locator.is_visible = AsyncMock(return_value=True)
         mock_locator.evaluate = AsyncMock(return_value=False)  # not covered
         mock_browser.get_element_by_ref.return_value = mock_locator
 
@@ -415,6 +417,7 @@ class TestElementInteractionTools:
         mock_locator = MagicMock()
         mock_locator.click = AsyncMock()
         mock_locator.bounding_box = AsyncMock(return_value={"x": 10, "y": 20, "width": 100, "height": 40})
+        mock_locator.is_visible = AsyncMock(return_value=True)
         mock_locator.evaluate = AsyncMock(return_value=True)  # covered by overlay
         mock_browser.get_element_by_ref.return_value = mock_locator
 
@@ -443,6 +446,7 @@ class TestElementInteractionTools:
         mock_locator = MagicMock()
         mock_locator.clear = AsyncMock()
         mock_locator.fill = AsyncMock()
+        mock_locator.is_visible = AsyncMock(return_value=True)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
         result = await input_text_by_ref(mock_browser, "e1", "test text")
@@ -456,13 +460,16 @@ class TestElementInteractionTools:
         from bridgic.browser.tools._browser_action_tools import input_text_by_ref
 
         mock_locator = MagicMock()
+        mock_locator.clear = AsyncMock()
         mock_locator.fill = AsyncMock()
+        mock_locator.is_visible = AsyncMock(return_value=True)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
         result = await input_text_by_ref(
             mock_browser, "e1", "secret_password", is_secret=True
         )
 
+        mock_locator.fill.assert_called_once_with("secret_password")
         assert "secret_password" not in result
 
     @pytest.mark.asyncio
@@ -473,6 +480,7 @@ class TestElementInteractionTools:
         mock_locator = MagicMock()
         mock_locator.hover = AsyncMock()
         mock_locator.bounding_box = AsyncMock(return_value=None)
+        mock_locator.is_visible = AsyncMock(return_value=True)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
         result = await hover_element_by_ref(mock_browser, "e1")
@@ -486,6 +494,7 @@ class TestElementInteractionTools:
 
         mock_locator = MagicMock()
         mock_locator.focus = AsyncMock()
+        mock_locator.is_visible = AsyncMock(return_value=True)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
         result = await focus_element_by_ref(mock_browser, "e1")
@@ -517,11 +526,41 @@ class TestElementInteractionTools:
         assert "Option 1" in result or "value1" in result
 
     @pytest.mark.asyncio
+    async def test_get_dropdown_options_by_ref_avoids_ambiguous_global_options(self, mock_browser):
+        """When multiple visible listboxes exist, avoid global fallback option matching."""
+        from bridgic.browser.tools._browser_action_tools import get_dropdown_options_by_ref
+
+        mock_locator = MagicMock()
+        mock_locator.get_attribute = AsyncMock(return_value=None)
+
+        mock_empty = MagicMock()
+        mock_empty.all = AsyncMock(return_value=[])
+        mock_locator.locator = MagicMock(return_value=mock_empty)
+
+        listbox_1 = MagicMock()
+        listbox_1.is_visible = AsyncMock(return_value=True)
+        listbox_2 = MagicMock()
+        listbox_2.is_visible = AsyncMock(return_value=True)
+
+        listbox_locator = MagicMock()
+        listbox_locator.all = AsyncMock(return_value=[listbox_1, listbox_2])
+
+        mock_page = MagicMock()
+        mock_page.locator = MagicMock(return_value=listbox_locator)
+        mock_browser.get_current_page = AsyncMock(return_value=mock_page)
+        mock_browser.get_element_by_ref.return_value = mock_locator
+
+        result = await get_dropdown_options_by_ref(mock_browser, "e1")
+
+        assert result == "This dropdown has no options"
+
+    @pytest.mark.asyncio
     async def test_select_dropdown_option_by_ref(self, mock_browser):
         """Test select_dropdown_option_by_ref."""
         from bridgic.browser.tools._browser_action_tools import select_dropdown_option_by_ref
 
         mock_locator = MagicMock()
+        mock_locator.evaluate = AsyncMock(return_value="select")
         mock_locator.select_option = AsyncMock()
         mock_browser.get_element_by_ref.return_value = mock_locator
 
@@ -576,6 +615,9 @@ class TestElementInteractionTools:
         mock_locator = MagicMock()
         mock_locator.check = AsyncMock()
         mock_locator.bounding_box = AsyncMock(return_value=None)
+        mock_locator.is_visible = AsyncMock(return_value=True)
+        mock_locator.evaluate = AsyncMock(side_effect=["input", False, True])
+        mock_locator.get_attribute = AsyncMock(return_value="checkbox")
         mock_browser.get_element_by_ref.return_value = mock_locator
 
         result = await check_element_by_ref(mock_browser, ref="e1")
@@ -591,6 +633,9 @@ class TestElementInteractionTools:
         mock_locator = MagicMock()
         mock_locator.uncheck = AsyncMock()
         mock_locator.bounding_box = AsyncMock(return_value=None)
+        mock_locator.is_visible = AsyncMock(return_value=True)
+        mock_locator.evaluate = AsyncMock(side_effect=["input", True, False])
+        mock_locator.get_attribute = AsyncMock(return_value="checkbox")
         mock_browser.get_element_by_ref.return_value = mock_locator
 
         result = await uncheck_element_by_ref(mock_browser, ref="e1")
@@ -609,7 +654,9 @@ class TestElementInteractionTools:
         mock_locator = MagicMock()
         mock_locator.uncheck = AsyncMock()
         mock_locator.bounding_box = AsyncMock(return_value={"x": 10, "y": 20, "width": 100, "height": 40})
-        mock_locator.evaluate = AsyncMock(return_value=True)
+        mock_locator.is_visible = AsyncMock(return_value=True)
+        mock_locator.evaluate = AsyncMock(side_effect=["input", True, True, False])
+        mock_locator.get_attribute = AsyncMock(return_value="checkbox")
         mock_browser.get_element_by_ref.return_value = mock_locator
 
         result = await uncheck_element_by_ref(mock_browser, ref="e1")
@@ -617,6 +664,109 @@ class TestElementInteractionTools:
         mock_locator.uncheck.assert_not_called()
         mock_page.evaluate.assert_called_once()
         assert "Unchecked" in result
+
+    @pytest.mark.asyncio
+    async def test_check_custom_checkbox_uses_click_instead_of_check(self, mock_browser):
+        """Custom role checkbox/radio should use click path, not locator.check()."""
+        from bridgic.browser.tools._browser_action_tools import check_element_by_ref
+
+        mock_locator = MagicMock()
+        mock_locator.check = AsyncMock()
+        mock_locator.click = AsyncMock()
+        mock_locator.dispatch_event = AsyncMock()
+        mock_locator.bounding_box = AsyncMock(return_value=None)
+        mock_locator.is_visible = AsyncMock(return_value=True)
+        mock_locator.evaluate = AsyncMock(side_effect=["div", False, True])
+        mock_locator.get_attribute = AsyncMock(return_value=None)
+        mock_browser.get_element_by_ref.return_value = mock_locator
+
+        result = await check_element_by_ref(mock_browser, ref="e1")
+
+        mock_locator.check.assert_not_called()
+        mock_locator.click.assert_called_once()
+        assert "Checked" in result
+
+    @pytest.mark.asyncio
+    async def test_uncheck_custom_checkbox_uses_click_instead_of_uncheck(self, mock_browser):
+        """Custom role checkbox/radio should use click path, not locator.uncheck()."""
+        from bridgic.browser.tools._browser_action_tools import uncheck_element_by_ref
+
+        mock_locator = MagicMock()
+        mock_locator.uncheck = AsyncMock()
+        mock_locator.click = AsyncMock()
+        mock_locator.dispatch_event = AsyncMock()
+        mock_locator.bounding_box = AsyncMock(return_value=None)
+        mock_locator.is_visible = AsyncMock(return_value=True)
+        mock_locator.evaluate = AsyncMock(side_effect=["div", True, False])
+        mock_locator.get_attribute = AsyncMock(return_value=None)
+        mock_browser.get_element_by_ref.return_value = mock_locator
+
+        result = await uncheck_element_by_ref(mock_browser, ref="e1")
+
+        mock_locator.uncheck.assert_not_called()
+        mock_locator.click.assert_called_once()
+        assert "Unchecked" in result
+
+    @pytest.mark.asyncio
+    async def test_check_custom_checkbox_reports_failure_when_state_not_changed(self, mock_browser):
+        """Custom checkbox: click path must fail if checked state does not change."""
+        from bridgic.browser.tools._browser_action_tools import check_element_by_ref
+
+        mock_locator = MagicMock()
+        mock_locator.click = AsyncMock()
+        mock_locator.dispatch_event = AsyncMock()
+        mock_locator.bounding_box = AsyncMock(return_value=None)
+        mock_locator.is_visible = AsyncMock(return_value=True)
+        # tag=input? no, custom div; initially unchecked -> still unchecked after click
+        mock_locator.evaluate = AsyncMock(side_effect=["div", False, False])
+        mock_locator.get_attribute = AsyncMock(return_value=None)
+        mock_browser.get_element_by_ref.return_value = mock_locator
+
+        result = await check_element_by_ref(mock_browser, ref="e1")
+
+        mock_locator.click.assert_called_once()
+        assert result.startswith("Failed to check element e1")
+
+    @pytest.mark.asyncio
+    async def test_uncheck_custom_checkbox_reports_failure_when_state_not_changed(self, mock_browser):
+        """Custom checkbox: click path must fail if checked state does not change."""
+        from bridgic.browser.tools._browser_action_tools import uncheck_element_by_ref
+
+        mock_locator = MagicMock()
+        mock_locator.click = AsyncMock()
+        mock_locator.dispatch_event = AsyncMock()
+        mock_locator.bounding_box = AsyncMock(return_value=None)
+        mock_locator.is_visible = AsyncMock(return_value=True)
+        # custom div; initially checked -> still checked after click
+        mock_locator.evaluate = AsyncMock(side_effect=["div", True, True])
+        mock_locator.get_attribute = AsyncMock(return_value=None)
+        mock_browser.get_element_by_ref.return_value = mock_locator
+
+        result = await uncheck_element_by_ref(mock_browser, ref="e1")
+
+        mock_locator.click.assert_called_once()
+        assert result.startswith("Failed to uncheck element e1")
+
+    @pytest.mark.asyncio
+    async def test_uncheck_native_radio_skips_post_condition_check(self, mock_browser):
+        """Native radio inputs cannot be unchecked by clicking; post-condition must be skipped."""
+        from bridgic.browser.tools._browser_action_tools import uncheck_element_by_ref
+
+        mock_locator = MagicMock()
+        mock_locator.uncheck = AsyncMock()
+        mock_locator.bounding_box = AsyncMock(return_value=None)
+        mock_locator.is_visible = AsyncMock(return_value=True)
+        # evaluate: [tagName="input", already_checked=True]
+        mock_locator.evaluate = AsyncMock(side_effect=["input", True])
+        # get_attribute: [type="radio" for is_native check, type="radio" for post-condition]
+        mock_locator.get_attribute = AsyncMock(return_value="radio")
+        mock_browser.get_element_by_ref.return_value = mock_locator
+
+        result = await uncheck_element_by_ref(mock_browser, ref="e1")
+
+        # Radio remains checked after click — must NOT report failure
+        assert "Unchecked" in result
+        assert "Failed" not in result
 
     @pytest.mark.asyncio
     async def test_hover_element_by_ref_covered_uses_mouse_move(self, mock_browser):
@@ -629,6 +779,7 @@ class TestElementInteractionTools:
         mock_locator = MagicMock()
         mock_locator.hover = AsyncMock()
         mock_locator.bounding_box = AsyncMock(return_value={"x": 10, "y": 20, "width": 100, "height": 40})
+        mock_locator.is_visible = AsyncMock(return_value=True)
         mock_locator.evaluate = AsyncMock(return_value=True)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
@@ -646,6 +797,7 @@ class TestElementInteractionTools:
         mock_locator = MagicMock()
         mock_locator.dblclick = AsyncMock()
         mock_locator.bounding_box = AsyncMock(return_value=None)
+        mock_locator.is_visible = AsyncMock(return_value=True)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
         result = await double_click_element_by_ref(mock_browser, ref="e1")

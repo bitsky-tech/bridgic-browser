@@ -173,6 +173,28 @@ async def test_get_llm_repr_truncation_next_start_char_accounts_for_offset(monke
     assert f"from character {start}" in result
 
 
+@pytest.mark.asyncio
+async def test_get_llm_repr_truncation_notice_preserves_snapshot_mode_params(monkeypatch) -> None:
+    from bridgic.browser.tools import _browser_state_tools as state_tools
+
+    monkeypatch.setattr(state_tools, "MAX_CHAR_LIMIT", 120)
+    long_tree = "z" * 500
+    mock_browser = MagicMock()
+    mock_browser.get_snapshot = AsyncMock(
+        return_value=EnhancedSnapshot(tree=long_tree, refs={})
+    )
+
+    result = await get_llm_repr(
+        mock_browser,
+        start_from_char=0,
+        interactive=True,
+        full_page=False,
+    )
+
+    assert "interactive=True, full_page=False" in result
+    assert "bridgic-browser snapshot -i -F -s 120" in result
+
+
 # @pytest.mark.integration
 # @pytest.mark.asyncio
 # async def test_get_llm_repr(browser_instance) -> None:
