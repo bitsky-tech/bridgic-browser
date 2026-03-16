@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>nth Key-Space Mismatch Test</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h2 { margin: 20px 0 10px; color: #555; }
+        h3 { margin: 15px 0 8px; color: #777; }
+        table { border-collapse: collapse; margin: 10px 0; }
+        td, th { border: 1px solid #ccc; padding: 6px 12px; }
+        .clickable { cursor: pointer; padding: 8px 16px; margin: 4px; border: 1px solid #ddd; }
+        .clickable:hover { background: #e0e0e0; }
+        fieldset { margin: 10px 0; padding: 10px; }
+        #log {
+            position: fixed; top: 10px; right: 10px; width: 350px;
+            background: #1a1a2e; color: #0f0; padding: 15px;
+            border-radius: 8px; font-family: monospace; font-size: 13px;
+            max-height: 400px; overflow-y: auto; z-index: 999;
+        }
+        #log .entry { margin: 2px 0; border-bottom: 1px solid #333; padding: 2px 0; }
+    </style>
+</head>
+<body>
+
+<div id="log"><div class="entry">No clicks yet</div></div>
+
+<h2>nth Key-Space Mismatch Test Page</h2>
+<p>This page tests correct element targeting when the same text appears across
+different HTML roles (div, td, span, button, p, etc.).</p>
+
+<!-- ================================================================
+     SCENARIO 1: "Pending" across multiple roles
+     Tests that generic "Pending" [nth=N] clicks the correct div,
+     NOT a td or span or button with the same text.
+     ================================================================ -->
+<h3>Scenario 1: Same text across roles</h3>
+
+<table>
+    <tr><th>Status</th><th>Type</th></tr>
+    <tr>
+        <td data-testid="td-pending-0" class="clickable"
+            onclick="log('td[data-testid=td-pending-0]')">Pending</td>
+        <td data-testid="td-active" class="clickable"
+            onclick="log('td[data-testid=td-active]')">Active</td>
+    </tr>
+    <tr>
+        <td data-testid="td-pending-1" class="clickable"
+            onclick="log('td[data-testid=td-pending-1]')">Pending</td>
+        <td data-testid="td-done" class="clickable"
+            onclick="log('td[data-testid=td-done]')">Done</td>
+    </tr>
+</table>
+
+<div data-testid="div-pending-0" class="clickable"
+     onclick="log('div[data-testid=div-pending-0]')">Pending</div>
+<div data-testid="div-pending-1" class="clickable"
+     onclick="log('div[data-testid=div-pending-1]')">Pending</div>
+<span data-testid="span-pending" class="clickable"
+      onclick="log('span[data-testid=span-pending]')">Pending</span>
+<div role="button" data-testid="btn-pending" class="clickable"
+     onclick="log('div[role=button][data-testid=btn-pending]')">Pending</div>
+<p data-testid="p-pending" class="clickable"
+   onclick="log('p[data-testid=p-pending]')">Pending</p>
+
+<fieldset>
+    <legend>Settings</legend>
+    <div data-testid="div-pending-2-in-fieldset" class="clickable"
+         onclick="log('div[data-testid=div-pending-2-in-fieldset]')">Pending</div>
+</fieldset>
+
+<!-- ================================================================
+     SCENARIO 2: Unnamed generics with child text
+     Tests the child-text fallback for unnamed generic containers.
+     ================================================================ -->
+<h3>Scenario 2: Unnamed generics with child text</h3>
+
+<div data-testid="unnamed-div-0" class="clickable"
+     onclick="log('div[data-testid=unnamed-div-0]')">
+    <span>Item Alpha</span>
+</div>
+<div data-testid="unnamed-div-1" class="clickable"
+     onclick="log('div[data-testid=unnamed-div-1]')">
+    <span>Item Beta</span>
+</div>
+<div data-testid="unnamed-div-2" class="clickable"
+     onclick="log('div[data-testid=unnamed-div-2]')">
+    <span>Item Alpha</span>
+</div>
+
+<!-- ================================================================
+     SCENARIO 3: Named group elements (fieldset)
+     Tests CSS-scoped locator for group role.
+     ================================================================ -->
+<h3>Scenario 3: Group role elements</h3>
+
+<fieldset data-testid="fieldset-billing"
+          onclick="log('fieldset[data-testid=fieldset-billing]')">
+    <legend>Billing</legend>
+    <input type="text" placeholder="Address">
+</fieldset>
+<fieldset data-testid="fieldset-shipping"
+          onclick="log('fieldset[data-testid=fieldset-shipping]')">
+    <legend>Shipping</legend>
+    <input type="text" placeholder="Address">
+</fieldset>
+<div data-testid="div-billing" class="clickable"
+     onclick="log('div[data-testid=div-billing]')">Billing</div>
+
+<!-- ================================================================
+     SCENARIO 4: text pseudo-role with duplicates
+     Tests that text "Foo" [nth=1] doesn't accidentally click a
+     button or heading with the same text.
+     ================================================================ -->
+<h3>Scenario 4: Text pseudo-role</h3>
+
+<div data-testid="container-status">
+    <span data-testid="text-status-0">Ready</span>
+    <button data-testid="btn-ready"
+            onclick="log('button[data-testid=btn-ready]')">Ready</button>
+    <span data-testid="text-status-1">Ready</span>
+    <h4>Ready</h4>
+</div>
+
+<!-- ================================================================
+     SCENARIO 5: ROLE_TEXT_MATCH_ROLES — cells/rows with same text
+     Tests that cell "Amount" [nth=1] correctly picks the 2nd cell,
+     not any other element with "Amount" text.
+     ================================================================ -->
+<h3>Scenario 5: Table cells with duplicate text</h3>
+
+<table>
+    <tr>
+        <th>Item</th><th>Amount</th><th>Status</th>
+    </tr>
+    <tr>
+        <td data-testid="cell-item-0" class="clickable"
+            onclick="log('td[data-testid=cell-item-0]')">Widget</td>
+        <td data-testid="cell-amount-0" class="clickable"
+            onclick="log('td[data-testid=cell-amount-0]')">$50.00</td>
+        <td data-testid="cell-status-0" class="clickable"
+            onclick="log('td[data-testid=cell-status-0]')">Pending</td>
+    </tr>
+    <tr>
+        <td data-testid="cell-item-1" class="clickable"
+            onclick="log('td[data-testid=cell-item-1]')">Gadget</td>
+        <td data-testid="cell-amount-1" class="clickable"
+            onclick="log('td[data-testid=cell-amount-1]')">$50.00</td>
+        <td data-testid="cell-status-1" class="clickable"
+            onclick="log('td[data-testid=cell-status-1]')">Pending</td>
+    </tr>
+</table>
+<div data-testid="div-fifty" class="clickable"
+     onclick="log('div[data-testid=div-fifty]')">$50.00</div>
+
+<!-- ================================================================
+     SCENARIO 6: normalized_text fallback (unnamed role + text_content)
+     Tests that an unnamed button with text_content doesn't apply nth
+     from the wrong key space.
+     ================================================================ -->
+<h3>Scenario 6: Unnamed elements with text content</h3>
+
+<button data-testid="btn-submit-0"
+        onclick="log('button[data-testid=btn-submit-0]')">Save</button>
+<button data-testid="btn-submit-1"
+        onclick="log('button[data-testid=btn-submit-1]')">Save</button>
+<div data-testid="div-save" class="clickable"
+     onclick="log('div[data-testid=div-save]')">Save</div>
+<span data-testid="span-save">Save</span>
+
+<!-- ================================================================
+     SCENARIO 7: div with explicit role="generic"
+     Rare but valid — tests that [role="generic"] is matched by CSS.
+     ================================================================ -->
+<h3>Scenario 7: Explicit role="generic"</h3>
+
+<div role="generic" data-testid="explicit-generic-0" class="clickable"
+     onclick="log('div[role=generic][data-testid=explicit-generic-0]')">Explicit Generic</div>
+<div data-testid="implicit-generic-0" class="clickable"
+     onclick="log('div[data-testid=implicit-generic-0]')">Explicit Generic</div>
+
+<!-- ================================================================
+     SCENARIO 8: span without role (implicit generic)
+     Tests that span:not([role]) is included in the generic CSS selector.
+     ================================================================ -->
+<h3>Scenario 8: Span as implicit generic</h3>
+
+<span data-testid="span-generic-0" class="clickable"
+      onclick="log('span[data-testid=span-generic-0]')">SpanText</span>
+<span data-testid="span-generic-1" class="clickable"
+      onclick="log('span[data-testid=span-generic-1]')">SpanText</span>
+<div data-testid="div-spantext" class="clickable"
+     onclick="log('div[data-testid=div-spantext]')">SpanText</div>
+
+<script>
+function log(msg) {
+    const el = document.getElementById('log');
+    const entry = document.createElement('div');
+    entry.className = 'entry';
+    entry.textContent = new Date().toLocaleTimeString() + ' → ' + msg;
+    el.insertBefore(entry, el.firstChild);
+}
+</script>
+
+</body>
+</html>

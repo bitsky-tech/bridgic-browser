@@ -323,6 +323,21 @@ class SnapshotGenerator:
     # These must use get_by_text() instead of get_by_role().
     TEXT_LEAF_ROLES: Set[str] = {'text'}
 
+    # CSS selectors that approximate each STRUCTURAL_NOISE role.
+    # Used by get_locator_from_ref_async to build locators scoped to the correct
+    # element type, so that nth indices remain valid within the scoped set.
+    #
+    # IMPORTANT: <span> is intentionally excluded from 'generic'.  Playwright's
+    # accessibility tree often maps <span> to 'text' (not 'generic'), so including
+    # span:not([role]) would overcount and shift nth indices — e.g. clicking
+    # generic "Pending" [nth=2] would hit a <span> instead of the correct <div>.
+    STRUCTURAL_NOISE_CSS: Dict[str, str] = {
+        'generic': 'div:not([role]), legend, [role="generic"]',
+        'group': 'fieldset, details, optgroup, [role="group"]',
+        'none': '[role="none"]',
+        'presentation': '[role="presentation"]',
+    }
+
     # Pre-compiled regex patterns (avoid recompilation per call)
     # Pattern for _process_page_snapshot_for_ai: matches any snapshot line
     _LINE_PATTERN = re.compile(
@@ -693,7 +708,10 @@ class SnapshotGenerator:
                     'meter': 'meter, [role="meter"]',
                     'summary': 'summary',
                     'details': 'details',
-                    'generic': 'div, span, [role="generic"]',
+                    'generic': 'div:not([role]), legend, [role="generic"]',
+                    'group': 'fieldset, details, optgroup, [role="group"]',
+                    'none': '[role="none"]',
+                    'presentation': '[role="presentation"]',
                 };
 
                 function getAssociatedLabelText(el) {
@@ -1837,10 +1855,25 @@ class SnapshotGenerator:
         elif ref_data.role in self.TEXT_LEAF_ROLES and match_text:
             # 'text' is a snapshot pseudo-role (not a valid ARIA role).
             locator = scope.get_by_text(match_text, exact=True)
+            # nth was computed counting only text-leaf nodes with this text,
+            # but get_by_text counts ALL elements with that text across any role
+            # (buttons, headings, cells, etc.) — a different key space.
+            skip_nth = True
         elif ref_data.role in self.STRUCTURAL_NOISE_ROLES and match_text:
             # generic/group/none/presentation have weak role semantics in Playwright;
-            # use text as primary anchor.
-            locator = scope.get_by_text(match_text, exact=True)
+            # get_by_role() returns 0 results for implicit generic/group roles.
+            # Use a CSS-scoped locator to restrict to the correct element type,
+            # keeping the nth index valid within the scoped set.
+            css = self.STRUCTURAL_NOISE_CSS.get(ref_data.role)
+            if css:
+                exact_text_pattern = text_pattern(match_text, exact=True)
+                locator = scope.locator(css).filter(has_text=exact_text_pattern)
+                # CSS-scoped locator approximates the role:name key space
+                # (e.g. only div/span elements containing "Pending"), so nth
+                # is safe to apply — no skip_nth needed.
+            else:
+                locator = scope.get_by_text(match_text, exact=True)
+                skip_nth = True
         elif ref_data.role in self.STRUCTURAL_NOISE_ROLES:
             # Unnamed and no stored text — scan text-leaf children as inner text anchor.
             # e.g. generic "" [ref=e28]:
@@ -1866,19 +1899,29 @@ class SnapshotGenerator:
                 None,
             )
             if child_text:
-                locator = scope.get_by_text(child_text, exact=True)
-                # The stored nth was computed in the 'generic:' key space (counting all
-                # unnamed generic/group/etc. elements), but get_by_text counts only
-                # elements containing this specific text — a completely different space.
-                # Applying the wrong nth would select a different element or throw an
-                # out-of-bounds error, so we skip it here.
+                css = self.STRUCTURAL_NOISE_CSS.get(ref_data.role)
+                if css:
+                    exact_text_pattern = text_pattern(child_text, exact=True)
+                    locator = scope.locator(css).filter(has_text=exact_text_pattern)
+                else:
+                    locator = scope.get_by_text(child_text, exact=True)
+                # nth was computed in 'generic:' key space (all unnamed generics),
+                # but this locator counts CSS-matched elements containing this specific
+                # child text — a different key space. Still skip nth.
                 skip_nth = True
             else:
                 locator = scope.get_by_role(ref_data.role)
         elif normalized_text:
             locator = scope.get_by_text(normalized_text, exact=True)
+            # nth was computed counting only unnamed elements of this role,
+            # but get_by_text counts ALL elements with that text across any role.
+            skip_nth = True
         else:
-            locator = scope.get_by_role(ref_data.role)
+            # No name and no text — use an empty-name regex to restrict to
+            # unnamed elements only.  Without this, get_by_role("combobox")
+            # would match ALL comboboxes (named + unnamed), but nth was
+            # computed among unnamed elements only → key-space mismatch.
+            locator = scope.get_by_role(ref_data.role, name=re.compile(r"^$"))
 
         # Only apply nth when the snapshot explicitly captured disambiguation,
         # and when the locator key space matches the role:name key space used

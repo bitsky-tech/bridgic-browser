@@ -8,25 +8,25 @@ Short reference for the main session and download APIs. For tool lists and prese
 |------------------|-------------|
 | `Browser(...)` | Constructor. Key args: `headless`, `viewport`, `user_data_dir`, `stealth`, `channel`, `proxy`, `downloads_path`, etc. |
 | `await browser.start()` | Launch browser and create context. |
-| `await browser.close()` | Close browser and release resources. |
-| `await browser.kill()` | Force kill the browser process. |
+| `await browser.stop()` | Stop the browser, auto-cleans active capture listeners. |
 | `await browser.navigate_to(url)` | Navigate current page to URL. |
 | `await browser.get_snapshot(interactive=False, full_page=True)` | Get `EnhancedSnapshot` (`.tree`, `.refs`). |
 | `await browser.get_element_by_ref(ref)` | Get Playwright `Locator` for ref (e.g. `"e1"`); uses last snapshot. |
 | `await browser.get_current_page()` | Get current Playwright `Page` or None. |
 | `browser.get_current_page_url()` | Get current page URL string. |
-| `browser.context` | Playwright `BrowserContext` (after `start()`). |
+| `browser.download_manager` | `DownloadManager` instance (after `start()`), or None if `downloads_path` not set. |
 
 ## DownloadManager
 
+`Browser` creates and manages a `DownloadManager` automatically when `downloads_path` is provided. Access it via `browser.download_manager` after `start()`.
+
 | Method / property | Description |
 |------------------|-------------|
-| `DownloadManager(config=...)` | Config: `downloads_path`, `auto_save`, `overwrite`, optional callbacks. |
-| `manager.attach_to_context(browser.context)` | Attach to a context so downloads are handled with correct filenames. |
-| `manager.downloaded_files` | List of `DownloadedFile` (e.g. `url`, `path`, `file_name`, `file_size`). |
+| `browser.download_manager` | The auto-created `DownloadManager` (None if `downloads_path` not set). |
+| `browser.download_manager.downloaded_files` | List of `DownloadedFile` (`.url`, `.path`, `.file_name`, `.file_size`). |
 
 ## Snapshot and state (see SNAPSHOT_AND_STATE.md)
 
 - **SnapshotOptions**: `interactive`, `full_page`.
 - **EnhancedSnapshot**: `.tree`, `.refs` (ref id → RefData).
-- **get_llm_repr(browser, start_from_char=0, interactive=False, full_page=True)**: Page state string for LLM, with optional pagination.
+- **await browser.get_snapshot_text(start_from_char=0, interactive=False, full_page=True)**: Page state string for LLM, with optional pagination.

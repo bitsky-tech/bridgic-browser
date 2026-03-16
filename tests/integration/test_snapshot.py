@@ -22,7 +22,6 @@ import pytest_asyncio
 pytestmark = pytest.mark.integration
 
 from bridgic.browser.session import Browser
-from bridgic.browser.tools import get_llm_repr
 
 
 # ==================== Constants ====================
@@ -92,7 +91,7 @@ async def browser():
     await b.navigate_to(f"file://{TEST_PAGE_PATH.absolute()}")
     await asyncio.sleep(0.3)
     yield b
-    await b.kill()
+    await b.stop()
 
 
 @pytest_asyncio.fixture
@@ -103,7 +102,7 @@ async def role_text_match_browser():
     await b.navigate_to(f"file://{ROLE_TEXT_MATCH_CASE_PATH.absolute()}")
     await asyncio.sleep(0.3)
     yield b
-    await b.kill()
+    await b.stop()
 
 
 # ==================== Snapshot Mode Tests ====================
@@ -115,7 +114,7 @@ class TestSnapshotModes:
     async def test_default_mode_contains_viewport_elements(self, browser):
         """Default mode (interactive=False, full_page=False) shows all
         element types in the viewport — headings, links, textboxes, labels."""
-        snap = await get_llm_repr(browser, interactive=False, full_page=False)
+        snap = await browser.get_snapshot_text(interactive=False, full_page=False)
         refs = parse_snapshot(snap)
 
         # Viewport should contain the top navigation links
@@ -134,7 +133,7 @@ class TestSnapshotModes:
     @pytest.mark.asyncio
     async def test_default_mode_excludes_below_viewport(self, browser):
         """Default mode should NOT contain elements far below the viewport."""
-        snap = await get_llm_repr(browser, interactive=False, full_page=False)
+        snap = await browser.get_snapshot_text(interactive=False, full_page=False)
         refs = parse_snapshot(snap)
 
         # Grid items, scroll markers, drag items are far below viewport
@@ -150,7 +149,7 @@ class TestSnapshotModes:
     async def test_interactive_mode_only_actionable(self, browser):
         """Interactive mode (interactive=True, full_page=False) shows only
         interactive elements in viewport — no headings, no paragraphs."""
-        snap = await get_llm_repr(browser, interactive=True, full_page=False)
+        snap = await browser.get_snapshot_text(interactive=True, full_page=False)
         refs = parse_snapshot(snap)
 
         # Interactive elements in viewport
@@ -167,7 +166,7 @@ class TestSnapshotModes:
     async def test_full_page_mode_includes_all_sections(self, browser):
         """Full page mode (interactive=False, full_page=True) includes
         elements from ALL sections of the page."""
-        snap = await get_llm_repr(browser, interactive=False, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=False, full_page=True)
         refs = parse_snapshot(snap)
 
         # Elements from every section
@@ -193,7 +192,7 @@ class TestSnapshotModes:
     async def test_interactive_full_page_comprehensive(self, browser):
         """Interactive + full_page mode is the most comprehensive — includes
         all interactive elements from the entire page."""
-        snap = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs = parse_snapshot(snap)
 
         # All links
@@ -236,7 +235,7 @@ class TestInteractiveDetection:
     @pytest.mark.asyncio
     async def test_cursor_pointer_elements_detected(self, browser):
         """Elements with cursor:pointer CSS should be detected as interactive."""
-        snap = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs = parse_snapshot(snap)
 
         # Grid items have cursor:pointer via CSS class .grid-item
@@ -252,7 +251,7 @@ class TestInteractiveDetection:
     async def test_event_handler_elements_detected(self, browser):
         """Elements with inline event handlers (onclick, onmouseenter, etc.)
         should be detected as interactive."""
-        snap = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs = parse_snapshot(snap)
 
         # Hover target has onmouseenter/onmouseleave
@@ -267,7 +266,7 @@ class TestInteractiveDetection:
     async def test_disabled_elements_included_with_flag(self, browser):
         """Disabled elements should be included in interactive snapshot
         with [disabled] attribute."""
-        snap = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs = parse_snapshot(snap)
 
         # Disabled button
@@ -285,7 +284,7 @@ class TestInteractiveDetection:
     @pytest.mark.asyncio
     async def test_file_upload_button_detected(self, browser):
         """input[type=file] should appear as a button with 'File Upload' name."""
-        snap = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs = parse_snapshot(snap)
 
         file_btn = find_ref(refs, "button", "File Upload")
@@ -302,7 +301,7 @@ class TestNameDedup:
     async def test_no_name_duplication_on_cursor_pointer_generics(self, browser):
         """generic "Item 1" [ref=eXX] [cursor=pointer] should NOT end with
         ': Item 1' or ': "Item 1"'."""
-        snap = await get_llm_repr(browser, interactive=False, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=False, full_page=True)
         refs = parse_snapshot(snap)
 
         for i in range(1, 7):
@@ -318,7 +317,7 @@ class TestNameDedup:
     @pytest.mark.asyncio
     async def test_no_name_duplication_on_double_click_area(self, browser):
         """generic "Double-click me! (Count: 0)" should not have duplicated text."""
-        snap = await get_llm_repr(browser, interactive=False, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=False, full_page=True)
         refs = parse_snapshot(snap)
 
         ref = find_ref(refs, "generic", "Double-click me!")
@@ -333,7 +332,7 @@ class TestNameDedup:
     @pytest.mark.asyncio
     async def test_no_name_duplication_on_escaped_quotes(self, browser):
         """Elements with escaped quotes in name should also be deduped."""
-        snap = await get_llm_repr(browser, interactive=False, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=False, full_page=True)
 
         # The element: textbox "Type \"hello\" to verify:"
         # Check the line containing this ref doesn't have duplicated text
@@ -353,7 +352,7 @@ class TestRefStructure:
     @pytest.mark.asyncio
     async def test_all_refs_are_unique(self, browser):
         """Every [ref=eXX] should appear exactly once in the snapshot."""
-        snap = await get_llm_repr(browser, interactive=False, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=False, full_page=True)
         ref_ids = re.findall(r'\[ref=(e\d+)\]', snap)
         assert len(ref_ids) == len(set(ref_ids)), \
             f"Duplicate refs found: {[r for r in ref_ids if ref_ids.count(r) > 1]}"
@@ -361,7 +360,7 @@ class TestRefStructure:
     @pytest.mark.asyncio
     async def test_refs_are_sequential(self, browser):
         """Refs should be numbered sequentially starting from e1."""
-        snap = await get_llm_repr(browser, interactive=False, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=False, full_page=True)
         ref_ids = re.findall(r'\[ref=(e\d+)\]', snap)
         numbers = sorted(int(r[1:]) for r in ref_ids)
         expected = list(range(1, len(numbers) + 1))
@@ -371,7 +370,7 @@ class TestRefStructure:
     @pytest.mark.asyncio
     async def test_combobox_has_nested_options(self, browser):
         """Combobox should contain nested options with proper indentation."""
-        snap = await get_llm_repr(browser, interactive=False, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=False, full_page=True)
         lines = snap.splitlines()
 
         combobox_idx = None
@@ -390,7 +389,7 @@ class TestRefStructure:
     @pytest.mark.asyncio
     async def test_links_have_url_metadata(self, browser):
         """Links should include /url metadata."""
-        snap = await get_llm_repr(browser, interactive=False, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=False, full_page=True)
         lines = snap.splitlines()
 
         for i, line in enumerate(lines):
@@ -406,7 +405,7 @@ class TestRefStructure:
     @pytest.mark.asyncio
     async def test_textbox_has_placeholder_metadata(self, browser):
         """Textboxes should include /placeholder metadata."""
-        snap = await get_llm_repr(browser, interactive=False, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=False, full_page=True)
         lines = snap.splitlines()
 
         for i, line in enumerate(lines):
@@ -421,7 +420,7 @@ class TestRefStructure:
     @pytest.mark.asyncio
     async def test_nth_attribute_for_duplicate_names(self, browser):
         """Elements with duplicate role+name should get [nth=N] attribute."""
-        snap = await get_llm_repr(browser, interactive=False, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=False, full_page=True)
 
         # There are two "Reset" buttons: form reset and counter reset
         reset_lines = [
@@ -439,7 +438,7 @@ class TestRefStructure:
     @pytest.mark.asyncio
     async def test_selected_option_marked(self, browser):
         """Default selected option should have [selected] attribute."""
-        snap = await get_llm_repr(browser, interactive=False, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=False, full_page=True)
 
         for line in snap.splitlines():
             if 'option "Select a country"' in line:
@@ -459,8 +458,7 @@ class TestLocatorResolution:
     @pytest.mark.asyncio
     async def test_click_button_by_ref(self, browser):
         """Button ref from interactive snapshot should resolve to a clickable locator."""
-        from bridgic.browser.tools import click_element_by_ref
-        snap = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs = parse_snapshot(snap)
 
         page = await browser.get_current_page()
@@ -468,7 +466,7 @@ class TestLocatorResolution:
 
         btn_ref = find_ref(refs, "button", "+1")
         assert btn_ref is not None
-        result = await click_element_by_ref(browser, btn_ref)
+        result = await browser.click_element_by_ref(btn_ref)
         assert "error" not in result.lower(), f"Click failed: {result}"
 
         after = await page.text_content("#counter-value")
@@ -477,50 +475,43 @@ class TestLocatorResolution:
     @pytest.mark.asyncio
     async def test_input_text_by_ref(self, browser):
         """Textbox ref should resolve and accept input."""
-        from bridgic.browser.tools import input_text_by_ref, verify_value
-        snap = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs = parse_snapshot(snap)
 
         tb_ref = find_ref(refs, "textbox", "Username")
         assert tb_ref is not None
-        await input_text_by_ref(browser, tb_ref, "integration_test")
-        result = await verify_value(browser, tb_ref, "integration_test")
+        await browser.input_text_by_ref(tb_ref, "integration_test")
+        result = await browser.verify_value(tb_ref, "integration_test")
         assert "PASS" in result
 
     @pytest.mark.asyncio
     async def test_check_uncheck_by_ref(self, browser):
         """Checkbox ref should support check/uncheck operations."""
-        from bridgic.browser.tools import (
-            check_element_by_ref,
-            uncheck_element_by_ref,
-            verify_element_state,
-        )
-        snap = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs = parse_snapshot(snap)
 
         cb_ref = find_ref(refs, "checkbox", "Technology")
         assert cb_ref is not None
 
         # Initially unchecked
-        result = await verify_element_state(browser, cb_ref, "unchecked")
+        result = await browser.verify_element_state(cb_ref, "unchecked")
         assert "PASS" in result
 
         # Check
-        await check_element_by_ref(browser, cb_ref)
-        result = await verify_element_state(browser, cb_ref, "checked")
+        await browser.check_checkbox_by_ref(cb_ref)
+        result = await browser.verify_element_state(cb_ref, "checked")
         assert "PASS" in result
 
         # Uncheck
-        await uncheck_element_by_ref(browser, cb_ref)
-        result = await verify_element_state(browser, cb_ref, "unchecked")
+        await browser.uncheck_checkbox_by_ref(cb_ref)
+        result = await browser.verify_element_state(cb_ref, "unchecked")
         assert "PASS" in result
 
     @pytest.mark.asyncio
     async def test_double_click_generic_by_ref(self, browser):
         """generic element ref (e.g., Double-click area) should resolve
         to a valid locator for double-click."""
-        from bridgic.browser.tools import double_click_element_by_ref
-        snap = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs = parse_snapshot(snap)
 
         page = await browser.get_current_page()
@@ -528,7 +519,7 @@ class TestLocatorResolution:
 
         dbl_ref = find_ref(refs, "generic", "Double-click me!")
         assert dbl_ref is not None, "Double-click area not found in interactive snapshot"
-        result = await double_click_element_by_ref(browser, dbl_ref)
+        result = await browser.double_click_element_by_ref(dbl_ref)
         assert "error" not in result.lower(), f"Double-click failed: {result}"
 
         after = await page.text_content("#double-click-count")
@@ -537,57 +528,51 @@ class TestLocatorResolution:
     @pytest.mark.asyncio
     async def test_hover_generic_by_ref(self, browser):
         """generic element ref with onmouseenter should resolve for hover."""
-        from bridgic.browser.tools import hover_element_by_ref, scroll_to_text
-        snap = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs = parse_snapshot(snap)
 
         hover_ref = find_ref(refs, "generic", "Hover over me!")
         assert hover_ref is not None, \
             "Hover target with onmouseenter not found in interactive snapshot"
 
-        await scroll_to_text(browser, "Hover over me!")
-        result = await hover_element_by_ref(browser, hover_ref)
+        await browser.scroll_to_text("Hover over me!")
+        result = await browser.hover_element_by_ref(hover_ref)
         assert "error" not in result.lower(), f"Hover failed: {result}"
 
     @pytest.mark.asyncio
     async def test_select_dropdown_by_ref(self, browser):
         """Combobox ref should support option selection."""
-        from bridgic.browser.tools import (
-            get_dropdown_options_by_ref,
-            select_dropdown_option_by_ref,
-        )
-        snap = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs = parse_snapshot(snap)
 
         combo_ref = find_ref(refs, "combobox", "Country")
         assert combo_ref is not None
 
         # Get options
-        options_result = await get_dropdown_options_by_ref(browser, combo_ref)
+        options_result = await browser.get_dropdown_options_by_ref(combo_ref)
         assert "United States" in options_result
 
         # Select an option
-        result = await select_dropdown_option_by_ref(
-            browser, combo_ref, "United States"
+        result = await browser.select_dropdown_option_by_ref(
+            combo_ref, "United States"
         )
         assert "error" not in result.lower(), f"Select failed: {result}"
 
     @pytest.mark.asyncio
     async def test_focus_element_by_ref(self, browser):
         """Textbox ref should support focus operation."""
-        from bridgic.browser.tools import focus_element_by_ref
-        snap = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs = parse_snapshot(snap)
 
         tb_ref = find_ref(refs, "textbox", "Email")
         assert tb_ref is not None
-        result = await focus_element_by_ref(browser, tb_ref)
+        result = await browser.focus_element_by_ref(tb_ref)
         assert "error" not in result.lower(), f"Focus failed: {result}"
 
     @pytest.mark.asyncio
     async def test_listitem_refs_resolve_to_elements(self, browser):
         """Listitem refs from snapshot should resolve to real locators."""
-        snap = await get_llm_repr(browser, interactive=False, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=False, full_page=True)
         refs = parse_snapshot(snap)
 
         listitem_refs = [
@@ -605,7 +590,7 @@ class TestLocatorResolution:
     @pytest.mark.asyncio
     async def test_option_refs_resolve_to_elements(self, browser):
         """Option refs should keep role+name path and resolve correctly."""
-        snap = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs = parse_snapshot(snap)
 
         option_refs = [
@@ -686,16 +671,15 @@ class TestSnapshotAfterStateChange:
     async def test_snapshot_reflects_input_value(self, browser):
         """After typing into a field, the snapshot should reflect the value
         or at least still contain the field."""
-        from bridgic.browser.tools import input_text_by_ref
-        snap1 = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap1 = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs1 = parse_snapshot(snap1)
 
         tb_ref = find_ref(refs1, "textbox", "Username")
         assert tb_ref is not None
-        await input_text_by_ref(browser, tb_ref, "changed_value")
+        await browser.input_text_by_ref(tb_ref, "changed_value")
 
         # Get fresh snapshot
-        snap2 = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap2 = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs2 = parse_snapshot(snap2)
         # Textbox should still be present with same or updated name
         assert find_ref(refs2, "textbox", "Username") or find_ref(refs2, "textbox", "changed")
@@ -703,8 +687,7 @@ class TestSnapshotAfterStateChange:
     @pytest.mark.asyncio
     async def test_snapshot_reflects_checkbox_state(self, browser):
         """After checking a checkbox, the snapshot should show [checked]."""
-        from bridgic.browser.tools import check_element_by_ref
-        snap1 = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap1 = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs1 = parse_snapshot(snap1)
 
         cb_ref = find_ref(refs1, "checkbox", "Technology")
@@ -713,10 +696,10 @@ class TestSnapshotAfterStateChange:
         # Initially should NOT have [checked]
         assert "[checked]" not in refs1[cb_ref]["suffix"]
 
-        await check_element_by_ref(browser, cb_ref)
+        await browser.check_checkbox_by_ref(cb_ref)
 
         # Fresh snapshot should show [checked]
-        snap2 = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap2 = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs2 = parse_snapshot(snap2)
         cb_ref2 = find_ref(refs2, "checkbox", "Technology")
         assert cb_ref2 is not None
@@ -726,15 +709,14 @@ class TestSnapshotAfterStateChange:
     @pytest.mark.asyncio
     async def test_snapshot_reflects_selected_option(self, browser):
         """After selecting a dropdown option, snapshot should update [selected]."""
-        from bridgic.browser.tools import select_dropdown_option_by_ref
-        snap1 = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap1 = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs1 = parse_snapshot(snap1)
 
         combo_ref = find_ref(refs1, "combobox", "Country")
         assert combo_ref is not None
-        await select_dropdown_option_by_ref(browser, combo_ref, "China")
+        await browser.select_dropdown_option_by_ref(combo_ref, "China")
 
-        snap2 = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap2 = await browser.get_snapshot_text(interactive=True, full_page=True)
         # "China" option should now have [selected]
         for line in snap2.splitlines():
             if 'option "China"' in line:
@@ -753,7 +735,7 @@ class TestEdgeCases:
     @pytest.mark.asyncio
     async def test_list_structure_preserved(self, browser):
         """Navigation list should maintain list > listitem > link hierarchy."""
-        snap = await get_llm_repr(browser, interactive=False, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=False, full_page=True)
         lines = snap.splitlines()
 
         # Find the list line
@@ -781,7 +763,7 @@ class TestEdgeCases:
     async def test_interactive_snapshot_element_count_reasonable(self, browser):
         """Interactive + full_page snapshot should have a reasonable count
         of elements — not too few (missing elements) nor too many (noise)."""
-        snap = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap = await browser.get_snapshot_text(interactive=True, full_page=True)
         refs = parse_snapshot(snap)
 
         # The test page has roughly:
@@ -794,8 +776,8 @@ class TestEdgeCases:
     @pytest.mark.asyncio
     async def test_full_page_snapshot_more_elements_than_viewport(self, browser):
         """Full page mode should always return more elements than viewport mode."""
-        snap_viewport = await get_llm_repr(browser, interactive=False, full_page=False)
-        snap_full = await get_llm_repr(browser, interactive=False, full_page=True)
+        snap_viewport = await browser.get_snapshot_text(interactive=False, full_page=False)
+        snap_full = await browser.get_snapshot_text(interactive=False, full_page=True)
 
         refs_vp = parse_snapshot(snap_viewport)
         refs_full = parse_snapshot(snap_full)
@@ -807,8 +789,8 @@ class TestEdgeCases:
     async def test_interactive_subset_of_full(self, browser):
         """Interactive elements should be a subset of the full element set
         (by role+name, not by ref number since those differ)."""
-        snap_all = await get_llm_repr(browser, interactive=False, full_page=True)
-        snap_interactive = await get_llm_repr(browser, interactive=True, full_page=True)
+        snap_all = await browser.get_snapshot_text(interactive=False, full_page=True)
+        snap_interactive = await browser.get_snapshot_text(interactive=True, full_page=True)
 
         refs_all = parse_snapshot(snap_all)
         refs_int = parse_snapshot(snap_interactive)

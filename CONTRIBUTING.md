@@ -131,9 +131,9 @@ bridgic-browser/
 │       │   ├── _stealth.py  # Stealth mode configuration
 │       │   └── _download.py # Download management
 │       ├── tools/           # Browser automation tools
-│       │   ├── _browser_tools.py
-│       │   ├── _browser_action_tools.py
-│       │   └── ...
+│       │   ├── __init__.py
+│       │   ├── _browser_tool_set_builder.py
+│       │   └── _browser_tool_spec.py
 │       └── utils/           # Utility functions
 ├── tests/                   # Test files
 ├── docs/                    # Documentation

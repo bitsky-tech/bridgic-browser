@@ -2,17 +2,15 @@
 
 This document describes how page snapshots and the LLM-facing page state work in Bridgic Browser: options, data structures, and the typical flow from snapshot to element interaction.
 
-For standards-level constraints and priority rules (W3C accessibility tree + Playwright locator/actionability), see [W3C_PLAYWRIGHT_PRIORITY_REFERENCE.md](W3C_PLAYWRIGHT_PRIORITY_REFERENCE.md).
-
 ## Overview
 
 - **Snapshot** (programmatic): `Browser.get_snapshot()` returns an `EnhancedSnapshot` with a tree string and a refs map. Used when you need structured access to both the tree and ref metadata.
-- **Page state for LLM** (tool): `get_llm_repr(browser, ...)` returns a single string (the same tree, possibly truncated with pagination). Use this from tools/agents so the LLM can read the page and choose refs to interact with.
-- **Element by ref**: `Browser.get_element_by_ref(ref)` returns a Playwright `Locator` for a given ref, using the **last** snapshot’s refs. So the flow is: get snapshot or get_llm_repr → parse refs from the tree → get_element_by_ref(ref) → click/fill/etc.
+- **Page state for LLM** (tool): `browser.get_snapshot_text(...)` returns a single string (the same tree, possibly truncated with pagination). Use this from tools/agents so the LLM can read the page and choose refs to interact with.
+- **Element by ref**: `Browser.get_element_by_ref(ref)` returns a Playwright `Locator` for a given ref, using the **last** snapshot’s refs. So the flow is: get snapshot or get_snapshot_text → parse refs from the tree → get_element_by_ref(ref) → click/fill/etc.
 
 ## SnapshotOptions
 
-Options for how the snapshot is generated (used by both `get_snapshot` and `get_llm_repr`).
+Options for how the snapshot is generated (used by both `get_snapshot` and `get_snapshot_text`).
 
 | Option         | Type | Default | Description |
 |----------------|------|---------|-------------|
@@ -79,11 +77,11 @@ if locator:
 
 When using `Browser`, you typically use `browser.get_snapshot()` and `browser.get_element_by_ref(ref)` instead, which delegate to the same generator and keep the “last snapshot” in sync.
 
-## get_llm_repr
+## get_snapshot_text
 
-Tool function used to supply the page state to an LLM. It calls `browser.get_snapshot(interactive=..., full_page=...)` and returns the tree string, with optional truncation and pagination.
+Browser method used to supply the page state to an LLM. It calls `browser.get_snapshot(interactive=..., full_page=...)` and returns the tree string, with optional truncation and pagination.
 
-- **Signature**: `get_llm_repr(browser, start_from_char=0, interactive=False, full_page=True) -> str`
+- **Signature**: `await browser.get_snapshot_text(start_from_char=0, interactive=False, full_page=True) -> str`
 - **Returns**: The accessibility tree string. May be truncated at ~30,000 characters; if so, a `[notice]` at the end explains how to continue (see below).
 
 ### Parameters
@@ -99,7 +97,7 @@ Tool function used to supply the page state to an LLM. It calls `browser.get_sna
 When the full tree is longer than the limit (default 30,000 characters), the returned string is cut at a natural break (e.g. paragraph or sentence) and a notice is appended, for example:
 
 ```
-[notice] Current page state text is too long, returned portion starting from character 0 (this segment length 30000 / total length 45000 characters). To continue getting subsequent content, use start_from_char=30000 to call get_llm_repr again.
+[notice] Current page state text is too long, returned portion starting from character 0 (this segment length 30000 / total length 45000 characters). To continue getting subsequent content, use start_from_char=30000 to call get_snapshot_text again.
 ```
 
 Use the given `start_from_char` (e.g. `30000`) in the next call to get the rest.
@@ -108,27 +106,27 @@ The character limit can be adjusted via the `BRIDGIC_MAX_CHARS` environment vari
 
 ### Relation to get_snapshot
 
-- `get_llm_repr` calls `browser.get_snapshot(interactive=interactive, full_page=full_page)` once per invocation.
+- `get_snapshot_text` calls `browser.get_snapshot(interactive=interactive, full_page=full_page)` once per invocation.
 - So the browser’s “last snapshot” (and thus `get_element_by_ref`) is updated to that snapshot. The LLM can safely use refs from the returned string with action tools.
 
 ## get_element_by_ref
 
 - **Usage**: `locator = await browser.get_element_by_ref(ref)` (e.g. `ref="e1"`).
 - **Returns**: A Playwright `Locator` or `None` if the ref is invalid or the element is not found.
-- **Depends on**: The **last** snapshot. You must call `get_snapshot()` or use a tool that calls `get_llm_repr()` (which triggers a snapshot) before using refs.
+- **Depends on**: The **last** snapshot. You must call `get_snapshot()` or `get_snapshot_text()` (which triggers a snapshot) before using refs.
 
 Typical flow:
 
-1. Navigate: `await browser.navigate_to(url)`.
-2. Get state: `state = await get_llm_repr(browser)` (or `snapshot = await browser.get_snapshot()`).
+1. Navigate: `await browser.navigate_to_url(url)`.
+2. Get state: `state = await browser.get_snapshot_text()` (or `snapshot = await browser.get_snapshot()`).
 3. LLM (or your code) reads the tree and picks a ref, e.g. `e5`.
-4. Interact: `el = await browser.get_element_by_ref("e5")` then e.g. `await el.click()` or use tools like `click_element_by_ref(browser, "e5")`.
+4. Interact: use tools like `await browser.click_element_by_ref("e5")`.
 
-If the page changes (e.g. after navigation or dynamic update), take a new snapshot or call `get_llm_repr` again so refs stay valid.
+If the page changes (e.g. after navigation or dynamic update), take a new snapshot or call `get_snapshot_text` again so refs stay valid.
 
 ## CLI: bridgic-browser snapshot
 
-The `snapshot` command is the CLI equivalent of `get_llm_repr`. It shares the same parameters and delegates to the same implementation (truncation, pagination, and all).
+The `snapshot` command is the CLI equivalent of `browser.get_snapshot_text()`. It shares the same parameters and delegates to the same implementation (truncation, pagination, and all).
 
 ```
 bridgic-browser snapshot [OPTIONS]
@@ -155,4 +153,4 @@ bridgic-browser snapshot -i -F -s 10000  # combined
 
 | Variable           | Default | Description |
 |--------------------|---------|-------------|
-| `BRIDGIC_MAX_CHARS` | `30000` | Max characters returned per `snapshot`/`get_llm_repr` call before pagination kicks in. |
+| `BRIDGIC_MAX_CHARS` | `30000` | Max characters returned per `snapshot`/`get_snapshot_text` call before pagination kicks in. |

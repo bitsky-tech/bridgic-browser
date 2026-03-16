@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Bridgic Browser** is an LLM-driven browser automation library built on Playwright with built-in stealth mode. It provides 69 browser tools organized into categories, an accessibility tree-based snapshot system, a stable element reference system (`e1`, `e2`, …) designed for reliable AI agent interactions, and a `bridgic-browser` CLI tool backed by a persistent daemon.
+**Bridgic Browser** is an LLM-driven browser automation library built on Playwright with built-in stealth mode. It provides 67 browser tools organized into categories, an accessibility tree-based snapshot system, a stable element reference system (`e1`, `e2`, …) designed for reliable AI agent interactions, and a `bridgic-browser` CLI tool backed by a persistent daemon.
 
 ## Commands
 
@@ -48,16 +48,12 @@ bridgic/browser/
 │   ├── _stealth.py       # StealthConfig + StealthArgsBuilder (50+ Chrome args)
 │   ├── _download.py      # DownloadManager
 │   └── _browser_model.py # Data models
-├── tools/            # 69 automation tools
+├── tools/            # 67 automation tools (all implemented in _browser.py)
 │   ├── _browser_tool_set_builder.py  # BrowserToolSetBuilder + ToolPreset
-│   ├── _browser_tool_spec.py         # BrowserToolSpec (wraps tool for agents)
-│   ├── _browser_tools.py             # Navigation + page control tools
-│   ├── _browser_action_tools.py      # Ref-based element interaction
-│   ├── _browser_mouse_tools.py       # Coordinate-based mouse tools
-│   └── _browser_*.py                 # Other tool categories
+│   └── _browser_tool_spec.py         # BrowserToolSpec (wraps tool for agents)
 └── cli/              # CLI tool (bridgic-browser command)
     ├── __init__.py       # Exports main()
-    ├── _commands.py      # Click command definitions (30 commands, SectionedGroup)
+    ├── _commands.py      # Click command definitions (67 commands, SectionedGroup)
     ├── _client.py        # Socket client: send_command(), ensure_daemon_running()
     └── _daemon.py        # Daemon: asyncio Unix socket server + Browser instance
 ```
@@ -74,7 +70,7 @@ bridgic/browser/
 
 3. **`await browser.get_element_by_ref(ref)`** → returns a Playwright `Locator` resolved from the snapshot refs dict.
 
-4. **Tools** are plain async functions that accept `browser` as first arg. Pass them to an LLM agent via `BrowserToolSetBuilder`.
+4. **Tools** are bound async methods on the `Browser` class. Pass them to an LLM agent via `BrowserToolSetBuilder`.
 
 ### Element reference system
 
@@ -86,29 +82,33 @@ Refs (`e1`, `e2`, …) are generated during snapshot and stored in `EnhancedSnap
 
 ```python
 # By preset
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)
+tools = builder.build()["tool_specs"]
 
 # By category
-tools = BrowserToolSetBuilder.for_categories(browser, "navigation", "action")
+builder = BrowserToolSetBuilder.for_categories(browser, "navigation", "element_interaction")
+tools = builder.build()["tool_specs"]
 
 # By function reference
-tools = BrowserToolSetBuilder.from_funcs(browser, click_element_by_ref, input_text_by_ref)
+builder = BrowserToolSetBuilder.for_funcs(
+    browser, browser.click_element_by_ref, browser.input_text_by_ref
+)
+tools = builder.build()["tool_specs"]
 
-# Fluent builder
-tools = (BrowserToolSetBuilder(browser)
-         .with_preset(ToolPreset.INTERACTIVE)
-         .without_tools("take_screenshot")
-         .build_specs())
+# Combine multiple for_* selections
+builder1 = BrowserToolSetBuilder.for_preset(browser, ToolPreset.INTERACTIVE)
+builder2 = BrowserToolSetBuilder.for_tool_names(browser, "verify_url")
+tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 ```
 
-**`ToolPreset` sizes**: MINIMAL (11), NAVIGATION (4), SCRAPING (14), FORM_FILLING (20), TESTING (28), INTERACTIVE (39), DEVELOPER (22), COMPLETE (69).
+**`ToolPreset` sizes**: MINIMAL (9), NAVIGATION (3), SCRAPING (10), FORM_FILLING (18), TESTING (26), INTERACTIVE (32), DEVELOPER (23), COMPLETE (67).
 
 ### Snapshot modes
 
 `get_snapshot(interactive=False, full_page=True)`:
 - `interactive=True` — flattened list of clickable/editable elements only (best for LLM action selection)
 - `full_page=False` — limit to viewport content only
-- `get_llm_repr(browser)` tool — returns a truncated string ready for LLM context, with pagination via `start_from_char`
+- `await browser.get_snapshot_text(...)` — returns a truncated string ready for LLM context, with pagination via `start_from_char`
 
 ### Stealth
 
@@ -134,7 +134,7 @@ bridgic-browser click @e2
 Key implementation details:
 - **`_client.py`**: `send_command()` auto-starts the daemon if no socket exists. `_spawn_daemon()` uses `select.select()` + `os.read()` for the 30-second ready timeout (avoids blocking `proc.stdout.read()`). `start_if_needed=False` prevents auto-start for the `close` command.
 - **`_daemon.py`**: `run_daemon()` calls `_build_browser_kwargs()` then launches `Browser(**kwargs)`, writes `BRIDGIC_DAEMON_READY` to stdout, and serves one JSON command per connection. `asyncio.wait_for(reader.readline(), timeout=60)` prevents hanging on idle connections. Signal handling uses `loop.add_signal_handler()` (asyncio-safe).
-- **`_commands.py`**: 30 Click commands in 10 sections via `SectionedGroup`. `scroll` uses `--dy`/`--dx` options (not positional) to support negative values. `screenshot`/`pdf` call `os.path.abspath()` in the client before sending (daemon cwd may differ). `snapshot` supports `-i`/`--interactive`, `-f/-F`/`--full-page/--no-full-page`, and `-s`/`--start-from-char`; it delegates to `get_llm_repr` (which adds truncation/pagination).
+- **`_commands.py`**: 67 Click commands in 15 sections via `SectionedGroup`. `scroll` uses `--dy`/`--dx` options (not positional) to support negative values. `screenshot`/`pdf`/`upload`/`storage-save`/`storage-load`/`trace-stop` call `os.path.abspath()` on the client side before sending (daemon cwd may differ). `snapshot` supports `-i`/`--interactive`, `-f/-F`/`--full-page/--no-full-page`, and `-s`/`--start-from-char`; it delegates to `browser.get_snapshot_text()` (which adds truncation/pagination).
 - **`_build_browser_kwargs()`** priority chain (lowest → highest): defaults → `~/.bridgic/bridgic-browser.json` → `./bridgic-browser.json` → `BRIDGIC_BROWSER_JSON` env var → `BRIDGIC_HEADLESS` env var.
 
 Socket path: `BRIDGIC_SOCKET` env var (default `~/.bridgic/run/bridgic-browser.sock`).

@@ -1,7 +1,7 @@
 """
-Tests for `get_llm_repr` (integration: require real browser).
+Tests for `get_snapshot_text` (integration: require real browser).
 
-This file focuses on `get_llm_repr` behavior across different options:
+This file focuses on `get_snapshot_text` behavior across different options:
 - pagination via start_from_char
 - truncation notice when snapshot text is too long
 - real snapshot differences for interactive / full_page
@@ -20,7 +20,8 @@ from urllib.parse import quote
 import pytest
 
 from bridgic.browser.session import EnhancedSnapshot
-from bridgic.browser.tools._browser_state_tools import get_llm_repr
+import bridgic.browser.session._browser as _browser_module
+from bridgic.browser.session._browser import Browser
 
 
 def _data_url(html: str) -> str:
@@ -30,7 +31,7 @@ def _data_url(html: str) -> str:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_get_llm_repr_full_page_controls_offscreen_inclusion(browser_instance) -> None:
+async def test_get_snapshot_text_full_page_controls_offscreen_inclusion(browser_instance) -> None:
     # A simple page with one button in the viewport and another pushed below the fold.
     html = """
 <!doctype html>
@@ -53,8 +54,8 @@ async def test_get_llm_repr_full_page_controls_offscreen_inclusion(browser_insta
 
     await browser_instance.navigate_to(_data_url(html))
 
-    snapshot_viewport = await get_llm_repr(browser_instance, full_page=False)
-    snapshot_full_page = await get_llm_repr(browser_instance, full_page=True)
+    snapshot_viewport = await browser_instance.get_snapshot_text(full_page=False)
+    snapshot_full_page = await browser_instance.get_snapshot_text(full_page=True)
 
     assert "Top Visible Button" in snapshot_viewport
     assert "Bottom Offscreen Button" not in snapshot_viewport
@@ -65,7 +66,7 @@ async def test_get_llm_repr_full_page_controls_offscreen_inclusion(browser_insta
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_get_llm_repr_interactive_filters_non_interactive(browser_instance) -> None:
+async def test_get_snapshot_text_interactive_filters_non_interactive(browser_instance) -> None:
     html = """
 <!doctype html>
 <html>
@@ -81,8 +82,8 @@ async def test_get_llm_repr_interactive_filters_non_interactive(browser_instance
 
     await browser_instance.navigate_to(_data_url(html))
 
-    snapshot_all = await get_llm_repr(browser_instance, interactive=False)
-    snapshot_interactive = await get_llm_repr(browser_instance, interactive=True)
+    snapshot_all = await browser_instance.get_snapshot_text(interactive=False)
+    snapshot_interactive = await browser_instance.get_snapshot_text(interactive=True)
 
     # Interactive snapshot should still contain interactive controls.
     assert "Click Me" in snapshot_interactive
@@ -99,7 +100,7 @@ async def test_get_llm_repr_interactive_filters_non_interactive(browser_instance
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_get_llm_repr_pagination_start_from_char_slices_text(browser_instance) -> None:
+async def test_get_snapshot_text_pagination_start_from_char_slices_text(browser_instance) -> None:
     html = """
 <!doctype html>
 <html><head><meta charset="utf-8" /><title>pagination test</title></head>
@@ -111,40 +112,38 @@ async def test_get_llm_repr_pagination_start_from_char_slices_text(browser_insta
 """.strip()
     await browser_instance.navigate_to(_data_url(html))
 
-    full = await get_llm_repr(browser_instance, start_from_char=0)
+    full = await browser_instance.get_snapshot_text(start_from_char=0)
     assert len(full) > 20
 
     start = 10
-    sliced = await get_llm_repr(browser_instance, start_from_char=start)
+    sliced = await browser_instance.get_snapshot_text(start_from_char=start)
     assert sliced == full[start:]
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_get_llm_repr_pagination_start_from_char_exceeds_total_length(browser_instance) -> None:
+async def test_get_snapshot_text_pagination_start_from_char_exceeds_total_length(browser_instance) -> None:
     html = "<!doctype html><html><body><button>Short</button></body></html>"
     await browser_instance.navigate_to(_data_url(html))
 
-    full = await get_llm_repr(browser_instance)
-    result = await get_llm_repr(browser_instance, start_from_char=len(full) + 1)
+    full = await browser_instance.get_snapshot_text()
+    result = await browser_instance.get_snapshot_text(start_from_char=len(full) + 1)
 
     assert "exceeds total page state length" in result.lower()
 
 
 @pytest.mark.asyncio
-async def test_get_llm_repr_truncates_and_adds_notice_with_next_start_char(monkeypatch) -> None:
+async def test_get_snapshot_text_truncates_and_adds_notice_with_next_start_char(monkeypatch) -> None:
     # Use a mock snapshot with a long tree so truncation is deterministic and does not
     # depend on Playwright including long paragraph text in the accessibility tree.
-    from bridgic.browser.tools import _browser_state_tools as state_tools
-
-    monkeypatch.setattr(state_tools, "MAX_CHAR_LIMIT", 250)
-    long_tree = "x" * 500  # Exceeds 250 so get_llm_repr will truncate and add notice
-    mock_browser = MagicMock()
+    monkeypatch.setattr(_browser_module, "_MAX_CHAR_LIMIT", 250)
+    long_tree = "x" * 500  # Exceeds 250 so get_snapshot_text will truncate and add notice
+    mock_browser = MagicMock(spec=Browser)
     mock_browser.get_snapshot = AsyncMock(
         return_value=EnhancedSnapshot(tree=long_tree, refs={})
     )
 
-    result = await get_llm_repr(mock_browser, start_from_char=0)
+    result = await Browser.get_snapshot_text(mock_browser, start_from_char=0)
 
     assert "[notice]" in result
     assert "start_from_char=250" in result
@@ -152,39 +151,35 @@ async def test_get_llm_repr_truncates_and_adds_notice_with_next_start_char(monke
 
 
 @pytest.mark.asyncio
-async def test_get_llm_repr_truncation_next_start_char_accounts_for_offset(monkeypatch) -> None:
+async def test_get_snapshot_text_truncation_next_start_char_accounts_for_offset(monkeypatch) -> None:
     # Use a mock snapshot with a long tree so that start_from_char=50 still leaves
     # more than MAX_CHAR_LIMIT chars, triggering truncation and a notice that mentions
     # the offset (does not depend on real browser snapshot length).
-    from bridgic.browser.tools import _browser_state_tools as state_tools
-
-    monkeypatch.setattr(state_tools, "MAX_CHAR_LIMIT", 200)
+    monkeypatch.setattr(_browser_module, "_MAX_CHAR_LIMIT", 200)
     # Tree length 500: after slice from 50 we have 450 chars, so truncation + notice.
     long_tree = "y" * 500
-    mock_browser = MagicMock()
+    mock_browser = MagicMock(spec=Browser)
     mock_browser.get_snapshot = AsyncMock(
         return_value=EnhancedSnapshot(tree=long_tree, refs={})
     )
 
     start = 50
-    result = await get_llm_repr(mock_browser, start_from_char=start)
+    result = await Browser.get_snapshot_text(mock_browser, start_from_char=start)
 
     assert "[notice]" in result
     assert f"from character {start}" in result
 
 
 @pytest.mark.asyncio
-async def test_get_llm_repr_truncation_notice_preserves_snapshot_mode_params(monkeypatch) -> None:
-    from bridgic.browser.tools import _browser_state_tools as state_tools
-
-    monkeypatch.setattr(state_tools, "MAX_CHAR_LIMIT", 120)
+async def test_get_snapshot_text_truncation_notice_preserves_snapshot_mode_params(monkeypatch) -> None:
+    monkeypatch.setattr(_browser_module, "_MAX_CHAR_LIMIT", 120)
     long_tree = "z" * 500
-    mock_browser = MagicMock()
+    mock_browser = MagicMock(spec=Browser)
     mock_browser.get_snapshot = AsyncMock(
         return_value=EnhancedSnapshot(tree=long_tree, refs={})
     )
 
-    result = await get_llm_repr(
+    result = await Browser.get_snapshot_text(
         mock_browser,
         start_from_char=0,
         interactive=True,
@@ -194,29 +189,3 @@ async def test_get_llm_repr_truncation_notice_preserves_snapshot_mode_params(mon
     assert "interactive=True, full_page=False" in result
     assert "bridgic-browser snapshot -i -F -s 120" in result
 
-
-# @pytest.mark.integration
-# @pytest.mark.asyncio
-# async def test_get_llm_repr(browser_instance) -> None:
-#     from pathlib import Path
-#     SNAPSHOT_DIR = Path(__file__).resolve().parents[1] / "fixtures"
-#     TEST_PAGE_PATH = SNAPSHOT_DIR / "test_page.html"
-#     test_url = f"file://{TEST_PAGE_PATH.absolute()}"
-#     await browser_instance.navigate_to(test_url)
-
-#     interactive_full_page_path = SNAPSHOT_DIR / "snapshot_interactive_full_page.yaml"
-#     interactive_full_page_result = await get_llm_repr(browser_instance, interactive=True, full_page=True)
-#     interactive_full_page_path.write_text(interactive_full_page_result, encoding="utf-8")
-#     assert interactive_full_page_result is not None
-#     interactive_path = SNAPSHOT_DIR / "snapshot_interactive.yaml"
-#     interactive_result = await get_llm_repr(browser_instance, interactive=True, full_page=False)
-#     interactive_path.write_text(interactive_result, encoding="utf-8")
-#     assert interactive_result is not None
-#     full_page_path = SNAPSHOT_DIR / "snapshot_full_page.yaml"
-#     full_page_result = await get_llm_repr(browser_instance, interactive=False, full_page=True)
-#     full_page_path.write_text(full_page_result, encoding="utf-8")
-#     assert full_page_result is not None 
-#     default_path = SNAPSHOT_DIR / "snapshot_default.yaml"
-#     default_result = await get_llm_repr(browser_instance, interactive=False, full_page=False)
-#     default_path.write_text(default_result, encoding="utf-8")
-#     assert default_result is not None

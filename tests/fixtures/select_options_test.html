@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Select &amp; Options Workflow Test</title>
+    <!-- React 18 -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <!-- antd 5 (UMD) — includes dayjs -->
+    <script src="https://unpkg.com/dayjs@1/dayjs.min.js"></script>
+    <script src="https://unpkg.com/antd@5/dist/antd.min.js" crossorigin></script>
+    <!-- Babel standalone for JSX in-browser -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/antd@5/dist/reset.css">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 20px; background: #f5f5f5; }
+        h2 { margin: 20px 0 10px; color: #555; }
+        h3 { margin: 15px 0 8px; color: #777; }
+        .section { margin: 20px 0; padding: 15px; background: #fff; border-radius: 8px; border: 1px solid #e0e0e0; }
+        #log {
+            position: fixed; top: 10px; right: 10px; width: 350px;
+            background: #1a1a2e; color: #0f0; padding: 15px;
+            border-radius: 8px; font-family: monospace; font-size: 13px;
+            max-height: 400px; overflow-y: auto; z-index: 9999;
+        }
+        #log .entry { margin: 2px 0; border-bottom: 1px solid #333; padding: 2px 0; }
+    </style>
+</head>
+<body>
+
+<div id="log"><div class="entry">No actions yet</div></div>
+
+<h2>Select &amp; Options Workflow Test Page</h2>
+<p>Tests native &lt;select&gt;, portalized dropdown (aria-controls), and React + antd Select components.</p>
+
+<!-- ================================================================
+     SECTION 1: Native <select> dropdowns
+     Moved from nth_keyspace_test.html Scenario 9
+     ================================================================ -->
+<div class="section">
+    <h3>Section 1: Native &lt;select&gt; dropdowns</h3>
+
+    <label for="status-filter">Status:</label>
+    <select id="status-filter" data-testid="select-status"
+            onchange="logMsg('select-status changed to: ' + this.value)">
+        <option value="">All</option>
+        <option value="pending">Pending</option>
+        <option value="active">Active</option>
+        <option value="resolved">Resolved</option>
+    </select>
+
+    <label for="priority-filter" style="margin-left:20px">Priority:</label>
+    <select id="priority-filter" data-testid="select-priority"
+            onchange="logMsg('select-priority changed to: ' + this.value)">
+        <option value="">All</option>
+        <option value="high">High</option>
+        <option value="medium">Medium</option>
+        <option value="low">Low</option>
+    </select>
+</div>
+
+<!-- ================================================================
+     SECTION 2: Portalized dropdown (vanilla HTML with aria-controls)
+     Moved from nth_keyspace_test.html Scenario 10
+     ================================================================ -->
+<div class="section">
+    <h3>Section 2: Portalized dropdown (aria-controls)</h3>
+
+    <div role="combobox" aria-controls="portal-listbox" aria-expanded="false"
+         aria-label="City" data-testid="portal-trigger" class="clickable" tabindex="0"
+         style="border:1px solid #999; padding:6px 12px; display:inline-block; min-width:150px; cursor:pointer"
+         onclick="togglePortalDropdown(this)">
+        <span id="portal-display">Choose a city</span>
+    </div>
+</div>
+
+<!-- Portalized listbox — rendered outside trigger's parent, as antd/MUI would do -->
+<div id="portal-listbox" role="listbox" style="display:none; position:absolute;
+     border:1px solid #ccc; background:#fff; z-index:10000; min-width:150px">
+    <div role="option" data-value="sh" style="padding:4px 12px; cursor:pointer"
+         onclick="selectPortalOption(this, 'sh', 'Shanghai')">Shanghai</div>
+    <div role="option" data-value="bj" style="padding:4px 12px; cursor:pointer"
+         onclick="selectPortalOption(this, 'bj', 'Beijing')">Beijing</div>
+    <div role="option" data-value="gz" style="padding:4px 12px; cursor:pointer"
+         onclick="selectPortalOption(this, 'gz', 'Guangzhou')">Guangzhou</div>
+    <div role="option" data-value="sz" style="padding:4px 12px; cursor:pointer"
+         onclick="selectPortalOption(this, 'sz', 'Shenzhen')">Shenzhen</div>
+</div>
+
+<!-- ================================================================
+     SECTION 3: React + antd Select components
+     ================================================================ -->
+<div class="section">
+    <h3>Section 3: React + antd Select</h3>
+    <div id="antd-root"></div>
+</div>
+
+<script>
+/* --- Portalized dropdown helpers --- */
+function togglePortalDropdown(trigger) {
+    var lb = document.getElementById('portal-listbox');
+    var expanded = trigger.getAttribute('aria-expanded') === 'true';
+    lb.style.display = expanded ? 'none' : 'block';
+    trigger.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+    if (!expanded) {
+        var rect = trigger.getBoundingClientRect();
+        lb.style.left = rect.left + 'px';
+        lb.style.top = (rect.bottom + 2) + 'px';
+    }
+}
+function selectPortalOption(optionEl, value, label) {
+    document.getElementById('portal-display').textContent = label;
+    document.getElementById('portal-listbox').style.display = 'none';
+    var trigger = document.querySelector('[aria-controls="portal-listbox"]');
+    trigger.setAttribute('aria-expanded', 'false');
+    trigger.dataset.selectedValue = value;
+    logMsg('portal-select → ' + label + ' (value=' + value + ')');
+}
+
+/* --- Logging --- */
+function logMsg(msg) {
+    var el = document.getElementById('log');
+    var entry = document.createElement('div');
+    entry.className = 'entry';
+    entry.textContent = new Date().toLocaleTimeString() + ' → ' + msg;
+    el.insertBefore(entry, el.firstChild);
+}
+/* Expose globally so React components can call it */
+window.logMsg = logMsg;
+</script>
+
+<script type="text/babel" data-type="module">
+const { Select, Space, Typography, Divider } = antd;
+const { Option } = Select;
+const { useState } = React;
+const { Text } = Typography;
+
+function AntdSelectDemo() {
+    const [fruit, setFruit] = useState(undefined);
+    const [color, setColor] = useState(undefined);
+    const [tags, setTags] = useState([]);
+
+    return (
+        <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+            <div>
+                <Text strong>Fruit (single select):</Text>
+                <br />
+                <Select
+                    placeholder="Choose a fruit"
+                    style={{ width: 200 }}
+                    listHeight={300}
+                    virtual={false}
+                    value={fruit}
+                    onChange={(val) => {
+                        setFruit(val);
+                        window.logMsg('antd-fruit → ' + val);
+                    }}
+                    getPopupContainer={() => document.body}
+                >
+                    <Option value="apple">Apple</Option>
+                    <Option value="banana">Banana</Option>
+                    <Option value="cherry">Cherry</Option>
+                    <Option value="durian">Durian</Option>
+                </Select>
+                <Text id="fruit-display" style={{ marginLeft: 12 }}>
+                    {fruit ? `Selected: ${fruit}` : 'None selected'}
+                </Text>
+            </div>
+
+            <Divider style={{ margin: '8px 0' }} />
+
+            <div>
+                <Text strong>Color (single select with search):</Text>
+                <br />
+                <Select
+                    placeholder="Pick a color"
+                    showSearch
+                    style={{ width: 200 }}
+                    virtual={false}
+                    value={color}
+                    onChange={(val) => {
+                        setColor(val);
+                        window.logMsg('antd-color → ' + val);
+                    }}
+                    getPopupContainer={() => document.body}
+                >
+                    <Option value="red">Red</Option>
+                    <Option value="green">Green</Option>
+                    <Option value="blue">Blue</Option>
+                </Select>
+                <Text id="color-display" style={{ marginLeft: 12 }}>
+                    {color ? `Selected: ${color}` : 'None selected'}
+                </Text>
+            </div>
+
+            <Divider style={{ margin: '8px 0' }} />
+
+            <div>
+                <Text strong>Tags (multiple select):</Text>
+                <br />
+                <Select
+                    mode="multiple"
+                    placeholder="Choose tags"
+                    style={{ width: 300 }}
+                    virtual={false}
+                    value={tags}
+                    onChange={(vals) => {
+                        setTags(vals);
+                        window.logMsg('antd-tags → [' + vals.join(', ') + ']');
+                    }}
+                    getPopupContainer={() => document.body}
+                >
+                    <Option value="frontend">Frontend</Option>
+                    <Option value="backend">Backend</Option>
+                    <Option value="devops">DevOps</Option>
+                    <Option value="design">Design</Option>
+                </Select>
+                <Text id="tags-display" style={{ marginLeft: 12 }}>
+                    {tags.length > 0 ? `Selected: ${tags.join(', ')}` : 'None selected'}
+                </Text>
+            </div>
+        </Space>
+    );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('antd-root'));
+root.render(<AntdSelectDemo />);
+</script>
+
+</body>
+</html>

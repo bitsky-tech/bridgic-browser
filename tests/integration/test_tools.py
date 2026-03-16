@@ -9,29 +9,30 @@ Test Organization:
 - Each category tests ALL tools in that category
 - ref-based tools use a pre-generated snapshot for consistent element references
 
-Tool Coverage (68 tools):
-- State (1): get_llm_repr
-- Navigation (4): search, navigate_to_url, go_back, go_forward
-- Page (9): get_current_page_info, reload_page, scroll_to_text, press_key,
-            evaluate_javascript, new_tab, get_tabs, switch_tab, close_tab
-- Control (3): browser_close, browser_resize, wait_for
-- Action (13): click_element_by_ref, input_text_by_ref, hover_element_by_ref,
-               focus_element_by_ref, check_element_by_ref, uncheck_element_by_ref,
-               double_click_element_by_ref, scroll_element_into_view_by_ref,
-               get_dropdown_options_by_ref, select_dropdown_option_by_ref,
-               upload_file_by_ref, drag_element_by_ref, evaluate_javascript_on_ref
-- Mouse (6): mouse_move, mouse_click, mouse_drag, mouse_down, mouse_up, mouse_wheel
-- Keyboard (5): press_sequentially, key_down, key_up, fill_form, insert_text
-- Screenshot (2): take_screenshot, save_pdf
-- Network (7): start_console_capture, stop_console_capture, get_console_messages,
-               start_network_capture, stop_network_capture, get_network_requests,
+Tool Coverage (67 tools, aligned with CLI sections):
+- Navigation (6): navigate_to_url, search, get_current_page_info_str, reload_page, go_back, go_forward
+- Snapshot (1): get_snapshot_text
+- Element Interaction (13): click_element_by_ref, input_text_by_ref, fill_form,
+               scroll_element_into_view_by_ref, select_dropdown_option_by_ref,
+               get_dropdown_options_by_ref, check_checkbox_by_ref, uncheck_checkbox_by_ref,
+               focus_element_by_ref, hover_element_by_ref, double_click_element_by_ref,
+               upload_file_by_ref, drag_element_by_ref
+- Tabs (4): get_tabs, new_tab, switch_tab, close_tab
+- Evaluate (2): evaluate_javascript, evaluate_javascript_on_ref
+- Keyboard (4): type_text, press_key, key_down, key_up
+- Mouse (6): mouse_wheel, mouse_click, mouse_move, mouse_drag, mouse_down, mouse_up
+- Wait (1): wait_for
+- Capture (2): take_screenshot, save_pdf
+- Network (4): start_network_capture, get_network_requests, stop_network_capture,
                wait_for_network_idle
 - Dialog (3): setup_dialog_handler, handle_dialog, remove_dialog_handler
-- Storage (5): save_storage_state, restore_storage_state, clear_cookies,
-               get_cookies, set_cookie
-- Verify (6): verify_element_visible, verify_text_visible, verify_value,
-              verify_element_state, verify_url, verify_title
-- DevTools (5): start_tracing, stop_tracing, start_video, stop_video, add_trace_chunk
+- Storage (5): get_cookies, set_cookie, clear_cookies, save_storage_state,
+               restore_storage_state
+- Verify (6): verify_text_visible, verify_element_visible, verify_url,
+              verify_title, verify_element_state, verify_value
+- Developer (8): start_console_capture, get_console_messages, stop_console_capture,
+                 start_tracing, add_trace_chunk, stop_tracing, start_video, stop_video
+- Lifecycle (2): browser_close, browser_resize
 """
 
 import asyncio
@@ -48,128 +49,6 @@ pytestmark = pytest.mark.integration
 
 from bridgic.browser.session import Browser
 
-# ==================== Tool Imports by Category ====================
-
-# State tools
-from bridgic.browser.tools import get_llm_repr
-
-# Navigation tools
-from bridgic.browser.tools import (
-    navigate_to_url,
-    go_back,
-    go_forward,
-    search,
-)
-
-# Page tools
-from bridgic.browser.tools import (
-    reload_page,
-    scroll_to_text,
-    press_key,
-    evaluate_javascript,
-    get_current_page_info,
-    new_tab,
-    get_tabs,
-    switch_tab,
-    close_tab,
-)
-
-# Action tools (ref-based)
-from bridgic.browser.tools import (
-    click_element_by_ref,
-    input_text_by_ref,
-    hover_element_by_ref,
-    focus_element_by_ref,
-    check_element_by_ref,
-    uncheck_element_by_ref,
-    double_click_element_by_ref,
-    scroll_element_into_view_by_ref,
-    get_dropdown_options_by_ref,
-    select_dropdown_option_by_ref,
-    upload_file_by_ref,
-    drag_element_by_ref,
-    evaluate_javascript_on_ref,
-)
-
-# Mouse tools
-from bridgic.browser.tools import (
-    mouse_move,
-    mouse_click,
-    mouse_drag,
-    mouse_down,
-    mouse_up,
-    mouse_wheel,
-)
-
-# Keyboard tools
-from bridgic.browser.tools import (
-    press_sequentially,
-    key_down,
-    key_up,
-    insert_text,
-    fill_form,
-)
-
-# Screenshot tools
-from bridgic.browser.tools import (
-    take_screenshot,
-    save_pdf,
-)
-
-# Network tools
-from bridgic.browser.tools import (
-    start_console_capture,
-    stop_console_capture,
-    get_console_messages,
-    start_network_capture,
-    stop_network_capture,
-    get_network_requests,
-    wait_for_network_idle,
-)
-
-# Dialog tools
-from bridgic.browser.tools import (
-    setup_dialog_handler,
-    handle_dialog,
-    remove_dialog_handler,
-)
-
-# Storage tools
-from bridgic.browser.tools import (
-    save_storage_state,
-    restore_storage_state,
-    clear_cookies,
-    get_cookies,
-    set_cookie,
-)
-
-# Verification tools
-from bridgic.browser.tools import (
-    verify_element_visible,
-    verify_text_visible,
-    verify_url,
-    verify_title,
-    verify_element_state,
-    verify_value,
-)
-
-# Control tools
-from bridgic.browser.tools import (
-    browser_resize,
-    wait_for,
-    browser_close,
-)
-
-# DevTools tools
-from bridgic.browser.tools import (
-    start_tracing,
-    stop_tracing,
-    start_video,
-    stop_video,
-    add_trace_chunk,
-)
-
-
 # ==================== Constants ====================
 
 SNAPSHOT_DIR = Path(__file__).resolve().parents[1] / "fixtures"
@@ -178,7 +57,6 @@ SNAPSHOT_PATH = SNAPSHOT_DIR / "diff_for_snapshot.yaml"
 SNAPSHOT_FILES = {
     "complete": SNAPSHOT_DIR / "snapshot_complete.yaml",
 }
-
 
 # ==================== Helper Functions ====================
 
@@ -209,7 +87,6 @@ def extract_refs_from_snapshot(snapshot: str) -> Dict[str, Dict[str, str]]:
                     refs[ref] = {"type": elem_type, "name": "", "ref": ref}
     return refs
 
-
 def find_ref_by_type_and_name(
     refs: Dict, elem_type: str, name_contains: str = "",
 ) -> Optional[str]:
@@ -219,7 +96,6 @@ def find_ref_by_type_and_name(
             if not name_contains or name_contains.lower() in info.get("name", "").lower():
                 return ref
     return None
-
 
 # ==================== Fixtures ====================
 
@@ -236,17 +112,15 @@ async def browser():
     await browser_instance.navigate_to(test_url)
     await asyncio.sleep(0.3)
     yield browser_instance
-    await browser_instance.kill()
-
+    await browser_instance.stop()
 
 @pytest_asyncio.fixture
 async def browser_with_complete_snapshot(browser):
     """Browser fixture with interactive=True, full_page=True snapshot."""
-    snapshot = await get_llm_repr(browser, interactive=True, full_page=True)
+    snapshot = await browser.get_snapshot_text(interactive=True, full_page=True)
     SNAPSHOT_FILES["complete"].write_text(snapshot, encoding="utf-8")
     refs = extract_refs_from_snapshot(snapshot)
     return browser, snapshot, refs
-
 
 # ==================== 1. Navigation Tools (4 tools) ====================
 
@@ -256,7 +130,7 @@ class TestNavigationTools:
     @pytest.mark.asyncio
     async def test_navigate_to_url(self, browser):
         test_url = f"file://{TEST_PAGE_PATH.absolute()}"
-        result = await navigate_to_url(browser, test_url)
+        result = await browser.navigate_to_url(test_url)
         assert "Navigated to" in result
 
     @pytest.mark.asyncio
@@ -266,21 +140,20 @@ class TestNavigationTools:
         await page.click("#link-form")
         await asyncio.sleep(0.2)
 
-        await go_back(browser)
-        verify = await verify_url(browser, test_url, exact=True)
+        await browser.go_back()
+        verify = await browser.verify_url(test_url, exact=True)
         assert "PASS" in verify
 
-        await go_forward(browser)
-        verify = await verify_url(browser, test_url, exact=False)
+        await browser.go_forward()
+        verify = await browser.verify_url(test_url, exact=False)
         assert "PASS" in verify
 
     @pytest.mark.asyncio
     async def test_search(self, browser):
-        result = await search(browser, "test query", "duckduckgo")
+        result = await browser.search("test query", "duckduckgo")
         assert "Searched on Duckduckgo" in result
-        info = await get_current_page_info(browser)
+        info = await browser.get_current_page_info_str()
         assert "duckduckgo.com" in info
-
 
 # ==================== 2. Page & Tab Tools (9 tools) ====================
 
@@ -290,17 +163,17 @@ class TestPageTools:
 
     @pytest.mark.asyncio
     async def test_get_current_page_info(self, browser):
-        result = await get_current_page_info(browser)
+        result = await browser.get_current_page_info_str()
         assert "test_page.html" in result
 
     @pytest.mark.asyncio
     async def test_reload_page(self, browser):
-        result = await reload_page(browser)
+        result = await browser.reload_page()
         assert "reload" in result.lower()
 
     @pytest.mark.asyncio
     async def test_scroll_to_text(self, browser):
-        result = await scroll_to_text(browser, "Hover over me!")
+        result = await browser.scroll_to_text("Hover over me!")
         assert "scroll" in result.lower() or "found" in result.lower()
 
     @pytest.mark.asyncio
@@ -309,7 +182,7 @@ class TestPageTools:
         # Focus on key-display first
         page = await browser.get_current_page()
         await page.focus("#key-display")
-        result = await press_key(browser, "a")
+        result = await browser.press_key("a")
         assert "press" in result.lower() or "key" in result.lower() or result
         # Verify the key was captured
         last_key = await page.text_content("#last-key")
@@ -317,28 +190,28 @@ class TestPageTools:
 
     @pytest.mark.asyncio
     async def test_evaluate_javascript(self, browser):
-        result = await evaluate_javascript(browser, "10 * 5 + 2")
+        result = await browser.evaluate_javascript("10 * 5 + 2")
         assert "52" == result
 
     @pytest.mark.asyncio
     async def test_tab_lifecycle(self, browser):
         """Tests new_tab, get_tabs, switch_tab, close_tab."""
-        result = await new_tab(browser)
-        assert "Created new blank tab" == result
+        result = await browser.new_tab()
+        assert result.startswith("Created new blank tab")
+        assert re.search(r"\bpage_\d+\b", result), result
 
         test_url = f"file://{TEST_PAGE_PATH.absolute()}"
-        await navigate_to_url(browser, test_url)
+        await browser.navigate_to_url(test_url)
 
-        result_str = await get_tabs(browser)
+        result_str = await browser.get_tabs()
         assert len(result_str.split("\n")) == 2
 
         tab_ids = re.findall(r'"page_id"[=:]?\s*"?([^",\}\]]+)"?', result_str)
         if len(tab_ids) >= 2:
-            result = await switch_tab(browser, tab_ids[0])
+            result = await browser.switch_tab(tab_ids[0])
             assert "switch" in result.lower()
-            result = await close_tab(browser, tab_ids[1])
+            result = await browser.close_tab(tab_ids[1])
             assert "close" in result.lower()
-
 
 # ==================== 3. Control Tools (3 tools) ====================
 
@@ -347,7 +220,7 @@ class TestControlTools:
 
     @pytest.mark.asyncio
     async def test_browser_resize(self, browser):
-        result = await browser_resize(browser, 800, 600)
+        result = await browser.browser_resize(800, 600)
         assert "resize" in result.lower() or "800" in result
 
         # Verify viewport changed
@@ -357,18 +230,18 @@ class TestControlTools:
         assert size["h"] == 600
 
         # Restore original size
-        await browser_resize(browser, 1280, 720)
+        await browser.browser_resize(1280, 720)
 
     @pytest.mark.asyncio
     async def test_wait_for_time(self, browser):
         """wait_for with time_seconds waits briefly."""
-        result = await wait_for(browser, time_seconds=0.1)
+        result = await browser.wait_for(time_seconds=0.1)
         assert "wait" in result.lower() or result
 
     @pytest.mark.asyncio
     async def test_wait_for_text(self, browser):
         """wait_for with text waits for visible text."""
-        result = await wait_for(browser, text="Bridgic Browser Test Page", timeout_ms=5000)
+        result = await browser.wait_for(text="Bridgic Browser Test Page", timeout_ms=5000)
         assert "wait" in result.lower() or "found" in result.lower() or result
 
     @pytest.mark.asyncio
@@ -376,15 +249,14 @@ class TestControlTools:
         """browser_close kills the browser instance (separate browser to avoid fixture conflict)."""
         b = Browser(headless=True, stealth=False, viewport={"width": 800, "height": 600})
         await b.start()
-        result = await browser_close(b)
+        result = await b.browser_close()
         assert "close" in result.lower() or "browser" in result.lower() or result
-
 
 # ==================== 4. Action Tools (13 tools) ====================
 
 class TestActionTools:
     """Tests: click_element_by_ref, input_text_by_ref, hover_element_by_ref,
-    focus_element_by_ref, check_element_by_ref, uncheck_element_by_ref,
+    focus_element_by_ref, check_checkbox_by_ref, uncheck_checkbox_by_ref,
     double_click_element_by_ref, scroll_element_into_view_by_ref,
     get_dropdown_options_by_ref, select_dropdown_option_by_ref,
     upload_file_by_ref, drag_element_by_ref, evaluate_javascript_on_ref"""
@@ -396,7 +268,7 @@ class TestActionTools:
         before = await page.text_content("#counter-value")
         btn_ref = find_ref_by_type_and_name(refs, "button", "+1")
         assert btn_ref is not None
-        await click_element_by_ref(browser, btn_ref)
+        await browser.click_element_by_ref(btn_ref)
         after = await page.text_content("#counter-value")
         assert int(after) > int(before)
 
@@ -405,8 +277,8 @@ class TestActionTools:
         browser, _, refs = browser_with_complete_snapshot
         tb_ref = find_ref_by_type_and_name(refs, "textbox", "Username")
         assert tb_ref is not None
-        await input_text_by_ref(browser, tb_ref, "test_user")
-        result = await verify_value(browser, tb_ref, "test_user")
+        await browser.input_text_by_ref(tb_ref, "test_user")
+        result = await browser.verify_value(tb_ref, "test_user")
         assert "PASS" in result
 
     @pytest.mark.asyncio
@@ -414,7 +286,7 @@ class TestActionTools:
         browser, _, refs = browser_with_complete_snapshot
         hover_ref = find_ref_by_type_and_name(refs, "generic", "Hover over me!")
         assert hover_ref is not None
-        result = await hover_element_by_ref(browser, hover_ref)
+        result = await browser.hover_element_by_ref(hover_ref)
         assert "hover" in result.lower() or "success" in result.lower()
 
     @pytest.mark.asyncio
@@ -422,7 +294,7 @@ class TestActionTools:
         browser, _, refs = browser_with_complete_snapshot
         tb_ref = find_ref_by_type_and_name(refs, "textbox", "Email")
         assert tb_ref is not None
-        result = await focus_element_by_ref(browser, tb_ref)
+        result = await browser.focus_element_by_ref(tb_ref)
         assert "error" not in result.lower()
 
     @pytest.mark.asyncio
@@ -431,12 +303,12 @@ class TestActionTools:
         cb_ref = find_ref_by_type_and_name(refs, "checkbox", "Technology")
         assert cb_ref is not None
 
-        await check_element_by_ref(browser, cb_ref)
-        result = await verify_element_state(browser, cb_ref, "checked")
+        await browser.check_checkbox_by_ref(cb_ref)
+        result = await browser.verify_element_state(cb_ref, "checked")
         assert "PASS" in result
 
-        await uncheck_element_by_ref(browser, cb_ref)
-        result = await verify_element_state(browser, cb_ref, "unchecked")
+        await browser.uncheck_checkbox_by_ref(cb_ref)
+        result = await browser.verify_element_state(cb_ref, "unchecked")
         assert "PASS" in result
 
     @pytest.mark.asyncio
@@ -446,7 +318,7 @@ class TestActionTools:
         before = await page.text_content("#double-click-count")
         dbl_ref = find_ref_by_type_and_name(refs, "generic", "Double-click me!")
         assert dbl_ref is not None
-        await double_click_element_by_ref(browser, dbl_ref)
+        await browser.double_click_element_by_ref(dbl_ref)
         after = await page.text_content("#double-click-count")
         assert int(after) > int(before)
 
@@ -456,7 +328,7 @@ class TestActionTools:
         # Pick an element that's below the viewport
         btn_ref = find_ref_by_type_and_name(refs, "button", "Show Alert")
         assert btn_ref is not None
-        result = await scroll_element_into_view_by_ref(browser, btn_ref)
+        result = await browser.scroll_element_into_view_by_ref(btn_ref)
         assert "error" not in result.lower()
 
     @pytest.mark.asyncio
@@ -466,11 +338,11 @@ class TestActionTools:
         combo_ref = find_ref_by_type_and_name(refs, "combobox", "Country")
         assert combo_ref is not None
 
-        options_result = await get_dropdown_options_by_ref(browser, combo_ref)
+        options_result = await browser.get_dropdown_options_by_ref(combo_ref)
         assert "United States" in options_result
         assert "China" in options_result
 
-        result = await select_dropdown_option_by_ref(browser, combo_ref, "Japan")
+        result = await browser.select_dropdown_option_by_ref(combo_ref, "Japan")
         assert "error" not in result.lower()
 
         # Verify selection took effect
@@ -492,7 +364,7 @@ class TestActionTools:
             temp_path = f.name
 
         try:
-            result = await upload_file_by_ref(browser, file_ref, temp_path)
+            result = await browser.upload_file_by_ref(file_ref, temp_path)
             assert "error" not in result.lower() or "upload" in result.lower()
         finally:
             os.unlink(temp_path)
@@ -506,7 +378,7 @@ class TestActionTools:
         item1_ref = find_ref_by_type_and_name(refs, "generic", "Item 1")
         item2_ref = find_ref_by_type_and_name(refs, "generic", "Item 2")
         if item1_ref and item2_ref:
-            result = await drag_element_by_ref(browser, item1_ref, item2_ref)
+            result = await browser.drag_element_by_ref(item1_ref, item2_ref)
             # Just verify it doesn't crash
             assert result is not None
 
@@ -515,11 +387,10 @@ class TestActionTools:
         browser, _, refs = browser_with_complete_snapshot
         btn_ref = find_ref_by_type_and_name(refs, "button", "Primary")
         assert btn_ref is not None
-        result = await evaluate_javascript_on_ref(
-            browser, btn_ref, "el => el.textContent",
+        result = await browser.evaluate_javascript_on_ref(
+            btn_ref, "el => el.textContent",
         )
         assert "Primary" in result
-
 
 # ==================== 5. Mouse Tools (6 tools) ====================
 
@@ -528,7 +399,7 @@ class TestMouseTools:
 
     @pytest.mark.asyncio
     async def test_mouse_move(self, browser):
-        result = await mouse_move(browser, 400, 300)
+        result = await browser.mouse_move(400, 300)
         assert "mouse" in result.lower() or "move" in result.lower() or result
 
         # Verify mouse position was tracked
@@ -551,7 +422,7 @@ class TestMouseTools:
         cy = box["y"] + box["height"] / 2
 
         before = await page.text_content("#counter-value")
-        result = await mouse_click(browser, cx, cy)
+        result = await browser.mouse_click(cx, cy)
         assert result is not None
         after = await page.text_content("#counter-value")
         assert int(after) > int(before)
@@ -559,16 +430,16 @@ class TestMouseTools:
     @pytest.mark.asyncio
     async def test_mouse_drag(self, browser):
         """mouse_drag from start to end coordinates."""
-        result = await mouse_drag(browser, 100, 100, 300, 300)
+        result = await browser.mouse_drag(100, 100, 300, 300)
         assert result is not None
 
     @pytest.mark.asyncio
     async def test_mouse_down_and_up(self, browser):
         """mouse_down and mouse_up lifecycle."""
-        await mouse_move(browser, 400, 300)
-        result_down = await mouse_down(browser)
+        await browser.mouse_move(400, 300)
+        result_down = await browser.mouse_down()
         assert result_down is not None
-        result_up = await mouse_up(browser)
+        result_up = await browser.mouse_up()
         assert result_up is not None
 
     @pytest.mark.asyncio
@@ -576,26 +447,25 @@ class TestMouseTools:
         """mouse_wheel scrolls the page."""
         page = await browser.get_current_page()
         scroll_before = await page.evaluate("window.scrollY")
-        result = await mouse_wheel(browser, delta_y=300)
+        result = await browser.mouse_wheel(delta_y=300)
         assert result is not None
         await asyncio.sleep(0.2)
         scroll_after = await page.evaluate("window.scrollY")
         assert scroll_after > scroll_before
 
-
 # ==================== 6. Keyboard Tools (5 tools) ====================
 
 class TestKeyboardTools:
-    """Tests: press_sequentially, key_down, key_up, fill_form, insert_text"""
+    """Tests: type_text, key_down, key_up, fill_form, insert_text"""
 
     @pytest.mark.asyncio
-    async def test_press_sequentially(self, browser_with_complete_snapshot):
-        """press_sequentially types text character by character."""
+    async def test_type_text(self, browser_with_complete_snapshot):
+        """type_text types text character by character."""
         browser, _, refs = browser_with_complete_snapshot
         tb_ref = find_ref_by_type_and_name(refs, "textbox", "Username")
         assert tb_ref is not None
-        await focus_element_by_ref(browser, tb_ref)
-        result = await press_sequentially(browser, "hello")
+        await browser.focus_element_by_ref(tb_ref)
+        result = await browser.type_text("hello")
         assert result is not None
 
         page = await browser.get_current_page()
@@ -607,9 +477,9 @@ class TestKeyboardTools:
         """key_down and key_up send individual key events."""
         page = await browser.get_current_page()
         await page.focus("#key-display")
-        result_down = await key_down(browser, "Shift")
+        result_down = await browser.key_down("Shift")
         assert result_down is not None
-        result_up = await key_up(browser, "Shift")
+        result_up = await browser.key_up("Shift")
         assert result_up is not None
 
     @pytest.mark.asyncio
@@ -618,8 +488,8 @@ class TestKeyboardTools:
         browser, _, refs = browser_with_complete_snapshot
         tb_ref = find_ref_by_type_and_name(refs, "textbox", "Email")
         assert tb_ref is not None
-        await focus_element_by_ref(browser, tb_ref)
-        result = await insert_text(browser, "test@example.com")
+        await browser.focus_element_by_ref(tb_ref)
+        result = await browser.insert_text("test@example.com")
         assert result is not None
 
         page = await browser.get_current_page()
@@ -634,7 +504,7 @@ class TestKeyboardTools:
         email_ref = find_ref_by_type_and_name(refs, "textbox", "Email")
         assert username_ref and email_ref
 
-        result = await fill_form(browser, [
+        result = await browser.fill_form([
             {"ref": username_ref, "value": "form_user"},
             {"ref": email_ref, "value": "form@test.com"},
         ])
@@ -646,7 +516,6 @@ class TestKeyboardTools:
         assert "form_user" in username_val
         assert "form@test.com" in email_val
 
-
 # ==================== 7. Screenshot Tools (2 tools) ====================
 
 class TestScreenshotTools:
@@ -656,7 +525,7 @@ class TestScreenshotTools:
     async def test_take_screenshot(self, browser):
         with tempfile.TemporaryDirectory() as tmpdir:
             filepath = os.path.join(tmpdir, "screenshot.png")
-            result = await take_screenshot(browser, filename=filepath)
+            result = await browser.take_screenshot(filename=filepath)
             assert result is not None
             assert os.path.exists(filepath)
             assert os.path.getsize(filepath) > 0
@@ -665,7 +534,7 @@ class TestScreenshotTools:
     async def test_take_screenshot_full_page(self, browser):
         with tempfile.TemporaryDirectory() as tmpdir:
             filepath = os.path.join(tmpdir, "full.png")
-            result = await take_screenshot(browser, filename=filepath, full_page=True)
+            result = await browser.take_screenshot(filename=filepath, full_page=True)
             assert result is not None
             assert os.path.exists(filepath)
 
@@ -673,11 +542,10 @@ class TestScreenshotTools:
     async def test_save_pdf(self, browser):
         with tempfile.TemporaryDirectory() as tmpdir:
             filepath = os.path.join(tmpdir, "page.pdf")
-            result = await save_pdf(browser, filename=filepath)
+            result = await browser.save_pdf(filename=filepath)
             assert result is not None
             assert os.path.exists(filepath)
             assert os.path.getsize(filepath) > 0
-
 
 # ==================== 8. Network Tools (7 tools) ====================
 
@@ -689,7 +557,7 @@ class TestNetworkTools:
     @pytest.mark.asyncio
     async def test_console_capture_lifecycle(self, browser):
         """Tests start_console_capture, get_console_messages, stop_console_capture."""
-        result = await start_console_capture(browser)
+        result = await browser.start_console_capture()
         assert result is not None
 
         # Trigger a console.log via JS (test page logs on load)
@@ -697,33 +565,32 @@ class TestNetworkTools:
         await page.evaluate("console.log('integration_test_message')")
         await asyncio.sleep(0.2)
 
-        messages = await get_console_messages(browser)
+        messages = await browser.get_console_messages()
         assert "integration_test_message" in messages
 
-        result = await stop_console_capture(browser)
+        result = await browser.stop_console_capture()
         assert result is not None
 
     @pytest.mark.asyncio
     async def test_network_capture_lifecycle(self, browser):
         """Tests start_network_capture, get_network_requests, stop_network_capture."""
-        result = await start_network_capture(browser)
+        result = await browser.start_network_capture()
         assert result is not None
 
         # Trigger a navigation (which creates network requests)
         test_url = f"file://{TEST_PAGE_PATH.absolute()}"
-        await navigate_to_url(browser, test_url)
+        await browser.navigate_to_url(test_url)
 
-        reqs = await get_network_requests(browser, include_static=True)
+        reqs = await browser.get_network_requests(include_static=True)
         assert reqs is not None
 
-        result = await stop_network_capture(browser)
+        result = await browser.stop_network_capture()
         assert result is not None
 
     @pytest.mark.asyncio
     async def test_wait_for_network_idle(self, browser):
-        result = await wait_for_network_idle(browser, timeout=5000)
+        result = await browser.wait_for_network_idle(timeout=5000)
         assert result is not None
-
 
 # ==================== 9. Dialog Tools (3 tools) ====================
 
@@ -734,7 +601,7 @@ class TestDialogTools:
     async def test_dialog_handler_lifecycle(self, browser):
         """Tests setup_dialog_handler, handle_dialog (via auto-accept), remove_dialog_handler."""
         # Set up auto-accept handler
-        result = await setup_dialog_handler(browser, default_action="accept")
+        result = await browser.setup_dialog_handler(default_action="accept")
         assert result is not None
 
         # Trigger alert and it should be auto-accepted
@@ -743,14 +610,14 @@ class TestDialogTools:
         await asyncio.sleep(0.5)
 
         # Remove handler
-        result = await remove_dialog_handler(browser)
+        result = await browser.remove_dialog_handler()
         assert result is not None
 
     @pytest.mark.asyncio
     async def test_dialog_handler_with_prompt(self, browser):
         """setup_dialog_handler with prompt text."""
-        result = await setup_dialog_handler(
-            browser, default_action="accept", default_prompt_text="my_answer",
+        result = await browser.setup_dialog_handler(
+            default_action="accept", default_prompt_text="my_answer",
         )
         assert result is not None
 
@@ -762,15 +629,14 @@ class TestDialogTools:
         # The auto handler should have responded with "my_answer"
         assert answer == "my_answer"
 
-        await remove_dialog_handler(browser)
+        await browser.remove_dialog_handler()
 
     @pytest.mark.asyncio
     async def test_handle_dialog_directly(self, browser):
         """handle_dialog accepts/dismisses a pending dialog."""
         # handle_dialog sets up a one-shot handler for the next dialog
-        result = await handle_dialog(browser, accept=True, prompt_text=None)
+        result = await browser.handle_dialog(accept=True, prompt_text=None)
         assert result is not None
-
 
 # ==================== 10. Storage Tools (5 tools) ====================
 
@@ -783,18 +649,18 @@ class TestStorageTools:
         """Tests set_cookie and get_cookies."""
         # Navigate to http page for cookie domain (file:// doesn't support cookies well)
         # Use the current page URL for cookie setting
-        result = await set_cookie(
-            browser, name="test_cookie", value="test_value",
+        result = await browser.set_cookie(
+            name="test_cookie", value="test_value",
             url="http://localhost", domain="localhost",
         )
         assert result is not None
 
-        cookies_result = await get_cookies(browser)
+        cookies_result = await browser.get_cookies()
         assert cookies_result is not None
 
     @pytest.mark.asyncio
     async def test_clear_cookies(self, browser):
-        result = await clear_cookies(browser)
+        result = await browser.clear_cookies()
         assert "clear" in result.lower() or "cookie" in result.lower() or result
 
     @pytest.mark.asyncio
@@ -802,14 +668,13 @@ class TestStorageTools:
         """Tests save_storage_state and restore_storage_state."""
         with tempfile.TemporaryDirectory() as tmpdir:
             filepath = os.path.join(tmpdir, "state.json")
-            result = await save_storage_state(browser, filename=filepath)
+            result = await browser.save_storage_state(filename=filepath)
             assert result is not None
             assert os.path.exists(filepath)
 
             # Restore it
-            result = await restore_storage_state(browser, filename=filepath)
+            result = await browser.restore_storage_state(filename=filepath)
             assert result is not None
-
 
 # ==================== 11. Verification Tools (6 tools) ====================
 
@@ -819,42 +684,42 @@ class TestVerificationTools:
 
     @pytest.mark.asyncio
     async def test_verify_element_visible(self, browser):
-        result = await verify_element_visible(browser, "heading", "Bridgic Browser Test Page")
+        result = await browser.verify_element_visible("heading", "Bridgic Browser Test Page")
         assert "PASS" in result
 
     @pytest.mark.asyncio
     async def test_verify_element_visible_not_found(self, browser):
-        result = await verify_element_visible(
-            browser, "heading", "NonExistent Element XYZ", timeout=1000,
+        result = await browser.verify_element_visible(
+            "heading", "NonExistent Element XYZ", timeout=1000,
         )
         assert "FAIL" in result
 
     @pytest.mark.asyncio
     async def test_verify_text_visible(self, browser):
-        result = await verify_text_visible(browser, "Bridgic Browser Test Page")
+        result = await browser.verify_text_visible("Bridgic Browser Test Page")
         assert "PASS" in result
 
     @pytest.mark.asyncio
     async def test_verify_text_visible_exact(self, browser):
-        result = await verify_text_visible(
-            browser, "Nonexistent text XYZ", exact=True, timeout=1000,
+        result = await browser.verify_text_visible(
+            "Nonexistent text XYZ", exact=True, timeout=1000,
         )
         assert "FAIL" in result
 
     @pytest.mark.asyncio
     async def test_verify_url(self, browser):
         test_url = f"file://{TEST_PAGE_PATH.absolute()}"
-        result = await verify_url(browser, test_url, exact=True)
+        result = await browser.verify_url(test_url, exact=True)
         assert "PASS" in result
 
     @pytest.mark.asyncio
     async def test_verify_title(self, browser):
-        result = await verify_title(browser, "Bridgic Browser Test Page", exact=True)
+        result = await browser.verify_title("Bridgic Browser Test Page", exact=True)
         assert "PASS" in result
 
     @pytest.mark.asyncio
     async def test_verify_title_partial(self, browser):
-        result = await verify_title(browser, "Bridgic", exact=False)
+        result = await browser.verify_title("Bridgic", exact=False)
         assert "PASS" in result
 
     @pytest.mark.asyncio
@@ -863,7 +728,7 @@ class TestVerificationTools:
         tb_ref = find_ref_by_type_and_name(refs, "textbox", "Username")
         assert tb_ref is not None
         # Empty by default
-        result = await verify_value(browser, tb_ref, "")
+        result = await browser.verify_value(tb_ref, "")
         assert "PASS" in result
 
     @pytest.mark.asyncio
@@ -872,9 +737,8 @@ class TestVerificationTools:
         # Disabled button
         btn_ref = find_ref_by_type_and_name(refs, "button", "Disabled Button")
         assert btn_ref is not None
-        result = await verify_element_state(browser, btn_ref, "disabled")
+        result = await browser.verify_element_state(btn_ref, "disabled")
         assert "PASS" in result
-
 
 # ==================== 12. DevTools Tools (5 tools) ====================
 
@@ -884,31 +748,31 @@ class TestDevTools:
     @pytest.mark.asyncio
     async def test_tracing_lifecycle(self, browser):
         """Tests start_tracing, add_trace_chunk, stop_tracing."""
-        result = await start_tracing(browser)
+        result = await browser.start_tracing()
         assert result is not None
 
         # Perform some action while tracing
-        await evaluate_javascript(browser, "1 + 1")
-        result = await add_trace_chunk(browser, title="test_chunk")
+        await browser.evaluate_javascript("1 + 1")
+        result = await browser.add_trace_chunk(title="test_chunk")
         assert result is not None
 
         with tempfile.TemporaryDirectory() as tmpdir:
             filepath = os.path.join(tmpdir, "trace.zip")
-            result = await stop_tracing(browser, filename=filepath)
+            result = await browser.stop_tracing(filename=filepath)
             assert result is not None
             assert os.path.exists(filepath)
 
     @pytest.mark.asyncio
     async def test_video_lifecycle(self, browser):
         """Tests start_video, stop_video."""
-        result = await start_video(browser)
+        result = await browser.start_video()
         assert result is not None
 
         # Perform some action while recording
-        await evaluate_javascript(browser, "document.title")
+        await browser.evaluate_javascript("document.title")
         await asyncio.sleep(0.5)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             filepath = os.path.join(tmpdir, "video.webm")
-            result = await stop_video(browser, filename=filepath)
+            result = await browser.stop_video(filename=filepath)
             assert result is not None

@@ -270,7 +270,12 @@ class TestGetLocatorFromRefAsync:
         locator = gen.get_locator_from_ref_async(page, "e1", refs)
 
         assert locator is role_locator
-        page.get_by_role.assert_called_once_with("cell")
+        # Blank name is normalized to None → unnamed locator uses empty-name regex
+        import re
+        page.get_by_role.assert_called_once()
+        call_args = page.get_by_role.call_args
+        assert call_args[0][0] == "cell"
+        assert call_args[1]["name"].pattern == re.compile(r"^$").pattern
         role_locator.nth.assert_not_called()
 
     def test_structural_noise_blank_text_falls_back_to_role_without_nth(self, gen: SnapshotGenerator) -> None:
@@ -293,11 +298,13 @@ class TestGetLocatorFromRefAsync:
         page.get_by_role.assert_called_once_with("generic")
         role_locator.nth.assert_not_called()
 
-    def test_unnamed_generic_falls_back_to_text_child(self, gen: SnapshotGenerator) -> None:
-        """Unnamed generic with a text child should locate via the child's text."""
+    def test_unnamed_generic_falls_back_to_css_scoped_child_text(self, gen: SnapshotGenerator) -> None:
+        """Unnamed generic with a text child should locate via CSS-scoped child text."""
         page = Mock()
-        text_locator = Mock()
-        page.get_by_text.return_value = text_locator
+        css_locator = Mock()
+        filtered_locator = Mock()
+        page.locator.return_value = css_locator
+        css_locator.filter.return_value = filtered_locator
         refs = {
             "e28": RefData(
                 selector="get_by_role('generic')",
@@ -319,30 +326,32 @@ class TestGetLocatorFromRefAsync:
 
         locator = gen.get_locator_from_ref_async(page, "e28", refs)
 
-        assert locator is text_locator
-        page.get_by_text.assert_called_once_with("ID", exact=True)
+        assert locator is filtered_locator
+        page.locator.assert_called_once_with('div:not([role]), legend, [role="generic"]')
+        css_locator.filter.assert_called_once()
         page.get_by_role.assert_not_called()
 
-    def test_unnamed_generic_with_nth_does_not_apply_nth_to_text_locator(
+    def test_unnamed_generic_with_nth_does_not_apply_nth_to_css_child_text_locator(
         self, gen: SnapshotGenerator
     ) -> None:
         """nth stored on an unnamed generic must NOT be applied to the child-text locator.
 
         The stored nth was computed in the 'generic:' key space (all unnamed generics).
-        The child-text locator ('get_by_text') operates in a different count space —
-        applying the wrong nth would throw an out-of-bounds error or select the wrong element.
+        The CSS-scoped child-text locator counts generic elements containing that text —
+        a different key space.  Applying the wrong nth would select the wrong element.
         """
         page = Mock()
-        text_locator = Mock()
-        page.get_by_text.return_value = text_locator
+        css_locator = Mock()
+        filtered_locator = Mock()
+        page.locator.return_value = css_locator
+        css_locator.filter.return_value = filtered_locator
         refs = {
             "e28": RefData(
                 selector="get_by_role('generic')",
                 role="generic",
                 name=None,
-                # nth=1 means this is the 2nd unnamed generic on the page — but there
-                # may be only ONE element containing "ID" text, so applying .nth(1)
-                # to get_by_text("ID") would be wrong.
+                # nth=1 means this is the 2nd unnamed generic on the page — but the
+                # CSS-scoped child-text locator has a different count space.
                 nth=1,
                 text_content=None,
                 parent_ref=None,
@@ -359,11 +368,11 @@ class TestGetLocatorFromRefAsync:
 
         locator = gen.get_locator_from_ref_async(page, "e28", refs)
 
-        assert locator is text_locator
-        page.get_by_text.assert_called_once_with("ID", exact=True)
-        # .nth() must NOT be called on the text_locator — the stored nth is in
-        # the wrong key space for a text-based locator.
-        text_locator.nth.assert_not_called()
+        assert locator is filtered_locator
+        page.locator.assert_called_once_with('div:not([role]), legend, [role="generic"]')
+        css_locator.filter.assert_called_once()
+        # .nth() must NOT be called — the stored nth is in a different key space
+        filtered_locator.nth.assert_not_called()
 
     def test_unnamed_generic_no_text_child_falls_back_to_role(self, gen: SnapshotGenerator) -> None:
         """Unnamed generic with no text children still falls back to get_by_role."""
@@ -430,10 +439,13 @@ class TestGetLocatorFromRefAsync:
         page.get_by_role.assert_called_once_with("button", name="Submit", exact=True)
         role_locator.nth.assert_not_called()
 
-    def test_structural_noise_uses_get_by_text_without_implicit_nth(self, gen: SnapshotGenerator) -> None:
+    def test_structural_noise_uses_css_scoped_locator_without_implicit_nth(self, gen: SnapshotGenerator) -> None:
+        """Named generic elements use CSS-scoped locator (div/span) + text filter."""
         page = Mock()
-        text_locator = Mock()
-        page.get_by_text.return_value = text_locator
+        css_locator = Mock()
+        filtered_locator = Mock()
+        page.locator.return_value = css_locator
+        css_locator.filter.return_value = filtered_locator
         refs = {
             "e1": RefData(
                 selector='get_by_text("Username", exact=True)',
@@ -446,21 +458,33 @@ class TestGetLocatorFromRefAsync:
 
         locator = gen.get_locator_from_ref_async(page, "e1", refs)
 
-        assert locator is text_locator
-        page.get_by_text.assert_called_once_with("Username", exact=True)
-        text_locator.nth.assert_not_called()
+        assert locator is filtered_locator
+        page.locator.assert_called_once_with('div:not([role]), legend, [role="generic"]')
+        css_locator.filter.assert_called_once()
+        # No nth since ref_data.nth is None
+        filtered_locator.nth.assert_not_called()
 
-    def test_structural_noise_with_explicit_nth_preserves_it(self, gen: SnapshotGenerator) -> None:
+    def test_named_generic_with_nth_applies_nth_to_css_scoped_locator(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """nth stored on a named generic IS applied to the CSS-scoped locator.
+
+        The CSS-scoped locator (div:not([role])) restricts to elements whose implicit
+        role is generic, matching the role:name key space used to compute nth.
+        Unlike the old get_by_text approach, nth is safe to apply here.
+        """
         page = Mock()
-        text_locator = Mock()
+        css_locator = Mock()
+        filtered_locator = Mock()
         nth_locator = Mock()
-        page.get_by_text.return_value = text_locator
-        text_locator.nth.return_value = nth_locator
+        page.locator.return_value = css_locator
+        css_locator.filter.return_value = filtered_locator
+        filtered_locator.nth.return_value = nth_locator
         refs = {
             "e1": RefData(
-                selector='get_by_text("自动检测", exact=True)',
+                selector='get_by_text("Pending", exact=True)',
                 role="generic",
-                name="自动检测",
+                name="Pending",
                 nth=2,
                 text_content=None,
             )
@@ -469,7 +493,10 @@ class TestGetLocatorFromRefAsync:
         locator = gen.get_locator_from_ref_async(page, "e1", refs)
 
         assert locator is nth_locator
-        text_locator.nth.assert_called_once_with(2)
+        page.locator.assert_called_once_with('div:not([role]), legend, [role="generic"]')
+        css_locator.filter.assert_called_once()
+        # nth IS applied — CSS-scoped key space matches role:name key space
+        filtered_locator.nth.assert_called_once_with(2)
 
     def test_bare_text_content_fallback_no_longer_forces_nth0(self, gen: SnapshotGenerator) -> None:
         page = Mock()
@@ -491,12 +518,15 @@ class TestGetLocatorFromRefAsync:
         page.get_by_text.assert_called_once_with("自动检测", exact=True)
         text_locator.nth.assert_not_called()
 
-    def test_bare_text_content_with_explicit_nth_preserves_it(self, gen: SnapshotGenerator) -> None:
+    def test_bare_text_content_with_explicit_nth_skips_nth(self, gen: SnapshotGenerator) -> None:
+        """Unnamed button with text_content: nth must NOT be applied.
+
+        The nth key 'button:' counts all unnamed buttons, but get_by_text("Click me")
+        counts all elements with that text regardless of role — a different key space.
+        """
         page = Mock()
         text_locator = Mock()
-        nth_locator = Mock()
         page.get_by_text.return_value = text_locator
-        text_locator.nth.return_value = nth_locator
         refs = {
             "e1": RefData(
                 selector='get_by_text("Click me", exact=True)',
@@ -509,8 +539,9 @@ class TestGetLocatorFromRefAsync:
 
         locator = gen.get_locator_from_ref_async(page, "e1", refs)
 
-        assert locator is nth_locator
-        text_locator.nth.assert_called_once_with(3)
+        assert locator is text_locator
+        page.get_by_text.assert_called_once_with("Click me", exact=True)
+        text_locator.nth.assert_not_called()
 
     def test_bare_role_no_name_no_longer_forces_nth0(self, gen: SnapshotGenerator) -> None:
         page = Mock()
@@ -529,7 +560,12 @@ class TestGetLocatorFromRefAsync:
         locator = gen.get_locator_from_ref_async(page, "e1", refs)
 
         assert locator is role_locator
-        page.get_by_role.assert_called_once_with("separator")
+        # Unnamed element → uses empty-name regex to avoid key-space mismatch
+        import re
+        page.get_by_role.assert_called_once()
+        call_args = page.get_by_role.call_args
+        assert call_args[0][0] == "separator"
+        assert call_args[1]["name"].pattern == re.compile(r"^$").pattern
         role_locator.nth.assert_not_called()
 
     def test_text_role_with_name_uses_get_by_text(self, gen: SnapshotGenerator) -> None:
@@ -553,12 +589,18 @@ class TestGetLocatorFromRefAsync:
         page.get_by_role.assert_not_called()
         text_locator.nth.assert_not_called()
 
-    def test_text_role_with_explicit_nth(self, gen: SnapshotGenerator) -> None:
+    def test_text_role_with_nth_does_not_apply_nth_to_text_locator(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """nth stored on a text-leaf role must NOT be applied to the get_by_text locator.
+
+        The stored nth was computed counting only text-leaf nodes with this text,
+        but get_by_text also matches buttons, headings, cells, etc. — a different key
+        space.  Applying the wrong nth silently selects the wrong element.
+        """
         page = Mock()
         text_locator = Mock()
-        nth_locator = Mock()
         page.get_by_text.return_value = text_locator
-        text_locator.nth.return_value = nth_locator
         refs = {
             "e1": RefData(
                 selector='get_by_text("Label", exact=True)',
@@ -571,8 +613,9 @@ class TestGetLocatorFromRefAsync:
 
         locator = gen.get_locator_from_ref_async(page, "e1", refs)
 
-        assert locator is nth_locator
-        text_locator.nth.assert_called_once_with(3)
+        assert locator is text_locator
+        page.get_by_text.assert_called_once_with("Label", exact=True)
+        text_locator.nth.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

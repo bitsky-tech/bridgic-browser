@@ -2,6 +2,7 @@
 Unit tests for the Browser class.
 """
 
+import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -263,13 +264,13 @@ class TestBrowserStartStop:
 
     @pytest.mark.asyncio
     async def test_kill_cleanup(self, mock_playwright, mock_context, mock_page):
-        """Test that kill cleans up all resources."""
+        """Test that stop cleans up all resources."""
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(stealth=False)
             await browser.start()
-            await browser.kill()
+            await browser.stop()
 
             assert browser._playwright is None
             assert browser._browser is None
@@ -278,7 +279,7 @@ class TestBrowserStartStop:
 
     @pytest.mark.asyncio
     async def test_kill_cleans_temp_dir(self, mock_playwright):
-        """Test that kill cleans up temporary user data directory."""
+        """Test that stop cleans up temporary user data directory."""
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
@@ -288,7 +289,7 @@ class TestBrowserStartStop:
             # Stealth with extensions creates temp dir
             temp_dir = browser._temp_user_data_dir
 
-            await browser.kill()
+            await browser.stop()
 
             assert browser._temp_user_data_dir is None
 
@@ -311,6 +312,163 @@ class TestBrowserStartStop:
             assert browser._browser is None
             assert browser._context is None
             assert browser._page is None
+
+    @pytest.mark.asyncio
+    async def test_stop_auto_saves_active_trace_and_video(self, mock_playwright):
+        """stop() auto-finalizes active tracing/video before teardown."""
+        from bridgic.browser.session import _browser as browser_module
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser.start()
+
+            context = browser._context
+            page = browser._page
+            assert context is not None
+            assert page is not None
+
+            context.tracing = MagicMock()
+            context.tracing.stop = AsyncMock()
+            context.pages = [page]
+
+            page.video = MagicMock()
+            page.video.path = AsyncMock(return_value="/tmp/playwright-video.webm")
+
+            context_key = browser_module._get_context_key(context)
+            browser_module._tracing_state[context_key] = True
+            browser_module._video_state[context_key] = True
+
+            with patch.object(browser_module.tempfile, "mkstemp", return_value=(99, "/tmp/auto_trace.zip")):
+                with patch.object(browser_module.os, "close"):
+                    await browser.stop()
+
+            context.tracing.stop.assert_awaited_once_with(path="/tmp/auto_trace.zip")
+            page.close.assert_awaited()
+            assert browser._last_shutdown_artifacts["trace"] == [os.path.abspath("/tmp/auto_trace.zip")]
+            assert browser._last_shutdown_artifacts["video"] == [
+                os.path.abspath("/tmp/playwright-video.webm")
+            ]
+            assert context_key not in browser_module._tracing_state
+            assert context_key not in browser_module._video_state
+
+    @pytest.mark.asyncio
+    async def test_browser_close_reports_auto_saved_paths(self, mock_playwright):
+        """browser_close() should include auto-saved artifact paths in the result."""
+        from bridgic.browser.session import _browser as browser_module
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser.start()
+
+            context = browser._context
+            page = browser._page
+            assert context is not None
+            assert page is not None
+
+            context.tracing = MagicMock()
+            context.tracing.stop = AsyncMock()
+            context.pages = [page]
+
+            page.video = MagicMock()
+            page.video.path = AsyncMock(return_value="/tmp/auto_video.webm")
+
+            context_key = browser_module._get_context_key(context)
+            browser_module._tracing_state[context_key] = True
+            browser_module._video_state[context_key] = True
+
+            with patch.object(browser_module.tempfile, "mkstemp", return_value=(88, "/tmp/auto_trace_2.zip")):
+                with patch.object(browser_module.os, "close"):
+                    result = await browser.browser_close()
+
+            assert "Browser closed successfully" in result
+            assert os.path.abspath("/tmp/auto_trace_2.zip") in result
+            assert os.path.abspath("/tmp/auto_video.webm") in result
+
+    @pytest.mark.asyncio
+    async def test_browser_close_warns_on_trace_finalize_failure(self, mock_playwright):
+        """browser_close() should report warnings when trace auto-save fails."""
+        from bridgic.browser.session import _browser as browser_module
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser.start()
+
+            context = browser._context
+            page = browser._page
+            assert context is not None
+            assert page is not None
+
+            context.tracing = MagicMock()
+            context.tracing.stop = AsyncMock(side_effect=RuntimeError("disk full"))
+            context.pages = [page]
+
+            context_key = browser_module._get_context_key(context)
+            browser_module._tracing_state[context_key] = True
+
+            temp_trace_path = "/tmp/auto_trace_failed.zip"
+
+            def _exists(path: str) -> bool:
+                return path == temp_trace_path
+
+            with patch.object(browser_module.tempfile, "mkstemp", return_value=(77, temp_trace_path)):
+                with patch.object(browser_module.os, "close"):
+                    with patch.object(browser_module.os.path, "exists", side_effect=_exists):
+                        with patch.object(browser_module.os, "remove") as mock_remove:
+                            result = await browser.browser_close()
+
+            mock_remove.assert_called_once_with(temp_trace_path)
+            assert "Browser closed with warnings" in result
+            assert "tracing.stop: disk full" in result
+
+    @pytest.mark.asyncio
+    async def test_stop_clears_page_scoped_handlers_before_auto_video_finalize(self, mock_playwright):
+        """stop() should remove page listeners/caches even when auto-video closes the page first."""
+        from bridgic.browser.session import _browser as browser_module
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser.start()
+
+            context = browser._context
+            page = browser._page
+            assert context is not None
+            assert page is not None
+
+            context.pages = [page]
+            page.video = MagicMock()
+            page.video.path = AsyncMock(return_value="/tmp/auto_listener_video.webm")
+
+            context_key = browser_module._get_context_key(context)
+            browser_module._video_state[context_key] = True
+
+            page_key = browser_module._get_page_key(page)
+            console_handler = MagicMock()
+            network_handler = MagicMock()
+            dialog_handler = MagicMock()
+            browser_module._console_handlers[page_key] = console_handler
+            browser_module._network_handlers[page_key] = network_handler
+            browser_module._dialog_handlers[page_key] = dialog_handler
+            browser_module._console_messages[page_key] = [{"type": "log", "text": "x"}]
+            browser_module._network_requests[page_key] = [{"url": "https://example.com"}]
+
+            await browser.stop()
+
+            page.remove_listener.assert_any_call("console", console_handler)
+            page.remove_listener.assert_any_call("request", network_handler)
+            page.remove_listener.assert_any_call("dialog", dialog_handler)
+            assert page_key not in browser_module._console_handlers
+            assert page_key not in browser_module._network_handlers
+            assert page_key not in browser_module._dialog_handlers
+            assert page_key not in browser_module._console_messages
+            assert page_key not in browser_module._network_requests
 
 
 class TestBrowserNavigation:

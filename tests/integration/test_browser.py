@@ -16,7 +16,7 @@ async def browser_instance():
     browser = Browser(headless=True, stealth=False)
     await browser.start()
     yield browser
-    await browser.kill()
+    await browser.stop()
 
 
 @pytest.mark.integration

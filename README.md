@@ -58,7 +58,7 @@ async def main():
         if element:
             await element.click()
     finally:
-        await browser.close()
+        await browser.stop()
 
 asyncio.run(main())
 ```
@@ -67,15 +67,15 @@ asyncio.run(main())
 
 ```python
 from bridgic.browser.session import Browser
-from bridgic.browser.tools import BrowserToolSetBuilder
+from bridgic.browser.tools import BrowserToolSetBuilder, ToolPreset
 
 async def create_agent():
     browser = Browser(headless=False)
     await browser.start()
 
-    # Build tool set for your agent (basic_tools = FORM_FILLING preset; prefer for_preset for control)
-    tools = BrowserToolSetBuilder.basic_tools(browser)
-    # Or: tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)
+    # Build tool set for your agent
+    builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)
+    tools = builder.build()["tool_specs"]
 
     # Use tools with your LLM agent
     # tools include: navigate, click, input_text, scroll, etc.
@@ -106,7 +106,7 @@ Browser options are read at daemon startup from the following sources, in priori
 | `./bridgic-browser.json` | Project-local config (in cwd at daemon start) |
 | `BRIDGIC_BROWSER_JSON` env var | Full JSON override for any `Browser` parameter |
 | `BRIDGIC_HEADLESS` env var | `0` = show window, any other value = headless |
-| `BRIDGIC_MAX_CHARS` env var | Max characters per `snapshot`/`get_llm_repr` response before pagination (default `30000`) |
+| `BRIDGIC_MAX_CHARS` env var | Max characters per `snapshot`/`get_snapshot_text` response before pagination (default `30000`) |
 
 The JSON sources accept any `Browser` constructor parameter:
 
@@ -130,18 +130,24 @@ BRIDGIC_BROWSER_JSON='{"channel":"chrome","headless":false}' bridgic-browser ope
 
 | Category | Commands |
 |----------|----------|
-| Navigation | `open`, `navigate`, `back`, `forward`, `reload`, `search`, `info` |
+| Navigation | `open`, `back`, `forward`, `reload`, `search`, `info` |
 | Snapshot | `snapshot [-i] [-f\|-F] [-s N]` |
-| Element | `click`, `double-click`, `hover`, `focus`, `fill`, `select`, `check`, `uncheck`, `get text` |
-| Keyboard | `press`, `type` |
-| Mouse | `scroll [--dy N] [--dx N]` |
-| Wait | `wait SECONDS`, `wait-for TEXT [--gone]` |
+| Element Interaction | `click`, `double-click`, `hover`, `focus`, `fill`, `select`, `options`, `check`, `uncheck`, `scroll-to`, `drag`, `upload`, `fill-form` |
+| Keyboard | `press`, `type`, `key-down`, `key-up` |
+| Mouse | `scroll`, `mouse-move`, `mouse-click`, `mouse-drag`, `mouse-down`, `mouse-up` |
+| Wait | `wait [SECONDS] [TEXT] [--gone]` |
 | Tabs | `tabs`, `new-tab`, `switch-tab`, `close-tab` |
-| Capture | `screenshot PATH [--full-page]`, `pdf PATH` |
-| Developer | `eval CODE` |
-| Lifecycle | `close` |
+| Evaluate | `eval`, `eval-on` |
+| Capture | `screenshot`, `pdf` |
+| Network | `network-start`, `network-stop`, `network`, `wait-network` |
+| Dialog | `dialog-setup`, `dialog`, `dialog-remove` |
+| Storage | `storage-save`, `storage-load`, `cookies-clear`, `cookies`, `cookie-set` |
+| Verify | `verify-visible`, `verify-text`, `verify-value`, `verify-state`, `verify-url`, `verify-title` |
+| Developer | `console-start`, `console-stop`, `console`, `trace-start`, `trace-stop`, `trace-chunk`, `video-start`, `video-stop` |
+| Lifecycle | `close`, `resize` |
+| Discovery | `commands [--section|--preset|--list-presets|--list-sections]` |
 
-Use `-h` or `--help` on any command for details:
+Use `-h` or `--help` on any command for details. For agent-oriented planning, prefer `bridgic-browser commands --preset PRESET`:
 
 ```bash
 bridgic-browser -h
@@ -208,27 +214,18 @@ browser = Browser(stealth=config, headless=False)
 Handle file downloads with proper filename preservation:
 
 ```python
-from bridgic.browser.session import DownloadManager, DownloadManagerConfig
+# Pass downloads_path to Browser — it creates and manages the DownloadManager internally
+browser = Browser(downloads_path="./downloads", headless=True)
+await browser.start()
 
-config = DownloadManagerConfig(
-    downloads_path="./downloads",
-    auto_save=True,
-    overwrite=False,
-)
-
-manager = DownloadManager(config=config)
-
-# Attach to browser context
-manager.attach_to_context(browser.context)
-
-# Access downloaded files
-for file in manager.downloaded_files:
+# Access downloaded files via the built-in manager
+for file in browser.download_manager.downloaded_files:
     print(f"Downloaded: {file.file_name} ({file.file_size} bytes)")
 ```
 
 ### Browser Tools
 
-Bridgic Browser provides 68+ tools organized into categories. Use `BrowserToolSetBuilder` with `ToolPreset` for scenario-based tool selection.
+Bridgic Browser provides 67 tools organized into categories. Use `BrowserToolSetBuilder` with `ToolPreset` for scenario-based tool selection.
 
 #### Quick Start with Presets
 
@@ -236,118 +233,126 @@ Bridgic Browser provides 68+ tools organized into categories. Use `BrowserToolSe
 from bridgic.browser.tools import BrowserToolSetBuilder, ToolPreset
 
 # Choose a preset for your use case
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.MINIMAL)       # 10 tools
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)  # 20 tools
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.TESTING)       # 28 tools
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.COMPLETE)      # 68 tools
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.MINIMAL)       # 9 tools
+tools = builder.build()["tool_specs"]
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)  # 18 tools
+tools = builder.build()["tool_specs"]
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.TESTING)       # 26 tools
+tools = builder.build()["tool_specs"]
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.COMPLETE)      # 67 tools
+tools = builder.build()["tool_specs"]
 ```
 
 #### Available Presets
 
 | Preset | Tools | Description |
 |--------|-------|-------------|
-| `MINIMAL` | 10 | Navigate, click, input, snapshot |
-| `NAVIGATION` | 4 | Search, navigate, back/forward |
-| `SCRAPING` | 13 | Navigation + snapshot + scroll |
-| `FORM_FILLING` | 20 | Navigation + input + dropdown + checkbox |
-| `TESTING` | 28 | Form filling + verification + screenshot |
-| `INTERACTIVE` | 40 | All action tools + mouse + keyboard |
-| `DEVELOPER` | 18 | Network + console + tracing |
-| `COMPLETE` | 68 | All available tools |
+| `MINIMAL` | 9 | Navigate, click, input, snapshot |
+| `NAVIGATION` | 3 | Navigate, back/forward |
+| `SCRAPING` | 10 | Navigation + snapshot + scroll |
+| `FORM_FILLING` | 18 | Navigation + input + dropdown + checkbox |
+| `TESTING` | 26 | Form filling + verification + screenshot |
+| `INTERACTIVE` | 32 | All action tools + mouse + keyboard |
+| `DEVELOPER` | 23 | Network + console + tracing |
+| `COMPLETE` | 67 | All available tools |
 
 #### Category-based Selection
 
 ```python
 # Select by category
-tools = BrowserToolSetBuilder.for_categories(
-    browser, "navigation", "action", "screenshot"
+builder = BrowserToolSetBuilder.for_categories(
+    browser, "navigation", "action", "capture"
 )
+tools = builder.build()["tool_specs"]
 ```
 
 #### Name-based Selection (by function name)
 
 ```python
 # Select by tool function names
-tools = BrowserToolSetBuilder.from_tool_names(
+builder = BrowserToolSetBuilder.for_tool_names(
     browser,
     "search",
     "navigate_to_url",
     "click_element_by_ref",
 )
+tools = builder.build()["tool_specs"]
 
-# Enable strict mode to catch typos early
-tools = BrowserToolSetBuilder.from_tool_names(
+# Enable strict mode to catch typos and missing browser methods early
+builder = BrowserToolSetBuilder.for_tool_names(
     browser,
     "search",
     "navigate_to_url",
     strict=True,
 )
+tools = builder.build()["tool_specs"]
 ```
 
-#### Fluent Builder for Custom Selection
+#### Combine `for_*` Builders
 
 ```python
-from bridgic.browser.tools import take_screenshot, verify_url
-
-tools = (BrowserToolSetBuilder(browser)
-    .with_preset(ToolPreset.MINIMAL)
-    .with_category("screenshot")
-    .with_tools(verify_url)
-    .with_tool_names("verify_title")
-    .without_tools("go_forward")
-    .build_specs())
+builder1 = BrowserToolSetBuilder.for_categories(
+    browser, "navigation", "action", "capture"
+)
+builder2 = BrowserToolSetBuilder.for_tool_names(
+    browser, "verify_url", "verify_title"
+)
+tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 ```
 
 #### Tool Categories
 
-**Navigation (4 tools):**
-- `search(query, engine)` - Search using search engine
+**Navigation (6 tools):**
 - `navigate_to_url(url)` - Navigate to URL
+- `search(query, engine)` - Search using search engine
+- `get_current_page_info_str()` - Get current page info (URL, title, etc.)
+- `reload_page()` - Reload current page
 - `go_back()` / `go_forward()` - Browser history navigation
 
-**Page (9 tools):**
-- `reload_page()` - Reload current page
-- `scroll_to_text(text)` - Scroll to text
-- `press_key(key)` - Press keyboard key
-- `evaluate_javascript(code)` - Execute JavaScript
-- `get_current_page_info()` - Get current page info
-- `new_tab(url)` / `get_tabs()` / `switch_tab(tab_id)` / `close_tab(tab_id)` - Tab management
+**Snapshot (1 tool):**
+- `get_snapshot_text(start_from_char=0, interactive=False, full_page=True)` - Get page state string for LLM (accessibility tree with refs). Use **start_from_char** for pagination when the page is long: if the return value is truncated, a `[notice]` at the end gives **next_start_char** to call again. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default). Output is truncated at the `BRIDGIC_MAX_CHARS` limit (default 30,000 chars) with a notice explaining how to continue.
 
-**Action (13 tools) - Element interaction by ref:**
+**Element Interaction (13 tools) - by ref:**
 - `click_element_by_ref(ref)` - Click element
 - `input_text_by_ref(ref, text)` - Input text
-- `hover_element_by_ref(ref)` - Hover over element
-- `focus_element_by_ref(ref)` - Focus element
-- `double_click_element_by_ref(ref)` - Double click
+- `fill_form(fields)` - Fill multiple form fields
 - `scroll_element_into_view_by_ref(ref)` - Scroll element into view
+- `select_dropdown_option_by_ref(ref, value)` - Select dropdown option
+- `get_dropdown_options_by_ref(ref)` - Get dropdown options
+- `check_checkbox_by_ref(ref)` / `uncheck_checkbox_by_ref(ref)` - Checkbox control
+- `focus_element_by_ref(ref)` - Focus element
+- `hover_element_by_ref(ref)` - Hover over element
+- `double_click_element_by_ref(ref)` - Double click
+- `upload_file_by_ref(ref, path)` - Upload file
 - `drag_element_by_ref(start_ref, end_ref)` - Drag and drop
 
-**Form (7 tools):**
-- `get_dropdown_options_by_ref(ref)` - Get dropdown options
-- `select_dropdown_option_by_ref(ref, value)` - Select dropdown option
-- `check_element_by_ref(ref)` / `uncheck_element_by_ref(ref)` - Checkbox control
-- `upload_file_by_ref(ref, path)` - Upload file
-- `fill_form(fields)` - Fill multiple form fields
+**Tabs (4 tools):**
+- `get_tabs()` / `new_tab(url)` / `switch_tab(tab_id)` / `close_tab(tab_id)` - Tab management
+
+**Evaluate (2 tools):**
+- `evaluate_javascript(code)` - Execute JavaScript
+- `evaluate_javascript_on_ref(ref, code)` - Execute JavaScript on element
+
+**Keyboard (4 tools):**
+- `type_text(text)` - Type text character by character (key events, no ref — acts on focused element)
+- `press_key(key)` - Press keyboard shortcut (e.g. `"Enter"`, `"Control+A"`)
+- `key_down(key)` / `key_up(key)` - Key control
 
 **Mouse (6 tools) - Coordinate-based:**
-- `mouse_move(x, y)` - Move mouse
+- `mouse_wheel(delta_x, delta_y)` - Scroll wheel
 - `mouse_click(x, y)` - Click at position
+- `mouse_move(x, y)` - Move mouse
 - `mouse_drag(start_x, start_y, end_x, end_y)` - Drag operation
 - `mouse_down()` / `mouse_up()` - Mouse button control
-- `mouse_wheel(delta_x, delta_y)` - Scroll wheel
 
-**Keyboard (5 tools):**
-- `press_sequentially(text)` - Type text character by character
-- `key_down(key)` / `key_up(key)` - Key control
-- `insert_text(text)` - Insert text at cursor
-- `fill_form(fields)` - Fill form fields
+**Wait (1 tool):**
+- `wait_for(time_seconds, text, text_gone, selector, state, timeout_ms)` - Wait for conditions
 
-**Screenshot (2 tools):**
+**Capture (2 tools):**
 - `take_screenshot(type, filename)` - Capture screenshot
 - `save_pdf(filename)` - Save page as PDF
 
-**Network (7 tools):**
-- `start_console_capture()` / `stop_console_capture()` / `get_console_messages()` - Console monitoring
+**Network (4 tools):**
 - `start_network_capture()` / `stop_network_capture()` / `get_network_requests()` - Network monitoring
 - `wait_for_network_idle()` - Wait for network idle
 
@@ -357,28 +362,24 @@ tools = (BrowserToolSetBuilder(browser)
 - `remove_dialog_handler()` - Remove dialog handler
 
 **Storage (5 tools):**
+- `get_cookies()` / `set_cookie()` / `clear_cookies()` - Cookie management
 - `save_storage_state(filename)` / `restore_storage_state(filename)` - Session persistence
-- `clear_cookies()` / `get_cookies()` / `set_cookie()` - Cookie management
 
 **Verify (6 tools):**
-- `verify_element_visible(ref)` - Check element visibility
 - `verify_text_visible(text)` - Check text visibility
-- `verify_value(ref, value)` - Check element value
-- `verify_element_state(ref, state)` - Check element state
+- `verify_element_visible(role, name)` - Check element visibility by role and accessible name
 - `verify_url(pattern)` / `verify_title(pattern)` - URL/title verification
+- `verify_element_state(ref, state)` - Check element state
+- `verify_value(ref, value)` - Check element value
 
-**DevTools (5 tools):**
-- `start_tracing()` / `stop_tracing()` - Performance tracing
+**Developer (8 tools):**
+- `start_console_capture()` / `stop_console_capture()` / `get_console_messages()` - Console monitoring
+- `start_tracing()` / `stop_tracing()` / `add_trace_chunk()` - Performance tracing
 - `start_video()` / `stop_video()` - Video recording
-- `add_trace_chunk()` - Add trace data
 
-**Control (3 tools):**
-- `browser_close()` - Close browser
+**Lifecycle (2 tools):**
+- `browser_close()` - Stop browser (calls `stop()`)
 - `browser_resize(width, height)` - Resize viewport
-- `wait_for(time_seconds, text, text_gone, selector, state, timeout_ms)` - Wait for conditions
-
-**State (1 tool):**
-- `get_llm_repr(browser, start_from_char=0, interactive=False, full_page=True)` - Get page state string for LLM (accessibility tree with refs). Use **start_from_char** for pagination when the page is long: if the return value is truncated, a `[notice]` at the end gives **next_start_char** to call again. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default). Output is truncated at the `BRIDGIC_MAX_CHARS` limit (default 30,000 chars) with a notice explaining how to continue.
 
 ### Stealth Mode
 
@@ -472,7 +473,7 @@ async def main():
         if element:
             await element.click()
     finally:
-        await browser.close()
+        await browser.stop()
 
 asyncio.run(main())
 ```
@@ -481,15 +482,15 @@ asyncio.run(main())
 
 ```python
 from bridgic.browser.session import Browser
-from bridgic.browser.tools import BrowserToolSetBuilder
+from bridgic.browser.tools import BrowserToolSetBuilder, ToolPreset
 
 async def create_agent():
     browser = Browser(headless=False)
     await browser.start()
 
-    # 为智能体构建工具集（basic_tools 等价于 FORM_FILLING 预设；推荐用 for_preset 更灵活）
-    tools = BrowserToolSetBuilder.basic_tools(browser)
-    # 或：tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)
+    # 为智能体构建工具集
+    builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)
+    tools = builder.build()["tool_specs"]
 
     # 将工具与 LLM 智能体配合使用
     # 工具包括：导航、点击、输入文本、滚动等
@@ -520,7 +521,7 @@ bridgic-browser close                       # 停止 daemon
 | `./bridgic-browser.json` | 项目本地配置（daemon 启动时的工作目录） |
 | `BRIDGIC_BROWSER_JSON` 环境变量 | 完整 JSON，支持所有 `Browser` 参数 |
 | `BRIDGIC_HEADLESS` 环境变量 | `0` = 显示窗口，其他值 = 无头模式 |
-| `BRIDGIC_MAX_CHARS` 环境变量 | `snapshot`/`get_llm_repr` 每次响应的最大字符数（超出则分页，默认 `30000`） |
+| `BRIDGIC_MAX_CHARS` 环境变量 | `snapshot`/`get_snapshot_text` 每次响应的最大字符数（超出则分页，默认 `30000`） |
 
 JSON 来源支持所有 `Browser` 构造参数：
 
@@ -544,18 +545,24 @@ BRIDGIC_BROWSER_JSON='{"channel":"chrome","headless":false}' bridgic-browser ope
 
 | 类别 | 命令 |
 |------|------|
-| 导航 | `open`、`navigate`、`back`、`forward`、`reload`、`search`、`info` |
+| 导航 | `open`、`back`、`forward`、`reload`、`search`、`info` |
 | 快照 | `snapshot [-i] [-f\|-F] [-s N]` |
-| 元素交互 | `click`、`double-click`、`hover`、`focus`、`fill`、`select`、`check`、`uncheck`、`get text` |
-| 键盘 | `press`、`type` |
-| 鼠标 | `scroll [--dy N] [--dx N]` |
-| 等待 | `wait SECONDS`、`wait-for TEXT [--gone]` |
+| 元素交互 | `click`、`double-click`、`hover`、`focus`、`fill`、`select`、`options`、`check`、`uncheck`、`scroll-to`、`drag`、`upload`、`fill-form` |
+| 键盘 | `press`、`type`、`key-down`、`key-up` |
+| 鼠标 | `scroll`、`mouse-move`、`mouse-click`、`mouse-drag`、`mouse-down`、`mouse-up` |
+| 等待 | `wait [SECONDS] [TEXT] [--gone]` |
 | 标签页 | `tabs`、`new-tab`、`switch-tab`、`close-tab` |
-| 截图 | `screenshot PATH [--full-page]`、`pdf PATH` |
-| 开发者 | `eval CODE` |
-| 生命周期 | `close` |
+| 评估 | `eval`、`eval-on` |
+| 截图 | `screenshot`、`pdf` |
+| 网络 | `network-start`、`network-stop`、`network`、`wait-network` |
+| 对话框 | `dialog-setup`、`dialog`、`dialog-remove` |
+| 存储 | `storage-save`、`storage-load`、`cookies-clear`、`cookies`、`cookie-set` |
+| 断言 | `verify-visible`、`verify-text`、`verify-value`、`verify-state`、`verify-url`、`verify-title` |
+| 开发者 | `console-start`、`console-stop`、`console`、`trace-start`、`trace-stop`、`trace-chunk`、`video-start`、`video-stop` |
+| 生命周期 | `close`、`resize` |
+| 发现 | `commands [--section|--preset|--list-presets|--list-sections]` |
 
-使用 `-h` 或 `--help` 查看任意命令的详细说明：
+使用 `-h` 或 `--help` 查看任意命令的详细说明。面向 Agent 的能力发现，推荐优先使用 `bridgic-browser commands --preset PRESET`：
 
 ```bash
 bridgic-browser -h
@@ -622,27 +629,18 @@ browser = Browser(stealth=config, headless=False)
 处理文件下载，正确保留文件名：
 
 ```python
-from bridgic.browser.session import DownloadManager, DownloadManagerConfig
+# 将 downloads_path 传给 Browser — 它会内部创建并管理 DownloadManager
+browser = Browser(downloads_path="./downloads", headless=True)
+await browser.start()
 
-config = DownloadManagerConfig(
-    downloads_path="./downloads",
-    auto_save=True,
-    overwrite=False,
-)
-
-manager = DownloadManager(config=config)
-
-# 附加到浏览器上下文
-manager.attach_to_context(browser.context)
-
-# 访问已下载的文件
-for file in manager.downloaded_files:
+# 通过内置管理器访问已下载的文件
+for file in browser.download_manager.downloaded_files:
     print(f"已下载：{file.file_name}（{file.file_size} 字节）")
 ```
 
 ### 浏览器工具
 
-Bridgic Browser 提供 68+ 个工具，按类别组织。使用 `BrowserToolSetBuilder` 配合 `ToolPreset` 进行场景化工具选择。
+Bridgic Browser 提供 67 个工具，按类别组织。使用 `BrowserToolSetBuilder` 配合 `ToolPreset` 进行场景化工具选择。
 
 #### 使用预设快速开始
 
@@ -650,118 +648,126 @@ Bridgic Browser 提供 68+ 个工具，按类别组织。使用 `BrowserToolSetB
 from bridgic.browser.tools import BrowserToolSetBuilder, ToolPreset
 
 # 根据使用场景选择预设
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.MINIMAL)       # 10 个工具
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)  # 20 个工具
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.TESTING)       # 28 个工具
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.COMPLETE)      # 68 个工具
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.MINIMAL)       # 9 个工具
+tools = builder.build()["tool_specs"]
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)  # 18 个工具
+tools = builder.build()["tool_specs"]
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.TESTING)       # 26 个工具
+tools = builder.build()["tool_specs"]
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.COMPLETE)      # 67 个工具
+tools = builder.build()["tool_specs"]
 ```
 
 #### 可用预设
 
 | 预设 | 工具数 | 描述 |
 |------|--------|------|
-| `MINIMAL` | 10 | 导航、点击、输入、快照 |
-| `NAVIGATION` | 4 | 搜索、导航、前进/后退 |
-| `SCRAPING` | 13 | 导航 + 快照 + 滚动 |
-| `FORM_FILLING` | 20 | 导航 + 输入 + 下拉框 + 复选框 |
-| `TESTING` | 28 | 表单填写 + 验证 + 截图 |
-| `INTERACTIVE` | 40 | 所有交互工具 + 鼠标 + 键盘 |
-| `DEVELOPER` | 18 | 网络 + 控制台 + 追踪 |
-| `COMPLETE` | 68 | 所有可用工具 |
+| `MINIMAL` | 9 | 导航、点击、输入、快照 |
+| `NAVIGATION` | 3 | 导航、前进/后退 |
+| `SCRAPING` | 10 | 导航 + 快照 + 滚动 |
+| `FORM_FILLING` | 18 | 导航 + 输入 + 下拉框 + 复选框 |
+| `TESTING` | 26 | 表单填写 + 验证 + 截图 |
+| `INTERACTIVE` | 32 | 所有交互工具 + 鼠标 + 键盘 |
+| `DEVELOPER` | 23 | 网络 + 控制台 + 追踪 |
+| `COMPLETE` | 67 | 所有可用工具 |
 
 #### 按类别选择
 
 ```python
 # 按类别选择工具
-tools = BrowserToolSetBuilder.for_categories(
-    browser, "navigation", "action", "screenshot"
+builder = BrowserToolSetBuilder.for_categories(
+    browser, "navigation", "action", "capture"
 )
+tools = builder.build()["tool_specs"]
 ```
 
 #### 按名称选择（按函数名）
 
 ```python
 # 按工具函数名选择
-tools = BrowserToolSetBuilder.from_tool_names(
+builder = BrowserToolSetBuilder.for_tool_names(
     browser,
     "search",
     "navigate_to_url",
     "click_element_by_ref",
 )
+tools = builder.build()["tool_specs"]
 
-# 开启 strict 模式，及时发现拼写错误
-tools = BrowserToolSetBuilder.from_tool_names(
+# 开启 strict 模式，及时发现拼写错误和 browser 缺失方法
+builder = BrowserToolSetBuilder.for_tool_names(
     browser,
     "search",
     "navigate_to_url",
     strict=True,
 )
+tools = builder.build()["tool_specs"]
 ```
 
-#### 流式构建器自定义选择
+#### 组合 `for_*` 构建器
 
 ```python
-from bridgic.browser.tools import take_screenshot, verify_url
-
-tools = (BrowserToolSetBuilder(browser)
-    .with_preset(ToolPreset.MINIMAL)
-    .with_category("screenshot")
-    .with_tools(verify_url)
-    .with_tool_names("verify_title")
-    .without_tools("go_forward")
-    .build_specs())
+builder1 = BrowserToolSetBuilder.for_categories(
+    browser, "navigation", "action", "capture"
+)
+builder2 = BrowserToolSetBuilder.for_tool_names(
+    browser, "verify_url", "verify_title"
+)
+tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 ```
 
 #### 工具类别
 
-**导航（4 个工具）：**
-- `search(query, engine)` - 使用搜索引擎搜索
+**导航（6 个工具）：**
 - `navigate_to_url(url)` - 导航到 URL
+- `search(query, engine)` - 使用搜索引擎搜索
+- `get_current_page_info_str()` - 获取当前页面信息（URL、标题等）
+- `reload_page()` - 重新加载当前页面
 - `go_back()` / `go_forward()` - 浏览器历史导航
 
-**页面（9 个工具）：**
-- `reload_page()` - 重新加载当前页面
-- `scroll_to_text(text)` - 滚动到指定文本
-- `press_key(key)` - 按下键盘键
-- `evaluate_javascript(code)` - 执行 JavaScript
-- `get_current_page_info()` - 获取当前页面信息
-- `new_tab(url)` / `get_tabs()` / `switch_tab(tab_id)` / `close_tab(tab_id)` - 标签页管理
+**快照（1 个工具）：**
+- `get_snapshot_text(start_from_char=0, interactive=False, full_page=True)` - 获取供 LLM 使用的页面状态字符串（带 ref 的可访问性树）。长页面可用 **start_from_char** 分页：若返回值被截断，末尾会有 `[notice]` 给出 **next_start_char** 供再次调用。**interactive** 与 **full_page** 与 `get_snapshot` 一致（默认全页面）。输出在 `BRIDGIC_MAX_CHARS` 上限处（默认 3 万字符）截断并附带续读说明。
 
-**动作（13 个工具）- 通过引用操作元素：**
+**元素交互（13 个工具）- 通过引用操作元素：**
 - `click_element_by_ref(ref)` - 点击元素
 - `input_text_by_ref(ref, text)` - 输入文本
-- `hover_element_by_ref(ref)` - 悬停在元素上
-- `focus_element_by_ref(ref)` - 聚焦元素
-- `double_click_element_by_ref(ref)` - 双击
+- `fill_form(fields)` - 填写多个表单字段
 - `scroll_element_into_view_by_ref(ref)` - 滚动元素到可视区域
+- `select_dropdown_option_by_ref(ref, value)` - 选择下拉选项
+- `get_dropdown_options_by_ref(ref)` - 获取下拉选项
+- `check_checkbox_by_ref(ref)` / `uncheck_checkbox_by_ref(ref)` - 复选框控制
+- `focus_element_by_ref(ref)` - 聚焦元素
+- `hover_element_by_ref(ref)` - 悬停在元素上
+- `double_click_element_by_ref(ref)` - 双击
+- `upload_file_by_ref(ref, path)` - 上传文件
 - `drag_element_by_ref(start_ref, end_ref)` - 拖放
 
-**表单（7 个工具）：**
-- `get_dropdown_options_by_ref(ref)` - 获取下拉选项
-- `select_dropdown_option_by_ref(ref, value)` - 选择下拉选项
-- `check_element_by_ref(ref)` / `uncheck_element_by_ref(ref)` - 复选框控制
-- `upload_file_by_ref(ref, path)` - 上传文件
-- `fill_form(fields)` - 填写多个表单字段
+**标签页（4 个工具）：**
+- `get_tabs()` / `new_tab(url)` / `switch_tab(tab_id)` / `close_tab(tab_id)` - 标签页管理
+
+**执行（2 个工具）：**
+- `evaluate_javascript(code)` - 执行 JavaScript
+- `evaluate_javascript_on_ref(ref, code)` - 在元素上执行 JavaScript
+
+**键盘（4 个工具）：**
+- `type_text(text)` - 逐字符输入文本（键盘事件，无 ref — 作用于当前焦点元素）
+- `press_key(key)` - 按键快捷键（如 `"Enter"`, `"Control+A"`）
+- `key_down(key)` / `key_up(key)` - 按键控制
 
 **鼠标（6 个工具）- 基于坐标：**
-- `mouse_move(x, y)` - 移动鼠标
+- `mouse_wheel(delta_x, delta_y)` - 滚轮
 - `mouse_click(x, y)` - 在指定位置点击
+- `mouse_move(x, y)` - 移动鼠标
 - `mouse_drag(start_x, start_y, end_x, end_y)` - 拖动操作
 - `mouse_down()` / `mouse_up()` - 鼠标按钮控制
-- `mouse_wheel(delta_x, delta_y)` - 滚轮
 
-**键盘（5 个工具）：**
-- `press_sequentially(text)` - 逐字符输入文本
-- `key_down(key)` / `key_up(key)` - 按键控制
-- `insert_text(text)` - 在光标处插入文本
-- `fill_form(fields)` - 填写表单字段
+**等待（1 个工具）：**
+- `wait_for(time_seconds, text, text_gone, selector, state, timeout_ms)` - 等待条件
 
 **截图（2 个工具）：**
 - `take_screenshot(type, filename)` - 截取屏幕截图
 - `save_pdf(filename)` - 保存页面为 PDF
 
-**网络（7 个工具）：**
-- `start_console_capture()` / `stop_console_capture()` / `get_console_messages()` - 控制台监控
+**网络（4 个工具）：**
 - `start_network_capture()` / `stop_network_capture()` / `get_network_requests()` - 网络监控
 - `wait_for_network_idle()` - 等待网络空闲
 
@@ -771,28 +777,24 @@ tools = (BrowserToolSetBuilder(browser)
 - `remove_dialog_handler()` - 移除对话框处理器
 
 **存储（5 个工具）：**
+- `get_cookies()` / `set_cookie()` / `clear_cookies()` - Cookie 管理
 - `save_storage_state(filename)` / `restore_storage_state(filename)` - 会话持久化
-- `clear_cookies()` / `get_cookies()` / `set_cookie()` - Cookie 管理
 
 **验证（6 个工具）：**
-- `verify_element_visible(ref)` - 检查元素可见性
 - `verify_text_visible(text)` - 检查文本可见性
-- `verify_value(ref, value)` - 检查元素值
-- `verify_element_state(ref, state)` - 检查元素状态
+- `verify_element_visible(role, name)` - 通过角色和可访问名称检查元素可见性
 - `verify_url(pattern)` / `verify_title(pattern)` - URL/标题验证
+- `verify_element_state(ref, state)` - 检查元素状态
+- `verify_value(ref, value)` - 检查元素值
 
-**开发者工具（5 个工具）：**
-- `start_tracing()` / `stop_tracing()` - 性能追踪
+**开发者工具（8 个工具）：**
+- `start_console_capture()` / `stop_console_capture()` / `get_console_messages()` - 控制台监控
+- `start_tracing()` / `stop_tracing()` / `add_trace_chunk()` - 性能追踪
 - `start_video()` / `stop_video()` - 视频录制
-- `add_trace_chunk()` - 添加追踪数据
 
-**控制（3 个工具）：**
-- `browser_close()` - 关闭浏览器
+**生命周期（2 个工具）：**
+- `browser_close()` - 停止浏览器（调用 `stop()`）
 - `browser_resize(width, height)` - 调整视口大小
-- `wait_for(time_seconds, text, text_gone, selector, state, timeout_ms)` - 等待条件
-
-**状态（1 个工具）：**
-- `get_llm_repr(browser, start_from_char=0, interactive=False, full_page=True)` - 获取供 LLM 使用的页面状态字符串（带 ref 的可访问性树）。长页面可用 **start_from_char** 分页：若返回值被截断，末尾会有 `[notice]` 给出 **next_start_char** 供再次调用。**interactive** 与 **full_page** 与 `get_snapshot` 一致（默认全页面）。输出在 `BRIDGIC_MAX_CHARS` 上限处（默认 3 万字符）截断并附带续读说明。
 
 ### 隐身模式
 
@@ -839,7 +841,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## More documentation
 
 - [Browser Tools Guide](docs/BROWSER_TOOLS_GUIDE.md) – Tool selection, ref vs coordinate, wait strategies, patterns.
-- [Snapshot and Page State](docs/SNAPSHOT_AND_STATE.md) – SnapshotOptions, EnhancedSnapshot, get_llm_repr, get_element_by_ref.
+- [Snapshot and Page State](docs/SNAPSHOT_AND_STATE.md) – SnapshotOptions, EnhancedSnapshot, get_snapshot_text, get_element_by_ref.
 - [API Summary](docs/API.md) – Session and DownloadManager API reference.
 
 ## Links

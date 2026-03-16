@@ -13,7 +13,7 @@ description: |
 Playwright-based browser automation for LLM/AI agents. Key abstractions:
 - **Browser** — Playwright wrapper with stealth mode and auto launch-mode selection
 - **EnhancedSnapshot** — accessibility tree with stable `[ref=eN]` element identifiers
-- **BrowserToolSetBuilder** — 69 tools in presets/categories, ready for agent tool-use
+- **BrowserToolSetBuilder** — 67 tools in presets/categories, ready for agent tool-use
 - **CLI** — `bridgic-browser` shell command backed by a persistent daemon
 
 ```python
@@ -95,7 +95,7 @@ snap = await browser.get_snapshot()   # keep full; use snap.tree to find interac
 ```python
 # Lifecycle — manual
 await browser.start()
-await browser.close()   # alias for kill()
+await browser.close()   # alias for stop()
 
 # Lifecycle — context manager (preferred for scripts: auto start + close)
 async with Browser(headless=True) as browser:
@@ -209,41 +209,54 @@ snap = await browser.get_snapshot()
 ```python
 from bridgic.browser.tools import BrowserToolSetBuilder, ToolPreset
 
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.MINIMAL)       # 11 — navigate, click, snapshot
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.NAVIGATION)    #  4 — navigate only
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.SCRAPING)      # 14 — + scroll, page info
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)  # 20 — + input, dropdown, checkbox
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.TESTING)       # 28 — + verify, screenshot
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.INTERACTIVE)   # 39 — + mouse, keyboard
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.DEVELOPER)     # 22 — network, devtools, tracing
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.COMPLETE)      # 69 — all
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.MINIMAL)       #  9 — navigate, click, snapshot
+tools = builder.build()["tool_specs"]
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.NAVIGATION)    #  3 — navigate only
+tools = builder.build()["tool_specs"]
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.SCRAPING)      # 10 — + scroll, page info
+tools = builder.build()["tool_specs"]
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)  # 18 — + input, dropdown, checkbox
+tools = builder.build()["tool_specs"]
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.TESTING)       # 26 — + verify, screenshot
+tools = builder.build()["tool_specs"]
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.INTERACTIVE)   # 32 — + mouse, keyboard
+tools = builder.build()["tool_specs"]
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.DEVELOPER)     # 23 — network, console, tracing
+tools = builder.build()["tool_specs"]
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.COMPLETE)      # 67 — all
+tools = builder.build()["tool_specs"]
 ```
 
 ### Fine-grained Selection
 
 ```python
-# By category: navigation, page, action, form, mouse, keyboard, screenshot,
-#              network, dialog, storage, verify, devtools, control, state, advanced
-tools = BrowserToolSetBuilder.for_categories(browser, "navigation", "action", "screenshot")
+# By category: navigation, snapshot, element_interaction, tabs, evaluate,
+#              keyboard, mouse, wait, capture, network, dialog, storage,
+#              verify, developer, lifecycle
+builder = BrowserToolSetBuilder.for_categories(browser, "navigation", "element_interaction", "capture")
+tools = builder.build()["tool_specs"]
 
-# By function reference
-from bridgic.browser.tools import click_element_by_ref, input_text_by_ref
-tools = BrowserToolSetBuilder.from_funcs(browser, click_element_by_ref, input_text_by_ref)
+# By function reference (pass bound methods)
+builder = BrowserToolSetBuilder.for_funcs(browser, browser.click_element_by_ref, browser.input_text_by_ref)
+tools = builder.build()["tool_specs"]
 
 # By tool name strings
-tools = BrowserToolSetBuilder.from_tool_names(browser, "search", "click_element_by_ref")
-tools = BrowserToolSetBuilder.from_tool_names(browser, "search", strict=True)  # raises ValueError for unknown names
+builder = BrowserToolSetBuilder.for_tool_names(browser, "search", "click_element_by_ref")
+tools = builder.build()["tool_specs"]
+builder = BrowserToolSetBuilder.for_tool_names(browser, "search", strict=True)  # raises ValueError for unknown names or missing browser methods
+tools = builder.build()["tool_specs"]
 
-# Fluent builder — build_specs() returns List[BrowserToolSpec]
-tools = (BrowserToolSetBuilder(browser)
-    .with_preset(ToolPreset.MINIMAL)
-    .with_category("screenshot")
-    .with_tools("wait_for")          # add by name or function ref
-    .without_tools("go_forward")
-    .build_specs())
+# Combine multiple for_* selections
+builder1 = BrowserToolSetBuilder.for_categories(
+    browser, "navigation", "capture"
+)
+builder2 = BrowserToolSetBuilder.for_tool_names(browser, "wait_for")
+tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 
-# ⚠️ Empty builder (no with_* calls) silently defaults to ToolPreset.MINIMAL
-tools = BrowserToolSetBuilder(browser).build_specs()   # → MINIMAL tools, not empty!
+# Explicit default minimal set
+tools = BrowserToolSetBuilder.for_preset(
+    browser, ToolPreset.MINIMAL
+).build()["tool_specs"]
 ```
 
 ### Custom Tools
@@ -260,8 +273,9 @@ custom_spec = BrowserToolSpec.from_raw(func=my_tool, browser=browser)
 # The 'browser' parameter is auto-excluded from the LLM schema — LLM only sees 'query'
 
 # Mix with preset tools
-builtin_specs = BrowserToolSetBuilder.for_preset(browser, ToolPreset.MINIMAL)
-all_tools = builtin_specs + [custom_spec]
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.MINIMAL)
+builtin_specs = builder.build()["tool_specs"]
+all_tools = [*builtin_specs, custom_spec]
 ```
 
 ## Ref-based vs Coordinate-based
@@ -273,9 +287,9 @@ Use **ref-based** when element appears in snapshot. Use **coordinate-based** for
 | Click | `click_element_by_ref` | `mouse_click` |
 | Right-click | — | `mouse_click(x, y, button="right")` |
 | Double-click | `double_click_element_by_ref` | `mouse_click(x, y, click_count=2)` |
-| Type | `input_text_by_ref` | `press_sequentially` (focused element) |
+| Type | `input_text_by_ref` | `type_text` (focused element) |
 | Drag | `drag_element_by_ref` | `mouse_drag` |
-| Scroll | `scroll_to_text` | `mouse_wheel` |
+| Scroll into view | `scroll_element_into_view_by_ref` | `mouse_wheel` |
 
 **Text input — choose the right method:**
 
@@ -286,17 +300,16 @@ Use **ref-based** when element appears in snapshot. Use **coordinate-based** for
 | `input_text_by_ref(ref, text, submit=True)` | fill + Enter | forms where you type then submit |
 | `input_text_by_ref(ref, text, clear=False)` | append | add to existing value |
 | `input_text_by_ref(ref, text, is_secret=True)` | `.fill()` | passwords — text masked in logs/return value |
-| `press_sequentially(text)` | key events per char | JS event handlers |
-| `press_sequentially(text, submit=True)` | key events + Enter | JS handlers + submit |
-| `insert_text(text)` | paste at cursor | fastest for long text |
+| `type_text(text)` | key events per char | JS event handlers |
+| `type_text(text, submit=True)` | key events + Enter | JS handlers + submit |
 | `fill_form(fields, submit=False)` | batch `.fill()` | fill multiple fields at once |
 
 `fill_form` accepts `fields = [{"ref": "e1", "value": "foo"}, {"ref": "e2", "value": "bar"}]` — more efficient than individual `input_text_by_ref` calls when filling a whole form.
 
-**`press_sequentially`, `insert_text`, `key_down`, `key_up` all operate on the currently focused element** — they have no `ref` parameter. You must focus the element first:
+**`type_text`, `key_down`, `key_up` all operate on the currently focused element** — they have no `ref` parameter. You must focus the element first:
 ```python
-await focus_element_by_ref(browser, ref="e3")   # focus first
-await press_sequentially(browser, text="hello") # then type
+await browser.focus_element_by_ref("e3")   # focus first
+await browser.type_text("hello")           # then type
 # Or use input_text_by_ref which handles focus internally
 ```
 
@@ -307,25 +320,23 @@ await press_sequentially(browser, text="hello") # then type
 
 ### Non-obvious Tool Behaviours
 
-**`get_llm_repr`** — the canonical snapshot tool for agents (not `get_snapshot()`). Wraps `get_snapshot()` and adds truncation + pagination. Returns a `str`, not an object.
+**`get_snapshot_text`** — the canonical snapshot tool for agents (not `get_snapshot()`). Wraps `get_snapshot()` and adds truncation + pagination. Returns a `str`, not an object.
 
 ```python
-from bridgic.browser.tools import get_llm_repr
-tree_str = await get_llm_repr(browser)                          # full page string
-tree_str = await get_llm_repr(browser, interactive=True)        # clickable only
-tree_str = await get_llm_repr(browser, start_from_char=30000)   # pagination
+tree_str = await browser.get_snapshot_text()                          # full page string
+tree_str = await browser.get_snapshot_text(interactive=True)          # clickable only
+tree_str = await browser.get_snapshot_text(start_from_char=30000)     # pagination
 ```
 
-**`take_screenshot` tool** (agent tool, distinct from `browser.take_screenshot()` method):
+**`take_screenshot`**:
 - No `filename` → returns **base64 data URL** string (`data:image/png;base64,...`), not bytes
 - With `filename` → saves file, returns `"Screenshot saved to: /path/file.png"`
 - With `ref=` → screenshots a single element, not the whole page
 
 ```python
-from bridgic.browser.tools import take_screenshot
-result = await take_screenshot(browser)                       # base64 data URL
-result = await take_screenshot(browser, filename="out.png")  # saves file
-result = await take_screenshot(browser, ref="e5")            # element only
+result = await browser.take_screenshot()                       # base64 data URL
+result = await browser.take_screenshot(filename="out.png")    # saves file
+result = await browser.take_screenshot(ref="e5")              # element only
 ```
 
 **`navigate_to_url` tool** auto-prepends `http://` when no protocol given. Blocks `javascript:`, `data:`, `vbscript:`, `about:` schemes for security.
@@ -333,91 +344,81 @@ result = await take_screenshot(browser, ref="e5")            # element only
 **`wait_for` tool** — mixed time units; only first matching condition is used:
 ```python
 # time_seconds is SECONDS;  timeout_ms is MILLISECONDS — different units!
-await wait_for(browser, time_seconds=3)                        # wait 3 seconds
-await wait_for(browser, text="Done", timeout_ms=10000)         # wait up to 10 s
-await wait_for(browser, text_gone="Loading", timeout_ms=5000)
-await wait_for(browser, selector=".modal", state="visible")
+await browser.wait_for(time_seconds=3)                        # wait 3 seconds
+await browser.wait_for(text="Done", timeout_ms=10000)         # wait up to 10 s
+await browser.wait_for(text_gone="Loading", timeout_ms=5000)
+await browser.wait_for(selector=".modal", state="visible")
 # Priority: time_seconds > text > text_gone > selector (only first provided is used)
 ```
 
 **`verify_element_visible` uses ARIA role + accessible_name, NOT a ref:**
 ```python
 # ❌ Wrong — does not accept ref
-# await verify_element_visible(browser, ref="e5")
+# await browser.verify_element_visible(ref="e5")
 
 # ✅ Correct
-from bridgic.browser.tools import verify_element_visible, verify_text_visible, verify_element_state
-await verify_element_visible(browser, role="button", accessible_name="Submit")
-await verify_text_visible(browser, text="Welcome")             # substring by default
-await verify_text_visible(browser, text="Welcome", exact=True)
-await verify_element_state(browser, ref="e5", state="enabled")
+await browser.verify_element_visible(role="button", accessible_name="Submit")
+await browser.verify_text_visible(text="Welcome")             # substring by default
+await browser.verify_text_visible(text="Welcome", exact=True)
+await browser.verify_element_state(ref="e5", state="enabled")
 # state options: "visible", "hidden", "enabled", "disabled", "checked", "unchecked", "editable"
 
-from bridgic.browser.tools import verify_url, verify_title
 # ⚠️ verify_url and verify_title also default to exact=False (substring/contains match)
-await verify_url(browser, expected_url="example.com")          # PASS if current URL contains "example.com"
-await verify_url(browser, expected_url="https://example.com/path", exact=True)  # full URL match
-await verify_title(browser, expected_title="Home")             # PASS if title contains "Home"
+await browser.verify_url(expected_url="example.com")          # PASS if current URL contains "example.com"
+await browser.verify_url(expected_url="https://example.com/path", exact=True)  # full URL match
+await browser.verify_title(expected_title="Home")             # PASS if title contains "Home"
 ```
 
 **`upload_file_by_ref`** — upload a local file via a file input element:
 ```python
-from bridgic.browser.tools import upload_file_by_ref
-await upload_file_by_ref(browser, ref="e3", file_path="/tmp/doc.pdf")
+await browser.upload_file_by_ref(ref="e3", file_path="/tmp/doc.pdf")
 ```
 
 **`evaluate_javascript_on_ref`** — run JS scoped to a specific element:
 ```python
-from bridgic.browser.tools import evaluate_javascript_on_ref
-result = await evaluate_javascript_on_ref(browser, ref="e5", code="el => el.value")
+result = await browser.evaluate_javascript_on_ref(ref="e5", code="el => el.value")
 ```
 
 **Dialog handling — register handler BEFORE the triggering action:**
 ```python
-from bridgic.browser.tools import handle_dialog, setup_dialog_handler
-
 # ❌ Wrong order — dialog fires before handler is registered
-await click_element_by_ref(browser, ref="e5")   # triggers alert
-await handle_dialog(browser, accept=True)        # too late, dialog already unhandled
+await browser.click_element_by_ref("e5")   # triggers alert
+await browser.handle_dialog(accept=True)   # too late, dialog already unhandled
 
 # ✅ Register handler first, then trigger
-await handle_dialog(browser, accept=True)        # one-time: handles the NEXT dialog
-await click_element_by_ref(browser, ref="e5")   # now fires → auto-accepted
+await browser.handle_dialog(accept=True)   # one-time: handles the NEXT dialog
+await browser.click_element_by_ref("e5")  # now fires → auto-accepted
 
 # For persistent handling of all dialogs on the page:
-await setup_dialog_handler(browser, default_action="accept")
+await browser.setup_dialog_handler(default_action="accept")
 # ... do actions that may trigger dialogs ...
-await remove_dialog_handler(browser)             # remove when done
+await browser.remove_dialog_handler()      # remove when done
 ```
 
 Note: `setup_dialog_handler` is page-specific — navigating to a new page may require re-setup.
 
 **`select_dropdown_option_by_ref` accepts value attr OR visible text** — tries `value` attribute first, falls back to visible label. Both work:
 ```python
-await select_dropdown_option_by_ref(browser, ref="e4", text="US")        # by value attr
-await select_dropdown_option_by_ref(browser, ref="e4", text="United States")  # by visible text
+await browser.select_dropdown_option_by_ref(ref="e4", text="US")        # by value attr
+await browser.select_dropdown_option_by_ref(ref="e4", text="United States")  # by visible text
 # Call get_dropdown_options_by_ref first to see available options (handles portalized dropdowns)
 ```
 
-**`check_element_by_ref` / `uncheck_element_by_ref` are idempotent** — they read the current checked state first and skip the click if already in the desired state. Safe to call multiple times.
+**`check_checkbox_by_ref` / `uncheck_checkbox_by_ref` are idempotent** — they read the current checked state first and skip the click if already in the desired state. Safe to call multiple times.
 
 **Console and network capture are page-specific and must be explicitly stopped:**
 ```python
-from bridgic.browser.tools import (
-    start_console_capture, get_console_messages, stop_console_capture,
-    start_network_capture, get_network_requests, stop_network_capture,
-)
-await start_console_capture(browser)   # start listening
+await browser.start_console_capture()   # start listening
 # ... do page actions ...
-messages = await get_console_messages(browser)        # clear=True by default — empties buffer after retrieval
-await stop_console_capture(browser)    # MUST stop — stored in memory until stopped
+messages = await browser.get_console_messages()        # clear=True by default — empties buffer after retrieval
+await browser.stop_console_capture()    # MUST stop — stored in memory until stopped
 
 # ⚠️ start_network_capture MUST be called BEFORE navigation to catch page-load requests
-await start_network_capture(browser)
+await browser.start_network_capture()
 await browser.navigate_to("https://example.com")      # requests captured from here
 # ... do page actions ...
-requests = await get_network_requests(browser)         # include_static=False and clear=True by default
-await stop_network_capture(browser)    # MUST stop
+requests = await browser.get_network_requests()        # include_static=False and clear=True by default
+await browser.stop_network_capture()    # MUST stop
 ```
 
 Key defaults:
@@ -430,13 +431,13 @@ Note: capture is page-specific — navigating to a new page requires re-starting
 **`start_video` does NOT start video recording** — it only checks if video was already configured. Video recording must be enabled at `Browser()` construction time via `record_video_dir`:
 ```python
 # ❌ start_video() alone does nothing — just returns a "not available" message
-await start_video(browser)
+await browser.start_video()
 
 # ✅ Configure at browser creation; videos auto-save when pages close
 browser = Browser(record_video_dir="./videos")
 # ... do actions ...
 # call stop_video() to get path; file is finalized only after page is closed
-result = await stop_video(browser, filename="session.webm")
+result = await browser.stop_video(filename="session.webm")
 # the .webm file may still be incomplete until close_page / browser.close()
 ```
 
@@ -446,7 +447,7 @@ result = await stop_video(browser, filename="session.webm")
 browser = Browser(storage_state="auth_state.json")   # via Playwright kwargs
 
 # ⚠️ Adds cookies/localStorage to existing context (may have conflicts)
-await restore_storage_state(browser, filename="auth_state.json")
+await browser.restore_storage_state(filename="auth_state.json")
 ```
 
 **`StealthConfig` key constraints:**
@@ -459,15 +460,18 @@ await restore_storage_state(browser, filename="auth_state.json")
 ```python
 # Web scraping
 browser = Browser(headless=True)
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.SCRAPING)
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.SCRAPING)
+tools = builder.build()["tool_specs"]
 
 # Form automation
 browser = Browser(headless=False)
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)
+tools = builder.build()["tool_specs"]
 
 # E2E testing (stealth off — reveals real browser to the site)
 browser = Browser(headless=True, stealth=False)
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.TESTING)
+builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.TESTING)
+tools = builder.build()["tool_specs"]
 
 # Persistent login — cookies/state survive process restarts
 browser = Browser(headless=False, user_data_dir="~/.agent_data", channel="chrome")

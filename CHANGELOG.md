@@ -20,28 +20,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Smart download management with original filename preservation
   - Multi-page/tab support with page descriptions
 
-- **Tool System** (68+ tools organized by category)
-  - Navigation tools: search, navigate_to_url, go_back, go_forward
-  - Page control tools: reload_page, scroll_to_text, press_key, evaluate_javascript
-  - Element interaction tools: click, input_text, hover, focus, drag, etc.
-  - Mouse tools: mouse_move, mouse_click, mouse_drag, mouse_wheel
-  - Keyboard tools: press_sequentially, key_down, key_up, fill_form, insert_text
-  - Screenshot tools: take_screenshot, save_pdf
-  - Network tools: console capture, network request monitoring
-  - Dialog tools: setup_dialog_handler, handle_dialog
-  - Storage tools: cookie management, storage state save/restore
-  - Verification tools: verify_element_visible, verify_text_visible, verify_value
-  - DevTools: start_tracing, stop_tracing, start_video, stop_video
+- **Tool System** (67 tools organized by category)
+  - Navigation: navigate_to_url, search, get_current_page_info_str, reload_page, go_back, go_forward
+  - Snapshot: get_snapshot_text
+  - Element Interaction: click, input_text, fill_form, scroll_into_view, select, options, check, uncheck, focus, hover, double_click, upload, drag (all by ref)
+  - Tabs: get_tabs, new_tab, switch_tab, close_tab
+  - Evaluate: evaluate_javascript, evaluate_javascript_on_ref
+  - Keyboard: type_text, press_key, key_down, key_up
+  - Mouse: mouse_wheel, mouse_click, mouse_move, mouse_drag, mouse_down, mouse_up
+  - Wait: wait_for
+  - Capture: take_screenshot, save_pdf
+  - Network: start_network_capture, get_network_requests, stop_network_capture, wait_for_network_idle
+  - Dialog: setup_dialog_handler, handle_dialog, remove_dialog_handler
+  - Storage: cookie management, storage state save/restore
+  - Verify: verify_text_visible, verify_element_visible, verify_url, verify_title, verify_element_state, verify_value
+  - Developer: console capture, tracing, video recording
+  - Lifecycle: browser_close, browser_resize
 
 - **Tool Presets**
-  - MINIMAL: 10 tools for basic navigation
-  - NAVIGATION: 4 tools for search and navigation
-  - SCRAPING: 13 tools for data extraction
-  - FORM_FILLING: 20 tools for form automation
-  - TESTING: 28 tools for E2E testing
-  - INTERACTIVE: 40 tools for full interaction
-  - DEVELOPER: 18 tools for development
-  - COMPLETE: 68 tools (all available)
+  - MINIMAL: 9 tools for basic navigation
+  - NAVIGATION: 3 tools for navigation
+  - SCRAPING: 10 tools for data extraction
+  - FORM_FILLING: 18 tools for form automation
+  - TESTING: 26 tools for E2E testing
+  - INTERACTIVE: 32 tools for full interaction
+  - DEVELOPER: 23 tools for development
+  - COMPLETE: 67 tools (all available)
 
 - **AI-Friendly Architecture**
   - Element reference system (refs) for stable element identification

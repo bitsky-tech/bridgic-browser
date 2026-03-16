@@ -7,13 +7,12 @@ This guide helps you choose the right tools for different browser automation sce
 | Category | Tools Count | Primary Use Case |
 |----------|-------------|------------------|
 | Navigation | 4 | Page navigation, search |
-| Page | 9 | Page control, tabs |
-| Action (ref-based) | 6 | Click, hover, focus, scroll-into-view, input |
-| Form (ref-based) | 7 | Inputs, dropdowns, checkboxes, file upload (`input_text_by_ref` shared with Action) |
-| Advanced (ref-based) | 2 | JS evaluation on element, drag-and-drop |
+| Page | 9 | Page control, tabs, JS eval |
+| Action (ref-based) | 7 | Click, hover, focus, scroll-into-view, input, drag-and-drop |
+| Form (ref-based) | 7 | Dropdowns, checkboxes, file upload, bulk fill |
 | Mouse (coordinate) | 6 | Precise mouse control |
 | Keyboard | 4 | Text input, shortcuts |
-| Screenshot | 2 | Capture visuals |
+| Capture | 2 | Capture visuals |
 | Network | 7 | Monitor requests/console |
 | Dialog | 3 | Handle popups |
 | State | 1 | Page snapshot for LLM |
@@ -22,9 +21,9 @@ This guide helps you choose the right tools for different browser automation sce
 | DevTools | 5 | Tracing, video |
 | Control | 3 | Browser lifecycle |
 
-## Page state and get_llm_repr
+## Page state and get_snapshot_text
 
-**Call `get_llm_repr` first** to get element refs (e.g. `e1`, `e2`) before using ref-based action tools. It returns a string representation of the accessibility tree that you can pass to your LLM; refs in that string are stable for the current page and can be used with `click_element_by_ref`, `input_text_by_ref`, etc.
+**Call `browser.get_snapshot_text()` first** to get element refs (e.g. `e1`, `e2`) before using ref-based action tools. It returns a string representation of the accessibility tree that you can pass to your LLM; refs in that string are stable for the current page and can be used with `click_element_by_ref`, `input_text_by_ref`, etc.
 
 ### Parameters
 
@@ -37,7 +36,7 @@ This guide helps you choose the right tools for different browser automation sce
 When the full tree exceeds the character limit, the tool returns a segment and appends a notice like:
 
 ```
-[notice] Current page state text is too long, returned portion starting from character 0 (this segment length 30000 / total length 45000 characters). To continue getting subsequent content, use start_from_char=30000 to call get_llm_repr again.
+[notice] Current page state text is too long, returned portion starting from character 0 (this segment length 30000 / total length 45000 characters). To continue getting subsequent content, use start_from_char=30000 to call get_snapshot_text again.
 ```
 
 Use the given `start_from_char` in the next call to continue reading.
@@ -46,15 +45,15 @@ Use the given `start_from_char` in the next call to continue reading.
 
 ```python
 # First call – get initial page state
-state = await get_llm_repr(browser)
+state = await browser.get_snapshot_text()
 # If state ends with [notice] and next_start_char=30000:
-# state_more = await get_llm_repr(browser, start_from_char=30000)
+# state_more = await browser.get_snapshot_text(start_from_char=30000)
 
-# Only interactive elements (good for “what can I click?”)
-state = await get_llm_repr(browser, interactive=True)
+# Only interactive elements (good for "what can I click?")
+state = await browser.get_snapshot_text(interactive=True)
 
 # Viewport-only (override default full_page=True)
-state = await get_llm_repr(browser, full_page=False)
+state = await browser.get_snapshot_text(full_page=False)
 ```
 
 ## Ref-based vs Coordinate-based Tools
@@ -64,12 +63,12 @@ state = await get_llm_repr(browser, full_page=False)
 **Ref-based tools** use element references (e.g., "e1", "e2") from the page state:
 
 ```python
-# Get page state with element refs (from get_llm_repr or browser.get_snapshot())
-state = await get_llm_repr(browser)
+# Get page state with element refs
+state = await browser.get_snapshot_text()
 # Tree lines look like: "- button 'Submit' [ref=e5]"
 
 # Use ref to interact
-await click_element_by_ref(browser, "e5")
+await browser.click_element_by_ref("e5")
 ```
 
 **Advantages**:
@@ -90,10 +89,10 @@ await click_element_by_ref(browser, "e5")
 
 ```python
 # Click at specific coordinates
-await mouse_click(browser, x=500, y=300)
+await browser.mouse_click(x=500, y=300)
 
 # Drag from one point to another
-await mouse_drag(browser, start_x=100, start_y=100, end_x=300, end_y=200)
+await browser.mouse_drag(start_x=100, start_y=100, end_x=300, end_y=200)
 ```
 
 **Advantages**:
@@ -111,12 +110,12 @@ await mouse_drag(browser, start_x=100, start_y=100, end_x=300, end_y=200)
 
 ## Text Input Methods Comparison
 
-### 1. `input_text_by_ref(browser, ref, text)`
+### 1. `browser.input_text_by_ref(ref, text)`
 
 The **default choice** for most text input scenarios.
 
 ```python
-await input_text_by_ref(browser, "e3", "hello@example.com")
+await browser.input_text_by_ref("e3", "hello@example.com")
 ```
 
 - Uses Playwright's `.fill()` method
@@ -124,24 +123,24 @@ await input_text_by_ref(browser, "e3", "hello@example.com")
 - Clears existing text by default
 - Triggers `input` and `change` events
 
-### 2. `input_text_by_ref(browser, ref, text, slowly=True)`
+### 2. `browser.input_text_by_ref(ref, text, slowly=True)`
 
 For inputs that need character-by-character typing:
 
 ```python
-await input_text_by_ref(browser, "e3", "search query", slowly=True)
+await browser.input_text_by_ref("e3", "search query", slowly=True)
 ```
 
 - Types each character with 100ms delay
 - Triggers `keydown`, `keypress`, `keyup` for each character
 - Use when autocomplete or real-time validation is needed
 
-### 3. `press_sequentially(browser, text)`
+### 3. `browser.type_text(text)`
 
 For typing at the current focus position:
 
 ```python
-await press_sequentially(browser, "hello world")
+await browser.type_text("hello world")
 ```
 
 - Types at cursor position (no ref needed)
@@ -149,26 +148,13 @@ await press_sequentially(browser, "hello world")
 - Good for search boxes with autocomplete
 - Can add `submit=True` to press Enter after
 
-### 4. `insert_text(browser, text)`
-
-Fastest method for bulk text:
-
-```python
-await insert_text(browser, "Large amount of text...")
-```
-
-- Direct text insertion
-- May not trigger all events
-- Best for performance-critical scenarios
-
 ### Comparison Table
 
 | Method | Speed | Events | Use Case |
 |--------|-------|--------|----------|
 | `input_text_by_ref` | Fast | input, change | Standard forms |
 | `input_text_by_ref(slowly=True)` | Slow | All keyboard | Autocomplete |
-| `press_sequentially` | Medium | All keyboard | At cursor |
-| `insert_text` | Fastest | Minimal | Bulk text |
+| `type_text` | Medium | All keyboard | At cursor (no ref) |
 
 ## Click Operations Comparison
 
@@ -176,10 +162,10 @@ await insert_text(browser, "Large amount of text...")
 
 ```python
 # Ref-based - preferred for standard elements
-await click_element_by_ref(browser, "e5")
+await browser.click_element_by_ref("e5")
 
 # Coordinate-based - for special cases
-await mouse_click(browser, x=500, y=300)
+await browser.mouse_click(x=500, y=300)
 ```
 
 | Feature | click_element_by_ref | mouse_click |
@@ -194,38 +180,30 @@ await mouse_click(browser, x=500, y=300)
 
 ```python
 # Ref-based
-await double_click_element_by_ref(browser, "e5")
+await browser.double_click_element_by_ref("e5")
 
 # Coordinate-based
-await mouse_click(browser, x=500, y=300, click_count=2)
+await browser.mouse_click(x=500, y=300, click_count=2)
 ```
 
 ### Right-click
 
 ```python
 # Ref-based
-await click_element_by_ref(browser, "e5", button="right")
+await browser.click_element_by_ref("e5", button="right")
 
 # Coordinate-based
-await mouse_click(browser, x=500, y=300, button="right")
+await browser.mouse_click(x=500, y=300, button="right")
 ```
 
 ## Scrolling Methods
-
-### `scroll_to_text`
-
-Scroll to bring specific text into view:
-
-```python
-await scroll_to_text(browser, "Contact Us")
-```
 
 ### `scroll_element_into_view_by_ref`
 
 Scroll to bring element with ref into view:
 
 ```python
-await scroll_element_into_view_by_ref(browser, "e15")
+await browser.scroll_element_into_view_by_ref("e15")
 ```
 
 ### `mouse_wheel`
@@ -234,13 +212,13 @@ Scroll by pixel amount:
 
 ```python
 # Scroll down 500 pixels
-await mouse_wheel(browser, delta_y=500)
+await browser.mouse_wheel(delta_y=500)
 
 # Scroll up 300 pixels
-await mouse_wheel(browser, delta_y=-300)
+await browser.mouse_wheel(delta_y=-300)
 
 # Scroll right 200 pixels
-await mouse_wheel(browser, delta_x=200)
+await browser.mouse_wheel(delta_x=200)
 ```
 
 ## Drag Operations
@@ -250,7 +228,7 @@ await mouse_wheel(browser, delta_x=200)
 Drag one element to another:
 
 ```python
-await drag_element_by_ref(browser, start_ref="e3", end_ref="e7")
+await browser.drag_element_by_ref(start_ref="e3", end_ref="e7")
 ```
 
 ### `mouse_drag`
@@ -258,7 +236,7 @@ await drag_element_by_ref(browser, start_ref="e3", end_ref="e7")
 Drag from coordinates to coordinates:
 
 ```python
-await mouse_drag(browser,
+await browser.mouse_drag(
     start_x=100, start_y=100,
     end_x=300, end_y=200,
     steps=10  # Smoothness
@@ -273,16 +251,16 @@ Flexible waiting with multiple conditions. Only one condition is used; priority 
 
 ```python
 # Wait for time (seconds, max 60)
-await wait_for(browser, time_seconds=2.0)
+await browser.wait_for(time_seconds=2.0)
 
 # Wait for text to appear (timeout_ms in milliseconds)
-await wait_for(browser, text="Loading complete", timeout_ms=10000)
+await browser.wait_for(text="Loading complete", timeout_ms=10000)
 
 # Wait for text to disappear
-await wait_for(browser, text_gone="Please wait...", timeout_ms=10000)
+await browser.wait_for(text_gone="Please wait...", timeout_ms=10000)
 
 # Wait for element state
-await wait_for(browser, selector=".modal", state="visible", timeout_ms=5000)
+await browser.wait_for(selector=".modal", state="visible", timeout_ms=5000)
 ```
 
 ### `wait_for_network_idle`
@@ -290,7 +268,7 @@ await wait_for(browser, selector=".modal", state="visible", timeout_ms=5000)
 Wait for network activity to settle. **timeout** is in milliseconds.
 
 ```python
-await wait_for_network_idle(browser, timeout=30000)  # 30 seconds
+await browser.wait_for_network_idle(timeout=30000)  # 30 seconds
 ```
 
 ## Verification Tools
@@ -298,10 +276,10 @@ await wait_for_network_idle(browser, timeout=30000)  # 30 seconds
 All verification tools return strings with `PASS:` or `FAIL:` prefix:
 
 ```python
-result = await verify_text_visible(browser, text="Welcome")
+result = await browser.verify_text_visible(text="Welcome")
 # Returns: "PASS: Text 'Welcome' is visible" or "FAIL: Text 'Welcome' not found"
 
-result = await verify_url(browser, expected_url="dashboard")
+result = await browser.verify_url(expected_url="dashboard")
 # Returns: "PASS: URL contains 'dashboard'" or "FAIL: URL mismatch..."
 ```
 
@@ -320,13 +298,13 @@ result = await verify_url(browser, expected_url="dashboard")
 
 | Scenario | Recommended Preset | Tools Count |
 |----------|-------------------|-------------|
-| Simple navigation | MINIMAL | 11 |
-| Data scraping | SCRAPING | 14 |
-| Form automation | FORM_FILLING | 20 |
-| E2E testing | TESTING | 28 |
-| Complex interactions | INTERACTIVE | 39 |
-| Debugging | DEVELOPER | 22 |
-| Full access | COMPLETE | 69 |
+| Simple navigation | MINIMAL | 9 |
+| Data scraping | SCRAPING | 10 |
+| Form automation | FORM_FILLING | 18 |
+| E2E testing | TESTING | 26 |
+| Complex interactions | INTERACTIVE | 32 |
+| Debugging | DEVELOPER | 23 |
+| Full access | COMPLETE | 67 |
 
 ## Picking by function names
 
@@ -335,34 +313,35 @@ Use name-based APIs when your tool list comes from config files, prompts, or oth
 ```python
 from bridgic.browser.tools import BrowserToolSetBuilder
 
-tools = BrowserToolSetBuilder.from_tool_names(
+builder = BrowserToolSetBuilder.for_tool_names(
     browser,
     "search",
     "navigate_to_url",
     "click_element_by_ref",
 )
+tools = builder.build()["tool_specs"]
 ```
 
-For fluent composition:
+For custom composition:
 
 ```python
-tools = (
-    BrowserToolSetBuilder(browser)
-    .with_category("navigation")
-    .with_tool_names("click_element_by_ref", "verify_url")
-    .build_specs()
+builder1 = BrowserToolSetBuilder.for_categories(browser, "navigation")
+builder2 = BrowserToolSetBuilder.for_tool_names(
+    browser, "click_element_by_ref", "verify_url"
 )
+tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 ```
 
-Use `strict=True` to fail fast on unknown names (recommended in production):
+Use `strict=True` to fail fast on unknown names or methods missing on the provided browser (recommended in production):
 
 ```python
-tools = BrowserToolSetBuilder.from_tool_names(
+builder = BrowserToolSetBuilder.for_tool_names(
     browser,
     "search",
     "navigate_to_url",
     strict=True,
 )
+tools = builder.build()["tool_specs"]
 ```
 
 ## Common Patterns
@@ -371,7 +350,7 @@ tools = BrowserToolSetBuilder.from_tool_names(
 
 ```python
 # Using fill_form for multiple fields
-await fill_form(browser, [
+await browser.fill_form([
     {"ref": "e1", "value": "John Doe"},
     {"ref": "e2", "value": "john@example.com"},
     {"ref": "e3", "value": "secret123"},
@@ -382,29 +361,29 @@ await fill_form(browser, [
 
 ```python
 # First, get available options
-options = await get_dropdown_options_by_ref(browser, "e5")
+options = await browser.get_dropdown_options_by_ref("e5")
 # Returns: "1. Option A (value: a)\n2. Option B (value: b)"
 
 # Then select by text or value
-await select_dropdown_option_by_ref(browser, "e5", "Option A")
+await browser.select_dropdown_option_by_ref("e5", "Option A")
 # or
-await select_dropdown_option_by_ref(browser, "e5", "a")
+await browser.select_dropdown_option_by_ref("e5", "a")
 ```
 
 ### File Upload
 
 ```python
-await upload_file_by_ref(browser, "e10", "/path/to/file.pdf")
+await browser.upload_file_by_ref("e10", "/path/to/file.pdf")
 ```
 
 ### Handling Dialogs
 
 ```python
 # Set up auto-handling
-await setup_dialog_handler(browser, default_action="accept")
+await browser.setup_dialog_handler(default_action="accept")
 
 # Or handle next dialog manually
-await handle_dialog(browser, accept=True, prompt_text="My input")
+await browser.handle_dialog(accept=True, prompt_text="My input")
 ```
 
 ## Error Handling
@@ -412,7 +391,7 @@ await handle_dialog(browser, accept=True, prompt_text="My input")
 All tools return string messages. Check for error patterns:
 
 ```python
-result = await click_element_by_ref(browser, "e999")
+result = await browser.click_element_by_ref("e999")
 
 if "not available" in result or "Failed" in result:
     # Element not found or operation failed

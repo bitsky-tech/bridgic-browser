@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
+from bridgic.browser._cli_catalog import CLI_HELP_SECTIONS
 from bridgic.browser.cli._commands import _strip_ref, cli, SectionedGroup
 from bridgic.browser.cli._daemon import (
     _build_browser_kwargs,
@@ -36,6 +37,49 @@ from bridgic.browser.cli._daemon import (
     _handle_search,
     _handle_close_tab,
     _handle_pdf,
+    # new handlers
+    _handle_scroll_into_view,
+    _handle_drag,
+    _handle_options,
+    _handle_upload,
+    _handle_fill_form,
+    _handle_type_text,
+    _handle_key_down,
+    _handle_key_up,
+    _handle_mouse_move,
+    _handle_mouse_click,
+    _handle_mouse_drag,
+    _handle_mouse_down,
+    _handle_mouse_up,
+    _handle_wait_network,
+    _handle_console_start,
+    _handle_console_stop,
+    _handle_console,
+    _handle_network_start,
+    _handle_network_stop,
+    _handle_network,
+    _handle_dialog_setup,
+    _handle_dialog,
+    _handle_dialog_remove,
+    _handle_storage_save,
+    _handle_storage_load,
+    _handle_cookies_clear,
+    _handle_cookies,
+    _handle_cookie_set,
+    _handle_verify_visible,
+    _handle_verify_text,
+    _handle_verify_value,
+    _handle_verify_state,
+    _handle_verify_url,
+    _handle_verify_title,
+    _handle_eval,
+    _handle_eval_on,
+    _handle_trace_start,
+    _handle_trace_stop,
+    _handle_trace_chunk,
+    _handle_video_start,
+    _handle_video_stop,
+    _handle_resize,
     _is_browser_closed_error,
     _default_socket_path,
     _safe_remove_socket,
@@ -82,6 +126,7 @@ def make_browser() -> MagicMock:
     b.get_snapshot = AsyncMock()
     b.get_element_by_ref = AsyncMock(return_value=None)
     b.navigate_to = AsyncMock()
+    b.browser_close = AsyncMock(return_value="Browser closed successfully")
     return b
 
 
@@ -118,6 +163,9 @@ class TestSectionedGroupHelp:
     def test_cli_group_is_sectioned(self):
         assert isinstance(cli, SectionedGroup)
 
+    def test_sections_follow_shared_catalog(self):
+        assert SectionedGroup.SECTIONS == CLI_HELP_SECTIONS
+
     def test_h_shorthand_on_group(self):
         result = invoke_raw(["-h"])
         assert result.exit_code == 0
@@ -136,20 +184,50 @@ class TestSectionedGroupHelp:
     def test_sections_present(self):
         result = invoke_raw(["-h"])
         out = result.output
-        for section in ("Navigation", "Snapshot", "Element Interaction",
-                        "Keyboard", "Mouse", "Wait", "Tabs", "Capture",
-                        "Developer", "Lifecycle"):
+        for section in (
+            "Navigation", "Snapshot", "Element Interaction",
+            "Keyboard", "Mouse", "Wait", "Tabs", "Evaluate", "Capture",
+            "Network", "Dialog", "Storage", "Verify",
+            "Developer", "Lifecycle",
+        ):
             assert section in out, f"Section '{section}' missing from help"
 
     def test_all_commands_appear_in_help(self):
         result = invoke_raw(["-h"])
         out = result.output
         expected_commands = [
-            "open", "navigate", "back", "forward", "reload", "search", "info",
-            "snapshot", "click", "double-click", "hover", "focus", "fill",
-            "select", "check", "uncheck", "get", "press", "type", "scroll",
-            "wait", "wait-for", "tabs", "new-tab", "switch-tab", "close-tab",
-            "screenshot", "pdf", "eval", "close",
+            # Navigation
+            "open", "back", "forward", "reload", "search", "info", "scroll-to",
+            # Snapshot
+            "snapshot",
+            # Element Interaction
+            "click", "double-click", "hover", "focus", "fill", "select",
+            "check", "uncheck", "drag", "options", "upload", "fill-form",
+            # Keyboard
+            "press", "type", "key-down", "key-up",
+            # Mouse
+            "scroll", "mouse-move", "mouse-click", "mouse-drag", "mouse-down", "mouse-up",
+            # Wait
+            "wait",
+            # Tabs
+            "tabs", "new-tab", "switch-tab", "close-tab",
+            # Capture
+            "screenshot", "pdf",
+            # Network
+            "console-start", "console-stop", "console",
+            "network-start", "network-stop", "network", "wait-network",
+            # Dialog
+            "dialog-setup", "dialog", "dialog-remove",
+            # Storage
+            "storage-save", "storage-load", "cookies-clear", "cookies", "cookie-set",
+            # Verify
+            "verify-visible", "verify-text", "verify-value",
+            "verify-state", "verify-url", "verify-title",
+            # Developer
+            "eval", "eval-on", "trace-start", "trace-stop", "trace-chunk",
+            "video-start", "video-stop",
+            # Lifecycle
+            "close", "resize",
         ]
         for cmd in expected_commands:
             assert cmd in out, f"Command '{cmd}' missing from help output"
@@ -193,10 +271,6 @@ class TestCliCommandRouting:
     def test_open(self):
         _, sc = invoke(["open", "https://example.com"])
         sc.assert_called_once_with("open", {"url": "https://example.com"})
-
-    def test_navigate(self):
-        _, sc = invoke(["navigate", "https://example.com"])
-        sc.assert_called_once_with("navigate", {"url": "https://example.com"})
 
     def test_back(self):
         _, sc = invoke(["back"])
@@ -286,18 +360,38 @@ class TestCliCommandRouting:
         _, sc = invoke(["uncheck", "@e9"])
         sc.assert_called_once_with("uncheck", {"ref": "e9"})
 
-    def test_get_text(self):
-        _, sc = invoke(["get", "text", "@e1"])
-        sc.assert_called_once_with("get_text", {"ref": "e1"})
+    def test_scroll_to(self):
+        _, sc = invoke(["scroll-to", "@e5"])
+        sc.assert_called_once_with("scroll_into_view", {"ref": "e5"})
 
-    def test_get_invalid_property_exits_nonzero(self):
-        result, sc = invoke(["get", "html", "@e1"])
+    def test_scroll_into_view_removed(self):
+        result, _ = invoke(["scroll-into-view", "@e5"])
         assert result.exit_code != 0
-        sc.assert_not_called()
+        assert "No such command 'scroll-into-view'" in result.output
 
-    def test_get_invalid_property_error_message(self):
-        result, _ = invoke(["get", "html", "@e1"])
-        assert "Unsupported property" in result.output
+    def test_drag(self):
+        _, sc = invoke(["drag", "@e1", "@e2"])
+        sc.assert_called_once_with("drag", {"start_ref": "e1", "end_ref": "e2"})
+
+    def test_options(self):
+        _, sc = invoke(["options", "@e3"])
+        sc.assert_called_once_with("options", {"ref": "e3"})
+
+    def test_upload_absolutizes_path(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        _, sc = invoke(["upload", "@e4", "file.txt"])
+        expected = str(tmp_path / "file.txt")
+        sc.assert_called_once_with("upload", {"ref": "e4", "path": expected})
+
+    def test_fill_form(self):
+        fields = '[{"ref":"e1","value":"hi"}]'
+        _, sc = invoke(["fill-form", fields])
+        sc.assert_called_once_with("fill_form", {"fields": fields, "submit": False})
+
+    def test_fill_form_with_submit(self):
+        fields = '[{"ref":"e1","value":"hi"}]'
+        _, sc = invoke(["fill-form", fields, "--submit"])
+        sc.assert_called_once_with("fill_form", {"fields": fields, "submit": True})
 
     # ── Keyboard ──────────────────────────────────────────────────────────────
 
@@ -307,7 +401,24 @@ class TestCliCommandRouting:
 
     def test_type(self):
         _, sc = invoke(["type", "hello world"])
-        sc.assert_called_once_with("type", {"text": "hello world"})
+        sc.assert_called_once_with("type_text", {"text": "hello world", "submit": False})
+
+    def test_type_with_submit(self):
+        _, sc = invoke(["type", "hello", "--submit"])
+        sc.assert_called_once_with("type_text", {"text": "hello", "submit": True})
+
+    def test_type_text_removed(self):
+        result, _ = invoke(["type-text", "hello"])
+        assert result.exit_code != 0
+        assert "No such command 'type-text'" in result.output
+
+    def test_key_down(self):
+        _, sc = invoke(["key-down", "Shift"])
+        sc.assert_called_once_with("key_down", {"key": "Shift"})
+
+    def test_key_up(self):
+        _, sc = invoke(["key-up", "Shift"])
+        sc.assert_called_once_with("key_up", {"key": "Shift"})
 
     # ── Mouse ─────────────────────────────────────────────────────────────────
 
@@ -323,25 +434,57 @@ class TestCliCommandRouting:
         _, sc = invoke(["scroll", "--dy", "100", "--dx", "50"])
         sc.assert_called_once_with("scroll", {"delta_x": 50.0, "delta_y": 100.0})
 
+    def test_mouse_move(self):
+        _, sc = invoke(["mouse-move", "100", "200"])
+        sc.assert_called_once_with("mouse_move", {"x": 100.0, "y": 200.0})
+
+    def test_mouse_click_defaults(self):
+        _, sc = invoke(["mouse-click", "150", "250"])
+        sc.assert_called_once_with("mouse_click", {"x": 150.0, "y": 250.0, "button": "left", "count": 1})
+
+    def test_mouse_click_right_button(self):
+        _, sc = invoke(["mouse-click", "150", "250", "--button", "right"])
+        sc.assert_called_once_with("mouse_click", {"x": 150.0, "y": 250.0, "button": "right", "count": 1})
+
+    def test_mouse_click_double(self):
+        _, sc = invoke(["mouse-click", "150", "250", "--count", "2"])
+        sc.assert_called_once_with("mouse_click", {"x": 150.0, "y": 250.0, "button": "left", "count": 2})
+
+    def test_mouse_drag(self):
+        _, sc = invoke(["mouse-drag", "10", "20", "100", "200"])
+        sc.assert_called_once_with("mouse_drag", {"x1": 10.0, "y1": 20.0, "x2": 100.0, "y2": 200.0})
+
+    def test_mouse_down_default(self):
+        _, sc = invoke(["mouse-down"])
+        sc.assert_called_once_with("mouse_down", {"button": "left"})
+
+    def test_mouse_down_right(self):
+        _, sc = invoke(["mouse-down", "--button", "right"])
+        sc.assert_called_once_with("mouse_down", {"button": "right"})
+
+    def test_mouse_up_default(self):
+        _, sc = invoke(["mouse-up"])
+        sc.assert_called_once_with("mouse_up", {"button": "left"})
+
     # ── Wait ──────────────────────────────────────────────────────────────────
 
     def test_wait_seconds(self):
         _, sc = invoke(["wait", "2.5"])
         sc.assert_called_once_with("wait", {"seconds": 2.5})
 
-    def test_wait_for_text_appear(self):
-        _, sc = invoke(["wait-for", "Done"])
+    def test_wait_text_appear(self):
+        _, sc = invoke(["wait", "Done"])
         sc.assert_called_once_with("wait", {"text": "Done"})
 
-    def test_wait_for_text_gone(self):
-        _, sc = invoke(["wait-for", "Loading", "--gone"])
+    def test_wait_text_gone(self):
+        _, sc = invoke(["wait", "--gone", "Loading"])
         sc.assert_called_once_with("wait", {"text_gone": "Loading"})
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
 
     def test_tabs(self):
         _, sc = invoke(["tabs"])
-        sc.assert_called_once_with("tabs")
+        sc.assert_called_once_with("tabs", start_if_needed=False)
 
     def test_new_tab_with_url(self):
         _, sc = invoke(["new-tab", "https://example.com"])
@@ -394,13 +537,207 @@ class TestCliCommandRouting:
         expected = str(tmp_path / "report.pdf")
         sc.assert_called_once_with("pdf", {"path": expected})
 
+    # ── Network ───────────────────────────────────────────────────────────────
+
+    def test_console_start(self):
+        _, sc = invoke(["console-start"])
+        sc.assert_called_once_with("console_start")
+
+    def test_console_stop(self):
+        _, sc = invoke(["console-stop"])
+        sc.assert_called_once_with("console_stop")
+
+    def test_console_defaults(self):
+        _, sc = invoke(["console"])
+        sc.assert_called_once_with("console", {"filter": None, "clear": True})
+
+    def test_console_with_filter(self):
+        _, sc = invoke(["console", "--filter", "error"])
+        sc.assert_called_once_with("console", {"filter": "error", "clear": True})
+
+    def test_console_no_clear(self):
+        _, sc = invoke(["console", "--no-clear"])
+        sc.assert_called_once_with("console", {"filter": None, "clear": False})
+
+    def test_network_start(self):
+        _, sc = invoke(["network-start"])
+        sc.assert_called_once_with("network_start")
+
+    def test_network_stop(self):
+        _, sc = invoke(["network-stop"])
+        sc.assert_called_once_with("network_stop")
+
+    def test_network_defaults(self):
+        _, sc = invoke(["network"])
+        sc.assert_called_once_with("network", {"include_static": False, "clear": True})
+
+    def test_network_with_static(self):
+        _, sc = invoke(["network", "--static"])
+        sc.assert_called_once_with("network", {"include_static": True, "clear": True})
+
+    def test_wait_network_defaults(self):
+        _, sc = invoke(["wait-network"])
+        sc.assert_called_once_with("wait_network", {"timeout": 30000.0})
+
+    def test_wait_network_custom_timeout(self):
+        _, sc = invoke(["wait-network", "--timeout", "5000"])
+        sc.assert_called_once_with("wait_network", {"timeout": 5000.0})
+
+    # ── Dialog ────────────────────────────────────────────────────────────────
+
+    def test_dialog_setup_defaults(self):
+        _, sc = invoke(["dialog-setup"])
+        sc.assert_called_once_with("dialog_setup", {"action": "accept", "text": None})
+
+    def test_dialog_setup_dismiss(self):
+        _, sc = invoke(["dialog-setup", "--action", "dismiss"])
+        sc.assert_called_once_with("dialog_setup", {"action": "dismiss", "text": None})
+
+    def test_dialog_setup_with_text(self):
+        _, sc = invoke(["dialog-setup", "--text", "yes"])
+        sc.assert_called_once_with("dialog_setup", {"action": "accept", "text": "yes"})
+
+    def test_dialog_accept(self):
+        _, sc = invoke(["dialog"])
+        sc.assert_called_once_with("dialog", {"dismiss": False, "text": None})
+
+    def test_dialog_dismiss(self):
+        _, sc = invoke(["dialog", "--dismiss"])
+        sc.assert_called_once_with("dialog", {"dismiss": True, "text": None})
+
+    def test_dialog_remove(self):
+        _, sc = invoke(["dialog-remove"])
+        sc.assert_called_once_with("dialog_remove")
+
+    # ── Storage ───────────────────────────────────────────────────────────────
+
+    def test_storage_save_absolutizes_path(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        _, sc = invoke(["storage-save", "state.json"])
+        sc.assert_called_once_with("storage_save", {"path": str(tmp_path / "state.json")})
+
+    def test_storage_load_absolutizes_path(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        _, sc = invoke(["storage-load", "state.json"])
+        sc.assert_called_once_with("storage_load", {"path": str(tmp_path / "state.json")})
+
+    def test_cookies_clear(self):
+        _, sc = invoke(["cookies-clear"])
+        sc.assert_called_once_with("cookies_clear")
+
+    def test_cookies_no_filter(self):
+        _, sc = invoke(["cookies"])
+        sc.assert_called_once_with("cookies", {"url": None})
+
+    def test_cookies_with_url(self):
+        _, sc = invoke(["cookies", "--url", "https://example.com"])
+        sc.assert_called_once_with("cookies", {"url": "https://example.com"})
+
+    def test_cookie_set_minimal(self):
+        _, sc = invoke(["cookie-set", "sid", "abc123"])
+        sc.assert_called_once_with("cookie_set", {
+            "name": "sid", "value": "abc123", "url": None, "domain": None,
+            "path": "/", "expires": None, "http_only": False, "secure": False, "same_site": None,
+        })
+
+    def test_cookie_set_full(self):
+        _, sc = invoke([
+            "cookie-set", "sid", "abc123",
+            "--url", "https://example.com",
+            "--http-only", "--secure",
+            "--same-site", "Strict",
+        ])
+        sc.assert_called_once_with("cookie_set", {
+            "name": "sid", "value": "abc123", "url": "https://example.com", "domain": None,
+            "path": "/", "expires": None, "http_only": True, "secure": True, "same_site": "Strict",
+        })
+
+    # ── Verify ────────────────────────────────────────────────────────────────
+
+    def test_verify_visible(self):
+        _, sc = invoke(["verify-visible", "button", "Submit"])
+        sc.assert_called_once_with("verify_visible", {"role": "button", "name": "Submit", "timeout": 5000.0})
+
+    def test_verify_visible_custom_timeout(self):
+        _, sc = invoke(["verify-visible", "button", "OK", "--timeout", "10000"])
+        sc.assert_called_once_with("verify_visible", {"role": "button", "name": "OK", "timeout": 10000.0})
+
+    def test_verify_text(self):
+        _, sc = invoke(["verify-text", "Hello world"])
+        sc.assert_called_once_with("verify_text", {"text": "Hello world", "exact": False, "timeout": 5000.0})
+
+    def test_verify_text_exact(self):
+        _, sc = invoke(["verify-text", "Hello", "--exact"])
+        sc.assert_called_once_with("verify_text", {"text": "Hello", "exact": True, "timeout": 5000.0})
+
+    def test_verify_value(self):
+        _, sc = invoke(["verify-value", "@e1", "expected"])
+        sc.assert_called_once_with("verify_value", {"ref": "e1", "expected": "expected"})
+
+    def test_verify_state(self):
+        _, sc = invoke(["verify-state", "@e2", "visible"])
+        sc.assert_called_once_with("verify_state", {"ref": "e2", "state": "visible"})
+
+    def test_verify_url(self):
+        _, sc = invoke(["verify-url", "https://example.com"])
+        sc.assert_called_once_with("verify_url", {"url": "https://example.com", "exact": False})
+
+    def test_verify_url_exact(self):
+        _, sc = invoke(["verify-url", "https://example.com", "--exact"])
+        sc.assert_called_once_with("verify_url", {"url": "https://example.com", "exact": True})
+
+    def test_verify_title(self):
+        _, sc = invoke(["verify-title", "My Page"])
+        sc.assert_called_once_with("verify_title", {"title": "My Page", "exact": False})
+
     # ── Developer ─────────────────────────────────────────────────────────────
 
     def test_eval(self):
         _, sc = invoke(["eval", "() => document.title"])
         sc.assert_called_once_with("eval", {"code": "() => document.title"})
 
+    def test_eval_on(self):
+        _, sc = invoke(["eval-on", "@e1", "el => el.textContent"])
+        sc.assert_called_once_with("eval_on", {"ref": "e1", "code": "el => el.textContent"})
+
+    def test_trace_start_defaults(self):
+        _, sc = invoke(["trace-start"])
+        sc.assert_called_once_with("trace_start", {"no_screenshots": False, "no_snapshots": False})
+
+    def test_trace_start_no_screenshots(self):
+        _, sc = invoke(["trace-start", "--no-screenshots"])
+        sc.assert_called_once_with("trace_start", {"no_screenshots": True, "no_snapshots": False})
+
+    def test_trace_stop_absolutizes_path(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        _, sc = invoke(["trace-stop", "trace.zip"])
+        sc.assert_called_once_with("trace_stop", {"path": str(tmp_path / "trace.zip")})
+
+    def test_trace_chunk(self):
+        _, sc = invoke(["trace-chunk", "login flow"])
+        sc.assert_called_once_with("trace_chunk", {"title": "login flow"})
+
+    def test_video_start_defaults(self):
+        _, sc = invoke(["video-start"])
+        sc.assert_called_once_with("video_start", {"width": None, "height": None})
+
+    def test_video_start_dimensions(self):
+        _, sc = invoke(["video-start", "--width", "1280", "--height", "720"])
+        sc.assert_called_once_with("video_start", {"width": 1280, "height": 720})
+
+    def test_video_stop_no_path(self):
+        _, sc = invoke(["video-stop"])
+        sc.assert_called_once_with("video_stop", {"path": None})
+
+    def test_video_stop_with_absolute_path(self):
+        _, sc = invoke(["video-stop", "/tmp/video.webm"])
+        sc.assert_called_once_with("video_stop", {"path": "/tmp/video.webm"})
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def test_resize(self):
+        _, sc = invoke(["resize", "1920", "1080"])
+        sc.assert_called_once_with("resize", {"width": 1920, "height": 1080})
 
     def test_close_uses_start_if_needed_false(self):
         _, sc = invoke(["close"])
@@ -442,11 +779,8 @@ class TestDaemonDispatch:
 
     async def test_known_command_returns_ok(self):
         browser = make_browser()
-        with patch(
-            "bridgic.browser.tools._browser_tools.navigate_to_url",
-            new=AsyncMock(return_value="Navigated"),
-        ):
-            resp = await _dispatch(browser, "open", {"url": "https://example.com"})
+        browser.navigate_to_url = AsyncMock(return_value="Navigated")
+        resp = await _dispatch(browser, "open", {"url": "https://example.com"})
         assert resp["status"] == "ok"
         assert resp["success"] is True
         assert resp["error_code"] is None
@@ -454,11 +788,8 @@ class TestDaemonDispatch:
 
     async def test_known_command_business_failure_returns_error(self):
         browser = make_browser()
-        with patch(
-            "bridgic.browser.tools._browser_tools.navigate_to_url",
-            new=AsyncMock(return_value="Navigation failed: timeout"),
-        ):
-            resp = await _dispatch(browser, "open", {"url": "https://example.com"})
+        browser.navigate_to_url = AsyncMock(return_value="Navigation failed: timeout")
+        resp = await _dispatch(browser, "open", {"url": "https://example.com"})
         assert resp["status"] == "error"
         assert resp["success"] is False
         assert resp["error_code"] == "NAVIGATION_FAILED"
@@ -466,61 +797,17 @@ class TestDaemonDispatch:
 
     async def test_eval_command_keeps_ok_for_arbitrary_string(self):
         browser = make_browser()
-        with patch(
-            "bridgic.browser.tools._browser_tools.evaluate_javascript",
-            new=AsyncMock(return_value="Failed to load widget title"),
-        ):
-            resp = await _dispatch(browser, "eval", {"code": "() => 'x'"})
+        browser.evaluate_javascript = AsyncMock(return_value="Failed to load widget title")
+        resp = await _dispatch(browser, "eval", {"code": "() => 'x'"})
         assert resp["status"] == "ok"
         assert resp["success"] is True
         assert resp["error_code"] is None
         assert "Failed to load widget title" in resp["result"]
 
-    async def test_get_text_literal_error_prefix_is_not_misclassified(self):
-        browser = make_browser()
-        locator = MagicMock()
-        literal_text = "Failed to get text from element e1: this is normal page text"
-        locator.inner_text = AsyncMock(return_value=literal_text)
-        browser.get_element_by_ref = AsyncMock(return_value=locator)
-
-        resp = await _dispatch(browser, "get_text", {"ref": "e1"})
-
-        assert resp["status"] == "ok"
-        assert resp["success"] is True
-        assert resp["error_code"] is None
-        assert resp["result"] == literal_text
-
-    async def test_get_text_runtime_failure_returns_specific_code(self):
-        browser = make_browser()
-        locator = MagicMock()
-        locator.inner_text = AsyncMock(side_effect=RuntimeError("boom"))
-        browser.get_element_by_ref = AsyncMock(return_value=locator)
-
-        resp = await _dispatch(browser, "get_text", {"ref": "e1"})
-
-        assert resp["status"] == "error"
-        assert resp["success"] is False
-        assert resp["error_code"] == "GET_TEXT_FAILED"
-        assert "boom" in resp["result"]
-
-    async def test_get_text_missing_ref_returns_ref_not_available(self):
-        browser = make_browser()
-        browser.get_element_by_ref = AsyncMock(return_value=None)
-
-        resp = await _dispatch(browser, "get_text", {"ref": "e404"})
-
-        assert resp["status"] == "error"
-        assert resp["success"] is False
-        assert resp["error_code"] == "REF_NOT_AVAILABLE"
-        assert "not available" in resp["result"]
-
     async def test_handler_exception_returns_error(self):
         browser = make_browser()
-        with patch(
-            "bridgic.browser.tools._browser_tools.navigate_to_url",
-            new=AsyncMock(side_effect=RuntimeError("boom")),
-        ):
-            resp = await _dispatch(browser, "open", {"url": "x"})
+        browser.navigate_to_url = AsyncMock(side_effect=RuntimeError("boom"))
+        resp = await _dispatch(browser, "open", {"url": "x"})
         assert resp["status"] == "error"
         assert resp["success"] is False
         assert resp["error_code"] == "HANDLER_EXCEPTION"
@@ -529,13 +816,10 @@ class TestDaemonDispatch:
     async def test_browser_closed_error_returns_hint(self):
         """Playwright 'browser has been closed' errors surface the recovery hint."""
         browser = make_browser()
-        with patch(
-            "bridgic.browser.tools._browser_tools.navigate_to_url",
-            new=AsyncMock(side_effect=Exception(
-                "Page.goto: Target page, context or browser has been closed"
-            )),
-        ):
-            resp = await _dispatch(browser, "open", {"url": "x"})
+        browser.navigate_to_url = AsyncMock(side_effect=Exception(
+            "Page.goto: Target page, context or browser has been closed"
+        ))
+        resp = await _dispatch(browser, "open", {"url": "x"})
         assert resp["status"] == "error"
         assert resp["success"] is False
         assert resp["error_code"] == "BROWSER_CLOSED"
@@ -566,18 +850,16 @@ class TestBrowserClosedDetection:
         assert _is_browser_closed_error(Exception("Timeout exceeded")) is False
 
     async def test_snapshot_none_returns_hint(self):
-        """When get_snapshot() returns None (browser gone), return a failure message."""
+        """When get_snapshot_text() returns a failure message (browser gone), propagate it."""
         browser = make_browser()
-        browser.get_snapshot = AsyncMock(return_value=None)
+        browser.get_snapshot_text = AsyncMock(return_value="Failed to get interface information")
         result = await _handle_snapshot(browser, {})
         assert "Failed to get interface information" in result
 
     async def test_snapshot_ok_returns_tree(self):
         """Normal snapshot path still returns the tree string."""
         browser = make_browser()
-        snap = MagicMock()
-        snap.tree = "- button [ref=e1]"
-        browser.get_snapshot = AsyncMock(return_value=snap)
+        browser.get_snapshot_text = AsyncMock(return_value="- button [ref=e1]")
         result = await _handle_snapshot(browser, {})
         assert result == "- button [ref=e1]"
 
@@ -588,9 +870,10 @@ class TestBrowserClosedDetection:
 
 class TestDaemonSocketSecurity:
     def test_default_socket_path_is_user_scoped(self, tmp_path):
-        with patch("bridgic.browser.cli._daemon.Path.home", return_value=tmp_path):
+        fake_home = tmp_path / ".bridgic"
+        with patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home):
             path = _default_socket_path()
-        assert path == str(tmp_path / ".bridgic" / "run" / "bridgic-browser.sock")
+        assert path == str(fake_home / "run" / "bridgic-browser.sock")
 
     def test_safe_remove_socket_removes_owned_socket(self):
         mock_path = MagicMock()
@@ -782,182 +1065,420 @@ class TestDaemonConnection:
 class TestDaemonHandlers:
     async def test_handle_open_calls_navigate(self):
         browser = make_browser()
-        with patch(
-            "bridgic.browser.tools._browser_tools.navigate_to_url",
-            new=AsyncMock(return_value="Navigated to: https://example.com"),
-        ) as mock_nav:
-            result = await _handle_open(browser, {"url": "https://example.com"})
-        mock_nav.assert_awaited_once_with(browser, "https://example.com")
+        browser.navigate_to_url = AsyncMock(return_value="Navigated to: https://example.com")
+        result = await _handle_open(browser, {"url": "https://example.com"})
+        browser.navigate_to_url.assert_awaited_once_with("https://example.com")
         assert result == "Navigated to: https://example.com"
 
     async def test_handle_snapshot_default(self):
         browser = make_browser()
-        snap = MagicMock()
-        snap.tree = "- heading 'Example' [ref=e1]"
-        browser.get_snapshot = AsyncMock(return_value=snap)
+        browser.get_snapshot_text = AsyncMock(return_value="- heading 'Example' [ref=e1]")
 
         result = await _handle_snapshot(browser, {})
 
-        browser.get_snapshot.assert_awaited_once_with(interactive=False, full_page=True)
-        assert result == snap.tree
+        browser.get_snapshot_text.assert_awaited_once_with(
+            start_from_char=0, interactive=False, full_page=True
+        )
+        assert result == "- heading 'Example' [ref=e1]"
 
     async def test_handle_snapshot_interactive(self):
         browser = make_browser()
-        snap = MagicMock(tree="- button 'Submit' [ref=e1]")
-        browser.get_snapshot = AsyncMock(return_value=snap)
+        browser.get_snapshot_text = AsyncMock(return_value="- button 'Submit' [ref=e1]")
 
         await _handle_snapshot(browser, {"interactive": True})
 
-        browser.get_snapshot.assert_awaited_once_with(interactive=True, full_page=True)
+        browser.get_snapshot_text.assert_awaited_once_with(
+            start_from_char=0, interactive=True, full_page=True
+        )
 
     async def test_handle_snapshot_full_page_false(self):
-        """full_page=False is passed through to get_llm_repr."""
+        """full_page=False is passed through to get_snapshot_text."""
         browser = make_browser()
-        call_args = []
-
-        async def mock_get_llm_repr(browser, start_from_char=0, interactive=False, full_page=True):
-            call_args.append((start_from_char, interactive, full_page))
-            return "- button [ref=e1]"
-
-        with patch(
-            "bridgic.browser.tools._browser_state_tools.get_llm_repr",
-            mock_get_llm_repr,
-        ):
-            result = await _handle_snapshot(browser, {"full_page": False})
-        assert call_args == [(0, False, False)]
+        browser.get_snapshot_text = AsyncMock(return_value="- button [ref=e1]")
+        result = await _handle_snapshot(browser, {"full_page": False})
+        browser.get_snapshot_text.assert_awaited_once_with(
+            start_from_char=0, interactive=False, full_page=False
+        )
         assert result == "- button [ref=e1]"
 
     async def test_handle_snapshot_start_from_char(self):
-        """start_from_char is passed through to get_llm_repr."""
+        """start_from_char is passed through to get_snapshot_text."""
         browser = make_browser()
-        with patch(
-            "bridgic.browser.tools._browser_state_tools.get_llm_repr",
-            new_callable=AsyncMock,
-            return_value="A" * 90,
-        ) as mock_repr:
-            result = await _handle_snapshot(browser, {"start_from_char": 10})
-        mock_repr.assert_awaited_once_with(
-            browser, start_from_char=10, interactive=False, full_page=True
+        browser.get_snapshot_text = AsyncMock(return_value="A" * 90)
+        result = await _handle_snapshot(browser, {"start_from_char": 10})
+        browser.get_snapshot_text.assert_awaited_once_with(
+            start_from_char=10, interactive=False, full_page=True
         )
         assert result == "A" * 90
 
     async def test_handle_click_calls_tool(self):
         browser = make_browser()
-        call_args = []
-
-        async def mock_click_element(browser, ref):
-            call_args.append((browser, ref))
-            return "Clicked e2"
-
-        with patch(
-            "bridgic.browser.tools._browser_action_tools.click_element_by_ref",
-            mock_click_element,
-        ):
-            result = await _handle_click(browser, {"ref": "e2"})
-        assert call_args == [(browser, "e2")]
+        browser.click_element_by_ref = AsyncMock(return_value="Clicked e2")
+        result = await _handle_click(browser, {"ref": "e2"})
+        browser.click_element_by_ref.assert_awaited_once_with("e2")
         assert result == "Clicked e2"
 
     async def test_handle_fill_calls_tool(self):
         browser = make_browser()
-        call_args = []
-
-        async def mock_input_text(browser, ref, text):
-            call_args.append((browser, ref, text))
-            return "Input text 'hello'"
-
-        with patch(
-            "bridgic.browser.tools._browser_action_tools.input_text_by_ref",
-            mock_input_text,
-        ):
-            result = await _handle_fill(browser, {"ref": "e3", "text": "hello"})
-        assert call_args == [(browser, "e3", "hello")]
+        browser.input_text_by_ref = AsyncMock(return_value="Input text 'hello'")
+        result = await _handle_fill(browser, {"ref": "e3", "text": "hello"})
+        browser.input_text_by_ref.assert_awaited_once_with("e3", "hello")
         assert "hello" in result
 
     async def test_handle_screenshot_passes_full_page(self):
         browser = make_browser()
-        call_args = []
-
-        async def mock_take_screenshot(browser, filename=None, full_page=False):
-            call_args.append((browser, filename, full_page))
-            return "Screenshot saved to: /tmp/x.png"
-
-        with patch(
-            "bridgic.browser.tools._browser_screenshot_tools.take_screenshot",
-            mock_take_screenshot,
-        ):
-            await _handle_screenshot(browser, {"path": "/tmp/x.png", "full_page": True})
-        assert len(call_args) == 1
-        assert call_args[0][1] == "/tmp/x.png"
-        assert call_args[0][2] is True
+        browser.take_screenshot = AsyncMock(return_value="Screenshot saved to: /tmp/x.png")
+        await _handle_screenshot(browser, {"path": "/tmp/x.png", "full_page": True})
+        browser.take_screenshot.assert_awaited_once_with(filename="/tmp/x.png", full_page=True)
 
     async def test_handle_screenshot_default_full_page_false(self):
         browser = make_browser()
-        with patch(
-            "bridgic.browser.tools._browser_screenshot_tools.take_screenshot",
-            new=AsyncMock(return_value="ok"),
-        ) as mock_ss:
-            await _handle_screenshot(browser, {"path": "/tmp/x.png"})
-        _, kwargs = mock_ss.call_args
+        browser.take_screenshot = AsyncMock(return_value="ok")
+        await _handle_screenshot(browser, {"path": "/tmp/x.png"})
+        _, kwargs = browser.take_screenshot.call_args
         assert kwargs.get("full_page") is False
 
     async def test_handle_scroll_passes_deltas(self):
         browser = make_browser()
-        with patch(
-            "bridgic.browser.tools._browser_mouse_tools.mouse_wheel",
-            new=AsyncMock(return_value="Scrolled"),
-        ) as mock_scroll:
-            await _handle_scroll(browser, {"delta_x": 10, "delta_y": 300})
-        mock_scroll.assert_awaited_once_with(browser, delta_x=10, delta_y=300)
+        browser.mouse_wheel = AsyncMock(return_value="Scrolled")
+        await _handle_scroll(browser, {"delta_x": 10, "delta_y": 300})
+        browser.mouse_wheel.assert_awaited_once_with(delta_x=10, delta_y=300)
 
     async def test_handle_wait_time_seconds(self):
         browser = make_browser()
-        with patch(
-            "bridgic.browser.tools._browser_tools.wait_for",
-            new=AsyncMock(return_value="Waited for 2.5 seconds"),
-        ) as mock_wait:
-            await _handle_wait(browser, {"seconds": 2.5})
-        mock_wait.assert_awaited_once_with(
-            browser, time_seconds=2.5, text=None, text_gone=None
+        browser.wait_for = AsyncMock(return_value="Waited for 2.5 seconds")
+        await _handle_wait(browser, {"seconds": 2.5})
+        browser.wait_for.assert_awaited_once_with(
+            time_seconds=2.5, text=None, text_gone=None
         )
 
     async def test_handle_wait_text(self):
         browser = make_browser()
-        with patch(
-            "bridgic.browser.tools._browser_tools.wait_for",
-            new=AsyncMock(return_value="Text appeared"),
-        ) as mock_wait:
-            await _handle_wait(browser, {"text": "Done"})
-        mock_wait.assert_awaited_once_with(
-            browser, time_seconds=None, text="Done", text_gone=None
+        browser.wait_for = AsyncMock(return_value="Text appeared")
+        await _handle_wait(browser, {"text": "Done"})
+        browser.wait_for.assert_awaited_once_with(
+            time_seconds=None, text="Done", text_gone=None
         )
 
     async def test_handle_search_default_engine(self):
         browser = make_browser()
-        with patch(
-            "bridgic.browser.tools._browser_tools.search",
-            new=AsyncMock(return_value="Searched"),
-        ) as mock_search:
-            await _handle_search(browser, {"query": "python"})
-        mock_search.assert_awaited_once_with(browser, "python", "duckduckgo")
+        browser.search = AsyncMock(return_value="Searched")
+        await _handle_search(browser, {"query": "python"})
+        browser.search.assert_awaited_once_with("python", "duckduckgo")
 
     async def test_handle_close_tab_none_page_id(self):
         """page_id=None should close the current tab."""
         browser = make_browser()
-        with patch(
-            "bridgic.browser.tools._browser_tools.close_tab",
-            new=AsyncMock(return_value="Tab closed"),
-        ) as mock_ct:
-            await _handle_close_tab(browser, {})
-        mock_ct.assert_awaited_once_with(browser, page_id=None)
+        browser.close_tab = AsyncMock(return_value="Tab closed")
+        await _handle_close_tab(browser, {})
+        browser.close_tab.assert_awaited_once_with(page_id=None)
 
     async def test_handle_pdf_passes_path(self):
         browser = make_browser()
-        with patch(
-            "bridgic.browser.tools._browser_screenshot_tools.save_pdf",
-            new=AsyncMock(return_value="PDF saved"),
-        ) as mock_pdf:
-            await _handle_pdf(browser, {"path": "/tmp/out.pdf"})
-        mock_pdf.assert_awaited_once_with(browser, filename="/tmp/out.pdf")
+        browser.save_pdf = AsyncMock(return_value="PDF saved")
+        await _handle_pdf(browser, {"path": "/tmp/out.pdf"})
+        browser.save_pdf.assert_awaited_once_with(filename="/tmp/out.pdf")
+
+    async def test_handle_scroll_into_view(self):
+        browser = make_browser()
+        browser.scroll_element_into_view_by_ref = AsyncMock(return_value="Scrolled e5 into view")
+        await _handle_scroll_into_view(browser, {"ref": "e5"})
+        browser.scroll_element_into_view_by_ref.assert_awaited_once_with("e5")
+
+    async def test_handle_drag(self):
+        browser = make_browser()
+        browser.drag_element_by_ref = AsyncMock(return_value="Dragged e1 to e2")
+        await _handle_drag(browser, {"start_ref": "e1", "end_ref": "e2"})
+        browser.drag_element_by_ref.assert_awaited_once_with("e1", "e2")
+
+    async def test_handle_options(self):
+        browser = make_browser()
+        browser.get_dropdown_options_by_ref = AsyncMock(return_value="Option A\nOption B")
+        await _handle_options(browser, {"ref": "e3"})
+        browser.get_dropdown_options_by_ref.assert_awaited_once_with("e3")
+
+    async def test_handle_upload(self):
+        browser = make_browser()
+        browser.upload_file_by_ref = AsyncMock(return_value="File uploaded")
+        await _handle_upload(browser, {"ref": "e4", "path": "/tmp/file.txt"})
+        browser.upload_file_by_ref.assert_awaited_once_with("e4", "/tmp/file.txt")
+
+    async def test_handle_fill_form_valid_json(self):
+        browser = make_browser()
+        browser.fill_form = AsyncMock(return_value="Form filled")
+        fields_json = '[{"ref": "e1", "value": "hello"}]'
+        await _handle_fill_form(browser, {"fields": fields_json, "submit": False})
+        browser.fill_form.assert_awaited_once_with([{"ref": "e1", "value": "hello"}], submit=False)
+
+    async def test_handle_fill_form_invalid_json_raises(self):
+        from bridgic.browser.cli._daemon import _DaemonCommandError
+        browser = make_browser()
+        with pytest.raises(_DaemonCommandError) as exc_info:
+            await _handle_fill_form(browser, {"fields": "not json", "submit": False})
+        assert exc_info.value.error_code == "INVALID_JSON_FIELDS"
+
+    async def test_handle_type_text(self):
+        browser = make_browser()
+        browser.type_text = AsyncMock(return_value="Typed")
+        await _handle_type_text(browser, {"text": "hello", "submit": True})
+        browser.type_text.assert_awaited_once_with("hello", submit=True)
+
+    async def test_handle_key_down(self):
+        browser = make_browser()
+        browser.key_down = AsyncMock(return_value="Key down: Shift")
+        await _handle_key_down(browser, {"key": "Shift"})
+        browser.key_down.assert_awaited_once_with("Shift")
+
+    async def test_handle_key_up(self):
+        browser = make_browser()
+        browser.key_up = AsyncMock(return_value="Key up: Shift")
+        await _handle_key_up(browser, {"key": "Shift"})
+        browser.key_up.assert_awaited_once_with("Shift")
+
+    async def test_handle_mouse_move(self):
+        browser = make_browser()
+        browser.mouse_move = AsyncMock(return_value="Mouse moved")
+        await _handle_mouse_move(browser, {"x": 100.0, "y": 200.0})
+        browser.mouse_move.assert_awaited_once_with(100.0, 200.0)
+
+    async def test_handle_mouse_click(self):
+        browser = make_browser()
+        browser.mouse_click = AsyncMock(return_value="Clicked")
+        await _handle_mouse_click(browser, {"x": 50.0, "y": 60.0, "button": "right", "count": 2})
+        browser.mouse_click.assert_awaited_once_with(50.0, 60.0, button="right", click_count=2)
+
+    async def test_handle_mouse_drag(self):
+        browser = make_browser()
+        browser.mouse_drag = AsyncMock(return_value="Dragged")
+        await _handle_mouse_drag(browser, {"x1": 10.0, "y1": 20.0, "x2": 100.0, "y2": 200.0})
+        browser.mouse_drag.assert_awaited_once_with(10.0, 20.0, 100.0, 200.0)
+
+    async def test_handle_mouse_down(self):
+        browser = make_browser()
+        browser.mouse_down = AsyncMock(return_value="Mouse down")
+        await _handle_mouse_down(browser, {"button": "right"})
+        browser.mouse_down.assert_awaited_once_with(button="right")
+
+    async def test_handle_mouse_up(self):
+        browser = make_browser()
+        browser.mouse_up = AsyncMock(return_value="Mouse up")
+        await _handle_mouse_up(browser, {"button": "left"})
+        browser.mouse_up.assert_awaited_once_with(button="left")
+
+    async def test_handle_wait_network(self):
+        browser = make_browser()
+        browser.wait_for_network_idle = AsyncMock(return_value="Network idle")
+        await _handle_wait_network(browser, {"timeout": 5000})
+        browser.wait_for_network_idle.assert_awaited_once_with(timeout=5000)
+
+    async def test_handle_console_start(self):
+        browser = make_browser()
+        browser.start_console_capture = AsyncMock(return_value="Console capture started")
+        await _handle_console_start(browser, {})
+        browser.start_console_capture.assert_awaited_once()
+
+    async def test_handle_console_stop(self):
+        browser = make_browser()
+        browser.stop_console_capture = AsyncMock(return_value="Console capture stopped")
+        await _handle_console_stop(browser, {})
+        browser.stop_console_capture.assert_awaited_once()
+
+    async def test_handle_console(self):
+        browser = make_browser()
+        browser.get_console_messages = AsyncMock(return_value="[error] boom")
+        await _handle_console(browser, {"filter": "error", "clear": True})
+        browser.get_console_messages.assert_awaited_once_with(type_filter="error", clear=True)
+
+    async def test_handle_network_start(self):
+        browser = make_browser()
+        browser.start_network_capture = AsyncMock(return_value="Network capture started")
+        await _handle_network_start(browser, {})
+        browser.start_network_capture.assert_awaited_once()
+
+    async def test_handle_network_stop(self):
+        browser = make_browser()
+        browser.stop_network_capture = AsyncMock(return_value="Network capture stopped")
+        await _handle_network_stop(browser, {})
+        browser.stop_network_capture.assert_awaited_once()
+
+    async def test_handle_network(self):
+        browser = make_browser()
+        browser.get_network_requests = AsyncMock(return_value="GET /api")
+        await _handle_network(browser, {"include_static": True, "clear": False})
+        browser.get_network_requests.assert_awaited_once_with(include_static=True, clear=False)
+
+    async def test_handle_dialog_setup(self):
+        browser = make_browser()
+        browser.setup_dialog_handler = AsyncMock(return_value="Dialog handler set")
+        await _handle_dialog_setup(browser, {"action": "dismiss", "text": None})
+        browser.setup_dialog_handler.assert_awaited_once_with(
+            default_action="dismiss", default_prompt_text=None
+        )
+
+    async def test_handle_dialog_accept(self):
+        browser = make_browser()
+        browser.handle_dialog = AsyncMock(return_value="Dialog accepted")
+        await _handle_dialog(browser, {"dismiss": False, "text": None})
+        browser.handle_dialog.assert_awaited_once_with(accept=True, prompt_text=None)
+
+    async def test_handle_dialog_dismiss(self):
+        browser = make_browser()
+        browser.handle_dialog = AsyncMock(return_value="Dialog dismissed")
+        await _handle_dialog(browser, {"dismiss": True, "text": "yes"})
+        browser.handle_dialog.assert_awaited_once_with(accept=False, prompt_text="yes")
+
+    async def test_handle_dialog_remove(self):
+        browser = make_browser()
+        browser.remove_dialog_handler = AsyncMock(return_value="Handler removed")
+        await _handle_dialog_remove(browser, {})
+        browser.remove_dialog_handler.assert_awaited_once()
+
+    async def test_handle_storage_save(self):
+        browser = make_browser()
+        browser.save_storage_state = AsyncMock(return_value="Saved")
+        await _handle_storage_save(browser, {"path": "/tmp/state.json"})
+        browser.save_storage_state.assert_awaited_once_with(filename="/tmp/state.json")
+
+    async def test_handle_storage_load(self):
+        browser = make_browser()
+        browser.restore_storage_state = AsyncMock(return_value="Loaded")
+        await _handle_storage_load(browser, {"path": "/tmp/state.json"})
+        browser.restore_storage_state.assert_awaited_once_with("/tmp/state.json")
+
+    async def test_handle_cookies_clear(self):
+        browser = make_browser()
+        browser.clear_cookies = AsyncMock(return_value="Cookies cleared")
+        await _handle_cookies_clear(browser, {})
+        browser.clear_cookies.assert_awaited_once()
+
+    async def test_handle_cookies_no_url(self):
+        browser = make_browser()
+        browser.get_cookies = AsyncMock(return_value="[]")
+        await _handle_cookies(browser, {})
+        browser.get_cookies.assert_awaited_once_with(urls=None)
+
+    async def test_handle_cookies_with_url(self):
+        browser = make_browser()
+        browser.get_cookies = AsyncMock(return_value="[]")
+        await _handle_cookies(browser, {"url": "https://example.com"})
+        browser.get_cookies.assert_awaited_once_with(urls=["https://example.com"])
+
+    async def test_handle_cookie_set(self):
+        browser = make_browser()
+        browser.set_cookie = AsyncMock(return_value="Cookie set")
+        await _handle_cookie_set(browser, {
+            "name": "sid", "value": "abc", "url": None, "domain": None,
+            "path": "/", "expires": None, "http_only": False, "secure": False, "same_site": None,
+        })
+        browser.set_cookie.assert_awaited_once_with(
+            name="sid", value="abc", url=None, domain=None,
+            path="/", expires=None, http_only=False, secure=False, same_site=None,
+        )
+
+    async def test_handle_verify_visible(self):
+        browser = make_browser()
+        browser.verify_element_visible = AsyncMock(return_value="PASS: element visible")
+        result = await _handle_verify_visible(browser, {"role": "button", "name": "Submit", "timeout": 5000})
+        browser.verify_element_visible.assert_awaited_once_with(
+            role="button", accessible_name="Submit", timeout=5000
+        )
+        assert result == "PASS: element visible"
+
+    async def test_handle_verify_text(self):
+        browser = make_browser()
+        browser.verify_text_visible = AsyncMock(return_value="PASS: text visible")
+        await _handle_verify_text(browser, {"text": "Hello", "exact": True, "timeout": 3000})
+        browser.verify_text_visible.assert_awaited_once_with(text="Hello", exact=True, timeout=3000)
+
+    async def test_handle_verify_value(self):
+        browser = make_browser()
+        browser.verify_value = AsyncMock(return_value="PASS: value matches")
+        await _handle_verify_value(browser, {"ref": "e1", "expected": "hello"})
+        browser.verify_value.assert_awaited_once_with("e1", "hello")
+
+    async def test_handle_verify_state(self):
+        browser = make_browser()
+        browser.verify_element_state = AsyncMock(return_value="PASS: state matches")
+        await _handle_verify_state(browser, {"ref": "e2", "state": "visible"})
+        browser.verify_element_state.assert_awaited_once_with("e2", "visible")
+
+    async def test_handle_verify_url(self):
+        browser = make_browser()
+        browser.verify_url = AsyncMock(return_value="PASS: url matches")
+        await _handle_verify_url(browser, {"url": "https://example.com", "exact": False})
+        browser.verify_url.assert_awaited_once_with("https://example.com", exact=False)
+
+    async def test_handle_verify_title(self):
+        browser = make_browser()
+        browser.verify_title = AsyncMock(return_value="PASS: title matches")
+        await _handle_verify_title(browser, {"title": "My Page", "exact": True})
+        browser.verify_title.assert_awaited_once_with("My Page", exact=True)
+
+    async def test_handle_eval(self):
+        browser = make_browser()
+        browser.evaluate_javascript = AsyncMock(return_value="42")
+        result = await _handle_eval(browser, {"code": "() => 42"})
+        browser.evaluate_javascript.assert_awaited_once_with("() => 42")
+        assert result == "42"
+
+    async def test_handle_eval_on(self):
+        browser = make_browser()
+        browser.evaluate_javascript_on_ref = AsyncMock(return_value="el text")
+        await _handle_eval_on(browser, {"ref": "e1", "code": "el => el.textContent"})
+        browser.evaluate_javascript_on_ref.assert_awaited_once_with("e1", "el => el.textContent")
+
+    async def test_handle_trace_start(self):
+        browser = make_browser()
+        browser.start_tracing = AsyncMock(return_value="Tracing started")
+        await _handle_trace_start(browser, {"no_screenshots": True, "no_snapshots": False})
+        browser.start_tracing.assert_awaited_once_with(screenshots=False, snapshots=True)
+
+    async def test_handle_trace_stop(self):
+        browser = make_browser()
+        browser.stop_tracing = AsyncMock(return_value="Trace saved")
+        await _handle_trace_stop(browser, {"path": "/tmp/trace.zip"})
+        browser.stop_tracing.assert_awaited_once_with(filename="/tmp/trace.zip")
+
+    async def test_handle_trace_chunk(self):
+        browser = make_browser()
+        browser.add_trace_chunk = AsyncMock(return_value="Chunk added")
+        await _handle_trace_chunk(browser, {"title": "login"})
+        browser.add_trace_chunk.assert_awaited_once_with(title="login")
+
+    async def test_handle_video_start(self):
+        browser = make_browser()
+        browser.start_video = AsyncMock(return_value="Recording started")
+        await _handle_video_start(browser, {"width": 1280, "height": 720})
+        browser.start_video.assert_awaited_once_with(width=1280, height=720)
+
+    async def test_handle_video_stop(self):
+        browser = make_browser()
+        browser.stop_video = AsyncMock(return_value="Video saved")
+        await _handle_video_stop(browser, {"path": "/tmp/video.webm"})
+        browser.stop_video.assert_awaited_once_with(filename="/tmp/video.webm")
+
+    async def test_handle_resize(self):
+        browser = make_browser()
+        browser.browser_resize = AsyncMock(return_value="Resized to 1920x1080")
+        await _handle_resize(browser, {"width": 1920, "height": 1080})
+        browser.browser_resize.assert_awaited_once_with(1920, 1080)
+
+    async def test_verify_fail_result_is_classified_as_error(self):
+        """verify_* handlers that return FAIL: should surface as error via _dispatch."""
+        browser = make_browser()
+        browser.verify_url = AsyncMock(return_value="FAIL: current URL does not match")
+        resp = await _dispatch(browser, "verify_url", {"url": "https://example.com", "exact": False})
+        assert resp["status"] == "error"
+        assert resp["success"] is False
+        assert resp["error_code"] == "VERIFICATION_FAILED"
+
+    async def test_eval_on_arbitrary_result_not_misclassified(self):
+        """eval_on returning a string starting with 'Failed to' must not be an error."""
+        browser = make_browser()
+        browser.evaluate_javascript_on_ref = AsyncMock(return_value="Failed to parse: intentional")
+        resp = await _dispatch(browser, "eval_on", {"ref": "e1", "code": "el => el.dataset.error"})
+        assert resp["status"] == "ok"
+        assert resp["success"] is True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1080,133 +1601,133 @@ class TestBuildBrowserKwargs:
 
     def test_user_config_file_applied(self, tmp_path):
         """~/.bridgic/bridgic-browser.json values are loaded."""
-        cfg = tmp_path / "bridgic-browser.json"
+        fake_home = tmp_path / ".bridgic"
+        fake_home.mkdir()
+        cfg = fake_home / "bridgic-browser.json"
         cfg.write_text(json.dumps({"headless": False, "channel": "chrome"}))
 
-        with patch("bridgic.browser.cli._daemon.Path") as mock_path_cls:
-            # home() / ".bridgic" / "bridgic-browser.json" → cfg
-            mock_home = MagicMock()
-            mock_path_cls.home.return_value = mock_home
-            mock_home.__truediv__ = lambda s, p: mock_home
-            mock_home.is_file.return_value = True
-            mock_home.read_text.return_value = cfg.read_text()
+        with (
+            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
+            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
+            patch.dict(os.environ, {}, clear=False),
+        ):
             # local config doesn't exist
             mock_local = MagicMock()
             mock_local.is_file.return_value = False
             mock_path_cls.return_value = mock_local
 
-            with patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("BRIDGIC_BROWSER_JSON", None)
-                os.environ.pop("BRIDGIC_HEADLESS", None)
-                kwargs = _build_browser_kwargs()
+            os.environ.pop("BRIDGIC_BROWSER_JSON", None)
+            os.environ.pop("BRIDGIC_HEADLESS", None)
+            kwargs = _build_browser_kwargs()
 
         assert kwargs["headless"] is False
         assert kwargs["channel"] == "chrome"
 
-    def test_local_config_overrides_user_config(self):
+    def test_local_config_overrides_user_config(self, tmp_path):
         """./bridgic-browser.json overrides ~/.bridgic/bridgic-browser.json."""
-        user_json = json.dumps({"headless": False, "channel": "chrome"})
+        fake_home = tmp_path / ".bridgic"
+        fake_home.mkdir()
+        user_cfg = fake_home / "bridgic-browser.json"
+        user_cfg.write_text(json.dumps({"headless": False, "channel": "chrome"}))
         local_json = json.dumps({"channel": "msedge"})
 
-        with patch("bridgic.browser.cli._daemon.Path") as mock_path_cls:
-            mock_home = MagicMock()
-            mock_path_cls.home.return_value = mock_home
-            mock_home.__truediv__ = lambda s, p: mock_home
-            mock_home.is_file.return_value = True
-            mock_home.read_text.return_value = user_json
-
+        with (
+            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
+            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
+            patch.dict(os.environ, {}, clear=False),
+        ):
             mock_local = MagicMock()
             mock_local.is_file.return_value = True
             mock_local.read_text.return_value = local_json
             mock_path_cls.return_value = mock_local
 
-            with patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("BRIDGIC_BROWSER_JSON", None)
-                os.environ.pop("BRIDGIC_HEADLESS", None)
-                kwargs = _build_browser_kwargs()
+            os.environ.pop("BRIDGIC_BROWSER_JSON", None)
+            os.environ.pop("BRIDGIC_HEADLESS", None)
+            kwargs = _build_browser_kwargs()
 
         assert kwargs["channel"] == "msedge"   # local overrides user
         assert kwargs["headless"] is False      # from user config (not overridden)
 
-    def test_env_json_overrides_config_files(self):
+    def test_env_json_overrides_config_files(self, tmp_path):
         """BRIDGIC_BROWSER_JSON overrides both config files."""
-        user_json = json.dumps({"channel": "chrome", "headless": False})
+        fake_home = tmp_path / ".bridgic"
+        fake_home.mkdir()
+        user_cfg = fake_home / "bridgic-browser.json"
+        user_cfg.write_text(json.dumps({"channel": "chrome", "headless": False}))
         env_json = json.dumps({"channel": "chromium", "locale": "zh-CN"})
 
-        with patch("bridgic.browser.cli._daemon.Path") as mock_path_cls:
-            mock_home = MagicMock()
-            mock_path_cls.home.return_value = mock_home
-            mock_home.__truediv__ = lambda s, p: mock_home
-            mock_home.is_file.return_value = True
-            mock_home.read_text.return_value = user_json
-
+        with (
+            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
+            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
+            patch.dict(os.environ, {"BRIDGIC_BROWSER_JSON": env_json}, clear=False),
+        ):
             mock_local = MagicMock()
             mock_local.is_file.return_value = False
             mock_path_cls.return_value = mock_local
 
-            with patch.dict(os.environ, {"BRIDGIC_BROWSER_JSON": env_json}, clear=False):
-                os.environ.pop("BRIDGIC_HEADLESS", None)
-                kwargs = _build_browser_kwargs()
+            os.environ.pop("BRIDGIC_HEADLESS", None)
+            kwargs = _build_browser_kwargs()
 
         assert kwargs["channel"] == "chromium"  # env JSON overrides user config
         assert kwargs["headless"] is False       # from user config (not in env JSON)
         assert kwargs["locale"] == "zh-CN"
 
-    def test_bridgic_headless_overrides_all(self):
+    def test_bridgic_headless_overrides_all(self, tmp_path):
         """BRIDGIC_HEADLESS=0 overrides even BRIDGIC_BROWSER_JSON."""
+        fake_home = tmp_path / ".bridgic"
+        fake_home.mkdir()
         env_json = json.dumps({"headless": True})
 
-        with patch("bridgic.browser.cli._daemon.Path") as mock_path_cls:
-            mock_home = MagicMock()
-            mock_path_cls.home.return_value = mock_home
-            mock_home.__truediv__ = lambda s, p: mock_home
-            mock_home.is_file.return_value = False
+        with (
+            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
+            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
+            patch.dict(os.environ, {"BRIDGIC_BROWSER_JSON": env_json, "BRIDGIC_HEADLESS": "0"}),
+        ):
             mock_local = MagicMock()
             mock_local.is_file.return_value = False
             mock_path_cls.return_value = mock_local
-
-            with patch.dict(os.environ, {"BRIDGIC_BROWSER_JSON": env_json, "BRIDGIC_HEADLESS": "0"}):
-                kwargs = _build_browser_kwargs()
+            kwargs = _build_browser_kwargs()
 
         assert kwargs["headless"] is False  # BRIDGIC_HEADLESS=0 wins
 
-    def test_invalid_env_json_is_ignored(self):
+    def test_invalid_env_json_is_ignored(self, tmp_path):
         """Malformed BRIDGIC_BROWSER_JSON is silently ignored (logged as warning)."""
-        with patch("bridgic.browser.cli._daemon.Path") as mock_path_cls:
-            mock_home = MagicMock()
-            mock_path_cls.home.return_value = mock_home
-            mock_home.__truediv__ = lambda s, p: mock_home
-            mock_home.is_file.return_value = False
+        fake_home = tmp_path / ".bridgic"
+        fake_home.mkdir()
+
+        with (
+            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
+            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
+            patch.dict(os.environ, {"BRIDGIC_BROWSER_JSON": "not valid json"}, clear=False),
+        ):
             mock_local = MagicMock()
             mock_local.is_file.return_value = False
             mock_path_cls.return_value = mock_local
-
-            with patch.dict(os.environ, {"BRIDGIC_BROWSER_JSON": "not valid json"}, clear=False):
-                os.environ.pop("BRIDGIC_HEADLESS", None)
-                kwargs = _build_browser_kwargs()  # must not raise
+            os.environ.pop("BRIDGIC_HEADLESS", None)
+            kwargs = _build_browser_kwargs()  # must not raise
 
         assert kwargs["headless"] is True  # falls back to default
 
-    def test_complex_params_passed_through(self):
+    def test_complex_params_passed_through(self, tmp_path):
         """Complex nested params (proxy, viewport) are passed through as-is."""
+        fake_home = tmp_path / ".bridgic"
+        fake_home.mkdir()
         env_json = json.dumps({
             "proxy": {"server": "http://proxy:8080", "username": "u", "password": "p"},
             "viewport": {"width": 1280, "height": 720},
             "extra_http_headers": {"X-Custom": "value"},
         })
 
-        with patch("bridgic.browser.cli._daemon.Path") as mock_path_cls:
-            mock_home = MagicMock()
-            mock_path_cls.home.return_value = mock_home
-            mock_home.__truediv__ = lambda s, p: mock_home
-            mock_home.is_file.return_value = False
+        with (
+            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
+            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
+            patch.dict(os.environ, {"BRIDGIC_BROWSER_JSON": env_json}, clear=False),
+        ):
             mock_local = MagicMock()
             mock_local.is_file.return_value = False
             mock_path_cls.return_value = mock_local
-
-            with patch.dict(os.environ, {"BRIDGIC_BROWSER_JSON": env_json}, clear=False):
-                os.environ.pop("BRIDGIC_HEADLESS", None)
-                kwargs = _build_browser_kwargs()
+            os.environ.pop("BRIDGIC_HEADLESS", None)
+            kwargs = _build_browser_kwargs()
 
         assert kwargs["proxy"] == {"server": "http://proxy:8080", "username": "u", "password": "p"}
         assert kwargs["viewport"] == {"width": 1280, "height": 720}
