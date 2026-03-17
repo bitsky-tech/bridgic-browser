@@ -1,13 +1,14 @@
 """
 Bridgic Browser daemon — holds the Browser instance and serves JSON commands
-over a Unix domain socket. One daemon process per socket path.
+over a platform-appropriate transport (Unix socket on POSIX, TCP loopback on
+Windows). One daemon process per run info file.
 
 Start via: python -m bridgic.browser daemon  (internal, not intended for users)
 
 Protocol (newline-delimited JSON):
   Request:  {"command": "open", "args": {"url": "https://example.com"}}
-  Response: {"status": "ok", "result": "Navigated to: https://example.com"}
-            {"status": "error", "result": "...error message..."}
+  Response: {"status":"ok","success":true,"result":"...","error_code":null,"data":null,"meta":{}}
+            {"status":"error","success":false,"result":"...","error_code":"...","data":{},"meta":{"retryable":false}}
 """
 from __future__ import annotations
 
@@ -16,68 +17,27 @@ import json
 import logging
 import os
 import signal
-import stat
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 
 from .._constants import BRIDGIC_HOME
+from ..errors import BridgicBrowserError, InvalidInputError
+from ._transport import (
+    _default_socket_path,
+    _safe_remove_socket,
+    get_transport,
+    write_run_info,
+    remove_run_info,
+)
+
+if TYPE_CHECKING:
+    from ..session._browser import Browser
 
 logger = logging.getLogger(__name__)
 
-
-class _DaemonCommandError(RuntimeError):
-    """Expected command-level failure with stable machine-readable code."""
-
-    def __init__(self, message: str, error_code: str):
-        super().__init__(message)
-        self.error_code = error_code
-
-
-def _default_socket_path() -> str:
-    """Return per-user default socket path."""
-    return str(BRIDGIC_HOME / "run" / "bridgic-browser.sock")
-
-
-SOCKET_PATH = os.environ.get("BRIDGIC_SOCKET", _default_socket_path())
 READY_SIGNAL = "BRIDGIC_DAEMON_READY\n"
 STREAM_LIMIT = 16 * 1024 * 1024  # 16 MB — handles large snapshots and fill/eval payloads
-
-
-def _ensure_socket_parent_dir(path: str) -> None:
-    """Create socket parent dir with private permissions when possible."""
-    parent = Path(path).parent
-    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        os.chmod(parent, 0o700)
-    except OSError:
-        # Custom socket directories (e.g. /tmp) may not be chmod-able by us.
-        pass
-
-
-def _safe_remove_socket(path: str) -> None:
-    """Remove a socket file only if it is owned by the current user."""
-    socket_path = Path(path)
-    try:
-        st = socket_path.stat()
-    except FileNotFoundError:
-        return
-
-    if not stat.S_ISSOCK(st.st_mode):
-        raise RuntimeError(f"Refusing to remove non-socket path: {path}")
-
-    if hasattr(os, "getuid"):
-        current_uid = os.getuid()
-        if st.st_uid != current_uid:
-            raise PermissionError(
-                f"Socket path {path} is owned by uid={st.st_uid}, current uid={current_uid}"
-            )
-
-    try:
-        socket_path.unlink()
-    except FileNotFoundError:
-        # Another process may remove the socket between stat() and unlink().
-        return
 
 
 _BROWSER_CLOSED_HINT = (
@@ -118,89 +78,36 @@ def _response(
     }
 
 
-def _is_command_result_error(command: str, result: Any) -> bool:
-    """Infer business-level failures from handler return values.
-
-    Most tool handlers return string messages instead of raising exceptions.
-    This keeps CLI output human-friendly but makes machine-level success/failure
-    ambiguous unless we classify known error signatures here.
-    """
-    if not isinstance(result, str):
-        return False
-
-    msg = result.strip().lower()
-    if not msg:
-        return False
-
-    # eval() / eval_on() can legitimately return any string; do not infer errors.
-    # eval_on() returns arbitrary JS evaluation results, same as eval().
-    if command in {"eval", "eval_on"}:
-        return False
-
-    generic_prefixes = (
-        "failed to ",
-        "fail: ",           # verify_* tools use PASS:/FAIL: format
-        "navigation failed",
-        "search failed",
-        "wait condition not met",
-        "url cannot be empty",
-        "search query cannot be empty",
-        "unsupported search engine",
-        "url scheme ",
-        "no active page available",
-        "no context is open",
-        "cannot navigate",
-        "unknown command:",
-        "invalid json:",
-        "could not hover element ",
-    )
-    if msg.startswith(generic_prefixes):
-        return True
-
-    if " is not available - page may have changed" in msg:
-        return True
-    if " does not exist" in msg and msg.startswith("file "):
-        return True
-    if " not found" in msg and "page_id" in msg:
-        return True
-
-    # Snapshot pagination overflow should surface as an error status.
-    if command == "snapshot" and msg.startswith("start_from_char ("):
-        return True
-
-    return False
-
-
 # ── Navigation ────────────────────────────────────────────────────────────────
 
-async def _handle_open(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_open(browser: "Browser", args: Dict[str, Any]) -> str:
     url = args.get("url", "")
-    return await browser.navigate_to_url(url)
+    return await browser.navigate_to(url)
 
 
-async def _handle_back(browser: Any, _args: Dict[str, Any]) -> str:
+async def _handle_back(browser: "Browser", _args: Dict[str, Any]) -> str:
     return await browser.go_back()
 
 
-async def _handle_forward(browser: Any, _args: Dict[str, Any]) -> str:
+async def _handle_forward(browser: "Browser", _args: Dict[str, Any]) -> str:
     return await browser.go_forward()
 
 
-async def _handle_reload(browser: Any, _args: Dict[str, Any]) -> str:
+async def _handle_reload(browser: "Browser", _args: Dict[str, Any]) -> str:
     return await browser.reload_page()
 
 
-async def _handle_info(browser: Any, _args: Dict[str, Any]) -> str:
+async def _handle_info(browser: "Browser", _args: Dict[str, Any]) -> str:
     return await browser.get_current_page_info_str()
 
 
-async def _handle_search(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_search(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.search(args.get("query", ""), args.get("engine", "duckduckgo"))
 
 
 # ── Snapshot ──────────────────────────────────────────────────────────────────
 
-async def _handle_snapshot(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_snapshot(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.get_snapshot_text(
         start_from_char=args.get("start_from_char", 0),
         interactive=args.get("interactive", False),
@@ -210,65 +117,69 @@ async def _handle_snapshot(browser: Any, args: Dict[str, Any]) -> str:
 
 # ── Element Interaction ───────────────────────────────────────────────────────
 
-async def _handle_click(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_click(browser: "Browser", args: Dict[str, Any]) -> str:
     ref = args.get("ref", "")
     return await browser.click_element_by_ref(ref)
 
 
-async def _handle_double_click(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_double_click(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.double_click_element_by_ref(args.get("ref", ""))
 
 
-async def _handle_hover(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_hover(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.hover_element_by_ref(args.get("ref", ""))
 
 
-async def _handle_focus(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_focus(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.focus_element_by_ref(args.get("ref", ""))
 
 
-async def _handle_fill(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_fill(browser: "Browser", args: Dict[str, Any]) -> str:
     ref = args.get("ref", "")
     text = args.get("text", "")
     return await browser.input_text_by_ref(ref, text)
 
 
-async def _handle_select(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_select(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.select_dropdown_option_by_ref(args.get("ref", ""), args.get("text", ""))
 
 
-async def _handle_check(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_check(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.check_checkbox_by_ref(args.get("ref", ""))
 
 
-async def _handle_uncheck(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_uncheck(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.uncheck_checkbox_by_ref(args.get("ref", ""))
 
 
 
-async def _handle_scroll_into_view(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_scroll_into_view(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.scroll_element_into_view_by_ref(args.get("ref", ""))
 
 
-async def _handle_drag(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_drag(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.drag_element_by_ref(args.get("start_ref", ""), args.get("end_ref", ""))
 
 
-async def _handle_options(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_options(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.get_dropdown_options_by_ref(args.get("ref", ""))
 
 
-async def _handle_upload(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_upload(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.upload_file_by_ref(args.get("ref", ""), args.get("path", ""))
 
 
-async def _handle_fill_form(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_fill_form(browser: "Browser", args: Dict[str, Any]) -> str:
     fields_raw = args.get("fields", "[]")
     if isinstance(fields_raw, str):
         try:
             fields = json.loads(fields_raw)
         except json.JSONDecodeError as exc:
-            raise _DaemonCommandError(f"Invalid JSON for fields: {exc}", "INVALID_JSON_FIELDS") from exc
+            raise InvalidInputError(
+                f"Invalid JSON for fields: {exc}",
+                code="INVALID_JSON_FIELDS",
+                details={"fields": fields_raw},
+            ) from exc
     else:
         fields = fields_raw
     submit = args.get("submit", False)
@@ -277,33 +188,33 @@ async def _handle_fill_form(browser: Any, args: Dict[str, Any]) -> str:
 
 # ── Keyboard ──────────────────────────────────────────────────────────────────
 
-async def _handle_press(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_press(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.press_key(args.get("key", ""))
 
 
-async def _handle_type_text(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_type_text(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.type_text(args.get("text", ""), submit=args.get("submit", False))
 
 
-async def _handle_key_down(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_key_down(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.key_down(args.get("key", ""))
 
 
-async def _handle_key_up(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_key_up(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.key_up(args.get("key", ""))
 
 
 # ── Mouse ─────────────────────────────────────────────────────────────────────
 
-async def _handle_scroll(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_scroll(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.mouse_wheel(delta_x=args.get("delta_x", 0), delta_y=args.get("delta_y", 0))
 
 
-async def _handle_mouse_move(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_mouse_move(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.mouse_move(args.get("x", 0.0), args.get("y", 0.0))
 
 
-async def _handle_mouse_click(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_mouse_click(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.mouse_click(
         args.get("x", 0.0),
         args.get("y", 0.0),
@@ -312,7 +223,7 @@ async def _handle_mouse_click(browser: Any, args: Dict[str, Any]) -> str:
     )
 
 
-async def _handle_mouse_drag(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_mouse_drag(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.mouse_drag(
         args.get("x1", 0.0),
         args.get("y1", 0.0),
@@ -321,17 +232,17 @@ async def _handle_mouse_drag(browser: Any, args: Dict[str, Any]) -> str:
     )
 
 
-async def _handle_mouse_down(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_mouse_down(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.mouse_down(button=args.get("button", "left"))
 
 
-async def _handle_mouse_up(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_mouse_up(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.mouse_up(button=args.get("button", "left"))
 
 
 # ── Wait ──────────────────────────────────────────────────────────────────────
 
-async def _handle_wait(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_wait(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.wait_for(
         time_seconds=args.get("seconds"),
         text=args.get("text"),
@@ -341,95 +252,95 @@ async def _handle_wait(browser: Any, args: Dict[str, Any]) -> str:
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-async def _handle_tabs(browser: Any, _args: Dict[str, Any]) -> str:
+async def _handle_tabs(browser: "Browser", _args: Dict[str, Any]) -> str:
     return await browser.get_tabs()
 
 
-async def _handle_new_tab(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_new_tab(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.new_tab(url=args.get("url"))
 
 
-async def _handle_switch_tab(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_switch_tab(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.switch_tab(args.get("page_id", ""))
 
 
-async def _handle_close_tab(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_close_tab(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.close_tab(page_id=args.get("page_id"))
 
 
 # ── Capture ───────────────────────────────────────────────────────────────────
 
-async def _handle_screenshot(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_screenshot(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.take_screenshot(
         filename=args.get("path"),
         full_page=args.get("full_page", False),
     )
 
 
-async def _handle_pdf(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_pdf(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.save_pdf(filename=args.get("path"))
 
 
 # ── Network ───────────────────────────────────────────────────────────────────
 
-async def _handle_network_start(browser: Any, _args: Dict[str, Any]) -> str:
+async def _handle_network_start(browser: "Browser", _args: Dict[str, Any]) -> str:
     return await browser.start_network_capture()
 
 
-async def _handle_network_stop(browser: Any, _args: Dict[str, Any]) -> str:
+async def _handle_network_stop(browser: "Browser", _args: Dict[str, Any]) -> str:
     return await browser.stop_network_capture()
 
 
-async def _handle_network(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_network(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.get_network_requests(
         include_static=args.get("include_static", False),
         clear=args.get("clear", True),
     )
 
 
-async def _handle_wait_network(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_wait_network(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.wait_for_network_idle(timeout=args.get("timeout", 30000))
 
 
 # ── Dialog ────────────────────────────────────────────────────────────────────
 
-async def _handle_dialog_setup(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_dialog_setup(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.setup_dialog_handler(
         default_action=args.get("action", "accept"),
         default_prompt_text=args.get("text"),
     )
 
 
-async def _handle_dialog(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_dialog(browser: "Browser", args: Dict[str, Any]) -> str:
     accept = not args.get("dismiss", False)
     return await browser.handle_dialog(accept=accept, prompt_text=args.get("text"))
 
 
-async def _handle_dialog_remove(browser: Any, _args: Dict[str, Any]) -> str:
+async def _handle_dialog_remove(browser: "Browser", _args: Dict[str, Any]) -> str:
     return await browser.remove_dialog_handler()
 
 
 # ── Storage ───────────────────────────────────────────────────────────────────
 
-async def _handle_storage_save(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_storage_save(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.save_storage_state(filename=args.get("path"))
 
 
-async def _handle_storage_load(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_storage_load(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.restore_storage_state(args.get("path", ""))
 
 
-async def _handle_cookies_clear(browser: Any, _args: Dict[str, Any]) -> str:
+async def _handle_cookies_clear(browser: "Browser", _args: Dict[str, Any]) -> str:
     return await browser.clear_cookies()
 
 
-async def _handle_cookies(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_cookies(browser: "Browser", args: Dict[str, Any]) -> str:
     url = args.get("url")
     urls = [url] if url else None
     return await browser.get_cookies(urls=urls)
 
 
-async def _handle_cookie_set(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_cookie_set(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.set_cookie(
         name=args.get("name", ""),
         value=args.get("value", ""),
@@ -445,7 +356,7 @@ async def _handle_cookie_set(browser: Any, args: Dict[str, Any]) -> str:
 
 # ── Verify ────────────────────────────────────────────────────────────────────
 
-async def _handle_verify_visible(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_verify_visible(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.verify_element_visible(
         role=args.get("role", ""),
         accessible_name=args.get("name", ""),
@@ -453,7 +364,7 @@ async def _handle_verify_visible(browser: Any, args: Dict[str, Any]) -> str:
     )
 
 
-async def _handle_verify_text(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_verify_text(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.verify_text_visible(
         text=args.get("text", ""),
         exact=args.get("exact", False),
@@ -461,82 +372,82 @@ async def _handle_verify_text(browser: Any, args: Dict[str, Any]) -> str:
     )
 
 
-async def _handle_verify_value(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_verify_value(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.verify_value(args.get("ref", ""), args.get("expected", ""))
 
 
-async def _handle_verify_state(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_verify_state(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.verify_element_state(args.get("ref", ""), args.get("state", ""))
 
 
-async def _handle_verify_url(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_verify_url(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.verify_url(args.get("url", ""), exact=args.get("exact", False))
 
 
-async def _handle_verify_title(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_verify_title(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.verify_title(args.get("title", ""), exact=args.get("exact", False))
 
 
 # ── Evaluate ──────────────────────────────────────────────────────────────────
 
-async def _handle_eval(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_eval(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.evaluate_javascript(args.get("code", ""))
 
 
-async def _handle_eval_on(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_eval_on(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.evaluate_javascript_on_ref(args.get("ref", ""), args.get("code", ""))
 
 
 # ── Developer ─────────────────────────────────────────────────────────────────
 
-async def _handle_console_start(browser: Any, _args: Dict[str, Any]) -> str:
+async def _handle_console_start(browser: "Browser", _args: Dict[str, Any]) -> str:
     return await browser.start_console_capture()
 
 
-async def _handle_console_stop(browser: Any, _args: Dict[str, Any]) -> str:
+async def _handle_console_stop(browser: "Browser", _args: Dict[str, Any]) -> str:
     return await browser.stop_console_capture()
 
 
-async def _handle_console(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_console(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.get_console_messages(
         type_filter=args.get("filter"),
         clear=args.get("clear", True),
     )
 
 
-async def _handle_trace_start(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_trace_start(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.start_tracing(
         screenshots=not args.get("no_screenshots", False),
         snapshots=not args.get("no_snapshots", False),
     )
 
 
-async def _handle_trace_stop(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_trace_stop(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.stop_tracing(filename=args.get("path"))
 
 
-async def _handle_trace_chunk(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_trace_chunk(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.add_trace_chunk(title=args.get("title"))
 
 
-async def _handle_video_start(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_video_start(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.start_video(
         width=args.get("width"),
         height=args.get("height"),
     )
 
 
-async def _handle_video_stop(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_video_stop(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.stop_video(filename=args.get("path"))
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
-async def _handle_close(browser: Any, _args: Dict[str, Any]) -> str:
+async def _handle_close(browser: "Browser", _args: Dict[str, Any]) -> str:
     return await browser.browser_close()
 
 
-async def _handle_resize(browser: Any, args: Dict[str, Any]) -> str:
+async def _handle_resize(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.browser_resize(args.get("width", 1280), args.get("height", 720))
 
 
@@ -626,42 +537,7 @@ _HANDLERS = {
 }
 
 
-def _infer_error_code(command: str, result: Any) -> Optional[str]:
-    """Infer a coarse error_code from legacy string-based tool results."""
-    if not _is_command_result_error(command, result):
-        return None
-
-    msg = str(result).strip().lower()
-    if " is not available - page may have changed" in msg:
-        return "REF_NOT_AVAILABLE"
-    if msg.startswith("start_from_char ("):
-        return "INVALID_PAGINATION_OFFSET"
-    if "url scheme" in msg:
-        return "URL_SCHEME_BLOCKED"
-    if "url cannot be empty" in msg:
-        return "URL_EMPTY"
-    if "search query cannot be empty" in msg:
-        return "QUERY_EMPTY"
-    if "unsupported search engine" in msg:
-        return "UNSUPPORTED_SEARCH_ENGINE"
-    if "no active page available" in msg:
-        return "NO_ACTIVE_PAGE"
-    if "no context is open" in msg:
-        return "NO_CONTEXT"
-    if "not found" in msg and "page_id" in msg:
-        return "TAB_NOT_FOUND"
-    if msg.startswith("fail: "):
-        return "VERIFICATION_FAILED"
-    if command == "wait":
-        return "WAIT_CONDITION_NOT_MET"
-    if command in {"open", "search"}:
-        return "NAVIGATION_FAILED"
-    if command == "snapshot":
-        return "SNAPSHOT_FAILED"
-    return "TOOL_ERROR"
-
-
-async def _dispatch(browser: Any, command: str, args: Dict[str, Any]) -> Dict[str, Any]:
+async def _dispatch(browser: "Browser", command: str, args: Dict[str, Any]) -> Dict[str, Any]:
     handler = _HANDLERS.get(command)
     if handler is None:
         return _response(
@@ -671,15 +547,12 @@ async def _dispatch(browser: Any, command: str, args: Dict[str, Any]) -> Dict[st
         )
     try:
         result = await handler(browser, args)
-        error_code = _infer_error_code(command, result)
         return _response(
-            success=error_code is None,
+            success=True,
             result=str(result),
-            error_code=error_code,
         )
-    except _DaemonCommandError as exc:
-        cause = exc.__cause__
-        if cause is not None and _is_browser_closed_error(cause):
+    except BridgicBrowserError as exc:
+        if _is_browser_closed_error(exc):
             return _response(
                 success=False,
                 result=_BROWSER_CLOSED_HINT,
@@ -687,8 +560,10 @@ async def _dispatch(browser: Any, command: str, args: Dict[str, Any]) -> Dict[st
             )
         return _response(
             success=False,
-            result=str(exc),
-            error_code=exc.error_code,
+            result=exc.message,
+            error_code=exc.code,
+            data=exc.details,
+            meta={"retryable": exc.retryable},
         )
     except Exception as exc:
         if _is_browser_closed_error(exc):
@@ -706,13 +581,30 @@ async def _dispatch(browser: Any, command: str, args: Dict[str, Any]) -> Dict[st
 
 
 _READ_TIMEOUT = 60.0  # seconds to wait for a command line from the client
+_CLOSE_DISPATCH_TIMEOUT = float(os.environ.get("BRIDGIC_CLOSE_DISPATCH_TIMEOUT", "45"))
+_DAEMON_STOP_TIMEOUT = float(os.environ.get("BRIDGIC_DAEMON_STOP_TIMEOUT", "45"))
+
+
+def _setup_signal_handlers(stop_event: asyncio.Event) -> None:
+    """Register SIGTERM/SIGINT to set the stop_event, cross-platform."""
+    loop = asyncio.get_running_loop()
+    if sys.platform != "win32":
+        loop.add_signal_handler(signal.SIGTERM, stop_event.set)
+        loop.add_signal_handler(signal.SIGINT, stop_event.set)
+    else:
+        def _handler(signum: int, frame: object) -> None:
+            loop.call_soon_threadsafe(stop_event.set)
+        signal.signal(signal.SIGTERM, _handler)
+        signal.signal(signal.SIGINT, _handler)
 
 
 async def _handle_connection(
-    browser: Any,
+    browser: "Browser",
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     stop_event: asyncio.Event,
+    *,
+    token_verifier: Optional[Callable[[Dict[str, Any]], bool]] = None,
 ) -> None:
     try:
         try:
@@ -734,13 +626,67 @@ async def _handle_connection(
             await writer.drain()
             return
 
+        if not isinstance(req, dict):
+            resp = _response(
+                success=False,
+                result="Invalid request: payload must be a JSON object.",
+                error_code="INVALID_REQUEST",
+            )
+            writer.write((json.dumps(resp) + "\n").encode())
+            await writer.drain()
+            return
+
+        if token_verifier is not None and not token_verifier(req):
+            resp = _response(
+                success=False,
+                result="Unauthorized",
+                error_code="UNAUTHORIZED",
+            )
+            writer.write((json.dumps(resp) + "\n").encode())
+            await writer.drain()
+            return
+
+        req.pop("_token", None)  # strip auth token before dispatch
+
         command = req.get("command", "")
         args = req.get("args", {})
+        if not isinstance(command, str) or not command.strip():
+            resp = _response(
+                success=False,
+                result="Invalid request: 'command' must be a non-empty string.",
+                error_code="INVALID_REQUEST",
+            )
+            writer.write((json.dumps(resp) + "\n").encode())
+            await writer.drain()
+            return
+        if not isinstance(args, dict):
+            resp = _response(
+                success=False,
+                result="Invalid request: 'args' must be a JSON object.",
+                error_code="INVALID_REQUEST",
+            )
+            writer.write((json.dumps(resp) + "\n").encode())
+            await writer.drain()
+            return
 
         if command == "close":
             # Close the browser first so we can return auto-saved artifact paths,
             # then signal daemon shutdown.
-            resp = await _dispatch(browser, command, args)
+            try:
+                resp = await asyncio.wait_for(
+                    _dispatch(browser, command, args),
+                    timeout=_CLOSE_DISPATCH_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                resp = _response(
+                    success=False,
+                    result=(
+                        "Close operation timed out after "
+                        f"{_CLOSE_DISPATCH_TIMEOUT:.0f} seconds; "
+                        "daemon shutdown will continue."
+                    ),
+                    error_code="CLOSE_TIMEOUT",
+                )
             writer.write((json.dumps(resp) + "\n").encode())
             await writer.drain()
             stop_event.set()
@@ -811,46 +757,40 @@ async def run_daemon() -> None:
     logger.info("[daemon] browser started (kwargs=%s)", {k: v for k, v in kwargs.items() if k != "proxy"})
 
     stop_event = asyncio.Event()
+    transport = get_transport()
 
     async def connection_cb(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        await _handle_connection(browser, reader, writer, stop_event)
+        await _handle_connection(
+            browser, reader, writer, stop_event,
+            token_verifier=transport.verify_auth,
+        )
 
-    # Remove stale socket if it exists
-    _ensure_socket_parent_dir(SOCKET_PATH)
-    if os.path.exists(SOCKET_PATH):
-        _safe_remove_socket(SOCKET_PATH)
-
-    server = await asyncio.start_unix_server(connection_cb, path=SOCKET_PATH, limit=STREAM_LIMIT)
-    try:
-        os.chmod(SOCKET_PATH, 0o600)
-    except OSError:
-        # Best effort; if chmod is unsupported we still proceed.
-        pass
+    server = await transport.start_server(connection_cb, stream_limit=STREAM_LIMIT)
+    write_run_info(transport.build_run_info(pid=os.getpid()))
 
     # Signal ready to parent process
     sys.stdout.write(READY_SIGNAL)
     sys.stdout.flush()
-    logger.info("[daemon] listening on %s", SOCKET_PATH)
+    logger.info("[daemon] ready")
 
-    # Use loop.add_signal_handler — safe for asyncio (unlike signal.signal)
-    loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGTERM, stop_event.set)
-    loop.add_signal_handler(signal.SIGINT, stop_event.set)
+    _setup_signal_handlers(stop_event)
 
     async with server:
         await stop_event.wait()
 
     logger.info("[daemon] shutting down")
     try:
-        await browser.stop()
+        await asyncio.wait_for(browser.stop(), timeout=_DAEMON_STOP_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.error(
+            "[daemon] browser.stop() timed out after %.0fs; forcing daemon exit",
+            _DAEMON_STOP_TIMEOUT,
+        )
     except Exception:
-        pass
+        logger.exception("[daemon] browser.stop() failed during shutdown")
 
-    if os.path.exists(SOCKET_PATH):
-        try:
-            _safe_remove_socket(SOCKET_PATH)
-        except Exception as exc:
-            logger.warning("[daemon] failed to remove socket %s: %s", SOCKET_PATH, exc)
+    transport.cleanup()
+    remove_run_info()
 
 
 def main() -> None:

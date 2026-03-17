@@ -1,6 +1,6 @@
 # API Summary
 
-Short reference for the main session and download APIs. For tool lists and presets, see [README](../README.md) and [BROWSER_TOOLS_GUIDE.md](BROWSER_TOOLS_GUIDE.md). For snapshot and page state details, see [SNAPSHOT_AND_STATE.md](SNAPSHOT_AND_STATE.md).
+Short reference for the main session and download APIs. For tool lists and selection strategies, see [README](../README.md) and [BROWSER_TOOLS_GUIDE.md](BROWSER_TOOLS_GUIDE.md). For snapshot and page state details, see [SNAPSHOT_AND_STATE.md](SNAPSHOT_AND_STATE.md).
 
 ## Session (Browser)
 
@@ -9,9 +9,9 @@ Short reference for the main session and download APIs. For tool lists and prese
 | `Browser(...)` | Constructor. Key args: `headless`, `viewport`, `user_data_dir`, `stealth`, `channel`, `proxy`, `downloads_path`, etc. |
 | `await browser.start()` | Launch browser and create context. |
 | `await browser.stop()` | Stop the browser, auto-cleans active capture listeners. |
-| `await browser.navigate_to(url)` | Navigate current page to URL. |
-| `await browser.get_snapshot(interactive=False, full_page=True)` | Get `EnhancedSnapshot` (`.tree`, `.refs`). |
-| `await browser.get_element_by_ref(ref)` | Get Playwright `Locator` for ref (e.g. `"e1"`); uses last snapshot. |
+| `await browser.navigate_to(url, wait_until="domcontentloaded", timeout=None)` | Navigate to URL with optional auto-prefix when missing protocol. `wait_until`: `"domcontentloaded"` (default), `"load"`, `"networkidle"`, or `"commit"`. |
+| `await browser.get_snapshot(interactive=False, full_page=True)` | Get `EnhancedSnapshot` (`.tree`, `.refs`). Raises `StateError` if no active page. |
+| `await browser.get_element_by_ref(ref)` | Get Playwright `Locator` for ref (e.g. `"e1"`); uses last cached snapshot refs — call `get_snapshot()` first. |
 | `await browser.get_current_page()` | Get current Playwright `Page` or None. |
 | `browser.get_current_page_url()` | Get current page URL string. |
 | `browser.download_manager` | `DownloadManager` instance (after `start()`), or None if `downloads_path` not set. |

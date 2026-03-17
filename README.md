@@ -67,14 +67,19 @@ asyncio.run(main())
 
 ```python
 from bridgic.browser.session import Browser
-from bridgic.browser.tools import BrowserToolSetBuilder, ToolPreset
+from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
 
 async def create_agent():
     browser = Browser(headless=False)
     await browser.start()
 
-    # Build tool set for your agent
-    builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)
+    # Build a focused tool set for your agent
+    builder = BrowserToolSetBuilder.for_categories(
+        browser,
+        ToolCategory.NAVIGATION,
+        ToolCategory.ELEMENT_INTERACTION,
+        ToolCategory.CAPTURE,
+    )
     tools = builder.build()["tool_specs"]
 
     # Use tools with your LLM agent
@@ -145,14 +150,40 @@ BRIDGIC_BROWSER_JSON='{"channel":"chrome","headless":false}' bridgic-browser ope
 | Verify | `verify-visible`, `verify-text`, `verify-value`, `verify-state`, `verify-url`, `verify-title` |
 | Developer | `console-start`, `console-stop`, `console`, `trace-start`, `trace-stop`, `trace-chunk`, `video-start`, `video-stop` |
 | Lifecycle | `close`, `resize` |
-| Discovery | `commands [--section|--preset|--list-presets|--list-sections]` |
 
-Use `-h` or `--help` on any command for details. For agent-oriented planning, prefer `bridgic-browser commands --preset PRESET`:
+Utility command: `commands [--section|--list-sections]`.
+
+Use `-h` or `--help` on any command for details. For agent-oriented planning, prefer `bridgic-browser commands --section SECTION`:
 
 ```bash
 bridgic-browser -h
 bridgic-browser scroll -h
 ```
+
+### Error Model
+
+SDK and CLI share one structured error protocol.
+
+- Base type: `BridgicBrowserError`
+- Stable fields: `code`, `message`, `details`, `retryable`
+- Behavior subclasses:
+  - `InvalidInputError` (invalid arguments/user input)
+  - `StateError` (invalid runtime state, e.g. no active page/session)
+  - `OperationError` (operation execution failures)
+  - `VerificationError` (assertion/verification failures)
+
+Why keep a small number of behavior subclasses:
+
+- Lets callers catch by behavior when needed (e.g. retry only `StateError`)
+- Encodes default retry semantics close to the failure source
+- Avoids a large, hard-to-maintain class hierarchy while keeping error handling predictable
+
+Daemon protocol is also structured:
+
+- Success: `{"success": true, "result": "..."}`
+- Failure: `{"success": false, "error_code": "...", "result": "...", "data": {...}, "meta": {"retryable": false}}`
+
+CLI client converts daemon failures into `BridgicBrowserCommandError`, and CLI output keeps machine code visible as `Error[CODE]: ...`.
 
 ### Core Components
 
@@ -225,43 +256,33 @@ for file in browser.download_manager.downloaded_files:
 
 ### Browser Tools
 
-Bridgic Browser provides 67 tools organized into categories. Use `BrowserToolSetBuilder` with `ToolPreset` for scenario-based tool selection.
+Bridgic Browser provides 67 tools organized into categories. Use `BrowserToolSetBuilder` with category/name selection for scenario-focused tool sets.
 
-#### Quick Start with Presets
+#### Quick Start with Categories
 
 ```python
-from bridgic.browser.tools import BrowserToolSetBuilder, ToolPreset
+from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
 
-# Choose a preset for your use case
-builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.MINIMAL)       # 9 tools
+# Focused set for common agent flows
+builder = BrowserToolSetBuilder.for_categories(
+    browser,
+    ToolCategory.NAVIGATION,
+    ToolCategory.ELEMENT_INTERACTION,
+    ToolCategory.CAPTURE,
+)
 tools = builder.build()["tool_specs"]
-builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)  # 18 tools
-tools = builder.build()["tool_specs"]
-builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.TESTING)       # 26 tools
-tools = builder.build()["tool_specs"]
-builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.COMPLETE)      # 67 tools
+
+# Include all available tools
+builder = BrowserToolSetBuilder.for_categories(browser, ToolCategory.ALL)
 tools = builder.build()["tool_specs"]
 ```
-
-#### Available Presets
-
-| Preset | Tools | Description |
-|--------|-------|-------------|
-| `MINIMAL` | 9 | Navigate, click, input, snapshot |
-| `NAVIGATION` | 3 | Navigate, back/forward |
-| `SCRAPING` | 10 | Navigation + snapshot + scroll |
-| `FORM_FILLING` | 18 | Navigation + input + dropdown + checkbox |
-| `TESTING` | 26 | Form filling + verification + screenshot |
-| `INTERACTIVE` | 32 | All action tools + mouse + keyboard |
-| `DEVELOPER` | 23 | Network + console + tracing |
-| `COMPLETE` | 67 | All available tools |
 
 #### Category-based Selection
 
 ```python
 # Select by category
 builder = BrowserToolSetBuilder.for_categories(
-    browser, "navigation", "action", "capture"
+    browser, "navigation", "element_interaction", "capture"
 )
 tools = builder.build()["tool_specs"]
 ```
@@ -273,7 +294,7 @@ tools = builder.build()["tool_specs"]
 builder = BrowserToolSetBuilder.for_tool_names(
     browser,
     "search",
-    "navigate_to_url",
+    "navigate_to",
     "click_element_by_ref",
 )
 tools = builder.build()["tool_specs"]
@@ -282,7 +303,7 @@ tools = builder.build()["tool_specs"]
 builder = BrowserToolSetBuilder.for_tool_names(
     browser,
     "search",
-    "navigate_to_url",
+    "navigate_to",
     strict=True,
 )
 tools = builder.build()["tool_specs"]
@@ -292,7 +313,7 @@ tools = builder.build()["tool_specs"]
 
 ```python
 builder1 = BrowserToolSetBuilder.for_categories(
-    browser, "navigation", "action", "capture"
+    browser, "navigation", "element_interaction", "capture"
 )
 builder2 = BrowserToolSetBuilder.for_tool_names(
     browser, "verify_url", "verify_title"
@@ -303,14 +324,14 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 #### Tool Categories
 
 **Navigation (6 tools):**
-- `navigate_to_url(url)` - Navigate to URL
+- `navigate_to(url)` - Navigate to URL
 - `search(query, engine)` - Search using search engine
 - `get_current_page_info_str()` - Get current page info (URL, title, etc.)
 - `reload_page()` - Reload current page
 - `go_back()` / `go_forward()` - Browser history navigation
 
 **Snapshot (1 tool):**
-- `get_snapshot_text(start_from_char=0, interactive=False, full_page=True)` - Get page state string for LLM (accessibility tree with refs). Use **start_from_char** for pagination when the page is long: if the return value is truncated, a `[notice]` at the end gives **next_start_char** to call again. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default). Output is truncated at the `BRIDGIC_MAX_CHARS` limit (default 30,000 chars) with a notice explaining how to continue.
+- `get_snapshot_text(start_from_char=0, interactive=False, full_page=True)` - Get page state string for LLM (accessibility tree with refs). **start_from_char** must be `>= 0` and is used for pagination when the page is long: if the return value is truncated, a `[notice]` at the end gives **next_start_char** to call again. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default). Output is truncated at the `BRIDGIC_MAX_CHARS` limit (default 30,000 chars) with a notice explaining how to continue.
 
 **Element Interaction (13 tools) - by ref:**
 - `click_element_by_ref(ref)` - Click element
@@ -327,7 +348,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `drag_element_by_ref(start_ref, end_ref)` - Drag and drop
 
 **Tabs (4 tools):**
-- `get_tabs()` / `new_tab(url)` / `switch_tab(tab_id)` / `close_tab(tab_id)` - Tab management
+- `get_tabs()` / `new_tab(url)` / `switch_tab(page_id)` / `close_tab(page_id)` - Tab management
 
 **Evaluate (2 tools):**
 - `evaluate_javascript(code)` - Execute JavaScript
@@ -349,7 +370,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `wait_for(time_seconds, text, text_gone, selector, state, timeout_ms)` - Wait for conditions
 
 **Capture (2 tools):**
-- `take_screenshot(type, filename)` - Capture screenshot
+- `take_screenshot(filename=None, ref=None, full_page=False, type="png")` - Capture screenshot
 - `save_pdf(filename)` - Save page as PDF
 
 **Network (4 tools):**
@@ -362,12 +383,12 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `remove_dialog_handler()` - Remove dialog handler
 
 **Storage (5 tools):**
-- `get_cookies()` / `set_cookie()` / `clear_cookies()` - Cookie management
+- `get_cookies()` / `set_cookie()` / `clear_cookies()` - Cookie management (`expires=0` is valid and preserved)
 - `save_storage_state(filename)` / `restore_storage_state(filename)` - Session persistence
 
 **Verify (6 tools):**
 - `verify_text_visible(text)` - Check text visibility
-- `verify_element_visible(role, name)` - Check element visibility by role and accessible name
+- `verify_element_visible(role, accessible_name)` - Check element visibility by role and accessible name
 - `verify_url(pattern)` / `verify_title(pattern)` - URL/title verification
 - `verify_element_state(ref, state)` - Check element state
 - `verify_value(ref, value)` - Check element value
@@ -409,7 +430,7 @@ browser = Browser(stealth=config)
 
 ### Requirements
 
-- Python 3.11+
+- Python 3.10+
 - Playwright 1.57+
 - Pydantic 2.11+
 
@@ -482,14 +503,19 @@ asyncio.run(main())
 
 ```python
 from bridgic.browser.session import Browser
-from bridgic.browser.tools import BrowserToolSetBuilder, ToolPreset
+from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
 
 async def create_agent():
     browser = Browser(headless=False)
     await browser.start()
 
-    # 为智能体构建工具集
-    builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)
+    # 为智能体构建聚焦工具集
+    builder = BrowserToolSetBuilder.for_categories(
+        browser,
+        ToolCategory.NAVIGATION,
+        ToolCategory.ELEMENT_INTERACTION,
+        ToolCategory.CAPTURE,
+    )
     tools = builder.build()["tool_specs"]
 
     # 将工具与 LLM 智能体配合使用
@@ -560,14 +586,40 @@ BRIDGIC_BROWSER_JSON='{"channel":"chrome","headless":false}' bridgic-browser ope
 | 断言 | `verify-visible`、`verify-text`、`verify-value`、`verify-state`、`verify-url`、`verify-title` |
 | 开发者 | `console-start`、`console-stop`、`console`、`trace-start`、`trace-stop`、`trace-chunk`、`video-start`、`video-stop` |
 | 生命周期 | `close`、`resize` |
-| 发现 | `commands [--section|--preset|--list-presets|--list-sections]` |
 
-使用 `-h` 或 `--help` 查看任意命令的详细说明。面向 Agent 的能力发现，推荐优先使用 `bridgic-browser commands --preset PRESET`：
+辅助命令：`commands [--section|--list-sections]`。
+
+使用 `-h` 或 `--help` 查看任意命令的详细说明。面向 Agent 的能力发现，推荐优先使用 `bridgic-browser commands --section SECTION`：
 
 ```bash
 bridgic-browser -h
 bridgic-browser scroll -h
 ```
+
+### 错误模型
+
+SDK 与 CLI 共享统一的结构化错误协议。
+
+- 基类：`BridgicBrowserError`
+- 稳定字段：`code`、`message`、`details`、`retryable`
+- 少量行为型子类：
+  - `InvalidInputError`（入参/用户输入错误）
+  - `StateError`（运行状态不满足，例如没有 active page/session）
+  - `OperationError`（执行过程失败）
+  - `VerificationError`（断言/验证失败）
+
+保留少量行为型子类的原因：
+
+- 调用方可以按“行为”分流处理（例如仅对 `StateError` 做重试）
+- 将默认重试语义放在错误源头附近，协议更稳定
+- 避免过多细粒度子类导致维护成本高，同时保持可预测性
+
+Daemon 侧返回同样是结构化协议：
+
+- 成功：`{"success": true, "result": "..."}`
+- 失败：`{"success": false, "error_code": "...", "result": "...", "data": {...}, "meta": {"retryable": false}}`
+
+CLI Client 会把 daemon 失败转换为 `BridgicBrowserCommandError`，CLI 输出保留机器可读错误码：`Error[CODE]: ...`。
 
 ### 核心组件
 
@@ -640,43 +692,33 @@ for file in browser.download_manager.downloaded_files:
 
 ### 浏览器工具
 
-Bridgic Browser 提供 67 个工具，按类别组织。使用 `BrowserToolSetBuilder` 配合 `ToolPreset` 进行场景化工具选择。
+Bridgic Browser 提供 67 个工具，按类别组织。使用 `BrowserToolSetBuilder` 通过类别/名称进行场景化工具选择。
 
-#### 使用预设快速开始
+#### 按类别快速开始
 
 ```python
-from bridgic.browser.tools import BrowserToolSetBuilder, ToolPreset
+from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
 
-# 根据使用场景选择预设
-builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.MINIMAL)       # 9 个工具
+# 常见 Agent 流程的聚焦工具集
+builder = BrowserToolSetBuilder.for_categories(
+    browser,
+    ToolCategory.NAVIGATION,
+    ToolCategory.ELEMENT_INTERACTION,
+    ToolCategory.CAPTURE,
+)
 tools = builder.build()["tool_specs"]
-builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)  # 18 个工具
-tools = builder.build()["tool_specs"]
-builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.TESTING)       # 26 个工具
-tools = builder.build()["tool_specs"]
-builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.COMPLETE)      # 67 个工具
+
+# 全量工具集
+builder = BrowserToolSetBuilder.for_categories(browser, ToolCategory.ALL)
 tools = builder.build()["tool_specs"]
 ```
-
-#### 可用预设
-
-| 预设 | 工具数 | 描述 |
-|------|--------|------|
-| `MINIMAL` | 9 | 导航、点击、输入、快照 |
-| `NAVIGATION` | 3 | 导航、前进/后退 |
-| `SCRAPING` | 10 | 导航 + 快照 + 滚动 |
-| `FORM_FILLING` | 18 | 导航 + 输入 + 下拉框 + 复选框 |
-| `TESTING` | 26 | 表单填写 + 验证 + 截图 |
-| `INTERACTIVE` | 32 | 所有交互工具 + 鼠标 + 键盘 |
-| `DEVELOPER` | 23 | 网络 + 控制台 + 追踪 |
-| `COMPLETE` | 67 | 所有可用工具 |
 
 #### 按类别选择
 
 ```python
 # 按类别选择工具
 builder = BrowserToolSetBuilder.for_categories(
-    browser, "navigation", "action", "capture"
+    browser, "navigation", "element_interaction", "capture"
 )
 tools = builder.build()["tool_specs"]
 ```
@@ -688,7 +730,7 @@ tools = builder.build()["tool_specs"]
 builder = BrowserToolSetBuilder.for_tool_names(
     browser,
     "search",
-    "navigate_to_url",
+    "navigate_to",
     "click_element_by_ref",
 )
 tools = builder.build()["tool_specs"]
@@ -697,7 +739,7 @@ tools = builder.build()["tool_specs"]
 builder = BrowserToolSetBuilder.for_tool_names(
     browser,
     "search",
-    "navigate_to_url",
+    "navigate_to",
     strict=True,
 )
 tools = builder.build()["tool_specs"]
@@ -707,7 +749,7 @@ tools = builder.build()["tool_specs"]
 
 ```python
 builder1 = BrowserToolSetBuilder.for_categories(
-    browser, "navigation", "action", "capture"
+    browser, "navigation", "element_interaction", "capture"
 )
 builder2 = BrowserToolSetBuilder.for_tool_names(
     browser, "verify_url", "verify_title"
@@ -718,14 +760,14 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 #### 工具类别
 
 **导航（6 个工具）：**
-- `navigate_to_url(url)` - 导航到 URL
+- `navigate_to(url)` - 导航到 URL
 - `search(query, engine)` - 使用搜索引擎搜索
 - `get_current_page_info_str()` - 获取当前页面信息（URL、标题等）
 - `reload_page()` - 重新加载当前页面
 - `go_back()` / `go_forward()` - 浏览器历史导航
 
 **快照（1 个工具）：**
-- `get_snapshot_text(start_from_char=0, interactive=False, full_page=True)` - 获取供 LLM 使用的页面状态字符串（带 ref 的可访问性树）。长页面可用 **start_from_char** 分页：若返回值被截断，末尾会有 `[notice]` 给出 **next_start_char** 供再次调用。**interactive** 与 **full_page** 与 `get_snapshot` 一致（默认全页面）。输出在 `BRIDGIC_MAX_CHARS` 上限处（默认 3 万字符）截断并附带续读说明。
+- `get_snapshot_text(start_from_char=0, interactive=False, full_page=True)` - 获取供 LLM 使用的页面状态字符串（带 ref 的可访问性树）。**start_from_char** 必须 `>= 0`，长页面可用它分页：若返回值被截断，末尾会有 `[notice]` 给出 **next_start_char** 供再次调用。**interactive** 与 **full_page** 与 `get_snapshot` 一致（默认全页面）。输出在 `BRIDGIC_MAX_CHARS` 上限处（默认 3 万字符）截断并附带续读说明。
 
 **元素交互（13 个工具）- 通过引用操作元素：**
 - `click_element_by_ref(ref)` - 点击元素
@@ -742,7 +784,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `drag_element_by_ref(start_ref, end_ref)` - 拖放
 
 **标签页（4 个工具）：**
-- `get_tabs()` / `new_tab(url)` / `switch_tab(tab_id)` / `close_tab(tab_id)` - 标签页管理
+- `get_tabs()` / `new_tab(url)` / `switch_tab(page_id)` / `close_tab(page_id)` - 标签页管理
 
 **执行（2 个工具）：**
 - `evaluate_javascript(code)` - 执行 JavaScript
@@ -764,7 +806,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `wait_for(time_seconds, text, text_gone, selector, state, timeout_ms)` - 等待条件
 
 **截图（2 个工具）：**
-- `take_screenshot(type, filename)` - 截取屏幕截图
+- `take_screenshot(filename=None, ref=None, full_page=False, type="png")` - 截取屏幕截图
 - `save_pdf(filename)` - 保存页面为 PDF
 
 **网络（4 个工具）：**
@@ -777,12 +819,12 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `remove_dialog_handler()` - 移除对话框处理器
 
 **存储（5 个工具）：**
-- `get_cookies()` / `set_cookie()` / `clear_cookies()` - Cookie 管理
+- `get_cookies()` / `set_cookie()` / `clear_cookies()` - Cookie 管理（`expires=0` 合法且会保留）
 - `save_storage_state(filename)` / `restore_storage_state(filename)` - 会话持久化
 
 **验证（6 个工具）：**
 - `verify_text_visible(text)` - 检查文本可见性
-- `verify_element_visible(role, name)` - 通过角色和可访问名称检查元素可见性
+- `verify_element_visible(role, accessible_name)` - 通过角色和可访问名称检查元素可见性
 - `verify_url(pattern)` / `verify_title(pattern)` - URL/标题验证
 - `verify_element_state(ref, state)` - 检查元素状态
 - `verify_value(ref, value)` - 检查元素值
@@ -824,7 +866,7 @@ browser = Browser(stealth=config)
 
 ### 环境要求
 
-- Python 3.11+
+- Python 3.10+
 - Playwright 1.57+
 - Pydantic 2.11+
 
@@ -843,6 +885,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 - [Browser Tools Guide](docs/BROWSER_TOOLS_GUIDE.md) – Tool selection, ref vs coordinate, wait strategies, patterns.
 - [Snapshot and Page State](docs/SNAPSHOT_AND_STATE.md) – SnapshotOptions, EnhancedSnapshot, get_snapshot_text, get_element_by_ref.
 - [API Summary](docs/API.md) – Session and DownloadManager API reference.
+
 
 ## Links
 

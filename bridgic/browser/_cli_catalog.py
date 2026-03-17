@@ -4,24 +4,24 @@ Shared CLI catalog and Browser-method mapping.
 Single source of truth for:
 - CLI help sections
 - CLI command metadata
-- CLI preset command sets
 - CLI command -> Browser method mapping
-- Derived tool categories and preset method lists for BrowserToolSetBuilder
+- Derived tool categories for BrowserToolSetBuilder
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections import Counter
+from collections.abc import Sequence
 from typing import Dict, List
 
-from ._constants import ToolPreset
+from ._constants import ToolCategory
 
-# Ordered list of (section_title, [command_names]) for top-level `-h` output.
-# Commands not listed here appear in a trailing "Other" section.
-CLI_HELP_SECTIONS: list[tuple[str, list[str]]] = [
-    ("Navigation", ["open", "search", "info", "reload", "back", "forward"]),
-    ("Snapshot", ["snapshot"]),
+# Ordered list of (ToolCategory, [command_names]).
+# ToolCategory.value provides the display title for `bridgic-browser -h`.
+CLI_HELP_SECTION_SPECS: list[tuple[ToolCategory, list[str]]] = [
+    (ToolCategory.NAVIGATION, ["open", "search", "info", "reload", "back", "forward"]),
+    (ToolCategory.SNAPSHOT, ["snapshot"]),
     (
-        "Element Interaction",
+        ToolCategory.ELEMENT_INTERACTION,
         [
             "click",
             "fill",
@@ -38,18 +38,18 @@ CLI_HELP_SECTIONS: list[tuple[str, list[str]]] = [
             "drag",
         ],
     ),
-    ("Tabs", ["tabs", "new-tab", "switch-tab", "close-tab"]),
-    ("Evaluate", ["eval", "eval-on"]),
-    ("Keyboard", ["type", "press", "key-down", "key-up"]),
-    ("Mouse", ["scroll", "mouse-click", "mouse-move", "mouse-drag", "mouse-down", "mouse-up"]),
-    ("Wait", ["wait"]),
-    ("Capture", ["screenshot", "pdf"]),
-    ("Network", ["network-start", "network", "network-stop", "wait-network"]),
-    ("Dialog", ["dialog-setup", "dialog", "dialog-remove"]),
-    ("Storage", ["cookies", "cookie-set", "cookies-clear", "storage-save", "storage-load"]),
-    ("Verify", ["verify-text", "verify-visible", "verify-url", "verify-title", "verify-state", "verify-value"]),
+    (ToolCategory.TABS, ["tabs", "new-tab", "switch-tab", "close-tab"]),
+    (ToolCategory.EVALUATE, ["eval", "eval-on"]),
+    (ToolCategory.KEYBOARD, ["type", "press", "key-down", "key-up"]),
+    (ToolCategory.MOUSE, ["scroll", "mouse-click", "mouse-move", "mouse-drag", "mouse-down", "mouse-up"]),
+    (ToolCategory.WAIT, ["wait"]),
+    (ToolCategory.CAPTURE, ["screenshot", "pdf"]),
+    (ToolCategory.NETWORK, ["network-start", "network", "network-stop", "wait-network"]),
+    (ToolCategory.DIALOG, ["dialog-setup", "dialog", "dialog-remove"]),
+    (ToolCategory.STORAGE, ["cookies", "cookie-set", "cookies-clear", "storage-save", "storage-load"]),
+    (ToolCategory.VERIFY, ["verify-text", "verify-visible", "verify-url", "verify-title", "verify-state", "verify-value"]),
     (
-        "Developer",
+        ToolCategory.DEVELOPER,
         [
             "console-start",
             "console",
@@ -61,245 +61,98 @@ CLI_HELP_SECTIONS: list[tuple[str, list[str]]] = [
             "video-stop",
         ],
     ),
-    ("Lifecycle", ["close", "resize"]),
+    (ToolCategory.LIFECYCLE, ["close", "resize"]),
 ]
 
-# command_name -> (section, one-line description)
-CLI_COMMAND_META: dict[str, tuple[str, str]] = {
-    "open": ("navigation", "Navigate to URL (starts browser if needed)"),
-    "back": ("navigation", "Go back to the previous page"),
-    "forward": ("navigation", "Go forward to the next page"),
-    "reload": ("navigation", "Reload the current page"),
-    "search": ("navigation", "Search the web for QUERY [--engine duckduckgo|google|bing]"),
-    "info": ("navigation", "Show current page URL, title, viewport, scroll position"),
-    "snapshot": ("snapshot", "Get accessibility tree + refs [-i] [-F] [-s OFFSET]"),
-    "click": ("element_interaction", "Click an element by ref (@e2 or e2)"),
-    "double-click": ("element_interaction", "Double-click an element by ref"),
-    "hover": ("element_interaction", "Hover over an element by ref"),
-    "focus": ("element_interaction", "Focus an element by ref"),
-    "fill": ("element_interaction", "Fill an input element by ref with TEXT"),
-    "select": ("element_interaction", "Select a dropdown option by ref and option text"),
-    "check": ("element_interaction", "Set checkbox/radio to checked by ref"),
-    "uncheck": ("element_interaction", "Uncheck checkbox by ref (radio usually cannot be unchecked)"),
-    "scroll-to": ("element_interaction", "Scroll an element into view by ref"),
-    "drag": ("element_interaction", "Drag from START_REF to END_REF"),
-    "options": ("element_interaction", "Get all options for a dropdown element by ref"),
-    "upload": ("element_interaction", "Upload a file at PATH to a file input element by ref"),
-    "fill-form": ("element_interaction", "Fill multiple form fields via JSON array [--submit]"),
-    "press": ("keyboard", "Press a key or combination (Enter, Control+A, ...)"),
-    "type": ("keyboard", "Type text character-by-character (triggers key events) [--submit]"),
-    "key-down": ("keyboard", "Press and hold a keyboard key"),
-    "key-up": ("keyboard", "Release a held keyboard key"),
-    "scroll": ("mouse", "Scroll page [--dy pixels] [--dx pixels]"),
-    "mouse-move": ("mouse", "Move the mouse to coordinates (X Y)"),
-    "mouse-click": ("mouse", "Click mouse at (X Y) [--button left|right|middle] [--count N]"),
-    "mouse-drag": ("mouse", "Drag mouse from (X1 Y1) to (X2 Y2)"),
-    "mouse-down": ("mouse", "Press and hold a mouse button [--button left]"),
-    "mouse-up": ("mouse", "Release a held mouse button [--button left]"),
-    "wait": ("wait", "Wait for SECONDS or until TEXT appears [--gone]"),
-    "tabs": ("tabs", "List all open tabs"),
-    "new-tab": ("tabs", "Open a new tab [URL]"),
-    "switch-tab": ("tabs", "Switch to a tab by page_id"),
-    "close-tab": ("tabs", "Close a tab by page_id (or current tab if omitted)"),
-    "screenshot": ("capture", "Save a screenshot to PATH [--full-page]"),
-    "pdf": ("capture", "Save the current page as PDF"),
-    "console-start": ("developer", "Start capturing browser console output"),
-    "console-stop": ("developer", "Stop capturing browser console output"),
-    "console": ("developer", "Get captured console messages [--filter TYPE] [--no-clear]"),
-    "network-start": ("network", "Start capturing network requests"),
-    "network-stop": ("network", "Stop capturing network requests"),
-    "network": ("network", "Get captured network requests [--static] [--no-clear]"),
-    "wait-network": ("network", "Wait until network is idle [--timeout MS]"),
-    "dialog-setup": ("dialog", "Set up automatic dialog handling [--action accept|dismiss] [--text TEXT]"),
-    "dialog": ("dialog", "Handle the next dialog [--dismiss] [--text TEXT]"),
-    "dialog-remove": ("dialog", "Remove the automatic dialog handler"),
-    "storage-save": ("storage", "Save browser storage state (cookies, localStorage) to PATH"),
-    "storage-load": ("storage", "Restore browser storage state from PATH"),
-    "cookies-clear": ("storage", "Clear all cookies from the browser context"),
-    "cookies": ("storage", "Get cookies from the browser context [--url URL]"),
+# Shape for Click group rendering: (display_title, [command_names]).
+CLI_HELP_SECTIONS: list[tuple[str, list[str]]] = [
+    (category.value, commands) for category, commands in CLI_HELP_SECTION_SPECS
+]
+
+# Flattened command list in CLI display order.
+CLI_ALL_COMMANDS: list[str] = [
+    command
+    for _category, commands in CLI_HELP_SECTION_SPECS
+    for command in commands
+]
+
+# command_name -> (ToolCategory, one-line description)
+CLI_COMMAND_META: dict[str, tuple[ToolCategory, str]] = {
+    "open": (ToolCategory.NAVIGATION, "Navigate to URL (starts browser if needed)"),
+    "back": (ToolCategory.NAVIGATION, "Go back to the previous page"),
+    "forward": (ToolCategory.NAVIGATION, "Go forward to the next page"),
+    "reload": (ToolCategory.NAVIGATION, "Reload the current page"),
+    "search": (ToolCategory.NAVIGATION, "Search the web for QUERY [--engine duckduckgo|google|bing]"),
+    "info": (ToolCategory.NAVIGATION, "Show current page URL, title, viewport, scroll position"),
+    "snapshot": (ToolCategory.SNAPSHOT, "Get current page accessibility tree + refs [-i] [-F] [-s OFFSET]"),
+    "click": (ToolCategory.ELEMENT_INTERACTION, "Click an element by ref (@e2 or e2)"),
+    "double-click": (ToolCategory.ELEMENT_INTERACTION, "Double-click an element by ref"),
+    "hover": (ToolCategory.ELEMENT_INTERACTION, "Hover over an element by ref"),
+    "focus": (ToolCategory.ELEMENT_INTERACTION, "Focus an element by ref"),
+    "fill": (ToolCategory.ELEMENT_INTERACTION, "Fill an input element by ref with TEXT"),
+    "select": (ToolCategory.ELEMENT_INTERACTION, "Select a dropdown option by ref and option text"),
+    "check": (ToolCategory.ELEMENT_INTERACTION, "Set checkbox/radio to checked by ref"),
+    "uncheck": (ToolCategory.ELEMENT_INTERACTION, "Uncheck checkbox by ref (radio usually cannot be unchecked)"),
+    "scroll-to": (ToolCategory.ELEMENT_INTERACTION, "Scroll an element into view by ref"),
+    "drag": (ToolCategory.ELEMENT_INTERACTION, "Drag from START_REF to END_REF"),
+    "options": (ToolCategory.ELEMENT_INTERACTION, "Get all options for a dropdown element by ref"),
+    "upload": (ToolCategory.ELEMENT_INTERACTION, "Upload a file at PATH to a file input element by ref"),
+    "fill-form": (ToolCategory.ELEMENT_INTERACTION, "Fill multiple form fields via JSON array [--submit]"),
+    "press": (ToolCategory.KEYBOARD, "Press a key or combination (Enter, Control+A, ...)"),
+    "type": (ToolCategory.KEYBOARD, "Type text character-by-character (triggers key events) [--submit]"),
+    "key-down": (ToolCategory.KEYBOARD, "Press and hold a keyboard key"),
+    "key-up": (ToolCategory.KEYBOARD, "Release a held keyboard key"),
+    "scroll": (ToolCategory.MOUSE, "Scroll page [--dy pixels] [--dx pixels]"),
+    "mouse-move": (ToolCategory.MOUSE, "Move the mouse to coordinates (X Y)"),
+    "mouse-click": (ToolCategory.MOUSE, "Click mouse at (X Y) [--button left|right|middle] [--count N]"),
+    "mouse-drag": (ToolCategory.MOUSE, "Drag mouse from (X1 Y1) to (X2 Y2)"),
+    "mouse-down": (ToolCategory.MOUSE, "Press and hold a mouse button [--button left]"),
+    "mouse-up": (ToolCategory.MOUSE, "Release a held mouse button [--button left]"),
+    "wait": (ToolCategory.WAIT, "Wait for SECONDS or until TEXT appears [--gone]"),
+    "tabs": (ToolCategory.TABS, "List all open tabs"),
+    "new-tab": (ToolCategory.TABS, "Open a new tab [URL]"),
+    "switch-tab": (ToolCategory.TABS, "Switch to a tab by page_id"),
+    "close-tab": (ToolCategory.TABS, "Close a tab by page_id (or current tab if omitted)"),
+    "screenshot": (ToolCategory.CAPTURE, "Save a screenshot to PATH [--full-page]"),
+    "pdf": (ToolCategory.CAPTURE, "Save the current page as PDF"),
+    "console-start": (ToolCategory.DEVELOPER, "Start capturing browser console output"),
+    "console-stop": (ToolCategory.DEVELOPER, "Stop capturing browser console output"),
+    "console": (ToolCategory.DEVELOPER, "Get captured console messages [--filter TYPE] [--no-clear]"),
+    "network-start": (ToolCategory.NETWORK, "Start capturing network requests"),
+    "network-stop": (ToolCategory.NETWORK, "Stop capturing network requests"),
+    "network": (ToolCategory.NETWORK, "Get captured network requests [--static] [--no-clear]"),
+    "wait-network": (ToolCategory.NETWORK, "Wait until network is idle [--timeout MS]"),
+    "dialog-setup": (ToolCategory.DIALOG, "Set up automatic dialog handling [--action accept|dismiss] [--text TEXT]"),
+    "dialog": (ToolCategory.DIALOG, "Handle the next dialog [--dismiss] [--text TEXT]"),
+    "dialog-remove": (ToolCategory.DIALOG, "Remove the automatic dialog handler"),
+    "storage-save": (ToolCategory.STORAGE, "Save browser storage state (cookies, localStorage) to PATH"),
+    "storage-load": (ToolCategory.STORAGE, "Restore browser storage state from PATH"),
+    "cookies-clear": (ToolCategory.STORAGE, "Clear all cookies from the browser context"),
+    "cookies": (ToolCategory.STORAGE, "Get cookies from the browser context [--url URL]"),
     "cookie-set": (
-        "storage",
+        ToolCategory.STORAGE,
         "Set a cookie NAME VALUE [--url] [--domain] [--path] [--expires] [--http-only] [--secure] [--same-site]",
     ),
-    "verify-visible": ("verify", "Verify element with ROLE and NAME is visible [--timeout MS]"),
-    "verify-text": ("verify", "Verify TEXT is visible on the page [--exact] [--timeout MS]"),
-    "verify-value": ("verify", "Verify value of REF element matches EXPECTED"),
-    "verify-state": ("verify", "Verify REF state: visible|hidden|enabled|disabled|checked|unchecked"),
-    "verify-url": ("verify", "Verify current page URL matches URL [--exact]"),
-    "verify-title": ("verify", "Verify current page title matches TITLE [--exact]"),
-    "eval": ("evaluate", "Evaluate JavaScript in the page context"),
-    "eval-on": ("evaluate", "Evaluate JavaScript with REF element as argument"),
-    "trace-start": ("developer", "Start browser tracing [--no-screenshots] [--no-snapshots]"),
-    "trace-stop": ("developer", "Stop tracing and save to PATH (.zip)"),
-    "trace-chunk": ("developer", "Add a named chunk marker to the current trace"),
-    "video-start": ("developer", "Start video recording [--width W] [--height H]"),
-    "video-stop": ("developer", "Stop video recording [PATH]"),
-    "close": ("lifecycle", "Close the browser and stop the daemon"),
-    "resize": ("lifecycle", "Resize the browser viewport to WIDTH x HEIGHT"),
+    "verify-visible": (ToolCategory.VERIFY, "Verify element with ROLE and NAME is visible [--timeout MS]"),
+    "verify-text": (ToolCategory.VERIFY, "Verify TEXT is visible on the page [--exact] [--timeout MS]"),
+    "verify-value": (ToolCategory.VERIFY, "Verify value of REF element matches EXPECTED"),
+    "verify-state": (ToolCategory.VERIFY, "Verify REF state: visible|hidden|enabled|disabled|checked|unchecked"),
+    "verify-url": (ToolCategory.VERIFY, "Verify current page URL matches URL [--exact]"),
+    "verify-title": (ToolCategory.VERIFY, "Verify current page title matches TITLE [--exact]"),
+    "eval": (ToolCategory.EVALUATE, "Evaluate JavaScript in the page context"),
+    "eval-on": (ToolCategory.EVALUATE, "Evaluate JavaScript with REF element as argument"),
+    "trace-start": (ToolCategory.DEVELOPER, "Start browser tracing [--no-screenshots] [--no-snapshots]"),
+    "trace-stop": (ToolCategory.DEVELOPER, "Stop tracing and save to PATH (.zip)"),
+    "trace-chunk": (ToolCategory.DEVELOPER, "Add a named chunk marker to the current trace"),
+    "video-start": (ToolCategory.DEVELOPER, "Start video recording [--width W] [--height H]"),
+    "video-stop": (ToolCategory.DEVELOPER, "Stop video recording [PATH]"),
+    "close": (ToolCategory.LIFECYCLE, "Close the browser and stop the daemon"),
+    "resize": (ToolCategory.LIFECYCLE, "Resize the browser viewport to WIDTH x HEIGHT"),
 }
-
-
-CLI_PRESET_COMMANDS: dict[ToolPreset, list[str]] = {
-    ToolPreset.MINIMAL: [
-        "open",
-        "back",
-        "forward",
-        "reload",
-        "info",
-        "snapshot",
-        "click",
-        "fill",
-        "close",
-    ],
-    ToolPreset.NAVIGATION: [
-        "open",
-        "back",
-        "forward",
-    ],
-    ToolPreset.SCRAPING: [
-        "open",
-        "back",
-        "forward",
-        "reload",
-        "info",
-        "snapshot",
-        "scroll",
-        "wait",
-        "screenshot",
-        "close",
-    ],
-    ToolPreset.FORM_FILLING: [
-        "open",
-        "back",
-        "forward",
-        "reload",
-        "info",
-        "snapshot",
-        "click",
-        "double-click",
-        "hover",
-        "focus",
-        "fill",
-        "select",
-        "check",
-        "uncheck",
-        "press",
-        "type",
-        "wait",
-        "close",
-    ],
-    ToolPreset.TESTING: [
-        "open",
-        "back",
-        "forward",
-        "reload",
-        "info",
-        "snapshot",
-        "click",
-        "double-click",
-        "hover",
-        "focus",
-        "fill",
-        "select",
-        "check",
-        "uncheck",
-        "press",
-        "type",
-        "scroll",
-        "wait",
-        "verify-visible",
-        "verify-text",
-        "verify-value",
-        "verify-state",
-        "verify-url",
-        "verify-title",
-        "screenshot",
-        "close",
-    ],
-    ToolPreset.INTERACTIVE: [
-        "open",
-        "back",
-        "forward",
-        "reload",
-        "search",
-        "info",
-        "snapshot",
-        "click",
-        "double-click",
-        "hover",
-        "focus",
-        "fill",
-        "select",
-        "check",
-        "uncheck",
-        "scroll-to",
-        "drag",
-        "options",
-        "upload",
-        "fill-form",
-        "press",
-        "type",
-        "scroll",
-        "mouse-move",
-        "mouse-click",
-        "wait",
-        "tabs",
-        "new-tab",
-        "switch-tab",
-        "close-tab",
-        "screenshot",
-        "close",
-    ],
-    ToolPreset.DEVELOPER: [
-        "open",
-        "back",
-        "reload",
-        "info",
-        "snapshot",
-        "click",
-        "fill",
-        "eval",
-        "eval-on",
-        "trace-start",
-        "trace-stop",
-        "trace-chunk",
-        "video-start",
-        "video-stop",
-        "console-start",
-        "console-stop",
-        "console",
-        "network-start",
-        "network-stop",
-        "network",
-        "screenshot",
-        "pdf",
-        "close",
-    ],
-    ToolPreset.COMPLETE: list(CLI_COMMAND_META.keys()),
-}
-
-
-CLI_SECTION_ORDER: list[str] = [
-    "navigation",
-    "snapshot",
-    "element_interaction",
-    "keyboard",
-    "mouse",
-    "wait",
-    "tabs",
-    "evaluate",
-    "capture",
-    "network",
-    "dialog",
-    "storage",
-    "verify",
-    "developer",
-    "lifecycle",
-]
 
 
 CLI_COMMAND_TO_TOOL_METHOD: Dict[str, str] = {
-    "open": "navigate_to_url",
+    "open": "navigate_to",
     "search": "search",
     "info": "get_current_page_info_str",
     "reload": "reload_page",
@@ -368,11 +221,10 @@ CLI_COMMAND_TO_TOOL_METHOD: Dict[str, str] = {
     "resize": "browser_resize",
 }
 
-
-
-def section_title_to_category(section_title: str) -> str:
-    """Convert CLI section title to BrowserToolSetBuilder category format."""
-    return section_title.strip().lower().replace(" ", "_")
+# CLI commands that are informational and not backed by Browser tool methods.
+# Keep this set for validation extension points; currently all sectioned commands
+# are mapped to Browser tool methods.
+CLI_NON_TOOL_COMMANDS: set[str] = set()
 
 
 def map_cli_commands_to_tool_methods(commands: Sequence[str]) -> List[str]:
@@ -390,55 +242,101 @@ def map_cli_commands_to_tool_methods(commands: Sequence[str]) -> List[str]:
     return ordered_methods
 
 
-def build_tool_categories_from_help_sections(
-    sections: Sequence[tuple[str, list[str]]],
-) -> Dict[str, List[str]]:
-    """Build BrowserToolSetBuilder categories from CLI help sections."""
-    categories: Dict[str, List[str]] = {}
-
-    for section_title, commands in sections:
+def _build_tool_categories() -> Dict[ToolCategory, List[str]]:
+    """Build BrowserToolSetBuilder categories from CLI_HELP_SECTION_SPECS."""
+    categories: Dict[ToolCategory, List[str]] = {}
+    for category, commands in CLI_HELP_SECTION_SPECS:
         method_names = map_cli_commands_to_tool_methods(commands)
-        if not method_names:
-            continue
-        categories[section_title_to_category(section_title)] = method_names
-
+        if method_names:
+            categories[category] = method_names
     return categories
 
 
-def build_tool_presets_from_cli_preset_commands(
-    preset_commands: Mapping[ToolPreset, Sequence[str]],
-) -> Dict[ToolPreset, List[str]]:
-    """Build BrowserToolSetBuilder preset method lists from CLI preset commands."""
-    return {
-        preset: map_cli_commands_to_tool_methods(commands)
-        for preset, commands in preset_commands.items()
-    }
+CLI_TOOL_CATEGORIES: Dict[ToolCategory, List[str]] = _build_tool_categories()
 
 
-CLI_TOOL_CATEGORIES: Dict[str, List[str]] = build_tool_categories_from_help_sections(CLI_HELP_SECTIONS)
-CLI_PRESET_TOOL_METHODS: Dict[ToolPreset, List[str]] = build_tool_presets_from_cli_preset_commands(CLI_PRESET_COMMANDS)
+def _find_duplicates(values: Sequence[str]) -> list[str]:
+    """Return sorted duplicate values from an ordered string sequence."""
+    counts = Counter(values)
+    return sorted(value for value, count in counts.items() if count > 1)
 
 
 def _validate_catalog() -> None:
     """Fail fast when catalog constants become inconsistent."""
-    known_commands = set(CLI_COMMAND_TO_TOOL_METHOD)
+    help_command_duplicates = _find_duplicates(CLI_ALL_COMMANDS)
+    if help_command_duplicates:
+        raise ValueError(
+            "Duplicate commands in CLI_HELP_SECTION_SPECS: "
+            + ", ".join(help_command_duplicates)
+        )
 
-    for _, commands in CLI_HELP_SECTIONS:
-        for command in commands:
-            if command not in known_commands:
-                raise ValueError(f"CLI help command not mapped: {command}")
+    for category, commands in CLI_HELP_SECTION_SPECS:
+        duplicates = _find_duplicates(commands)
+        if duplicates:
+            raise ValueError(
+                f"Duplicate commands in section {category.name!r}: "
+                + ", ".join(duplicates)
+            )
 
-    for commands in CLI_PRESET_COMMANDS.values():
-        for command in commands:
-            if command not in known_commands:
-                raise ValueError(f"CLI preset command not mapped: {command}")
+    help_command_set = set(CLI_ALL_COMMANDS)
+    meta_command_set = set(CLI_COMMAND_META)
+    mapped_command_set = set(CLI_COMMAND_TO_TOOL_METHOD)
 
-    help_section_commands = {command for _, commands in CLI_HELP_SECTIONS for command in commands}
-    missing_from_help = set(CLI_COMMAND_META) - help_section_commands
-    if missing_from_help:
-        missing_sorted = ", ".join(sorted(missing_from_help))
-        raise ValueError(f"CLI command metadata missing from help sections: {missing_sorted}")
+    missing_in_meta = sorted(help_command_set - meta_command_set)
+    if missing_in_meta:
+        raise ValueError(
+            "CLI commands missing metadata: " + ", ".join(missing_in_meta)
+        )
+
+    missing_in_help = sorted(meta_command_set - help_command_set)
+    if missing_in_help:
+        raise ValueError(
+            "CLI command metadata missing from help sections: " + ", ".join(missing_in_help)
+        )
+
+    missing_in_mapping = sorted(
+        command
+        for command in (help_command_set - mapped_command_set)
+        if command not in CLI_NON_TOOL_COMMANDS
+    )
+    if missing_in_mapping:
+        raise ValueError(
+            "CLI commands missing command-to-tool mapping: " + ", ".join(missing_in_mapping)
+        )
+
+    unknown_non_tool = sorted(CLI_NON_TOOL_COMMANDS - help_command_set)
+    if unknown_non_tool:
+        raise ValueError(
+            "Non-tool command set contains unknown commands: " + ", ".join(unknown_non_tool)
+        )
+
+    non_tool_with_mapping = sorted(CLI_NON_TOOL_COMMANDS & mapped_command_set)
+    if non_tool_with_mapping:
+        raise ValueError(
+            "Non-tool commands should not define command-to-tool mapping: "
+            + ", ".join(non_tool_with_mapping)
+        )
+
+    extra_in_mapping = sorted(mapped_command_set - help_command_set)
+    if extra_in_mapping:
+        raise ValueError(
+            "Mapped commands not present in CLI help sections: " + ", ".join(extra_in_mapping)
+        )
+
+    command_to_category = {
+        command: category
+        for category, commands in CLI_HELP_SECTION_SPECS
+        for command in commands
+    }
+    for command, (meta_category, _description) in CLI_COMMAND_META.items():
+        expected_category = command_to_category.get(command)
+        if expected_category is None:
+            continue
+        if meta_category != expected_category:
+            raise ValueError(
+                f"CLI metadata section mismatch for {command!r}: "
+                f"expected {expected_category.name!r}, got {meta_category.name!r}"
+            )
 
 
 _validate_catalog()
-

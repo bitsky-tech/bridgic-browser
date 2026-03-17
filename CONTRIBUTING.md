@@ -63,7 +63,7 @@ make test-integration
 
 | Target | What it does | When to use |
 |--------|----------------|--------------|
-| **test-quick** | Runs all tests via `uv run pytest` (no build). Uses the project in editable mode. **Fastest.** | Day-to-day development; quick feedback after code changes. |
+| **test-quick** | Runs tests via `uv run pytest -m "not integration"` (no build). Uses the project in editable mode. **Fastest.** | Day-to-day development; quick feedback after code changes. |
 | **test** | Syncs deps → builds wheel → installs wheel → runs pytest with PYTHONPATH from site-packages. Simulates the package **as installed** (e.g. namespace + deps from PyPI). | Before committing/PR; CI; verify “real install” behavior. |
 | **test-integration** | Runs only tests marked `@pytest.mark.integration` (e.g. tests that need a real browser). | When you want to run only integration/E2E tests. |
 
@@ -86,7 +86,7 @@ make test-integration
    make test-quick
    
    # Check for linting issues (optional)
-   uv run ruff check .
+   uvx ruff check .
    ```
 
 3. **Commit your changes:**

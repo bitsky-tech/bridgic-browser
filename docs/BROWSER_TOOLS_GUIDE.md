@@ -4,22 +4,23 @@ This guide helps you choose the right tools for different browser automation sce
 
 ## Tool Categories Overview
 
-| Category | Tools Count | Primary Use Case |
-|----------|-------------|------------------|
-| Navigation | 4 | Page navigation, search |
-| Page | 9 | Page control, tabs, JS eval |
-| Action (ref-based) | 7 | Click, hover, focus, scroll-into-view, input, drag-and-drop |
-| Form (ref-based) | 7 | Dropdowns, checkboxes, file upload, bulk fill |
-| Mouse (coordinate) | 6 | Precise mouse control |
-| Keyboard | 4 | Text input, shortcuts |
-| Capture | 2 | Capture visuals |
-| Network | 7 | Monitor requests/console |
-| Dialog | 3 | Handle popups |
-| State | 1 | Page snapshot for LLM |
-| Storage | 5 | Cookies, state |
-| Verify | 6 | Assertions |
-| DevTools | 5 | Tracing, video |
-| Control | 3 | Browser lifecycle |
+| Category | Count | Primary Use Case |
+|----------|-------|------------------|
+| Navigation | 6 | URL/search/navigation info and history |
+| Snapshot | 1 | LLM page state with refs |
+| Element Interaction | 13 | Ref-based click/input/form/file interactions |
+| Tabs | 4 | Tab lifecycle and switching |
+| Evaluate | 2 | Execute JavaScript in page or on element |
+| Keyboard | 4 | Keyboard typing and key state |
+| Mouse | 6 | Coordinate-based pointer control |
+| Wait | 1 | Time/text/selector waits |
+| Capture | 2 | Screenshot and PDF |
+| Network | 4 | Request capture and network idle waits |
+| Dialog | 3 | Alert/confirm/prompt handling |
+| Storage | 5 | Cookies and storage state |
+| Verify | 6 | Assertions for text/value/state/url/title |
+| Developer | 8 | Console, tracing, and video |
+| Lifecycle | 2 | Browser close/resize |
 
 ## Page state and get_snapshot_text
 
@@ -27,7 +28,7 @@ This guide helps you choose the right tools for different browser automation sce
 
 ### Parameters
 
-- **start_from_char** (int, default 0): Pagination offset. When the page state is long, the returned text may be truncated at ~30,000 characters. A `[notice]` at the end of the string tells you the **next_start_char** value to use for the next call to get the rest of the content.
+- **start_from_char** (int, default 0): Pagination offset, must be `>= 0`. When the page state is long, the returned text may be truncated at ~30,000 characters. A `[notice]` at the end of the string tells you the **next_start_char** value to use for the next call to get the rest of the content.
 - **interactive** (bool, default False): If True, only clickable/editable elements are included (buttons, links, inputs, checkboxes, elements with `cursor:pointer`, etc.), with flattened output. Use for action-focused tasks.
 - **full_page** (bool, default True): If True (default), include all elements regardless of viewport position; if False, only viewport content.
 
@@ -110,7 +111,7 @@ await browser.mouse_drag(start_x=100, start_y=100, end_x=300, end_y=200)
 
 ## Text Input Methods Comparison
 
-### 1. `browser.input_text_by_ref(ref, text)`
+### 1. `browser.input_text_by_ref(ref, text, ...)`
 
 The **default choice** for most text input scenarios.
 
@@ -118,10 +119,19 @@ The **default choice** for most text input scenarios.
 await browser.input_text_by_ref("e3", "hello@example.com")
 ```
 
-- Uses Playwright's `.fill()` method
-- Fast and reliable
-- Clears existing text by default
-- Triggers `input` and `change` events
+Full signature: `input_text_by_ref(ref, text, clear=True, is_secret=False, slowly=False, submit=False)`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `ref` | str | — | Element ref from snapshot (e.g. `"e3"`) |
+| `text` | str | — | Text to input |
+| `clear` | bool | `True` | Clear the field before typing |
+| `is_secret` | bool | `False` | Hide text value in the result message (e.g. passwords) |
+| `slowly` | bool | `False` | Type character-by-character with ~100ms delays (triggers all keyboard events) |
+| `submit` | bool | `False` | Press Enter after typing |
+
+- Uses Playwright's `.fill()` method by default (fast, triggers `input`/`change` events)
+- With `slowly=True`: types each character with 100ms delay, triggering `keydown`/`keypress`/`keyup`
 
 ### 2. `browser.input_text_by_ref(ref, text, slowly=True)`
 
@@ -189,10 +199,7 @@ await browser.mouse_click(x=500, y=300, click_count=2)
 ### Right-click
 
 ```python
-# Ref-based
-await browser.click_element_by_ref("e5", button="right")
-
-# Coordinate-based
+# Coordinate-based (supported)
 await browser.mouse_click(x=500, y=300, button="right")
 ```
 
@@ -238,8 +245,7 @@ Drag from coordinates to coordinates:
 ```python
 await browser.mouse_drag(
     start_x=100, start_y=100,
-    end_x=300, end_y=200,
-    steps=10  # Smoothness
+    end_x=300, end_y=200
 )
 ```
 
@@ -273,14 +279,21 @@ await browser.wait_for_network_idle(timeout=30000)  # 30 seconds
 
 ## Verification Tools
 
-All verification tools return strings with `PASS:` or `FAIL:` prefix:
+Verification tools return `PASS: ...` on success. On mismatch, SDK raises
+`VerificationError` (structured error with `code/message/details/retryable`).
 
 ```python
-result = await browser.verify_text_visible(text="Welcome")
-# Returns: "PASS: Text 'Welcome' is visible" or "FAIL: Text 'Welcome' not found"
+from bridgic.browser.errors import VerificationError
 
-result = await browser.verify_url(expected_url="dashboard")
-# Returns: "PASS: URL contains 'dashboard'" or "FAIL: URL mismatch..."
+result = await browser.verify_text_visible(text="Welcome")
+# Success: "PASS: Text 'Welcome' is visible on the page"
+
+try:
+    await browser.verify_url(expected_url="dashboard")
+except VerificationError as exc:
+    # exc.code == "VERIFICATION_FAILED"
+    # exc.details includes expected/actual values when available
+    print(exc.code, exc.message, exc.details)
 ```
 
 ### Available Verifications
@@ -294,17 +307,51 @@ result = await browser.verify_url(expected_url="dashboard")
 | `verify_url` | Current URL contains string |
 | `verify_title` | Page title contains string |
 
-## Preset Selection Guide
+## Category-based Tool Selection
 
-| Scenario | Recommended Preset | Tools Count |
-|----------|-------------------|-------------|
-| Simple navigation | MINIMAL | 9 |
-| Data scraping | SCRAPING | 10 |
-| Form automation | FORM_FILLING | 18 |
-| E2E testing | TESTING | 26 |
-| Complex interactions | INTERACTIVE | 32 |
-| Debugging | DEVELOPER | 23 |
-| Full access | COMPLETE | 67 |
+Use `BrowserToolSetBuilder.for_categories()` with one or more `ToolCategory` values to pick the right tool set for your scenario:
+
+```python
+from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
+
+# Simple navigation
+builder = BrowserToolSetBuilder.for_categories(browser, ToolCategory.NAVIGATION)
+tools = builder.build()["tool_specs"]
+
+# Data scraping
+builder = BrowserToolSetBuilder.for_categories(
+    browser, ToolCategory.NAVIGATION, ToolCategory.SNAPSHOT, ToolCategory.EVALUATE
+)
+tools = builder.build()["tool_specs"]
+
+# Form automation
+builder = BrowserToolSetBuilder.for_categories(
+    browser,
+    ToolCategory.NAVIGATION,
+    ToolCategory.SNAPSHOT,
+    ToolCategory.ELEMENT_INTERACTION,
+    ToolCategory.WAIT,
+)
+tools = builder.build()["tool_specs"]
+
+# E2E testing
+builder = BrowserToolSetBuilder.for_categories(
+    browser,
+    ToolCategory.NAVIGATION,
+    ToolCategory.SNAPSHOT,
+    ToolCategory.ELEMENT_INTERACTION,
+    ToolCategory.WAIT,
+    ToolCategory.VERIFY,
+    ToolCategory.CAPTURE,
+)
+tools = builder.build()["tool_specs"]
+
+# Full access (all 67 tools)
+builder = BrowserToolSetBuilder.for_categories(browser, ToolCategory.ALL)
+tools = builder.build()["tool_specs"]
+```
+
+Available categories: `NAVIGATION`, `SNAPSHOT`, `ELEMENT_INTERACTION`, `TABS`, `EVALUATE`, `KEYBOARD`, `MOUSE`, `WAIT`, `CAPTURE`, `NETWORK`, `DIALOG`, `STORAGE`, `VERIFY`, `DEVELOPER`, `LIFECYCLE`. Pass `ToolCategory.ALL` to include every tool.
 
 ## Picking by function names
 
@@ -316,7 +363,7 @@ from bridgic.browser.tools import BrowserToolSetBuilder
 builder = BrowserToolSetBuilder.for_tool_names(
     browser,
     "search",
-    "navigate_to_url",
+    "navigate_to",
     "click_element_by_ref",
 )
 tools = builder.build()["tool_specs"]
@@ -332,14 +379,13 @@ builder2 = BrowserToolSetBuilder.for_tool_names(
 tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 ```
 
-Use `strict=True` to fail fast on unknown names or methods missing on the provided browser (recommended in production):
+`for_tool_names` validates names against the CLI-mapped tool inventory and fails fast on unknown names or methods missing on the provided browser:
 
 ```python
 builder = BrowserToolSetBuilder.for_tool_names(
     browser,
     "search",
-    "navigate_to_url",
-    strict=True,
+    "navigate_to",
 )
 tools = builder.build()["tool_specs"]
 ```
@@ -388,15 +434,26 @@ await browser.handle_dialog(accept=True, prompt_text="My input")
 
 ## Error Handling
 
-All tools return string messages. Check for error patterns:
+Use structured SDK exceptions instead of string matching:
 
 ```python
-result = await browser.click_element_by_ref("e999")
+from bridgic.browser.errors import (
+    InvalidInputError,
+    StateError,
+    OperationError,
+    VerificationError,
+)
 
-if "not available" in result or "Failed" in result:
-    # Element not found or operation failed
-    print(f"Error: {result}")
-else:
-    # Success
+try:
+    result = await browser.click_element_by_ref("e999")
     print(f"Success: {result}")
+except StateError as exc:
+    # predictable runtime-state issue (e.g. REF_NOT_AVAILABLE)
+    print(exc.code, exc.message, exc.details)
+except InvalidInputError as exc:
+    print(exc.code, exc.message)
+except VerificationError as exc:
+    print(exc.code, exc.message, exc.details)
+except OperationError as exc:
+    print(exc.code, exc.message)
 ```

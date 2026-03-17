@@ -26,10 +26,16 @@ from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 import pytest
 from bridgic.browser._cli_catalog import (
-    build_tool_categories_from_help_sections,
-    build_tool_presets_from_cli_preset_commands,
+    CLI_ALL_COMMANDS,
     CLI_COMMAND_TO_TOOL_METHOD,
-    CLI_PRESET_COMMANDS,
+    CLI_TOOL_CATEGORIES,
+    map_cli_commands_to_tool_methods,
+)
+from bridgic.browser.errors import (
+    InvalidInputError,
+    OperationError,
+    StateError,
+    VerificationError,
 )
 from bridgic.browser.session import Browser
 
@@ -39,8 +45,12 @@ from bridgic.browser.session import Browser
 def mock_browser():
     """Create a comprehensive mock Browser instance."""
     browser = MagicMock()
+    mock_page = MagicMock()
+    mock_page.goto = AsyncMock()
+    browser._page = mock_page
+    browser._context = MagicMock()
     browser.navigate_to = AsyncMock()
-    browser.get_current_page = AsyncMock()
+    browser.get_current_page = AsyncMock(return_value=mock_page)
     browser.get_pages = MagicMock(return_value=[])
     browser.get_all_page_descs = AsyncMock(return_value=[])
     browser.switch_to_page = AsyncMock(return_value=(True, "Switched"))
@@ -52,7 +62,7 @@ def mock_browser():
 
     # Browser tool methods (all async)
     browser.search = AsyncMock(return_value="Searched on Duckduckgo for 'test query'")
-    browser.navigate_to_url = AsyncMock(return_value="Navigated to https://example.com")
+    browser.navigate_to = AsyncMock(return_value="Navigated to https://example.com")
     browser.go_back = AsyncMock(return_value="Navigated back")
     browser.go_forward = AsyncMock(return_value="Navigated forward")
     browser.reload_page = AsyncMock(return_value="Page reloaded")
@@ -169,6 +179,13 @@ def mock_browser():
     browser.get_current_page.return_value = mock_page
     browser._page = mock_page
     browser._context = mock_context
+    browser._console_messages = {}
+    browser._network_requests = {}
+    browser._console_handlers = {}
+    browser._network_handlers = {}
+    browser._dialog_handlers = {}
+    browser._tracing_state = {}
+    browser._video_state = {}
 
     return browser
 
@@ -201,54 +218,57 @@ class TestNavigationTools:
     @pytest.mark.asyncio
     async def test_search_invalid_engine(self, mock_browser):
         """Test search with invalid engine returns error."""
-
-        result = await Browser.search(mock_browser, "test query", "invalid")
-
-        assert "unsupported" in result.lower() or "error" in result.lower()
+        with pytest.raises(InvalidInputError) as exc_info:
+            await Browser.search(mock_browser, "test query", "invalid")
+        assert exc_info.value.code == "UNSUPPORTED_SEARCH_ENGINE"
         mock_browser.navigate_to.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_navigate_to_url(self, mock_browser):
-        """Test navigate_to_url."""
+    async def test_navigate_to(self, mock_browser):
+        """Test navigate_to."""
+        mock_browser._page.goto = AsyncMock()
 
-        result = await Browser.navigate_to_url(mock_browser, "https://example.com")
+        result = await Browser.navigate_to(mock_browser, "https://example.com")
 
-        mock_browser.navigate_to.assert_called_once_with(
-            "https://example.com", wait_until="domcontentloaded", timeout=None
+        mock_browser._page.goto.assert_called_once_with(
+            "https://example.com", wait_until="domcontentloaded"
         )
         assert "Navigated to" in result
 
     @pytest.mark.asyncio
-    async def test_navigate_to_url_adds_protocol(self, mock_browser):
-        """Test navigate_to_url adds http:// if missing."""
+    async def test_navigate_to_adds_protocol(self, mock_browser):
+        """Test navigate_to adds http:// if missing."""
+        mock_browser._page.goto = AsyncMock()
 
-        result = await Browser.navigate_to_url(mock_browser, "example.com")
+        result = await Browser.navigate_to(mock_browser, "example.com")
 
-        mock_browser.navigate_to.assert_called_once_with(
-            "http://example.com", wait_until="domcontentloaded", timeout=None
+        mock_browser._page.goto.assert_called_once_with(
+            "http://example.com", wait_until="domcontentloaded"
         )
 
     @pytest.mark.asyncio
-    async def test_navigate_to_url_empty(self, mock_browser):
-        """Test navigate_to_url with empty URL."""
-
-        result = await Browser.navigate_to_url(mock_browser, "")
-
-        assert "empty" in result.lower()
-        mock_browser.navigate_to.assert_not_called()
+    async def test_navigate_to_empty(self, mock_browser):
+        """Test navigate_to with empty URL."""
+        with pytest.raises(InvalidInputError) as exc_info:
+            await Browser.navigate_to(mock_browser, "")
+        assert exc_info.value.code == "URL_EMPTY"
+        mock_browser._page.goto.assert_not_called()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("dangerous_url", [
+    @pytest.mark.parametrize("special_url", [
         "javascript:alert(1)",
         "data:text/html,<h1>test</h1>",
     ])
-    async def test_navigate_to_url_blocks_dangerous(self, mock_browser, dangerous_url):
-        """Test navigate_to_url blocks dangerous URLs."""
+    async def test_navigate_to_allows_special_schemes(self, mock_browser, special_url):
+        """Test navigate_to allows special schemes without auto-prefix."""
+        mock_browser._page.goto = AsyncMock()
 
-        result = await Browser.navigate_to_url(mock_browser, dangerous_url)
+        result = await Browser.navigate_to(mock_browser, special_url)
 
-        assert "not allowed" in result.lower()
-        mock_browser.navigate_to.assert_not_called()
+        mock_browser._page.goto.assert_called_once_with(
+            special_url, wait_until="domcontentloaded"
+        )
+        assert "Navigated to" in result
 
     @pytest.mark.asyncio
     async def test_go_back(self, mock_browser):
@@ -487,10 +507,9 @@ class TestElementInteractionTools:
         """Test click_element_by_ref when element not found."""
 
         mock_browser.get_element_by_ref.return_value = None
-
-        result = await Browser.click_element_by_ref(mock_browser, "e999")
-
-        assert "not found" in result.lower() or "failed" in result.lower() or "not available" in result.lower()
+        with pytest.raises(StateError) as exc_info:
+            await Browser.click_element_by_ref(mock_browser, "e999")
+        assert exc_info.value.code == "REF_NOT_AVAILABLE"
 
     @pytest.mark.asyncio
     async def test_input_text_by_ref(self, mock_browser):
@@ -598,9 +617,9 @@ class TestElementInteractionTools:
         mock_browser.get_current_page = AsyncMock(return_value=mock_page)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
-        result = await Browser.get_dropdown_options_by_ref(mock_browser, "e1")
-
-        assert result == "This dropdown has no options"
+        with pytest.raises(StateError) as exc_info:
+            await Browser.get_dropdown_options_by_ref(mock_browser, "e1")
+        assert exc_info.value.code == "ELEMENT_STATE_ERROR"
 
     @pytest.mark.asyncio
     async def test_select_dropdown_option_by_ref(self, mock_browser):
@@ -761,10 +780,10 @@ class TestElementInteractionTools:
         mock_locator.get_attribute = AsyncMock(return_value=None)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
-        result = await Browser.check_checkbox_by_ref(mock_browser, ref="e1")
-
+        with pytest.raises(OperationError) as exc_info:
+            await Browser.check_checkbox_by_ref(mock_browser, ref="e1")
         mock_locator.click.assert_called_once()
-        assert result.startswith("Failed to check element e1")
+        assert "Failed to check element e1" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_uncheck_custom_checkbox_reports_failure_when_state_not_changed(self, mock_browser):
@@ -780,10 +799,10 @@ class TestElementInteractionTools:
         mock_locator.get_attribute = AsyncMock(return_value=None)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
-        result = await Browser.uncheck_checkbox_by_ref(mock_browser, ref="e1")
-
+        with pytest.raises(OperationError) as exc_info:
+            await Browser.uncheck_checkbox_by_ref(mock_browser, ref="e1")
         mock_locator.click.assert_called_once()
-        assert result.startswith("Failed to uncheck element e1")
+        assert "Failed to uncheck element e1" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_uncheck_native_radio_skips_post_condition_check(self, mock_browser):
@@ -1119,11 +1138,12 @@ class TestScreenshotTools:
             with patch("bridgic.browser.session._browser.os.close"):
                 with patch("bridgic.browser.session._browser.os.path.exists", return_value=True):
                     with patch("bridgic.browser.session._browser.os.remove") as mock_remove:
-                        result = await Browser.save_pdf(mock_browser)
+                        with pytest.raises(OperationError) as exc_info:
+                            await Browser.save_pdf(mock_browser)
 
         mock_remove.assert_called_once_with("/tmp/pdf_fail.pdf")
-        assert "Failed to save PDF" in result
-        assert "pdf failure" in result
+        assert "Failed to save PDF" in exc_info.value.message
+        assert "pdf failure" in exc_info.value.message
 
 # ==================== Network Tools Tests ====================
 
@@ -1141,10 +1161,15 @@ class TestNetworkTools:
     @pytest.mark.asyncio
     async def test_get_console_messages(self, mock_browser):
         """Test getting captured console messages."""
-
+        mock_page = mock_browser.get_current_page.return_value
+        page_key = str(id(mock_page))
+        mock_browser._console_messages[page_key] = [
+            {"type": "log", "text": "hello", "location": None}
+        ]
         result = await Browser.get_console_messages(mock_browser)
 
         assert isinstance(result, str)
+        assert "hello" in result
 
     @pytest.mark.asyncio
     async def test_start_network_capture(self, mock_browser):
@@ -1289,6 +1314,21 @@ class TestStorageTools:
 
         assert result is not None
 
+    @pytest.mark.asyncio
+    async def test_set_cookie_expires_zero_is_preserved(self, mock_browser):
+        """expires=0 should be passed through (epoch is a valid timestamp)."""
+        await Browser.set_cookie(
+            mock_browser,
+            name="test_cookie",
+            value="test_value",
+            domain="example.com",
+            expires=0,
+        )
+
+        mock_browser._context.add_cookies.assert_called_once()
+        cookie = mock_browser._context.add_cookies.call_args[0][0][0]
+        assert cookie["expires"] == 0
+
 # ==================== Verification Tools Tests ====================
 
 class TestVerifyTools:
@@ -1316,9 +1356,9 @@ class TestVerifyTools:
         mock_locator.wait_for = AsyncMock(side_effect=Exception("Timeout"))
         mock_page.get_by_role.return_value = mock_locator
 
-        result = await Browser.verify_element_visible(mock_browser, role="button", accessible_name="NonExistent")
-
-        assert "FAIL" in result
+        with pytest.raises(VerificationError) as exc_info:
+            await Browser.verify_element_visible(mock_browser, role="button", accessible_name="NonExistent")
+        assert exc_info.value.code == "VERIFICATION_FAILED"
 
     @pytest.mark.asyncio
     async def test_verify_text_visible(self, mock_browser):
@@ -1355,9 +1395,9 @@ class TestVerifyTools:
         mock_locator.input_value = AsyncMock(return_value="actual_value")
         mock_browser.get_element_by_ref.return_value = mock_locator
 
-        result = await Browser.verify_value(mock_browser, ref="e1", value="expected_value")
-
-        assert "FAIL" in result
+        with pytest.raises(VerificationError) as exc_info:
+            await Browser.verify_value(mock_browser, ref="e1", value="expected_value")
+        assert exc_info.value.code == "VERIFICATION_FAILED"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("state,method,return_value", [
@@ -1409,12 +1449,9 @@ class TestDevTools:
     @pytest.mark.asyncio
     async def test_stop_tracing(self, mock_browser, temp_dir):
         """Test stopping trace recording."""
-
-        mock_browser._tracing_active = True
-
-        result = await Browser.stop_tracing(mock_browser)
-
-        assert isinstance(result, str)
+        with pytest.raises(StateError) as exc_info:
+            await Browser.stop_tracing(mock_browser)
+        assert exc_info.value.code == "NO_ACTIVE_TRACING"
 
     @pytest.mark.asyncio
     async def test_start_video(self, mock_browser):
@@ -1427,10 +1464,9 @@ class TestDevTools:
     @pytest.mark.asyncio
     async def test_stop_video(self, mock_browser):
         """Test stopping video recording."""
-
-        result = await Browser.stop_video(mock_browser)
-
-        assert "video" in result.lower() or "stopped" in result.lower() or "not" in result.lower()
+        with pytest.raises(StateError) as exc_info:
+            await Browser.stop_video(mock_browser)
+        assert exc_info.value.code == "NO_ACTIVE_RECORDING"
 
 # ==================== State Tools Tests ====================
 
@@ -1485,46 +1521,56 @@ class TestStateTools:
         assert result is not None
 
     @pytest.mark.asyncio
+    async def test_get_snapshot_text_negative_start_from_char(self, mock_browser):
+        """Negative start_from_char should raise InvalidInputError."""
+        mock_snapshot = MagicMock()
+        mock_snapshot.tree = "- button 'Click me' [ref=e1]"
+        mock_browser.get_snapshot.return_value = mock_snapshot
+
+        with pytest.raises(InvalidInputError) as exc_info:
+            await Browser.get_snapshot_text(mock_browser, start_from_char=-1)
+        assert exc_info.value.code == "INVALID_START_FROM_CHAR"
+
+    @pytest.mark.asyncio
+    async def test_get_snapshot_text_start_from_char_out_of_range(self, mock_browser):
+        """Out-of-range start_from_char should raise InvalidInputError."""
+        mock_snapshot = MagicMock()
+        mock_snapshot.tree = "abc"
+        mock_browser.get_snapshot.return_value = mock_snapshot
+
+        with pytest.raises(InvalidInputError) as exc_info:
+            await Browser.get_snapshot_text(mock_browser, start_from_char=99999)
+        assert exc_info.value.code == "START_FROM_CHAR_OUT_OF_RANGE"
+
+    @pytest.mark.asyncio
     async def test_get_snapshot_text_snapshot_failed(self, mock_browser):
         """Test get_snapshot_text when snapshot returns None."""
 
         mock_browser.get_snapshot.return_value = None
-
-        result = await Browser.get_snapshot_text(mock_browser)
-
-        assert "failed" in result.lower()
+        with pytest.raises(OperationError) as exc_info:
+            await Browser.get_snapshot_text(mock_browser)
+        assert "Failed to get interface information" in exc_info.value.message
 
 # ==================== BrowserToolSetBuilder Tests ====================
 
 class TestBrowserToolSetBuilder:
     """Tests for the BrowserToolSetBuilder API."""
 
-    def test_list_presets(self):
-        """Test listing available presets."""
-        from bridgic.browser.tools import BrowserToolSetBuilder
-
-        presets = BrowserToolSetBuilder.list_presets()
-
-        assert "MINIMAL" in presets
-        assert "FORM_FILLING" in presets
-        assert "TESTING" in presets
-        assert "COMPLETE" in presets
-
     def test_list_categories(self):
         """Test listing available categories."""
-        from bridgic.browser.tools import BrowserToolSetBuilder
+        from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
 
         categories = BrowserToolSetBuilder.list_categories()
 
-        assert "navigation" in categories
-        assert "element_interaction" in categories
-        assert "snapshot" in categories
-        assert "mouse" in categories
-        assert "keyboard" in categories
+        assert ToolCategory.NAVIGATION in categories
+        assert ToolCategory.ELEMENT_INTERACTION in categories
+        assert ToolCategory.SNAPSHOT in categories
+        assert ToolCategory.MOUSE in categories
+        assert ToolCategory.KEYBOARD in categories
 
     def test_for_categories_adds_tools(self):
         """Test that for_categories adds tools from that category."""
-        from bridgic.browser.tools import BrowserToolSetBuilder
+        from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
 
         browser = MagicMock()
         for name in ("take_screenshot", "save_pdf"):
@@ -1533,12 +1579,27 @@ class TestBrowserToolSetBuilder:
             method.__doc__ = f"Mock {name} method."
             setattr(browser, name, method)
 
-        builder = BrowserToolSetBuilder.for_categories(browser, "capture")
+        builder = BrowserToolSetBuilder.for_categories(browser, ToolCategory.CAPTURE)
         names = {spec.to_tool().name for spec in builder.build()["tool_specs"]}
         assert names == {"take_screenshot", "save_pdf"}
 
-    def test_for_tool_names_strict_raises_on_unknown(self):
-        """Strict mode raises when unknown tool names are provided."""
+    def test_for_categories_accepts_string_aliases(self):
+        """String aliases should map to ToolCategory values."""
+        from bridgic.browser.tools import BrowserToolSetBuilder
+
+        browser = MagicMock(spec=["click_element_by_ref", "input_text_by_ref"])
+        for name in ("click_element_by_ref", "input_text_by_ref"):
+            method = MagicMock()
+            method.__name__ = name
+            method.__doc__ = f"Mock {name} method."
+            setattr(browser, name, method)
+
+        builder = BrowserToolSetBuilder.for_categories(browser, "action")
+        names = {spec.to_tool().name for spec in builder.build()["tool_specs"]}
+        assert {"click_element_by_ref", "input_text_by_ref"} <= names
+
+    def test_for_tool_names_raises_on_unknown(self):
+        """for_tool_names raises when unknown tool names are provided."""
         from bridgic.browser.tools import BrowserToolSetBuilder
 
         browser = MagicMock(spec=["search"])
@@ -1548,12 +1609,10 @@ class TestBrowserToolSetBuilder:
         setattr(browser, "search", search_method)
 
         with pytest.raises(ValueError, match="Unknown tool name"):
-            BrowserToolSetBuilder.for_tool_names(
-                browser, "search", "not_a_real_tool", strict=True
-            )
+            BrowserToolSetBuilder.for_tool_names(browser, "search", "not_a_real_tool")
 
-    def test_for_tool_names_strict_raises_when_method_missing_on_browser(self):
-        """Strict mode should raise when known tool is unavailable on browser."""
+    def test_for_tool_names_raises_when_method_missing_on_browser(self):
+        """for_tool_names should raise when known tool is unavailable on browser."""
         from bridgic.browser.tools import BrowserToolSetBuilder
 
         browser = MagicMock(spec=["search"])
@@ -1563,50 +1622,7 @@ class TestBrowserToolSetBuilder:
         setattr(browser, "search", search_method)
 
         with pytest.raises(ValueError, match="not available on browser instance"):
-            BrowserToolSetBuilder.for_tool_names(
-                browser, "search", "navigate_to_url", strict=True
-            )
-
-    def test_for_preset_returns_builder(self):
-        """Test for_preset returns a configured builder."""
-        from bridgic.browser.tools import BrowserToolSetBuilder, ToolPreset
-
-        browser = MagicMock()
-        for name in ("navigate_to_url", "go_back", "go_forward"):
-            method = MagicMock()
-            method.__name__ = name
-            method.__doc__ = f"Mock {name} method."
-            setattr(browser, name, method)
-
-        builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.NAVIGATION)
-        assert isinstance(builder, BrowserToolSetBuilder)
-
-        names = {spec.to_tool().name for spec in builder.build()["tool_specs"]}
-        assert names == {"navigate_to_url", "go_back", "go_forward"}
-
-    def test_for_funcs_returns_builder(self):
-        """Test for_funcs returns a configured builder."""
-        from bridgic.browser.tools import BrowserToolSetBuilder
-
-        browser = MagicMock()
-        search_method = MagicMock()
-        search_method.__name__ = "search"
-        search_method.__doc__ = "Mock search method."
-        setattr(browser, "search", search_method)
-
-        builder = BrowserToolSetBuilder.for_funcs(browser, search_method)
-        assert isinstance(builder, BrowserToolSetBuilder)
-
-        names = {spec.to_tool().name for spec in builder.build()["tool_specs"]}
-        assert names == {"search"}
-
-    def test_for_funcs_raises_on_non_callable(self):
-        """for_funcs should fail fast when passed non-callable entries."""
-        from bridgic.browser.tools import BrowserToolSetBuilder
-
-        browser = MagicMock()
-        with pytest.raises(TypeError, match="expects callable tool methods"):
-            BrowserToolSetBuilder.for_funcs(browser, "search")  # type: ignore[arg-type]
+            BrowserToolSetBuilder.for_tool_names(browser, "search", "navigate_to")
 
     def test_for_tool_names_builds_specs(self):
         """Test for_tool_names returns a configured builder and builds specs."""
@@ -1614,7 +1630,7 @@ class TestBrowserToolSetBuilder:
 
         # Create a mock with proper __name__ on returned attributes
         browser = MagicMock()
-        for name in ("search", "navigate_to_url"):
+        for name in ("search", "navigate_to"):
             method = MagicMock()
             method.__name__ = name
             method.__doc__ = f"Mock {name} method."
@@ -1623,26 +1639,73 @@ class TestBrowserToolSetBuilder:
         builder = BrowserToolSetBuilder.for_tool_names(
             browser,
             "search",
-            "navigate_to_url",
+            "navigate_to",
         )
         assert isinstance(builder, BrowserToolSetBuilder)
         specs = builder.build()["tool_specs"]
 
         names = {spec.to_tool().name for spec in specs}
         assert "search" in names
-        assert "navigate_to_url" in names
+        assert "navigate_to" in names
+
+    def test_for_tool_names_non_strict_ignores_unavailable(self):
+        """strict=False should keep available names and ignore the rest."""
+        from bridgic.browser.tools import BrowserToolSetBuilder
+
+        browser = MagicMock(spec=["search"])
+        search_method = MagicMock()
+        search_method.__name__ = "search"
+        search_method.__doc__ = "Mock search method."
+        setattr(browser, "search", search_method)
+
+        builder = BrowserToolSetBuilder.for_tool_names(
+            browser,
+            "search",
+            "navigate_to",
+            "not_a_real_tool",
+            strict=False,
+        )
+        specs = builder.build()["tool_specs"]
+        names = [spec.to_tool().name for spec in specs]
+        assert names == ["search"]
+
+    def test_for_categories_all_builds_expected_count(self):
+        """ALL category should produce deterministic tool counts."""
+        from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
+
+        browser = MagicMock()
+        for category_tools in BrowserToolSetBuilder._CATEGORIES.values():
+            for name in category_tools:
+                method = MagicMock()
+                method.__name__ = name
+                method.__doc__ = f"Mock {name} method."
+                setattr(browser, name, method)
+
+        expected_count = len(
+            {
+                name
+                for category_tools in BrowserToolSetBuilder._CATEGORIES.values()
+                for name in category_tools
+            }
+        )
+
+        builder = BrowserToolSetBuilder.for_categories(browser, ToolCategory.ALL)
+        assert len(builder.build()["tool_specs"]) == expected_count
+
+        builder = BrowserToolSetBuilder.for_categories(browser, "all")
+        assert len(builder.build()["tool_specs"]) == expected_count
 
     def test_build_has_deterministic_tool_order(self):
-        """Build output should be deterministic for known and custom tools."""
+        """Build output should be deterministic using CLI catalog category order."""
         from bridgic.browser.tools import BrowserToolSetBuilder
 
         browser = MagicMock()
         for name in (
             "go_forward",
             "search",
-            "navigate_to_url",
-            "custom_b",
-            "custom_a",
+            "navigate_to",
+            "click_element_by_ref",
+            "take_screenshot",
         ):
             method = MagicMock()
             method.__name__ = name
@@ -1652,64 +1715,45 @@ class TestBrowserToolSetBuilder:
         builder = BrowserToolSetBuilder.for_tool_names(
             browser,
             "go_forward",
-            "custom_b",
+            "click_element_by_ref",
             "search",
-            "custom_a",
-            "navigate_to_url",
+            "take_screenshot",
+            "navigate_to",
         )
 
         names = [spec.to_tool().name for spec in builder.build()["tool_specs"]]
         assert names == [
-            "navigate_to_url",
+            "navigate_to",
             "search",
             "go_forward",
-            "custom_a",
-            "custom_b",
+            "click_element_by_ref",
+            "take_screenshot",
         ]
-
-    def test_preset_tool_names_are_valid(self):
-        """Test that all preset tool names exist in the category inventory."""
-        from bridgic.browser.tools import BrowserToolSetBuilder, ToolPreset
-
-        all_tools = set()
-        for names in BrowserToolSetBuilder._CATEGORIES.values():
-            all_tools.update(names)
-        for preset in ToolPreset:
-            tools = BrowserToolSetBuilder._PRESET_TOOL_NAMES.get(preset, [])
-            for tool_name in tools:
-                assert tool_name in all_tools, f"Tool {tool_name} not found for preset {preset}"
 
     def test_categories_match_cli_sections(self):
         """Tool categories should stay aligned with CLI command sections."""
-        from bridgic.browser.cli._commands import SectionedGroup
         from bridgic.browser.tools import BrowserToolSetBuilder
 
-        expected = build_tool_categories_from_help_sections(SectionedGroup.SECTIONS)
+        assert CLI_TOOL_CATEGORIES == BrowserToolSetBuilder._CATEGORIES
 
-        assert expected == BrowserToolSetBuilder._CATEGORIES
+    def test_builder_tool_inventory_matches_cli_command_mapping(self):
+        """Total SDK tool inventory should exactly match mapped CLI command capabilities."""
+        from bridgic.browser.tools import BrowserToolSetBuilder
 
-    def test_presets_match_cli_presets(self):
-        """Tool preset method lists should match CLI preset command mappings."""
-        from bridgic.browser.tools import BrowserToolSetBuilder, ToolPreset
-
-        expected_by_preset = build_tool_presets_from_cli_preset_commands(CLI_PRESET_COMMANDS)
-
-        for preset in ToolPreset:
-            expected = expected_by_preset[preset]
-            actual = BrowserToolSetBuilder._PRESET_TOOL_NAMES[preset]
-            assert set(expected) == set(actual)
-            assert len(expected) == len(actual)
+        expected = set(map_cli_commands_to_tool_methods(CLI_ALL_COMMANDS))
+        actual = {
+            tool_name
+            for names in BrowserToolSetBuilder._CATEGORIES.values()
+            for tool_name in names
+        }
+        assert actual == expected
+        assert len(actual) == len(expected)
 
     def test_cli_section_commands_are_mapped(self):
         """Every CLI section command should have a tool mapping."""
-        from bridgic.browser.cli._commands import SectionedGroup
+        from bridgic.browser._cli_catalog import CLI_NON_TOOL_COMMANDS
 
-        for section_title, commands in SectionedGroup.SECTIONS:
-            for command in commands:
-                assert command in CLI_COMMAND_TO_TOOL_METHOD
-
-    def test_cli_preset_commands_are_mapped(self):
-        """Every CLI preset command should have a tool mapping."""
-        for commands in CLI_PRESET_COMMANDS.values():
-            for command in commands:
-                assert command in CLI_COMMAND_TO_TOOL_METHOD
+        for command in CLI_ALL_COMMANDS:
+            if command in CLI_NON_TOOL_COMMANDS:
+                continue
+            assert command in CLI_COMMAND_TO_TOOL_METHOD

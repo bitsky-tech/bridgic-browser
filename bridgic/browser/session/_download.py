@@ -394,7 +394,9 @@ class DownloadManager:
             downloaded = file
             download_event.set()
             if original_callback:
-                original_callback(file)
+                result = original_callback(file)
+                if asyncio.iscoroutine(result):
+                    asyncio.create_task(result)
 
         self._config.on_download_complete = on_complete
 
@@ -402,10 +404,9 @@ class DownloadManager:
             # Start waiting for download
             async with page.expect_download(timeout=timeout) as download_info:
                 # Perform the action that triggers download
-                if asyncio.iscoroutinefunction(action):
-                    await action()
-                else:
-                    action()
+                action_result = action()
+                if asyncio.iscoroutine(action_result):
+                    await action_result
 
             # Wait for our handler to process it
             await asyncio.wait_for(

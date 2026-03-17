@@ -21,7 +21,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from bridgic.browser._cli_catalog import CLI_HELP_SECTIONS
+from bridgic.browser._cli_catalog import CLI_ALL_COMMANDS, CLI_HELP_SECTIONS
+from bridgic.browser.errors import (
+    BridgicBrowserCommandError,
+    InvalidInputError,
+    OperationError,
+    VerificationError,
+)
 from bridgic.browser.cli._commands import _strip_ref, cli, SectionedGroup
 from bridgic.browser.cli._daemon import (
     _build_browser_kwargs,
@@ -81,8 +87,19 @@ from bridgic.browser.cli._daemon import (
     _handle_video_stop,
     _handle_resize,
     _is_browser_closed_error,
+    # re-exported from _transport for backward compatibility
     _default_socket_path,
     _safe_remove_socket,
+)
+from bridgic.browser.cli._transport import (
+    RUN_INFO_PATH,
+    BaseTransport,
+    TcpTransport,
+    UnixTransport,
+    get_transport,
+    read_run_info,
+    remove_run_info,
+    write_run_info,
 )
 
 
@@ -166,6 +183,11 @@ class TestSectionedGroupHelp:
     def test_sections_follow_shared_catalog(self):
         assert SectionedGroup.SECTIONS == CLI_HELP_SECTIONS
 
+    def test_registered_commands_match_catalog(self):
+        # `commands` is intentionally unsectioned and appears under "Other".
+        assert set(CLI_ALL_COMMANDS).issubset(set(cli.commands.keys()))
+        assert "commands" in cli.commands
+
     def test_h_shorthand_on_group(self):
         result = invoke_raw(["-h"])
         assert result.exit_code == 0
@@ -188,7 +210,7 @@ class TestSectionedGroupHelp:
             "Navigation", "Snapshot", "Element Interaction",
             "Keyboard", "Mouse", "Wait", "Tabs", "Evaluate", "Capture",
             "Network", "Dialog", "Storage", "Verify",
-            "Developer", "Lifecycle",
+            "Developer", "Lifecycle", "Other",
         ):
             assert section in out, f"Section '{section}' missing from help"
 
@@ -228,6 +250,8 @@ class TestSectionedGroupHelp:
             "video-start", "video-stop",
             # Lifecycle
             "close", "resize",
+            # Utility metadata
+            "commands",
         ]
         for cmd in expected_commands:
             assert cmd in out, f"Command '{cmd}' missing from help output"
@@ -259,6 +283,25 @@ class TestSectionedGroupHelp:
             )
 
 
+class TestCommandsMetadata:
+    def test_commands_without_args_shows_usage_hint(self):
+        result = invoke_raw(["commands"])
+        assert result.exit_code == 0
+        assert "Use --list-sections or --section NAME." in result.output
+
+    def test_commands_list_sections(self):
+        result = invoke_raw(["commands", "--list-sections"])
+        assert result.exit_code == 0
+        assert "Sections:" in result.output
+        assert "navigation" in result.output
+        assert "lifecycle" in result.output
+
+    def test_commands_with_unknown_section(self):
+        result = invoke_raw(["commands", "--section", "not_real"])
+        assert result.exit_code == 1
+        assert "Unknown section" in result.output
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI command → send_command mapping
 # ─────────────────────────────────────────────────────────────────────────────
@@ -270,99 +313,112 @@ class TestCliCommandRouting:
 
     def test_open(self):
         _, sc = invoke(["open", "https://example.com"])
-        sc.assert_called_once_with("open", {"url": "https://example.com"})
+        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=False)
+
+    def test_open_headed(self):
+        _, sc = invoke(["open", "--headed", "https://example.com"])
+        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=True)
 
     def test_back(self):
         _, sc = invoke(["back"])
-        sc.assert_called_once_with("back")
+        sc.assert_called_once_with("back", start_if_needed=False)
 
     def test_forward(self):
         _, sc = invoke(["forward"])
-        sc.assert_called_once_with("forward")
+        sc.assert_called_once_with("forward", start_if_needed=False)
 
     def test_reload(self):
         _, sc = invoke(["reload"])
-        sc.assert_called_once_with("reload")
+        sc.assert_called_once_with("reload", start_if_needed=False)
 
     def test_search_default_engine(self):
         _, sc = invoke(["search", "python async"])
-        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"})
+        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=False)
 
     def test_search_custom_engine(self):
         _, sc = invoke(["search", "query", "--engine", "google"])
-        sc.assert_called_once_with("search", {"query": "query", "engine": "google"})
+        sc.assert_called_once_with("search", {"query": "query", "engine": "google"}, headed=False)
+
+    def test_search_headed(self):
+        _, sc = invoke(["search", "--headed", "python async"])
+        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=True)
 
     def test_info(self):
         _, sc = invoke(["info"])
-        sc.assert_called_once_with("info")
+        sc.assert_called_once_with("info", start_if_needed=False)
 
     # ── Snapshot ──────────────────────────────────────────────────────────────
 
     def test_snapshot_default(self):
         _, sc = invoke(["snapshot"])
-        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": True, "start_from_char": 0})
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": True, "start_from_char": 0}, start_if_needed=False)
 
     def test_snapshot_interactive(self):
         _, sc = invoke(["snapshot", "--interactive"])
-        sc.assert_called_once_with("snapshot", {"interactive": True, "full_page": True, "start_from_char": 0})
+        sc.assert_called_once_with("snapshot", {"interactive": True, "full_page": True, "start_from_char": 0}, start_if_needed=False)
 
     def test_snapshot_interactive_short(self):
         _, sc = invoke(["snapshot", "-i"])
-        sc.assert_called_once_with("snapshot", {"interactive": True, "full_page": True, "start_from_char": 0})
+        sc.assert_called_once_with("snapshot", {"interactive": True, "full_page": True, "start_from_char": 0}, start_if_needed=False)
 
     def test_snapshot_no_full_page(self):
         _, sc = invoke(["snapshot", "--no-full-page"])
-        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": False, "start_from_char": 0})
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": False, "start_from_char": 0}, start_if_needed=False)
 
     def test_snapshot_no_full_page_short(self):
         _, sc = invoke(["snapshot", "-F"])
-        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": False, "start_from_char": 0})
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": False, "start_from_char": 0}, start_if_needed=False)
 
     def test_snapshot_start_from_char(self):
         _, sc = invoke(["snapshot", "-s", "5000"])
-        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": True, "start_from_char": 5000})
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": True, "start_from_char": 5000}, start_if_needed=False)
+
+    def test_snapshot_start_from_char_rejects_negative(self):
+        result, sc = invoke(["snapshot", "-s", "-1"])
+        assert result.exit_code != 0
+        sc.assert_not_called()
 
     # ── Element interaction ───────────────────────────────────────────────────
 
     def test_click_strips_at(self):
         _, sc = invoke(["click", "@e2"])
-        sc.assert_called_once_with("click", {"ref": "e2"})
+        sc.assert_called_once_with("click", {"ref": "e2"}, start_if_needed=False)
 
     def test_click_plain_ref(self):
         _, sc = invoke(["click", "e3"])
-        sc.assert_called_once_with("click", {"ref": "e3"})
+        sc.assert_called_once_with("click", {"ref": "e3"}, start_if_needed=False)
 
     def test_double_click(self):
         _, sc = invoke(["double-click", "@e4"])
-        sc.assert_called_once_with("double_click", {"ref": "e4"})
+        sc.assert_called_once_with("double_click", {"ref": "e4"}, start_if_needed=False)
 
     def test_hover(self):
         _, sc = invoke(["hover", "@e5"])
-        sc.assert_called_once_with("hover", {"ref": "e5"})
+        sc.assert_called_once_with("hover", {"ref": "e5"}, start_if_needed=False)
 
     def test_focus(self):
         _, sc = invoke(["focus", "e6"])
-        sc.assert_called_once_with("focus", {"ref": "e6"})
+        sc.assert_called_once_with("focus", {"ref": "e6"}, start_if_needed=False)
 
     def test_fill(self):
         _, sc = invoke(["fill", "@e3", "hello"])
-        sc.assert_called_once_with("fill", {"ref": "e3", "text": "hello"})
+        sc.assert_called_once_with("fill", {"ref": "e3", "text": "hello"}, start_if_needed=False)
 
     def test_select(self):
         _, sc = invoke(["select", "@e7", "Option A"])
-        sc.assert_called_once_with("select", {"ref": "e7", "text": "Option A"})
+        sc.assert_called_once_with("select", {"ref": "e7", "text": "Option A"}, start_if_needed=False)
 
     def test_check(self):
         _, sc = invoke(["check", "@e8"])
-        sc.assert_called_once_with("check", {"ref": "e8"})
+        sc.assert_called_once_with("check", {"ref": "e8"}, start_if_needed=False)
 
     def test_uncheck(self):
         _, sc = invoke(["uncheck", "@e9"])
-        sc.assert_called_once_with("uncheck", {"ref": "e9"})
+        sc.assert_called_once_with("uncheck", {"ref": "e9"}, start_if_needed=False)
 
     def test_scroll_to(self):
         _, sc = invoke(["scroll-to", "@e5"])
-        sc.assert_called_once_with("scroll_into_view", {"ref": "e5"})
+        sc.assert_called_once_with("scroll_into_view", {"ref": "e5"}, start_if_needed=False)
 
     def test_scroll_into_view_removed(self):
         result, _ = invoke(["scroll-into-view", "@e5"])
@@ -371,41 +427,41 @@ class TestCliCommandRouting:
 
     def test_drag(self):
         _, sc = invoke(["drag", "@e1", "@e2"])
-        sc.assert_called_once_with("drag", {"start_ref": "e1", "end_ref": "e2"})
+        sc.assert_called_once_with("drag", {"start_ref": "e1", "end_ref": "e2"}, start_if_needed=False)
 
     def test_options(self):
         _, sc = invoke(["options", "@e3"])
-        sc.assert_called_once_with("options", {"ref": "e3"})
+        sc.assert_called_once_with("options", {"ref": "e3"}, start_if_needed=False)
 
     def test_upload_absolutizes_path(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         _, sc = invoke(["upload", "@e4", "file.txt"])
         expected = str(tmp_path / "file.txt")
-        sc.assert_called_once_with("upload", {"ref": "e4", "path": expected})
+        sc.assert_called_once_with("upload", {"ref": "e4", "path": expected}, start_if_needed=False)
 
     def test_fill_form(self):
         fields = '[{"ref":"e1","value":"hi"}]'
         _, sc = invoke(["fill-form", fields])
-        sc.assert_called_once_with("fill_form", {"fields": fields, "submit": False})
+        sc.assert_called_once_with("fill_form", {"fields": fields, "submit": False}, start_if_needed=False)
 
     def test_fill_form_with_submit(self):
         fields = '[{"ref":"e1","value":"hi"}]'
         _, sc = invoke(["fill-form", fields, "--submit"])
-        sc.assert_called_once_with("fill_form", {"fields": fields, "submit": True})
+        sc.assert_called_once_with("fill_form", {"fields": fields, "submit": True}, start_if_needed=False)
 
     # ── Keyboard ──────────────────────────────────────────────────────────────
 
     def test_press(self):
         _, sc = invoke(["press", "Control+A"])
-        sc.assert_called_once_with("press", {"key": "Control+A"})
+        sc.assert_called_once_with("press", {"key": "Control+A"}, start_if_needed=False)
 
     def test_type(self):
         _, sc = invoke(["type", "hello world"])
-        sc.assert_called_once_with("type_text", {"text": "hello world", "submit": False})
+        sc.assert_called_once_with("type_text", {"text": "hello world", "submit": False}, start_if_needed=False)
 
     def test_type_with_submit(self):
         _, sc = invoke(["type", "hello", "--submit"])
-        sc.assert_called_once_with("type_text", {"text": "hello", "submit": True})
+        sc.assert_called_once_with("type_text", {"text": "hello", "submit": True}, start_if_needed=False)
 
     def test_type_text_removed(self):
         result, _ = invoke(["type-text", "hello"])
@@ -414,71 +470,71 @@ class TestCliCommandRouting:
 
     def test_key_down(self):
         _, sc = invoke(["key-down", "Shift"])
-        sc.assert_called_once_with("key_down", {"key": "Shift"})
+        sc.assert_called_once_with("key_down", {"key": "Shift"}, start_if_needed=False)
 
     def test_key_up(self):
         _, sc = invoke(["key-up", "Shift"])
-        sc.assert_called_once_with("key_up", {"key": "Shift"})
+        sc.assert_called_once_with("key_up", {"key": "Shift"}, start_if_needed=False)
 
     # ── Mouse ─────────────────────────────────────────────────────────────────
 
     def test_scroll_down(self):
         _, sc = invoke(["scroll", "--dy", "300"])
-        sc.assert_called_once_with("scroll", {"delta_x": 0.0, "delta_y": 300.0})
+        sc.assert_called_once_with("scroll", {"delta_x": 0.0, "delta_y": 300.0}, start_if_needed=False)
 
     def test_scroll_up(self):
         _, sc = invoke(["scroll", "--dy", "-200"])
-        sc.assert_called_once_with("scroll", {"delta_x": 0.0, "delta_y": -200.0})
+        sc.assert_called_once_with("scroll", {"delta_x": 0.0, "delta_y": -200.0}, start_if_needed=False)
 
     def test_scroll_with_dx(self):
         _, sc = invoke(["scroll", "--dy", "100", "--dx", "50"])
-        sc.assert_called_once_with("scroll", {"delta_x": 50.0, "delta_y": 100.0})
+        sc.assert_called_once_with("scroll", {"delta_x": 50.0, "delta_y": 100.0}, start_if_needed=False)
 
     def test_mouse_move(self):
         _, sc = invoke(["mouse-move", "100", "200"])
-        sc.assert_called_once_with("mouse_move", {"x": 100.0, "y": 200.0})
+        sc.assert_called_once_with("mouse_move", {"x": 100.0, "y": 200.0}, start_if_needed=False)
 
     def test_mouse_click_defaults(self):
         _, sc = invoke(["mouse-click", "150", "250"])
-        sc.assert_called_once_with("mouse_click", {"x": 150.0, "y": 250.0, "button": "left", "count": 1})
+        sc.assert_called_once_with("mouse_click", {"x": 150.0, "y": 250.0, "button": "left", "count": 1}, start_if_needed=False)
 
     def test_mouse_click_right_button(self):
         _, sc = invoke(["mouse-click", "150", "250", "--button", "right"])
-        sc.assert_called_once_with("mouse_click", {"x": 150.0, "y": 250.0, "button": "right", "count": 1})
+        sc.assert_called_once_with("mouse_click", {"x": 150.0, "y": 250.0, "button": "right", "count": 1}, start_if_needed=False)
 
     def test_mouse_click_double(self):
         _, sc = invoke(["mouse-click", "150", "250", "--count", "2"])
-        sc.assert_called_once_with("mouse_click", {"x": 150.0, "y": 250.0, "button": "left", "count": 2})
+        sc.assert_called_once_with("mouse_click", {"x": 150.0, "y": 250.0, "button": "left", "count": 2}, start_if_needed=False)
 
     def test_mouse_drag(self):
         _, sc = invoke(["mouse-drag", "10", "20", "100", "200"])
-        sc.assert_called_once_with("mouse_drag", {"x1": 10.0, "y1": 20.0, "x2": 100.0, "y2": 200.0})
+        sc.assert_called_once_with("mouse_drag", {"x1": 10.0, "y1": 20.0, "x2": 100.0, "y2": 200.0}, start_if_needed=False)
 
     def test_mouse_down_default(self):
         _, sc = invoke(["mouse-down"])
-        sc.assert_called_once_with("mouse_down", {"button": "left"})
+        sc.assert_called_once_with("mouse_down", {"button": "left"}, start_if_needed=False)
 
     def test_mouse_down_right(self):
         _, sc = invoke(["mouse-down", "--button", "right"])
-        sc.assert_called_once_with("mouse_down", {"button": "right"})
+        sc.assert_called_once_with("mouse_down", {"button": "right"}, start_if_needed=False)
 
     def test_mouse_up_default(self):
         _, sc = invoke(["mouse-up"])
-        sc.assert_called_once_with("mouse_up", {"button": "left"})
+        sc.assert_called_once_with("mouse_up", {"button": "left"}, start_if_needed=False)
 
     # ── Wait ──────────────────────────────────────────────────────────────────
 
     def test_wait_seconds(self):
         _, sc = invoke(["wait", "2.5"])
-        sc.assert_called_once_with("wait", {"seconds": 2.5})
+        sc.assert_called_once_with("wait", {"seconds": 2.5}, start_if_needed=False)
 
     def test_wait_text_appear(self):
         _, sc = invoke(["wait", "Done"])
-        sc.assert_called_once_with("wait", {"text": "Done"})
+        sc.assert_called_once_with("wait", {"text": "Done"}, start_if_needed=False)
 
     def test_wait_text_gone(self):
         _, sc = invoke(["wait", "--gone", "Loading"])
-        sc.assert_called_once_with("wait", {"text_gone": "Loading"})
+        sc.assert_called_once_with("wait", {"text_gone": "Loading"}, start_if_needed=False)
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
 
@@ -488,23 +544,23 @@ class TestCliCommandRouting:
 
     def test_new_tab_with_url(self):
         _, sc = invoke(["new-tab", "https://example.com"])
-        sc.assert_called_once_with("new_tab", {"url": "https://example.com"})
+        sc.assert_called_once_with("new_tab", {"url": "https://example.com"}, start_if_needed=False)
 
     def test_new_tab_blank(self):
         _, sc = invoke(["new-tab"])
-        sc.assert_called_once_with("new_tab", {"url": None})
+        sc.assert_called_once_with("new_tab", {"url": None}, start_if_needed=False)
 
     def test_switch_tab(self):
         _, sc = invoke(["switch-tab", "page_1234"])
-        sc.assert_called_once_with("switch_tab", {"page_id": "page_1234"})
+        sc.assert_called_once_with("switch_tab", {"page_id": "page_1234"}, start_if_needed=False)
 
     def test_close_tab_current(self):
         _, sc = invoke(["close-tab"])
-        sc.assert_called_once_with("close_tab", {"page_id": None})
+        sc.assert_called_once_with("close_tab", {"page_id": None}, start_if_needed=False)
 
     def test_close_tab_by_id(self):
         _, sc = invoke(["close-tab", "page_5678"])
-        sc.assert_called_once_with("close_tab", {"page_id": "page_5678"})
+        sc.assert_called_once_with("close_tab", {"page_id": "page_5678"}, start_if_needed=False)
 
     # ── Capture ───────────────────────────────────────────────────────────────
 
@@ -513,7 +569,7 @@ class TestCliCommandRouting:
         _, sc = invoke(["screenshot", "page.png"])
         expected = str(tmp_path / "page.png")
         sc.assert_called_once_with(
-            "screenshot", {"path": expected, "full_page": False}
+            "screenshot", {"path": expected, "full_page": False}, start_if_needed=False
         )
 
     def test_screenshot_full_page(self, tmp_path, monkeypatch):
@@ -521,124 +577,124 @@ class TestCliCommandRouting:
         _, sc = invoke(["screenshot", "page.png", "--full-page"])
         expected = str(tmp_path / "page.png")
         sc.assert_called_once_with(
-            "screenshot", {"path": expected, "full_page": True}
+            "screenshot", {"path": expected, "full_page": True}, start_if_needed=False
         )
 
     def test_screenshot_absolute_path_unchanged(self):
         abs_path = "/tmp/my_screenshot.png"
         _, sc = invoke(["screenshot", abs_path])
         sc.assert_called_once_with(
-            "screenshot", {"path": abs_path, "full_page": False}
+            "screenshot", {"path": abs_path, "full_page": False}, start_if_needed=False
         )
 
     def test_pdf_absolutizes_relative_path(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         _, sc = invoke(["pdf", "report.pdf"])
         expected = str(tmp_path / "report.pdf")
-        sc.assert_called_once_with("pdf", {"path": expected})
+        sc.assert_called_once_with("pdf", {"path": expected}, start_if_needed=False)
 
     # ── Network ───────────────────────────────────────────────────────────────
 
     def test_console_start(self):
         _, sc = invoke(["console-start"])
-        sc.assert_called_once_with("console_start")
+        sc.assert_called_once_with("console_start", start_if_needed=False)
 
     def test_console_stop(self):
         _, sc = invoke(["console-stop"])
-        sc.assert_called_once_with("console_stop")
+        sc.assert_called_once_with("console_stop", start_if_needed=False)
 
     def test_console_defaults(self):
         _, sc = invoke(["console"])
-        sc.assert_called_once_with("console", {"filter": None, "clear": True})
+        sc.assert_called_once_with("console", {"filter": None, "clear": True}, start_if_needed=False)
 
     def test_console_with_filter(self):
         _, sc = invoke(["console", "--filter", "error"])
-        sc.assert_called_once_with("console", {"filter": "error", "clear": True})
+        sc.assert_called_once_with("console", {"filter": "error", "clear": True}, start_if_needed=False)
 
     def test_console_no_clear(self):
         _, sc = invoke(["console", "--no-clear"])
-        sc.assert_called_once_with("console", {"filter": None, "clear": False})
+        sc.assert_called_once_with("console", {"filter": None, "clear": False}, start_if_needed=False)
 
     def test_network_start(self):
         _, sc = invoke(["network-start"])
-        sc.assert_called_once_with("network_start")
+        sc.assert_called_once_with("network_start", start_if_needed=False)
 
     def test_network_stop(self):
         _, sc = invoke(["network-stop"])
-        sc.assert_called_once_with("network_stop")
+        sc.assert_called_once_with("network_stop", start_if_needed=False)
 
     def test_network_defaults(self):
         _, sc = invoke(["network"])
-        sc.assert_called_once_with("network", {"include_static": False, "clear": True})
+        sc.assert_called_once_with("network", {"include_static": False, "clear": True}, start_if_needed=False)
 
     def test_network_with_static(self):
         _, sc = invoke(["network", "--static"])
-        sc.assert_called_once_with("network", {"include_static": True, "clear": True})
+        sc.assert_called_once_with("network", {"include_static": True, "clear": True}, start_if_needed=False)
 
     def test_wait_network_defaults(self):
         _, sc = invoke(["wait-network"])
-        sc.assert_called_once_with("wait_network", {"timeout": 30000.0})
+        sc.assert_called_once_with("wait_network", {"timeout": 30000.0}, start_if_needed=False)
 
     def test_wait_network_custom_timeout(self):
         _, sc = invoke(["wait-network", "--timeout", "5000"])
-        sc.assert_called_once_with("wait_network", {"timeout": 5000.0})
+        sc.assert_called_once_with("wait_network", {"timeout": 5000.0}, start_if_needed=False)
 
     # ── Dialog ────────────────────────────────────────────────────────────────
 
     def test_dialog_setup_defaults(self):
         _, sc = invoke(["dialog-setup"])
-        sc.assert_called_once_with("dialog_setup", {"action": "accept", "text": None})
+        sc.assert_called_once_with("dialog_setup", {"action": "accept", "text": None}, start_if_needed=False)
 
     def test_dialog_setup_dismiss(self):
         _, sc = invoke(["dialog-setup", "--action", "dismiss"])
-        sc.assert_called_once_with("dialog_setup", {"action": "dismiss", "text": None})
+        sc.assert_called_once_with("dialog_setup", {"action": "dismiss", "text": None}, start_if_needed=False)
 
     def test_dialog_setup_with_text(self):
         _, sc = invoke(["dialog-setup", "--text", "yes"])
-        sc.assert_called_once_with("dialog_setup", {"action": "accept", "text": "yes"})
+        sc.assert_called_once_with("dialog_setup", {"action": "accept", "text": "yes"}, start_if_needed=False)
 
     def test_dialog_accept(self):
         _, sc = invoke(["dialog"])
-        sc.assert_called_once_with("dialog", {"dismiss": False, "text": None})
+        sc.assert_called_once_with("dialog", {"dismiss": False, "text": None}, start_if_needed=False)
 
     def test_dialog_dismiss(self):
         _, sc = invoke(["dialog", "--dismiss"])
-        sc.assert_called_once_with("dialog", {"dismiss": True, "text": None})
+        sc.assert_called_once_with("dialog", {"dismiss": True, "text": None}, start_if_needed=False)
 
     def test_dialog_remove(self):
         _, sc = invoke(["dialog-remove"])
-        sc.assert_called_once_with("dialog_remove")
+        sc.assert_called_once_with("dialog_remove", start_if_needed=False)
 
     # ── Storage ───────────────────────────────────────────────────────────────
 
     def test_storage_save_absolutizes_path(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         _, sc = invoke(["storage-save", "state.json"])
-        sc.assert_called_once_with("storage_save", {"path": str(tmp_path / "state.json")})
+        sc.assert_called_once_with("storage_save", {"path": str(tmp_path / "state.json")}, start_if_needed=False)
 
     def test_storage_load_absolutizes_path(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         _, sc = invoke(["storage-load", "state.json"])
-        sc.assert_called_once_with("storage_load", {"path": str(tmp_path / "state.json")})
+        sc.assert_called_once_with("storage_load", {"path": str(tmp_path / "state.json")}, start_if_needed=False)
 
     def test_cookies_clear(self):
         _, sc = invoke(["cookies-clear"])
-        sc.assert_called_once_with("cookies_clear")
+        sc.assert_called_once_with("cookies_clear", start_if_needed=False)
 
     def test_cookies_no_filter(self):
         _, sc = invoke(["cookies"])
-        sc.assert_called_once_with("cookies", {"url": None})
+        sc.assert_called_once_with("cookies", {"url": None}, start_if_needed=False)
 
     def test_cookies_with_url(self):
         _, sc = invoke(["cookies", "--url", "https://example.com"])
-        sc.assert_called_once_with("cookies", {"url": "https://example.com"})
+        sc.assert_called_once_with("cookies", {"url": "https://example.com"}, start_if_needed=False)
 
     def test_cookie_set_minimal(self):
         _, sc = invoke(["cookie-set", "sid", "abc123"])
         sc.assert_called_once_with("cookie_set", {
             "name": "sid", "value": "abc123", "url": None, "domain": None,
             "path": "/", "expires": None, "http_only": False, "secure": False, "same_site": None,
-        })
+        }, start_if_needed=False)
 
     def test_cookie_set_full(self):
         _, sc = invoke([
@@ -650,94 +706,94 @@ class TestCliCommandRouting:
         sc.assert_called_once_with("cookie_set", {
             "name": "sid", "value": "abc123", "url": "https://example.com", "domain": None,
             "path": "/", "expires": None, "http_only": True, "secure": True, "same_site": "Strict",
-        })
+        }, start_if_needed=False)
 
     # ── Verify ────────────────────────────────────────────────────────────────
 
     def test_verify_visible(self):
         _, sc = invoke(["verify-visible", "button", "Submit"])
-        sc.assert_called_once_with("verify_visible", {"role": "button", "name": "Submit", "timeout": 5000.0})
+        sc.assert_called_once_with("verify_visible", {"role": "button", "name": "Submit", "timeout": 5000.0}, start_if_needed=False)
 
     def test_verify_visible_custom_timeout(self):
         _, sc = invoke(["verify-visible", "button", "OK", "--timeout", "10000"])
-        sc.assert_called_once_with("verify_visible", {"role": "button", "name": "OK", "timeout": 10000.0})
+        sc.assert_called_once_with("verify_visible", {"role": "button", "name": "OK", "timeout": 10000.0}, start_if_needed=False)
 
     def test_verify_text(self):
         _, sc = invoke(["verify-text", "Hello world"])
-        sc.assert_called_once_with("verify_text", {"text": "Hello world", "exact": False, "timeout": 5000.0})
+        sc.assert_called_once_with("verify_text", {"text": "Hello world", "exact": False, "timeout": 5000.0}, start_if_needed=False)
 
     def test_verify_text_exact(self):
         _, sc = invoke(["verify-text", "Hello", "--exact"])
-        sc.assert_called_once_with("verify_text", {"text": "Hello", "exact": True, "timeout": 5000.0})
+        sc.assert_called_once_with("verify_text", {"text": "Hello", "exact": True, "timeout": 5000.0}, start_if_needed=False)
 
     def test_verify_value(self):
         _, sc = invoke(["verify-value", "@e1", "expected"])
-        sc.assert_called_once_with("verify_value", {"ref": "e1", "expected": "expected"})
+        sc.assert_called_once_with("verify_value", {"ref": "e1", "expected": "expected"}, start_if_needed=False)
 
     def test_verify_state(self):
         _, sc = invoke(["verify-state", "@e2", "visible"])
-        sc.assert_called_once_with("verify_state", {"ref": "e2", "state": "visible"})
+        sc.assert_called_once_with("verify_state", {"ref": "e2", "state": "visible"}, start_if_needed=False)
 
     def test_verify_url(self):
         _, sc = invoke(["verify-url", "https://example.com"])
-        sc.assert_called_once_with("verify_url", {"url": "https://example.com", "exact": False})
+        sc.assert_called_once_with("verify_url", {"url": "https://example.com", "exact": False}, start_if_needed=False)
 
     def test_verify_url_exact(self):
         _, sc = invoke(["verify-url", "https://example.com", "--exact"])
-        sc.assert_called_once_with("verify_url", {"url": "https://example.com", "exact": True})
+        sc.assert_called_once_with("verify_url", {"url": "https://example.com", "exact": True}, start_if_needed=False)
 
     def test_verify_title(self):
         _, sc = invoke(["verify-title", "My Page"])
-        sc.assert_called_once_with("verify_title", {"title": "My Page", "exact": False})
+        sc.assert_called_once_with("verify_title", {"title": "My Page", "exact": False}, start_if_needed=False)
 
     # ── Developer ─────────────────────────────────────────────────────────────
 
     def test_eval(self):
         _, sc = invoke(["eval", "() => document.title"])
-        sc.assert_called_once_with("eval", {"code": "() => document.title"})
+        sc.assert_called_once_with("eval", {"code": "() => document.title"}, start_if_needed=False)
 
     def test_eval_on(self):
         _, sc = invoke(["eval-on", "@e1", "el => el.textContent"])
-        sc.assert_called_once_with("eval_on", {"ref": "e1", "code": "el => el.textContent"})
+        sc.assert_called_once_with("eval_on", {"ref": "e1", "code": "el => el.textContent"}, start_if_needed=False)
 
     def test_trace_start_defaults(self):
         _, sc = invoke(["trace-start"])
-        sc.assert_called_once_with("trace_start", {"no_screenshots": False, "no_snapshots": False})
+        sc.assert_called_once_with("trace_start", {"no_screenshots": False, "no_snapshots": False}, start_if_needed=False)
 
     def test_trace_start_no_screenshots(self):
         _, sc = invoke(["trace-start", "--no-screenshots"])
-        sc.assert_called_once_with("trace_start", {"no_screenshots": True, "no_snapshots": False})
+        sc.assert_called_once_with("trace_start", {"no_screenshots": True, "no_snapshots": False}, start_if_needed=False)
 
     def test_trace_stop_absolutizes_path(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         _, sc = invoke(["trace-stop", "trace.zip"])
-        sc.assert_called_once_with("trace_stop", {"path": str(tmp_path / "trace.zip")})
+        sc.assert_called_once_with("trace_stop", {"path": str(tmp_path / "trace.zip")}, start_if_needed=False)
 
     def test_trace_chunk(self):
         _, sc = invoke(["trace-chunk", "login flow"])
-        sc.assert_called_once_with("trace_chunk", {"title": "login flow"})
+        sc.assert_called_once_with("trace_chunk", {"title": "login flow"}, start_if_needed=False)
 
     def test_video_start_defaults(self):
         _, sc = invoke(["video-start"])
-        sc.assert_called_once_with("video_start", {"width": None, "height": None})
+        sc.assert_called_once_with("video_start", {"width": None, "height": None}, start_if_needed=False)
 
     def test_video_start_dimensions(self):
         _, sc = invoke(["video-start", "--width", "1280", "--height", "720"])
-        sc.assert_called_once_with("video_start", {"width": 1280, "height": 720})
+        sc.assert_called_once_with("video_start", {"width": 1280, "height": 720}, start_if_needed=False)
 
     def test_video_stop_no_path(self):
         _, sc = invoke(["video-stop"])
-        sc.assert_called_once_with("video_stop", {"path": None})
+        sc.assert_called_once_with("video_stop", {"path": None}, start_if_needed=False)
 
     def test_video_stop_with_absolute_path(self):
         _, sc = invoke(["video-stop", "/tmp/video.webm"])
-        sc.assert_called_once_with("video_stop", {"path": "/tmp/video.webm"})
+        sc.assert_called_once_with("video_stop", {"path": "/tmp/video.webm"}, start_if_needed=False)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def test_resize(self):
         _, sc = invoke(["resize", "1920", "1080"])
-        sc.assert_called_once_with("resize", {"width": 1920, "height": 1080})
+        sc.assert_called_once_with("resize", {"width": 1920, "height": 1080}, start_if_needed=False)
 
     def test_close_uses_start_if_needed_false(self):
         _, sc = invoke(["close"])
@@ -752,6 +808,22 @@ class TestCliCommandRouting:
         ):
             result = runner.invoke(cli, ["open", "https://example.com"])
         assert "Error: daemon failed" in result.output
+        assert result.exit_code != 0
+
+    def test_structured_error_printed_with_code(self):
+        with patch(
+            "bridgic.browser.cli._commands.send_command",
+            side_effect=BridgicBrowserCommandError(
+                command="open",
+                code="NO_BROWSER_SESSION",
+                message="No browser session is running.",
+                details={"hint": "run open"},
+                retryable=True,
+            ),
+        ):
+            result = runner.invoke(cli, ["open", "https://example.com"])
+        assert "Error[NO_BROWSER_SESSION]: No browser session is running." in result.output
+        assert "Details:" in result.output
         assert result.exit_code != 0
 
     def test_result_printed_on_success(self):
@@ -779,7 +851,7 @@ class TestDaemonDispatch:
 
     async def test_known_command_returns_ok(self):
         browser = make_browser()
-        browser.navigate_to_url = AsyncMock(return_value="Navigated")
+        browser.navigate_to = AsyncMock(return_value="Navigated")
         resp = await _dispatch(browser, "open", {"url": "https://example.com"})
         assert resp["status"] == "ok"
         assert resp["success"] is True
@@ -788,7 +860,9 @@ class TestDaemonDispatch:
 
     async def test_known_command_business_failure_returns_error(self):
         browser = make_browser()
-        browser.navigate_to_url = AsyncMock(return_value="Navigation failed: timeout")
+        browser.navigate_to = AsyncMock(
+            side_effect=OperationError("Navigation failed: timeout", code="NAVIGATION_FAILED")
+        )
         resp = await _dispatch(browser, "open", {"url": "https://example.com"})
         assert resp["status"] == "error"
         assert resp["success"] is False
@@ -806,7 +880,7 @@ class TestDaemonDispatch:
 
     async def test_handler_exception_returns_error(self):
         browser = make_browser()
-        browser.navigate_to_url = AsyncMock(side_effect=RuntimeError("boom"))
+        browser.navigate_to = AsyncMock(side_effect=RuntimeError("boom"))
         resp = await _dispatch(browser, "open", {"url": "x"})
         assert resp["status"] == "error"
         assert resp["success"] is False
@@ -816,7 +890,7 @@ class TestDaemonDispatch:
     async def test_browser_closed_error_returns_hint(self):
         """Playwright 'browser has been closed' errors surface the recovery hint."""
         browser = make_browser()
-        browser.navigate_to_url = AsyncMock(side_effect=Exception(
+        browser.navigate_to = AsyncMock(side_effect=Exception(
             "Page.goto: Target page, context or browser has been closed"
         ))
         resp = await _dispatch(browser, "open", {"url": "x"})
@@ -871,7 +945,7 @@ class TestBrowserClosedDetection:
 class TestDaemonSocketSecurity:
     def test_default_socket_path_is_user_scoped(self, tmp_path):
         fake_home = tmp_path / ".bridgic"
-        with patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home):
+        with patch("bridgic.browser.cli._transport.BRIDGIC_HOME", fake_home):
             path = _default_socket_path()
         assert path == str(fake_home / "run" / "bridgic-browser.sock")
 
@@ -883,8 +957,8 @@ class TestDaemonSocketSecurity:
             st_uid=1000,
         )
 
-        with patch("bridgic.browser.cli._daemon.Path", return_value=mock_path):
-            with patch("bridgic.browser.cli._daemon.os.getuid", return_value=1000):
+        with patch("bridgic.browser.cli._transport.Path", return_value=mock_path):
+            with patch("bridgic.browser.cli._transport.os.getuid", return_value=1000):
                 _safe_remove_socket("/tmp/test.sock")
 
         mock_path.unlink.assert_called_once()
@@ -897,8 +971,8 @@ class TestDaemonSocketSecurity:
             st_uid=1000,
         )
 
-        with patch("bridgic.browser.cli._daemon.Path", return_value=mock_path):
-            with patch("bridgic.browser.cli._daemon.os.getuid", return_value=1000):
+        with patch("bridgic.browser.cli._transport.Path", return_value=mock_path):
+            with patch("bridgic.browser.cli._transport.os.getuid", return_value=1000):
                 with pytest.raises(RuntimeError, match="non-socket"):
                     _safe_remove_socket("/tmp/not-a-socket")
 
@@ -913,8 +987,8 @@ class TestDaemonSocketSecurity:
             st_uid=1000,
         )
 
-        with patch("bridgic.browser.cli._daemon.Path", return_value=mock_path):
-            monkeypatch.setattr("bridgic.browser.cli._daemon.os.getuid", lambda: 1001)
+        with patch("bridgic.browser.cli._transport.Path", return_value=mock_path):
+            monkeypatch.setattr("bridgic.browser.cli._transport.os.getuid", lambda: 1001)
             with pytest.raises(PermissionError, match="owned by uid"):
                 _safe_remove_socket("/tmp/foreign.sock")
 
@@ -924,7 +998,7 @@ class TestDaemonSocketSecurity:
         mock_path = MagicMock()
         mock_path.stat.side_effect = FileNotFoundError
 
-        with patch("bridgic.browser.cli._daemon.Path", return_value=mock_path):
+        with patch("bridgic.browser.cli._transport.Path", return_value=mock_path):
             _safe_remove_socket("/tmp/missing.sock")
 
         mock_path.unlink.assert_not_called()
@@ -933,7 +1007,7 @@ class TestDaemonSocketSecurity:
         mock_path = MagicMock()
         mock_path.stat.side_effect = FileNotFoundError("raced")
 
-        with patch("bridgic.browser.cli._daemon.Path", return_value=mock_path):
+        with patch("bridgic.browser.cli._transport.Path", return_value=mock_path):
             _safe_remove_socket("/tmp/raced.sock")
 
         mock_path.unlink.assert_not_called()
@@ -946,8 +1020,8 @@ class TestDaemonSocketSecurity:
         )
         mock_path.unlink.side_effect = FileNotFoundError("raced")
 
-        with patch("bridgic.browser.cli._daemon.Path", return_value=mock_path):
-            with patch("bridgic.browser.cli._daemon.os.getuid", return_value=1000):
+        with patch("bridgic.browser.cli._transport.Path", return_value=mock_path):
+            with patch("bridgic.browser.cli._transport.os.getuid", return_value=1000):
                 _safe_remove_socket("/tmp/raced.sock")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -997,6 +1071,50 @@ class TestDaemonConnection:
         assert resp["error_code"] == "INVALID_JSON"
         assert "Invalid JSON" in resp["result"]
 
+    async def test_non_object_payload_writes_invalid_request(self):
+        browser = make_browser()
+        stop = asyncio.Event()
+        reader = make_reader(b"[]\n")
+        writer = make_writer()
+
+        await _handle_connection(browser, reader, writer, stop)
+
+        written = b"".join(call.args[0] for call in writer.write.call_args_list)
+        resp = json.loads(written.decode().strip())
+        assert resp["status"] == "error"
+        assert resp["error_code"] == "INVALID_REQUEST"
+        assert "payload must be a JSON object" in resp["result"]
+
+    async def test_non_object_args_writes_invalid_request(self):
+        browser = make_browser()
+        stop = asyncio.Event()
+        req = json.dumps({"command": "back", "args": []}).encode() + b"\n"
+        reader = make_reader(req)
+        writer = make_writer()
+
+        await _handle_connection(browser, reader, writer, stop)
+
+        written = b"".join(call.args[0] for call in writer.write.call_args_list)
+        resp = json.loads(written.decode().strip())
+        assert resp["status"] == "error"
+        assert resp["error_code"] == "INVALID_REQUEST"
+        assert "'args' must be a JSON object" in resp["result"]
+
+    async def test_non_string_command_writes_invalid_request(self):
+        browser = make_browser()
+        stop = asyncio.Event()
+        req = json.dumps({"command": 123, "args": {}}).encode() + b"\n"
+        reader = make_reader(req)
+        writer = make_writer()
+
+        await _handle_connection(browser, reader, writer, stop)
+
+        written = b"".join(call.args[0] for call in writer.write.call_args_list)
+        resp = json.loads(written.decode().strip())
+        assert resp["status"] == "error"
+        assert resp["error_code"] == "INVALID_REQUEST"
+        assert "'command' must be a non-empty string" in resp["result"]
+
     async def test_eof_returns_silently(self):
         browser = make_browser()
         stop = asyncio.Event()
@@ -1040,6 +1158,31 @@ class TestDaemonConnection:
         assert resp["success"] is True
         assert resp["error_code"] is None
 
+    async def test_close_command_timeout_still_sets_stop_event(self):
+        browser = make_browser()
+        stop = asyncio.Event()
+        req = json.dumps({"command": "close", "args": {}}).encode() + b"\n"
+        reader = make_reader(req)
+        writer = make_writer()
+
+        async def _slow_dispatch(_browser, _command, _args):
+            await asyncio.sleep(1.0)
+            return {"status": "ok", "success": True, "result": "done"}
+
+        with (
+            patch("bridgic.browser.cli._daemon._dispatch", new=_slow_dispatch),
+            patch("bridgic.browser.cli._daemon._CLOSE_DISPATCH_TIMEOUT", 0.01),
+        ):
+            await _handle_connection(browser, reader, writer, stop)
+
+        assert stop.is_set()
+        written = b"".join(call.args[0] for call in writer.write.call_args_list)
+        resp = json.loads(written.decode().strip())
+        assert resp["status"] == "error"
+        assert resp["success"] is False
+        assert resp["error_code"] == "CLOSE_TIMEOUT"
+        assert "Close operation timed out" in resp["result"]
+
     async def test_writer_always_closed(self):
         """writer.close() must be called even when an exception occurs."""
         browser = make_browser()
@@ -1065,9 +1208,9 @@ class TestDaemonConnection:
 class TestDaemonHandlers:
     async def test_handle_open_calls_navigate(self):
         browser = make_browser()
-        browser.navigate_to_url = AsyncMock(return_value="Navigated to: https://example.com")
+        browser.navigate_to = AsyncMock(return_value="Navigated to: https://example.com")
         result = await _handle_open(browser, {"url": "https://example.com"})
-        browser.navigate_to_url.assert_awaited_once_with("https://example.com")
+        browser.navigate_to.assert_awaited_once_with("https://example.com")
         assert result == "Navigated to: https://example.com"
 
     async def test_handle_snapshot_default(self):
@@ -1211,11 +1354,10 @@ class TestDaemonHandlers:
         browser.fill_form.assert_awaited_once_with([{"ref": "e1", "value": "hello"}], submit=False)
 
     async def test_handle_fill_form_invalid_json_raises(self):
-        from bridgic.browser.cli._daemon import _DaemonCommandError
         browser = make_browser()
-        with pytest.raises(_DaemonCommandError) as exc_info:
+        with pytest.raises(InvalidInputError) as exc_info:
             await _handle_fill_form(browser, {"fields": "not json", "submit": False})
-        assert exc_info.value.error_code == "INVALID_JSON_FIELDS"
+        assert exc_info.value.code == "INVALID_JSON_FIELDS"
 
     async def test_handle_type_text(self):
         browser = make_browser()
@@ -1464,9 +1606,11 @@ class TestDaemonHandlers:
         browser.browser_resize.assert_awaited_once_with(1920, 1080)
 
     async def test_verify_fail_result_is_classified_as_error(self):
-        """verify_* handlers that return FAIL: should surface as error via _dispatch."""
+        """verify_* handler exceptions should surface as error via _dispatch."""
         browser = make_browser()
-        browser.verify_url = AsyncMock(return_value="FAIL: current URL does not match")
+        browser.verify_url = AsyncMock(
+            side_effect=VerificationError("URL mismatch", code="VERIFICATION_FAILED")
+        )
         resp = await _dispatch(browser, "verify_url", {"url": "https://example.com", "exact": False})
         assert resp["status"] == "error"
         assert resp["success"] is False
@@ -1489,24 +1633,69 @@ class TestClientSendCommand:
     def test_raises_when_socket_missing_and_no_start(self):
         from bridgic.browser.cli._client import send_command
 
-        with patch("bridgic.browser.cli._client.os.path.exists", return_value=False):
-            with pytest.raises(RuntimeError, match="No browser session is running"):
+        with patch("bridgic.browser.cli._client.RUN_INFO_PATH") as mock_rip:
+            mock_rip.exists.return_value = False
+            with pytest.raises(BridgicBrowserCommandError) as exc_info:
                 send_command("close", start_if_needed=False)
+        assert exc_info.value.code == "NO_BROWSER_SESSION"
 
     def test_start_if_needed_false_proceeds_when_socket_present(self):
-        """When socket file exists, proceed to send command (don't spawn daemon)."""
+        """When run info exists and daemon is reachable, proceed to send command."""
         from bridgic.browser.cli._client import send_command
 
         async def mock_send_command(_cmd: str, _args: dict) -> str:
             return "Daemon shutting down"
 
-        with patch("bridgic.browser.cli._client.os.path.exists", return_value=True):
-            with patch(
-                "bridgic.browser.cli._client._send_command_async",
-                mock_send_command,
-            ):
-                result = send_command("close", start_if_needed=False)
+        with patch("bridgic.browser.cli._client.RUN_INFO_PATH") as mock_rip:
+            mock_rip.exists.return_value = True
+            with patch("bridgic.browser.cli._client._probe_socket_sync", return_value=True):
+                with patch(
+                    "bridgic.browser.cli._client._send_command_async",
+                    mock_send_command,
+                ):
+                    result = send_command("close", start_if_needed=False)
         assert result == "Daemon shutting down"
+
+    def test_start_if_needed_false_raises_when_socket_is_stale(self):
+        from bridgic.browser.cli._client import send_command
+
+        with patch("bridgic.browser.cli._client.RUN_INFO_PATH") as mock_rip:
+            mock_rip.exists.return_value = True
+            with patch("bridgic.browser.cli._client._probe_socket_sync", return_value=False):
+                with pytest.raises(BridgicBrowserCommandError) as exc_info:
+                    send_command("close", start_if_needed=False)
+        assert exc_info.value.code == "NO_BROWSER_SESSION"
+
+    def test_start_if_needed_true_wraps_daemon_start_failure(self):
+        from bridgic.browser.cli._client import send_command
+
+        with patch(
+            "bridgic.browser.cli._client.ensure_daemon_running",
+            side_effect=RuntimeError("spawn failed"),
+        ):
+            with pytest.raises(BridgicBrowserCommandError) as exc_info:
+                send_command("snapshot")
+        assert exc_info.value.code == "DAEMON_START_FAILED"
+
+    def test_send_command_wraps_connection_error_as_no_session(self):
+        from bridgic.browser.cli._client import send_command
+
+        async def mock_send_command(_cmd: str, _args: dict) -> str:
+            raise ConnectionRefusedError("refused")
+
+        with patch("bridgic.browser.cli._client.RUN_INFO_PATH") as mock_rip:
+            mock_rip.exists.return_value = True
+            with patch(
+                "bridgic.browser.cli._client._probe_socket_sync",
+                return_value=True,
+            ):
+                with patch(
+                    "bridgic.browser.cli._client._send_command_async",
+                    mock_send_command,
+                ):
+                    with pytest.raises(BridgicBrowserCommandError) as exc_info:
+                        send_command("close", start_if_needed=False)
+        assert exc_info.value.code == "NO_BROWSER_SESSION"
 
     def test_start_if_needed_true_calls_ensure_daemon(self):
         from bridgic.browser.cli._client import send_command
@@ -1525,32 +1714,55 @@ class TestClientSendCommand:
     def test_ensure_daemon_running_removes_stale_socket_then_spawns(self):
         from bridgic.browser.cli import _client
 
-        with patch("bridgic.browser.cli._client.os.path.exists", return_value=True):
+        with patch("bridgic.browser.cli._client.RUN_INFO_PATH") as mock_rip:
+            mock_rip.exists.return_value = True
             with patch(
-                "bridgic.browser.cli._client._probe_socket",
-                new=AsyncMock(side_effect=RuntimeError("stale socket")),
+                "bridgic.browser.cli._client._probe_socket_sync",
+                return_value=False,
             ):
-                with patch("bridgic.browser.cli._client._safe_remove_socket") as mock_remove:
-                    with patch("bridgic.browser.cli._client._spawn_daemon") as mock_spawn:
-                        _client.ensure_daemon_running()
+                with patch(
+                    "bridgic.browser.cli._client.read_run_info",
+                    return_value={"transport": "unix", "socket": "/tmp/test.sock"},
+                ):
+                    with patch("bridgic.browser.cli._client._safe_remove_socket") as mock_remove:
+                        with patch("bridgic.browser.cli._client.remove_run_info") as mock_rm_info:
+                            with patch("bridgic.browser.cli._client._spawn_daemon") as mock_spawn:
+                                _client.ensure_daemon_running()
 
-        mock_remove.assert_called_once()
+        mock_remove.assert_called_once_with("/tmp/test.sock")
+        mock_rm_info.assert_called_once()
         mock_spawn.assert_called_once()
 
     def test_ensure_daemon_running_raises_when_stale_socket_is_unsafe(self):
         from bridgic.browser.cli import _client
 
-        with patch("bridgic.browser.cli._client.os.path.exists", return_value=True):
+        with patch("bridgic.browser.cli._client.RUN_INFO_PATH") as mock_rip:
+            mock_rip.exists.return_value = True
             with patch(
-                "bridgic.browser.cli._client._probe_socket",
-                new=AsyncMock(side_effect=RuntimeError("stale socket")),
+                "bridgic.browser.cli._client._probe_socket_sync",
+                return_value=False,
             ):
                 with patch(
-                    "bridgic.browser.cli._client._safe_remove_socket",
-                    side_effect=PermissionError("owned by another user"),
+                    "bridgic.browser.cli._client.read_run_info",
+                    return_value={"transport": "unix", "socket": "/tmp/test.sock"},
                 ):
-                    with pytest.raises(RuntimeError, match="cannot remove it safely"):
-                        _client.ensure_daemon_running()
+                    with patch(
+                        "bridgic.browser.cli._client._safe_remove_socket",
+                        side_effect=PermissionError("owned by another user"),
+                    ):
+                        with pytest.raises(RuntimeError, match="cannot remove it safely"):
+                            _client.ensure_daemon_running()
+
+    def test_spawn_daemon_includes_output_tail_on_timeout(self):
+        import io
+        from bridgic.browser.cli import _client
+
+        fake_proc = MagicMock()
+        fake_proc.stdout = io.BytesIO(b"startup failed\n")
+
+        with patch("bridgic.browser.cli._client.subprocess.Popen", return_value=fake_proc):
+            with pytest.raises(RuntimeError, match="Daemon output \\(tail\\):"):
+                _client._spawn_daemon()
 
     @pytest.mark.asyncio
     async def test_send_command_async_uses_success_field_when_present(self):
@@ -1559,12 +1771,15 @@ class TestClientSendCommand:
         reader = make_reader(b'{"status":"ok","success":false,"result":"x"}\n')
         writer = make_writer()
 
-        with patch(
-            "bridgic.browser.cli._client.asyncio.open_unix_connection",
-            new=AsyncMock(return_value=(reader, writer)),
-        ):
-            with pytest.raises(RuntimeError, match="x"):
+        mock_transport = MagicMock()
+        mock_transport.open_connection = AsyncMock(return_value=(reader, writer))
+        mock_transport.inject_auth = lambda req: req
+
+        with patch("bridgic.browser.cli._client.get_transport", return_value=mock_transport):
+            with pytest.raises(BridgicBrowserCommandError) as exc_info:
                 await _send_command_async("snapshot", {})
+        assert exc_info.value.message == "x"
+        assert exc_info.value.code == "DAEMON_ERROR"
 
     @pytest.mark.asyncio
     async def test_send_command_async_falls_back_to_status_for_legacy_responses(self):
@@ -1573,12 +1788,36 @@ class TestClientSendCommand:
         reader = make_reader(b'{"status":"error","result":"legacy error"}\n')
         writer = make_writer()
 
-        with patch(
-            "bridgic.browser.cli._client.asyncio.open_unix_connection",
-            new=AsyncMock(return_value=(reader, writer)),
-        ):
-            with pytest.raises(RuntimeError, match="legacy error"):
+        mock_transport = MagicMock()
+        mock_transport.open_connection = AsyncMock(return_value=(reader, writer))
+        mock_transport.inject_auth = lambda req: req
+
+        with patch("bridgic.browser.cli._client.get_transport", return_value=mock_transport):
+            with pytest.raises(BridgicBrowserCommandError) as exc_info:
                 await _send_command_async("snapshot", {})
+        assert exc_info.value.message == "legacy error"
+        assert exc_info.value.code == "DAEMON_ERROR"
+
+    @pytest.mark.asyncio
+    async def test_send_command_async_times_out_when_daemon_never_replies(self):
+        from bridgic.browser.cli._client import _send_command_async
+
+        reader = MagicMock()
+        reader.readline = AsyncMock(side_effect=asyncio.TimeoutError)
+        writer = make_writer()
+
+        mock_transport = MagicMock()
+        mock_transport.open_connection = AsyncMock(return_value=(reader, writer))
+        mock_transport.inject_auth = lambda req: req
+
+        with (
+            patch("bridgic.browser.cli._client.get_transport", return_value=mock_transport),
+            patch("bridgic.browser.cli._client._DAEMON_RESPONSE_TIMEOUT", 0.01),
+            patch("bridgic.browser.cli._client.asyncio.wait_for", side_effect=asyncio.TimeoutError),
+        ):
+            with pytest.raises(BridgicBrowserCommandError) as exc_info:
+                await _send_command_async("snapshot", {})
+        assert exc_info.value.code == "DAEMON_RESPONSE_TIMEOUT"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1739,3 +1978,96 @@ def _non_existent() -> MagicMock:
     m = MagicMock()
     m.is_file.return_value = False
     return m
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Transport layer
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestTransport:
+
+    def test_get_transport_returns_unix_on_posix(self):
+        with patch("bridgic.browser.cli._transport.sys") as mock_sys:
+            mock_sys.platform = "linux"
+            t = get_transport()
+        assert isinstance(t, UnixTransport)
+
+    def test_get_transport_returns_tcp_on_windows(self):
+        with patch("bridgic.browser.cli._transport.sys") as mock_sys:
+            mock_sys.platform = "win32"
+            with patch("bridgic.browser.cli._transport.read_run_info", return_value=None):
+                t = get_transport()
+        assert isinstance(t, TcpTransport)
+
+    def test_get_transport_reads_run_info_on_windows(self):
+        run_info = {"transport": "tcp", "port": 12345, "token": "abc123"}
+        with patch("bridgic.browser.cli._transport.sys") as mock_sys:
+            mock_sys.platform = "win32"
+            with patch("bridgic.browser.cli._transport.read_run_info", return_value=run_info):
+                t = get_transport()
+        assert isinstance(t, TcpTransport)
+        assert t._port == 12345
+        assert t._token == "abc123"
+
+    def test_unix_transport_probe_returns_false_when_no_socket(self, tmp_path):
+        sock_path = str(tmp_path / "no.sock")
+        t = UnixTransport(sock_path)
+        assert t.probe() is False
+
+    def test_tcp_transport_inject_auth_adds_token(self):
+        t = TcpTransport(port=9999, token="mytoken")
+        result = t.inject_auth({"command": "snapshot", "args": {}})
+        assert result["_token"] == "mytoken"
+        assert result["command"] == "snapshot"
+
+    def test_tcp_transport_verify_auth_passes_correct_token(self):
+        t = TcpTransport(port=9999, token="correct")
+        assert t.verify_auth({"_token": "correct"}) is True
+
+    def test_tcp_transport_verify_auth_rejects_wrong_token(self):
+        t = TcpTransport(port=9999, token="correct")
+        assert t.verify_auth({"_token": "wrong"}) is False
+
+    def test_tcp_transport_verify_auth_rejects_missing_token(self):
+        t = TcpTransport(port=9999, token="correct")
+        assert t.verify_auth({}) is False
+
+    def test_tcp_transport_verify_auth_rejects_when_token_not_initialised(self):
+        # Before start_server() is called, self._token is None.
+        # A request with no _token must NOT be accepted (None == None must not pass).
+        t = TcpTransport()
+        assert t.verify_auth({}) is False
+        assert t.verify_auth({"_token": None}) is False
+
+    def test_write_run_info_overwrites_existing(self, tmp_path):
+        """write_run_info must succeed even when the file already exists (Windows replace() semantics)."""
+        fake_path = tmp_path / "run" / "bridgic-browser.json"
+        with patch("bridgic.browser.cli._transport.RUN_INFO_PATH", fake_path):
+            write_run_info({"transport": "unix", "pid": 1})
+            write_run_info({"transport": "unix", "pid": 2})  # must not raise
+            result = read_run_info()
+        assert result["pid"] == 2
+
+    def test_write_and_read_run_info(self, tmp_path):
+        fake_path = tmp_path / "run" / "bridgic-browser.json"
+        with patch("bridgic.browser.cli._transport.RUN_INFO_PATH", fake_path):
+            write_run_info({"transport": "unix", "socket": "/tmp/test.sock", "pid": 42})
+            result = read_run_info()
+        assert result == {"transport": "unix", "socket": "/tmp/test.sock", "pid": 42}
+
+    def test_remove_run_info_noop_when_missing(self, tmp_path):
+        fake_path = tmp_path / "nonexistent.json"
+        with patch("bridgic.browser.cli._transport.RUN_INFO_PATH", fake_path):
+            remove_run_info()  # must not raise
+
+    def test_unix_transport_verify_auth_always_true(self):
+        t = UnixTransport("/tmp/test.sock")
+        assert t.verify_auth({"command": "snapshot"}) is True
+        assert t.verify_auth({}) is True
+
+    def test_unix_transport_inject_auth_is_noop(self):
+        t = UnixTransport("/tmp/test.sock")
+        req = {"command": "snapshot", "args": {}}
+        result = t.inject_auth(req)
+        assert result == req
+        assert "_token" not in result

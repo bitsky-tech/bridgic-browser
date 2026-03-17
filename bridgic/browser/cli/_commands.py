@@ -17,11 +17,14 @@ import sys
 
 import click
 
+from ..errors import BridgicBrowserCommandError
 from ._client import send_command
 from .._cli_catalog import (
     CLI_COMMAND_META,
+    CLI_HELP_SECTION_SPECS,
     CLI_HELP_SECTIONS,
 )
+from .._constants import ToolCategory
 
 # Support both -h and --help for every command
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
@@ -79,8 +82,13 @@ def _ok(result: str) -> None:
     click.echo(result)
 
 
-def _err(msg: str) -> None:
-    click.echo(f"Error: {msg}", err=True)
+def _err(err: Exception | str) -> None:
+    if isinstance(err, BridgicBrowserCommandError):
+        click.echo(f"Error[{err.code}]: {err.message}", err=True)
+        if err.details:
+            click.echo(f"Details: {json.dumps(err.details, ensure_ascii=False)}", err=True)
+    else:
+        click.echo(f"Error: {err}", err=True)
     sys.exit(1)
 
 
@@ -93,43 +101,57 @@ def cli() -> None:
     """
 
 
+def _resolve_section(section: str) -> ToolCategory:
+    """Resolve a section name/label to ToolCategory."""
+    normalized = section.strip().replace("-", " ").replace("_", " ").lower()
+    for category, _commands in CLI_HELP_SECTION_SPECS:
+        if normalized in {
+            category.name.lower().replace("_", " "),
+            category.value.lower(),
+        }:
+            return category
+    raise ValueError(f"Unknown section: {section}")
+
+
 # ── Navigation ────────────────────────────────────────────────────────────────
 
 @cli.command("open", context_settings=CONTEXT_SETTINGS)
 @click.argument("url")
-def cmd_open(url: str) -> None:
+@click.option("--headed", is_flag=True, default=False,
+              help="Launch the browser in headed (visible) mode.")
+def cmd_open(url: str, headed: bool) -> None:
     """Navigate to URL (starts browser if needed)."""
     try:
-        _ok(send_command("open", {"url": url}))
+        _ok(send_command("open", {"url": url}, headed=headed))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("back", context_settings=CONTEXT_SETTINGS)
 def cmd_back() -> None:
     """Go back to the previous page."""
     try:
-        _ok(send_command("back"))
+        _ok(send_command("back", start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("forward", context_settings=CONTEXT_SETTINGS)
 def cmd_forward() -> None:
     """Go forward to the next page."""
     try:
-        _ok(send_command("forward"))
+        _ok(send_command("forward", start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("reload", context_settings=CONTEXT_SETTINGS)
 def cmd_reload() -> None:
     """Reload the current page."""
     try:
-        _ok(send_command("reload"))
+        _ok(send_command("reload", start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("search", context_settings=CONTEXT_SETTINGS)
@@ -139,21 +161,23 @@ def cmd_reload() -> None:
     type=click.Choice(["duckduckgo", "google", "bing"], case_sensitive=False),
     help="Search engine (default: duckduckgo).",
 )
-def cmd_search(query: str, engine: str) -> None:
+@click.option("--headed", is_flag=True, default=False,
+              help="Launch the browser in headed (visible) mode.")
+def cmd_search(query: str, engine: str, headed: bool) -> None:
     """Search the web using a search engine."""
     try:
-        _ok(send_command("search", {"query": query, "engine": engine}))
+        _ok(send_command("search", {"query": query, "engine": engine}, headed=headed))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("info", context_settings=CONTEXT_SETTINGS)
 def cmd_info() -> None:
     """Show current page URL, title, viewport, and scroll position."""
     try:
-        _ok(send_command("info"))
+        _ok(send_command("info", start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 # ── Snapshot ──────────────────────────────────────────────────────────────────
@@ -163,7 +187,7 @@ def cmd_info() -> None:
               help="Only show clickable/editable elements.")
 @click.option("-f/-F", "--full-page/--no-full-page", default=True,
               help="Include elements outside the viewport (default: true). -F = viewport only.")
-@click.option("-s", "--start-from-char", default=0, type=int,
+@click.option("-s", "--start-from-char", default=0, type=click.IntRange(min=0),
               help="Pagination offset. Use next_start_char from the truncation notice.")
 def cmd_snapshot(interactive: bool, full_page: bool, start_from_char: int) -> None:
     """Print the current accessibility tree snapshot."""
@@ -172,9 +196,9 @@ def cmd_snapshot(interactive: bool, full_page: bool, start_from_char: int) -> No
             "interactive": interactive,
             "full_page": full_page,
             "start_from_char": start_from_char,
-        }))
+        }, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 # ── Element Interaction ───────────────────────────────────────────────────────
@@ -184,9 +208,9 @@ def cmd_snapshot(interactive: bool, full_page: bool, start_from_char: int) -> No
 def cmd_click(ref: str) -> None:
     """Click an element by ref (@e2 or e2)."""
     try:
-        _ok(send_command("click", {"ref": _strip_ref(ref)}))
+        _ok(send_command("click", {"ref": _strip_ref(ref)}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("double-click", context_settings=CONTEXT_SETTINGS)
@@ -194,9 +218,9 @@ def cmd_click(ref: str) -> None:
 def cmd_double_click(ref: str) -> None:
     """Double-click an element by ref."""
     try:
-        _ok(send_command("double_click", {"ref": _strip_ref(ref)}))
+        _ok(send_command("double_click", {"ref": _strip_ref(ref)}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("hover", context_settings=CONTEXT_SETTINGS)
@@ -204,9 +228,9 @@ def cmd_double_click(ref: str) -> None:
 def cmd_hover(ref: str) -> None:
     """Hover over an element by ref."""
     try:
-        _ok(send_command("hover", {"ref": _strip_ref(ref)}))
+        _ok(send_command("hover", {"ref": _strip_ref(ref)}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("focus", context_settings=CONTEXT_SETTINGS)
@@ -214,9 +238,9 @@ def cmd_hover(ref: str) -> None:
 def cmd_focus(ref: str) -> None:
     """Focus an element by ref."""
     try:
-        _ok(send_command("focus", {"ref": _strip_ref(ref)}))
+        _ok(send_command("focus", {"ref": _strip_ref(ref)}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("fill", context_settings=CONTEXT_SETTINGS)
@@ -225,9 +249,9 @@ def cmd_focus(ref: str) -> None:
 def cmd_fill(ref: str, text: str) -> None:
     """Fill an input element by ref with TEXT."""
     try:
-        _ok(send_command("fill", {"ref": _strip_ref(ref), "text": text}))
+        _ok(send_command("fill", {"ref": _strip_ref(ref), "text": text}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("select", context_settings=CONTEXT_SETTINGS)
@@ -236,9 +260,9 @@ def cmd_fill(ref: str, text: str) -> None:
 def cmd_select(ref: str, option: str) -> None:
     """Select a dropdown option by ref and option text."""
     try:
-        _ok(send_command("select", {"ref": _strip_ref(ref), "text": option}))
+        _ok(send_command("select", {"ref": _strip_ref(ref), "text": option}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("check", context_settings=CONTEXT_SETTINGS)
@@ -246,9 +270,9 @@ def cmd_select(ref: str, option: str) -> None:
 def cmd_check(ref: str) -> None:
     """Check a checkbox or radio by ref."""
     try:
-        _ok(send_command("check", {"ref": _strip_ref(ref)}))
+        _ok(send_command("check", {"ref": _strip_ref(ref)}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("uncheck", context_settings=CONTEXT_SETTINGS)
@@ -256,9 +280,9 @@ def cmd_check(ref: str) -> None:
 def cmd_uncheck(ref: str) -> None:
     """Uncheck a checkbox by ref (radios usually require selecting another option)."""
     try:
-        _ok(send_command("uncheck", {"ref": _strip_ref(ref)}))
+        _ok(send_command("uncheck", {"ref": _strip_ref(ref)}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 
@@ -267,9 +291,9 @@ def cmd_uncheck(ref: str) -> None:
 def cmd_scroll_into_view(ref: str) -> None:
     """Scroll an element into view by ref."""
     try:
-        _ok(send_command("scroll_into_view", {"ref": _strip_ref(ref)}))
+        _ok(send_command("scroll_into_view", {"ref": _strip_ref(ref)}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("drag", context_settings=CONTEXT_SETTINGS)
@@ -281,9 +305,9 @@ def cmd_drag(start_ref: str, end_ref: str) -> None:
         _ok(send_command("drag", {
             "start_ref": _strip_ref(start_ref),
             "end_ref": _strip_ref(end_ref),
-        }))
+        }, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("options", context_settings=CONTEXT_SETTINGS)
@@ -291,9 +315,9 @@ def cmd_drag(start_ref: str, end_ref: str) -> None:
 def cmd_options(ref: str) -> None:
     """Get all available options for a dropdown element by ref."""
     try:
-        _ok(send_command("options", {"ref": _strip_ref(ref)}))
+        _ok(send_command("options", {"ref": _strip_ref(ref)}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("upload", context_settings=CONTEXT_SETTINGS)
@@ -303,9 +327,9 @@ def cmd_upload(ref: str, path: str) -> None:
     """Upload a file at PATH to a file input element by ref."""
     try:
         abs_path = os.path.abspath(path)
-        _ok(send_command("upload", {"ref": _strip_ref(ref), "path": abs_path}))
+        _ok(send_command("upload", {"ref": _strip_ref(ref), "path": abs_path}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("fill-form", context_settings=CONTEXT_SETTINGS)
@@ -315,9 +339,9 @@ def cmd_upload(ref: str, path: str) -> None:
 def cmd_fill_form(fields_json: str, submit: bool) -> None:
     """Fill multiple form fields at once. FIELDS_JSON is a JSON array like '[{"ref":"e1","value":"hi"}]'."""
     try:
-        _ok(send_command("fill_form", {"fields": fields_json, "submit": submit}))
+        _ok(send_command("fill_form", {"fields": fields_json, "submit": submit}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 # ── Keyboard ──────────────────────────────────────────────────────────────────
@@ -327,9 +351,9 @@ def cmd_fill_form(fields_json: str, submit: bool) -> None:
 def cmd_press(key: str) -> None:
     """Press a keyboard key or combination (Enter, Control+A, Shift+Tab…)."""
     try:
-        _ok(send_command("press", {"key": key}))
+        _ok(send_command("press", {"key": key}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("type", context_settings=CONTEXT_SETTINGS)
@@ -339,9 +363,9 @@ def cmd_press(key: str) -> None:
 def cmd_type(text: str, submit: bool) -> None:
     """Type text character-by-character (triggers keyboard events)."""
     try:
-        _ok(send_command("type_text", {"text": text, "submit": submit}))
+        _ok(send_command("type_text", {"text": text, "submit": submit}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("key-down", context_settings=CONTEXT_SETTINGS)
@@ -349,9 +373,9 @@ def cmd_type(text: str, submit: bool) -> None:
 def cmd_key_down(key: str) -> None:
     """Press and hold a keyboard key."""
     try:
-        _ok(send_command("key_down", {"key": key}))
+        _ok(send_command("key_down", {"key": key}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("key-up", context_settings=CONTEXT_SETTINGS)
@@ -359,9 +383,9 @@ def cmd_key_down(key: str) -> None:
 def cmd_key_up(key: str) -> None:
     """Release a held keyboard key."""
     try:
-        _ok(send_command("key_up", {"key": key}))
+        _ok(send_command("key_up", {"key": key}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 # ── Mouse ─────────────────────────────────────────────────────────────────────
@@ -372,9 +396,9 @@ def cmd_key_up(key: str) -> None:
 def cmd_scroll(dy: float, dx: float) -> None:
     """Scroll the page vertically (--dy) and/or horizontally (--dx)."""
     try:
-        _ok(send_command("scroll", {"delta_x": dx, "delta_y": dy}))
+        _ok(send_command("scroll", {"delta_x": dx, "delta_y": dy}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("mouse-move", context_settings=CONTEXT_SETTINGS)
@@ -383,9 +407,9 @@ def cmd_scroll(dy: float, dx: float) -> None:
 def cmd_mouse_move(x: float, y: float) -> None:
     """Move the mouse to coordinates (X, Y)."""
     try:
-        _ok(send_command("mouse_move", {"x": x, "y": y}))
+        _ok(send_command("mouse_move", {"x": x, "y": y}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("mouse-click", context_settings=CONTEXT_SETTINGS)
@@ -398,9 +422,9 @@ def cmd_mouse_move(x: float, y: float) -> None:
 def cmd_mouse_click(x: float, y: float, button: str, count: int) -> None:
     """Click the mouse at coordinates (X, Y)."""
     try:
-        _ok(send_command("mouse_click", {"x": x, "y": y, "button": button, "count": count}))
+        _ok(send_command("mouse_click", {"x": x, "y": y, "button": button, "count": count}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("mouse-drag", context_settings=CONTEXT_SETTINGS)
@@ -411,9 +435,9 @@ def cmd_mouse_click(x: float, y: float, button: str, count: int) -> None:
 def cmd_mouse_drag(x1: float, y1: float, x2: float, y2: float) -> None:
     """Drag the mouse from (X1, Y1) to (X2, Y2)."""
     try:
-        _ok(send_command("mouse_drag", {"x1": x1, "y1": y1, "x2": x2, "y2": y2}))
+        _ok(send_command("mouse_drag", {"x1": x1, "y1": y1, "x2": x2, "y2": y2}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("mouse-down", context_settings=CONTEXT_SETTINGS)
@@ -423,9 +447,9 @@ def cmd_mouse_drag(x1: float, y1: float, x2: float, y2: float) -> None:
 def cmd_mouse_down(button: str) -> None:
     """Press and hold a mouse button."""
     try:
-        _ok(send_command("mouse_down", {"button": button}))
+        _ok(send_command("mouse_down", {"button": button}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("mouse-up", context_settings=CONTEXT_SETTINGS)
@@ -435,9 +459,9 @@ def cmd_mouse_down(button: str) -> None:
 def cmd_mouse_up(button: str) -> None:
     """Release a held mouse button."""
     try:
-        _ok(send_command("mouse_up", {"button": button}))
+        _ok(send_command("mouse_up", {"button": button}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 # ── Wait ──────────────────────────────────────────────────────────────────────
@@ -468,13 +492,13 @@ def cmd_wait(value: str, gone: bool) -> None:
             seconds = None
 
         if seconds is not None and not gone:
-            _ok(send_command("wait", {"seconds": seconds}))
+            _ok(send_command("wait", {"seconds": seconds}, start_if_needed=False))
         elif gone:
-            _ok(send_command("wait", {"text_gone": value}))
+            _ok(send_command("wait", {"text_gone": value}, start_if_needed=False))
         else:
-            _ok(send_command("wait", {"text": value}))
+            _ok(send_command("wait", {"text": value}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
@@ -486,7 +510,7 @@ def cmd_tabs() -> None:
         # Read-only query: do not auto-spawn a new browser session.
         _ok(send_command("tabs", start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("new-tab", context_settings=CONTEXT_SETTINGS)
@@ -494,9 +518,9 @@ def cmd_tabs() -> None:
 def cmd_new_tab(url: str | None) -> None:
     """Open a new tab, optionally navigating to URL."""
     try:
-        _ok(send_command("new_tab", {"url": url}))
+        _ok(send_command("new_tab", {"url": url}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("switch-tab", context_settings=CONTEXT_SETTINGS)
@@ -504,9 +528,9 @@ def cmd_new_tab(url: str | None) -> None:
 def cmd_switch_tab(page_id: str) -> None:
     """Switch to a tab by its page_id (from 'tabs' command)."""
     try:
-        _ok(send_command("switch_tab", {"page_id": page_id}))
+        _ok(send_command("switch_tab", {"page_id": page_id}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("close-tab", context_settings=CONTEXT_SETTINGS)
@@ -514,9 +538,9 @@ def cmd_switch_tab(page_id: str) -> None:
 def cmd_close_tab(page_id: str | None) -> None:
     """Close a tab by page_id, or the current tab if omitted."""
     try:
-        _ok(send_command("close_tab", {"page_id": page_id}))
+        _ok(send_command("close_tab", {"page_id": page_id}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 # ── Capture ───────────────────────────────────────────────────────────────────
@@ -529,9 +553,9 @@ def cmd_screenshot(path: str, full_page: bool) -> None:
     """Save a screenshot to PATH."""
     try:
         abs_path = os.path.abspath(path)
-        _ok(send_command("screenshot", {"path": abs_path, "full_page": full_page}))
+        _ok(send_command("screenshot", {"path": abs_path, "full_page": full_page}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("pdf", context_settings=CONTEXT_SETTINGS)
@@ -540,9 +564,9 @@ def cmd_pdf(path: str) -> None:
     """Save the current page as a PDF."""
     try:
         abs_path = os.path.abspath(path)
-        _ok(send_command("pdf", {"path": abs_path}))
+        _ok(send_command("pdf", {"path": abs_path}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 # ── Network ───────────────────────────────────────────────────────────────────
@@ -551,18 +575,18 @@ def cmd_pdf(path: str) -> None:
 def cmd_network_start() -> None:
     """Start capturing network requests."""
     try:
-        _ok(send_command("network_start"))
+        _ok(send_command("network_start", start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("network-stop", context_settings=CONTEXT_SETTINGS)
 def cmd_network_stop() -> None:
     """Stop capturing network requests."""
     try:
-        _ok(send_command("network_stop"))
+        _ok(send_command("network_stop", start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("network", context_settings=CONTEXT_SETTINGS)
@@ -573,9 +597,9 @@ def cmd_network_stop() -> None:
 def cmd_network(include_static: bool, no_clear: bool) -> None:
     """Get captured network requests."""
     try:
-        _ok(send_command("network", {"include_static": include_static, "clear": not no_clear}))
+        _ok(send_command("network", {"include_static": include_static, "clear": not no_clear}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("wait-network", context_settings=CONTEXT_SETTINGS)
@@ -584,9 +608,9 @@ def cmd_network(include_static: bool, no_clear: bool) -> None:
 def cmd_wait_network(timeout: float) -> None:
     """Wait until the network is idle."""
     try:
-        _ok(send_command("wait_network", {"timeout": timeout}))
+        _ok(send_command("wait_network", {"timeout": timeout}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 # ── Dialog ────────────────────────────────────────────────────────────────────
@@ -599,9 +623,9 @@ def cmd_wait_network(timeout: float) -> None:
 def cmd_dialog_setup(action: str, text: str | None) -> None:
     """Set up automatic dialog handling for all future dialogs."""
     try:
-        _ok(send_command("dialog_setup", {"action": action, "text": text}))
+        _ok(send_command("dialog_setup", {"action": action, "text": text}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("dialog", context_settings=CONTEXT_SETTINGS)
@@ -611,18 +635,18 @@ def cmd_dialog_setup(action: str, text: str | None) -> None:
 def cmd_dialog(dismiss: bool, text: str | None) -> None:
     """Handle the next dialog that appears."""
     try:
-        _ok(send_command("dialog", {"dismiss": dismiss, "text": text}))
+        _ok(send_command("dialog", {"dismiss": dismiss, "text": text}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("dialog-remove", context_settings=CONTEXT_SETTINGS)
 def cmd_dialog_remove() -> None:
     """Remove the automatic dialog handler."""
     try:
-        _ok(send_command("dialog_remove"))
+        _ok(send_command("dialog_remove", start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 # ── Storage ───────────────────────────────────────────────────────────────────
@@ -633,9 +657,9 @@ def cmd_storage_save(path: str) -> None:
     """Save browser storage state (cookies, localStorage) to PATH."""
     try:
         abs_path = os.path.abspath(path)
-        _ok(send_command("storage_save", {"path": abs_path}))
+        _ok(send_command("storage_save", {"path": abs_path}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("storage-load", context_settings=CONTEXT_SETTINGS)
@@ -644,18 +668,18 @@ def cmd_storage_load(path: str) -> None:
     """Restore browser storage state from PATH."""
     try:
         abs_path = os.path.abspath(path)
-        _ok(send_command("storage_load", {"path": abs_path}))
+        _ok(send_command("storage_load", {"path": abs_path}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("cookies-clear", context_settings=CONTEXT_SETTINGS)
 def cmd_cookies_clear() -> None:
     """Clear all cookies from the browser context."""
     try:
-        _ok(send_command("cookies_clear"))
+        _ok(send_command("cookies_clear", start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("cookies", context_settings=CONTEXT_SETTINGS)
@@ -663,9 +687,9 @@ def cmd_cookies_clear() -> None:
 def cmd_cookies(url: str | None) -> None:
     """Get cookies from the browser context."""
     try:
-        _ok(send_command("cookies", {"url": url}))
+        _ok(send_command("cookies", {"url": url}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("cookie-set", context_settings=CONTEXT_SETTINGS)
@@ -690,9 +714,9 @@ def cmd_cookie_set(
             "name": name, "value": value, "url": url, "domain": domain,
             "path": cookie_path, "expires": expires, "http_only": http_only,
             "secure": secure, "same_site": same_site,
-        }))
+        }, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 # ── Verify ────────────────────────────────────────────────────────────────────
@@ -705,9 +729,9 @@ def cmd_cookie_set(
 def cmd_verify_visible(role: str, name: str, timeout: float) -> None:
     """Verify an element with ROLE and NAME is visible on the page."""
     try:
-        _ok(send_command("verify_visible", {"role": role, "name": name, "timeout": timeout}))
+        _ok(send_command("verify_visible", {"role": role, "name": name, "timeout": timeout}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("verify-text", context_settings=CONTEXT_SETTINGS)
@@ -719,9 +743,9 @@ def cmd_verify_visible(role: str, name: str, timeout: float) -> None:
 def cmd_verify_text(text: str, exact: bool, timeout: float) -> None:
     """Verify that TEXT is visible on the page."""
     try:
-        _ok(send_command("verify_text", {"text": text, "exact": exact, "timeout": timeout}))
+        _ok(send_command("verify_text", {"text": text, "exact": exact, "timeout": timeout}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("verify-value", context_settings=CONTEXT_SETTINGS)
@@ -730,9 +754,9 @@ def cmd_verify_text(text: str, exact: bool, timeout: float) -> None:
 def cmd_verify_value(ref: str, expected: str) -> None:
     """Verify that the value of REF element matches EXPECTED."""
     try:
-        _ok(send_command("verify_value", {"ref": _strip_ref(ref), "expected": expected}))
+        _ok(send_command("verify_value", {"ref": _strip_ref(ref), "expected": expected}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("verify-state", context_settings=CONTEXT_SETTINGS)
@@ -741,9 +765,9 @@ def cmd_verify_value(ref: str, expected: str) -> None:
 def cmd_verify_state(ref: str, state: str) -> None:
     """Verify the STATE of a REF element (visible, hidden, enabled, disabled, checked, unchecked)."""
     try:
-        _ok(send_command("verify_state", {"ref": _strip_ref(ref), "state": state}))
+        _ok(send_command("verify_state", {"ref": _strip_ref(ref), "state": state}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("verify-url", context_settings=CONTEXT_SETTINGS)
@@ -753,9 +777,9 @@ def cmd_verify_state(ref: str, state: str) -> None:
 def cmd_verify_url(url: str, exact: bool) -> None:
     """Verify the current page URL matches URL."""
     try:
-        _ok(send_command("verify_url", {"url": url, "exact": exact}))
+        _ok(send_command("verify_url", {"url": url, "exact": exact}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("verify-title", context_settings=CONTEXT_SETTINGS)
@@ -765,9 +789,9 @@ def cmd_verify_url(url: str, exact: bool) -> None:
 def cmd_verify_title(title: str, exact: bool) -> None:
     """Verify the current page title matches TITLE."""
     try:
-        _ok(send_command("verify_title", {"title": title, "exact": exact}))
+        _ok(send_command("verify_title", {"title": title, "exact": exact}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 # ── Evaluate ──────────────────────────────────────────────────────────────────
@@ -777,9 +801,9 @@ def cmd_verify_title(title: str, exact: bool) -> None:
 def cmd_eval(code: str) -> None:
     """Evaluate JavaScript in the page context and print the result."""
     try:
-        _ok(send_command("eval", {"code": code}))
+        _ok(send_command("eval", {"code": code}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("eval-on", context_settings=CONTEXT_SETTINGS)
@@ -788,9 +812,9 @@ def cmd_eval(code: str) -> None:
 def cmd_eval_on(ref: str, code: str) -> None:
     """Evaluate JavaScript with a REF element as the argument."""
     try:
-        _ok(send_command("eval_on", {"ref": _strip_ref(ref), "code": code}))
+        _ok(send_command("eval_on", {"ref": _strip_ref(ref), "code": code}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 # ── Developer ─────────────────────────────────────────────────────────────────
@@ -799,18 +823,18 @@ def cmd_eval_on(ref: str, code: str) -> None:
 def cmd_console_start() -> None:
     """Start capturing browser console output."""
     try:
-        _ok(send_command("console_start"))
+        _ok(send_command("console_start", start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("console-stop", context_settings=CONTEXT_SETTINGS)
 def cmd_console_stop() -> None:
     """Stop capturing browser console output."""
     try:
-        _ok(send_command("console_stop"))
+        _ok(send_command("console_stop", start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("console", context_settings=CONTEXT_SETTINGS)
@@ -823,9 +847,9 @@ def cmd_console_stop() -> None:
 def cmd_console(type_filter: str | None, no_clear: bool) -> None:
     """Get captured console messages."""
     try:
-        _ok(send_command("console", {"filter": type_filter, "clear": not no_clear}))
+        _ok(send_command("console", {"filter": type_filter, "clear": not no_clear}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("trace-start", context_settings=CONTEXT_SETTINGS)
@@ -839,9 +863,9 @@ def cmd_trace_start(no_screenshots: bool, no_snapshots: bool) -> None:
         _ok(send_command("trace_start", {
             "no_screenshots": no_screenshots,
             "no_snapshots": no_snapshots,
-        }))
+        }, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("trace-stop", context_settings=CONTEXT_SETTINGS)
@@ -850,9 +874,9 @@ def cmd_trace_stop(path: str) -> None:
     """Stop tracing and save the trace to PATH (.zip)."""
     try:
         abs_path = os.path.abspath(path)
-        _ok(send_command("trace_stop", {"path": abs_path}))
+        _ok(send_command("trace_stop", {"path": abs_path}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("trace-chunk", context_settings=CONTEXT_SETTINGS)
@@ -860,9 +884,9 @@ def cmd_trace_stop(path: str) -> None:
 def cmd_trace_chunk(title: str) -> None:
     """Add a named chunk/annotation to the current trace."""
     try:
-        _ok(send_command("trace_chunk", {"title": title}))
+        _ok(send_command("trace_chunk", {"title": title}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("video-start", context_settings=CONTEXT_SETTINGS)
@@ -871,9 +895,9 @@ def cmd_trace_chunk(title: str) -> None:
 def cmd_video_start(width: int | None, height: int | None) -> None:
     """Start video recording."""
     try:
-        _ok(send_command("video_start", {"width": width, "height": height}))
+        _ok(send_command("video_start", {"width": width, "height": height}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("video-stop", context_settings=CONTEXT_SETTINGS)
@@ -882,9 +906,9 @@ def cmd_video_stop(path: str | None) -> None:
     """Stop video recording and save to PATH (optional)."""
     try:
         abs_path = os.path.abspath(path) if path else None
-        _ok(send_command("video_stop", {"path": abs_path}))
+        _ok(send_command("video_stop", {"path": abs_path}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -893,9 +917,10 @@ def cmd_video_stop(path: str | None) -> None:
 def cmd_close() -> None:
     """Close the browser and stop the daemon."""
     try:
+        click.echo("Closing browser session...", err=True)
         _ok(send_command("close", {}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
 
 
 @cli.command("resize", context_settings=CONTEXT_SETTINGS)
@@ -904,6 +929,49 @@ def cmd_close() -> None:
 def cmd_resize(width: int, height: int) -> None:
     """Resize the browser viewport to WIDTH × HEIGHT pixels."""
     try:
-        _ok(send_command("resize", {"width": width, "height": height}))
+        _ok(send_command("resize", {"width": width, "height": height}, start_if_needed=False))
     except Exception as exc:
-        _err(str(exc))
+        _err(exc)
+
+
+# ── Utility ──────────────────────────────────────────────────────────────────
+
+@cli.command("commands", context_settings=CONTEXT_SETTINGS)
+@click.option("--section", "section_name", default=None,
+              help="Show CLI commands in one section (e.g. navigation, capture, verify).")
+@click.option("--list-sections", is_flag=True, default=False,
+              help="List available CLI sections.")
+def cmd_commands(
+    section_name: str | None,
+    list_sections: bool,
+) -> None:
+    """Show CLI section info and command descriptions."""
+    lines: list[str] = []
+
+    if list_sections:
+        lines.append("Sections:")
+        for category, commands in CLI_HELP_SECTION_SPECS:
+            lines.append(f"- {category.name.lower()}: {len(commands)} commands")
+
+    if section_name:
+        try:
+            category = _resolve_section(section_name)
+        except ValueError as exc:
+            _err(exc)
+            return
+
+        commands = []
+        for section_category, section_commands in CLI_HELP_SECTION_SPECS:
+            if section_category == category:
+                commands = section_commands
+                break
+        lines.append(f"Section {category.name.lower()} ({len(commands)} commands):")
+        for name in commands:
+            _meta = CLI_COMMAND_META.get(name)
+            desc = _meta[1] if _meta else ""
+            lines.append(f"- {name}: {desc}")
+
+    if not lines:
+        lines.append("Use --list-sections or --section NAME.")
+
+    _ok("\n".join(lines))

@@ -88,7 +88,7 @@ Browser method used to supply the page state to an LLM. It calls `browser.get_sn
 
 | Parameter         | Type | Default | Description |
 |-------------------|------|---------|-------------|
-| `start_from_char` | int  | 0       | Character offset for pagination. Use the `next_start_char` from the truncation notice to get the next segment. |
+| `start_from_char` | int  | 0       | Character offset for pagination. Must be `>= 0`. Use the `next_start_char` from the truncation notice to get the next segment. |
 | `interactive`     | bool | False   | Same as `SnapshotOptions.interactive`: only interactive elements, flattened. |
 | `full_page`       | bool | True    | Same as `SnapshotOptions.full_page`: include all elements regardless of viewport position. |
 
@@ -117,7 +117,7 @@ The character limit can be adjusted via the `BRIDGIC_MAX_CHARS` environment vari
 
 Typical flow:
 
-1. Navigate: `await browser.navigate_to_url(url)`.
+1. Navigate: `await browser.navigate_to(url)`.
 2. Get state: `state = await browser.get_snapshot_text()` (or `snapshot = await browser.get_snapshot()`).
 3. LLM (or your code) reads the tree and picks a ref, e.g. `e5`.
 4. Interact: use tools like `await browser.click_element_by_ref("e5")`.

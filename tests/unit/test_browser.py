@@ -2,6 +2,7 @@
 Unit tests for the Browser class.
 """
 
+import asyncio
 import os
 import tempfile
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 
+from bridgic.browser.errors import InvalidInputError, OperationError, StateError
 from bridgic.browser.session import Browser, StealthConfig
 
 
@@ -69,6 +71,18 @@ class TestBrowserInitialization:
         assert browser.stealth_enabled is True
         assert browser.stealth_config.enable_extensions is False
         assert browser.stealth_config.disable_security is True
+
+    def test_devtools_forces_headless_false(self):
+        """Test that devtools forces headless=False."""
+        browser = Browser(headless=True, devtools=True)
+
+        assert browser.headless is False
+
+    def test_no_viewport_conflict_raises(self):
+        """Test that viewport and no_viewport cannot be used together."""
+        with pytest.raises(InvalidInputError) as exc_info:
+            Browser(viewport={"width": 800, "height": 600}, no_viewport=True)
+        assert exc_info.value.code == "VIEWPORT_CONFLICT"
 
     def test_headless_false_with_stealth_extensions(self):
         """Test that stealth with extensions forces persistent context."""
@@ -179,6 +193,14 @@ class TestBrowserContextOptions:
 
         assert options["viewport"] == {"width": 1920, "height": 1080}
 
+    def test_context_options_no_viewport(self):
+        """Test no_viewport disables viewport and passes through flag."""
+        browser = Browser(stealth=False, no_viewport=True)
+        options = browser._get_context_options()
+
+        assert "viewport" not in options
+        assert options["no_viewport"] is True
+
     def test_context_options_with_stealth(self):
         """Test context options include stealth settings."""
         browser = Browser(stealth=True)
@@ -263,6 +285,23 @@ class TestBrowserStartStop:
             assert mock_playwright.chromium.launch.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_start_rolls_back_on_launch_failure(self, mock_playwright):
+        """If launch fails after playwright starts, partial state should be cleaned up."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            mock_playwright.chromium.launch = AsyncMock(side_effect=RuntimeError("launch failed"))
+
+            browser = Browser(stealth=False)
+            with pytest.raises(RuntimeError, match="launch failed"):
+                await browser.start()
+
+            assert browser._playwright is None
+            assert browser._browser is None
+            assert browser._context is None
+            assert browser._page is None
+            mock_playwright.stop.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_kill_cleanup(self, mock_playwright, mock_context, mock_page):
         """Test that stop cleans up all resources."""
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
@@ -337,8 +376,8 @@ class TestBrowserStartStop:
             page.video.path = AsyncMock(return_value="/tmp/playwright-video.webm")
 
             context_key = browser_module._get_context_key(context)
-            browser_module._tracing_state[context_key] = True
-            browser_module._video_state[context_key] = True
+            browser._tracing_state[context_key] = True
+            browser._video_state[context_key] = True
 
             with patch.object(browser_module.tempfile, "mkstemp", return_value=(99, "/tmp/auto_trace.zip")):
                 with patch.object(browser_module.os, "close"):
@@ -350,8 +389,8 @@ class TestBrowserStartStop:
             assert browser._last_shutdown_artifacts["video"] == [
                 os.path.abspath("/tmp/playwright-video.webm")
             ]
-            assert context_key not in browser_module._tracing_state
-            assert context_key not in browser_module._video_state
+            assert context_key not in browser._tracing_state
+            assert context_key not in browser._video_state
 
     @pytest.mark.asyncio
     async def test_browser_close_reports_auto_saved_paths(self, mock_playwright):
@@ -377,8 +416,8 @@ class TestBrowserStartStop:
             page.video.path = AsyncMock(return_value="/tmp/auto_video.webm")
 
             context_key = browser_module._get_context_key(context)
-            browser_module._tracing_state[context_key] = True
-            browser_module._video_state[context_key] = True
+            browser._tracing_state[context_key] = True
+            browser._video_state[context_key] = True
 
             with patch.object(browser_module.tempfile, "mkstemp", return_value=(88, "/tmp/auto_trace_2.zip")):
                 with patch.object(browser_module.os, "close"):
@@ -409,7 +448,7 @@ class TestBrowserStartStop:
             context.pages = [page]
 
             context_key = browser_module._get_context_key(context)
-            browser_module._tracing_state[context_key] = True
+            browser._tracing_state[context_key] = True
 
             temp_trace_path = "/tmp/auto_trace_failed.zip"
 
@@ -447,28 +486,51 @@ class TestBrowserStartStop:
             page.video.path = AsyncMock(return_value="/tmp/auto_listener_video.webm")
 
             context_key = browser_module._get_context_key(context)
-            browser_module._video_state[context_key] = True
+            browser._video_state[context_key] = True
 
             page_key = browser_module._get_page_key(page)
             console_handler = MagicMock()
             network_handler = MagicMock()
             dialog_handler = MagicMock()
-            browser_module._console_handlers[page_key] = console_handler
-            browser_module._network_handlers[page_key] = network_handler
-            browser_module._dialog_handlers[page_key] = dialog_handler
-            browser_module._console_messages[page_key] = [{"type": "log", "text": "x"}]
-            browser_module._network_requests[page_key] = [{"url": "https://example.com"}]
+            browser._console_handlers[page_key] = console_handler
+            browser._network_handlers[page_key] = network_handler
+            browser._dialog_handlers[page_key] = dialog_handler
+            browser._console_messages[page_key] = [{"type": "log", "text": "x"}]
+            browser._network_requests[page_key] = [{"url": "https://example.com"}]
 
             await browser.stop()
 
             page.remove_listener.assert_any_call("console", console_handler)
             page.remove_listener.assert_any_call("request", network_handler)
             page.remove_listener.assert_any_call("dialog", dialog_handler)
-            assert page_key not in browser_module._console_handlers
-            assert page_key not in browser_module._network_handlers
-            assert page_key not in browser_module._dialog_handlers
-            assert page_key not in browser_module._console_messages
-            assert page_key not in browser_module._network_requests
+            assert page_key not in browser._console_handlers
+            assert page_key not in browser._network_handlers
+            assert page_key not in browser._dialog_handlers
+            assert page_key not in browser._console_messages
+            assert page_key not in browser._network_requests
+
+    @pytest.mark.asyncio
+    async def test_stop_adds_warning_when_context_close_times_out(self, mock_playwright):
+        """stop() should not hang forever if context.close blocks."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser.start()
+
+            async def _slow_close():
+                await asyncio.sleep(1.0)
+
+            assert browser._context is not None
+            browser._context.close = AsyncMock(side_effect=_slow_close)
+            browser._CONTEXT_CLOSE_TIMEOUT = 0.01
+
+            await browser.stop()
+
+            assert any(
+                warning.startswith("context.close: timeout after")
+                for warning in browser._last_shutdown_errors
+            )
 
 
 class TestBrowserNavigation:
@@ -506,6 +568,46 @@ class TestBrowserNavigation:
             assert browser._last_snapshot is None
             assert browser._last_snapshot_url is None
 
+    @pytest.mark.asyncio
+    async def test_navigate_to_empty_url_raises_invalid_input(self):
+        browser = Browser(stealth=False)
+
+        with pytest.raises(InvalidInputError) as exc_info:
+            await browser.navigate_to("   ")
+        assert exc_info.value.code == "URL_EMPTY"
+
+    @pytest.mark.asyncio
+    async def test_navigate_to_wraps_playwright_errors(self, mock_playwright, mock_page):
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            mock_page.goto = AsyncMock(side_effect=RuntimeError("boom"))
+
+            browser = Browser(stealth=False)
+            await browser.start()
+
+            with pytest.raises(OperationError):
+                await browser.navigate_to("https://example.com")
+
+
+class TestBrowserSnapshot:
+    """Tests for Browser snapshot methods."""
+
+    @pytest.mark.asyncio
+    async def test_get_snapshot_without_page_raises_state_error(self):
+        browser = Browser(stealth=False)
+
+        with pytest.raises(StateError) as exc_info:
+            await browser.get_snapshot()
+        assert exc_info.value.code == "NO_ACTIVE_PAGE"
+
+    @pytest.mark.asyncio
+    async def test_navigate_to_without_context_raises_state_error(self):
+        browser = Browser(stealth=False)
+
+        with pytest.raises(StateError) as exc_info:
+            await browser.navigate_to("https://example.com")
+        assert exc_info.value.code == "NO_BROWSER_CONTEXT"
+
 
 class TestBrowserPageManagement:
     """Tests for Browser page management methods."""
@@ -523,6 +625,14 @@ class TestBrowserPageManagement:
 
             assert new_page is not None
             mock_context.new_page.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_new_page_without_context_raises_state_error(self):
+        browser = Browser(stealth=False)
+
+        with pytest.raises(StateError) as exc_info:
+            await browser.new_page()
+        assert exc_info.value.code == "NO_BROWSER_CONTEXT"
 
     @pytest.mark.asyncio
     async def test_get_pages(self, mock_playwright, mock_context, mock_page):

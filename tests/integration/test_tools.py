@@ -10,7 +10,7 @@ Test Organization:
 - ref-based tools use a pre-generated snapshot for consistent element references
 
 Tool Coverage (67 tools, aligned with CLI sections):
-- Navigation (6): navigate_to_url, search, get_current_page_info_str, reload_page, go_back, go_forward
+- Navigation (6): navigate_to, search, get_current_page_info_str, reload_page, go_back, go_forward
 - Snapshot (1): get_snapshot_text
 - Element Interaction (13): click_element_by_ref, input_text_by_ref, fill_form,
                scroll_element_into_view_by_ref, select_dropdown_option_by_ref,
@@ -125,12 +125,12 @@ async def browser_with_complete_snapshot(browser):
 # ==================== 1. Navigation Tools (4 tools) ====================
 
 class TestNavigationTools:
-    """Tests: navigate_to_url, go_back, go_forward, search"""
+    """Tests: navigate_to, go_back, go_forward, search"""
 
     @pytest.mark.asyncio
-    async def test_navigate_to_url(self, browser):
+    async def test_navigate_to(self, browser):
         test_url = f"file://{TEST_PAGE_PATH.absolute()}"
-        result = await browser.navigate_to_url(test_url)
+        result = await browser.navigate_to(test_url)
         assert "Navigated to" in result
 
     @pytest.mark.asyncio
@@ -201,7 +201,7 @@ class TestPageTools:
         assert re.search(r"\bpage_\d+\b", result), result
 
         test_url = f"file://{TEST_PAGE_PATH.absolute()}"
-        await browser.navigate_to_url(test_url)
+        await browser.navigate_to(test_url)
 
         result_str = await browser.get_tabs()
         assert len(result_str.split("\n")) == 2
@@ -579,7 +579,7 @@ class TestNetworkTools:
 
         # Trigger a navigation (which creates network requests)
         test_url = f"file://{TEST_PAGE_PATH.absolute()}"
-        await browser.navigate_to_url(test_url)
+        await browser.navigate_to(test_url)
 
         reqs = await browser.get_network_requests(include_static=True)
         assert reqs is not None

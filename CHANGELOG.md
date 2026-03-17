@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Multi-page/tab support with page descriptions
 
 - **Tool System** (67 tools organized by category)
-  - Navigation: navigate_to_url, search, get_current_page_info_str, reload_page, go_back, go_forward
+  - Navigation: navigate_to, search, get_current_page_info_str, reload_page, go_back, go_forward
   - Snapshot: get_snapshot_text
   - Element Interaction: click, input_text, fill_form, scroll_into_view, select, options, check, uncheck, focus, hover, double_click, upload, drag (all by ref)
   - Tabs: get_tabs, new_tab, switch_tab, close_tab
@@ -37,15 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Developer: console capture, tracing, video recording
   - Lifecycle: browser_close, browser_resize
 
-- **Tool Presets**
-  - MINIMAL: 9 tools for basic navigation
-  - NAVIGATION: 3 tools for navigation
-  - SCRAPING: 10 tools for data extraction
-  - FORM_FILLING: 18 tools for form automation
-  - TESTING: 26 tools for E2E testing
-  - INTERACTIVE: 32 tools for full interaction
-  - DEVELOPER: 23 tools for development
-  - COMPLETE: 67 tools (all available)
+- **Tool Selection via ToolCategory**
+  - 15 named categories: NAVIGATION, SNAPSHOT, ELEMENT_INTERACTION, TABS, EVALUATE, KEYBOARD, MOUSE, WAIT, CAPTURE, NETWORK, DIALOG, STORAGE, VERIFY, DEVELOPER, LIFECYCLE
+  - `BrowserToolSetBuilder.for_categories(browser, ToolCategory.NAVIGATION, ...)` — select by category
+  - `BrowserToolSetBuilder.for_tool_names(browser, "click_element_by_ref", ...)` — select by method name
+  - `ToolCategory.ALL` — include all 67 tools
 
 - **AI-Friendly Architecture**
   - Element reference system (refs) for stable element identification

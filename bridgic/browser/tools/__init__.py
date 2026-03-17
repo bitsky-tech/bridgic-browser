@@ -2,52 +2,48 @@
 Browser automation tools module.
 
 This module provides browser automation tools that can be used with Bridgic agents.
-Use BrowserToolSetBuilder with ToolPreset for scenario-based tool selection.
+Use BrowserToolSetBuilder with category-based tool selection.
 
 Quick Start
 -----------
 >>> from bridgic.browser.session import Browser
->>> from bridgic.browser.tools import BrowserToolSetBuilder, ToolPreset
+>>> from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
 >>>
 >>> browser = Browser(headless=False)
 >>> await browser.start()
 >>>
->>> # Choose a preset for your use case
->>> builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.MINIMAL)
->>> tools = builder.build()["tool_specs"]
->>> builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)
->>> tools = builder.build()["tool_specs"]
->>> builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.TESTING)
+>>> # Select by category
+>>> builder = BrowserToolSetBuilder.for_categories(
+...     browser, ToolCategory.NAVIGATION, ToolCategory.ELEMENT_INTERACTION,
+... )
 >>> tools = builder.build()["tool_specs"]
 >>>
->>> # Or select by category
->>> builder = BrowserToolSetBuilder.for_categories(browser, "navigation", "element_interaction")
+>>> # Select all tools
+>>> builder = BrowserToolSetBuilder.for_categories(browser, ToolCategory.ALL)
 >>> tools = builder.build()["tool_specs"]
 >>>
 >>> # Or select by tool method names
 >>> builder = BrowserToolSetBuilder.for_tool_names(
 ...     browser,
 ...     "search",
-...     "navigate_to_url",
+...     "navigate_to",
 ...     "click_element_by_ref",
 ... )
 >>> tools = builder.build()["tool_specs"]
 >>>
 >>> # Combine builders from different selection strategies
->>> builder1 = BrowserToolSetBuilder.for_categories(browser, "navigation", "element_interaction")
+>>> builder1 = BrowserToolSetBuilder.for_categories(
+...     browser, ToolCategory.NAVIGATION, ToolCategory.ELEMENT_INTERACTION,
+... )
 >>> builder2 = BrowserToolSetBuilder.for_tool_names(browser, "verify_url")
 >>> tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 
-Available Presets
------------------
-- MINIMAL: Minimal browser control mapped from CLI preset
-- NAVIGATION: Navigation-only mapped from CLI preset
-- SCRAPING: Scraping-focused mapped from CLI preset
-- FORM_FILLING: Form filling mapped from CLI preset
-- TESTING: Testing mapped from CLI preset
-- INTERACTIVE: Interactive mapped from CLI preset
-- DEVELOPER: Developer mapped from CLI preset
-- COMPLETE: All CLI-mapped tools
+Available Categories (ToolCategory enum)
+----------------------------------------
+NAVIGATION, SNAPSHOT, ELEMENT_INTERACTION, TABS, EVALUATE, KEYBOARD,
+MOUSE, WAIT, CAPTURE, NETWORK, DIALOG, STORAGE, VERIFY, DEVELOPER, LIFECYCLE
+
+Pass ``ToolCategory.ALL`` to ``for_categories()`` to include every tool.
 
 Return Value Format
 -------------------
@@ -57,10 +53,10 @@ All tools return a string message following a consistent format:
 - Action confirmation: "Clicked element e1", "Navigated to https://..."
 - Data results: JSON string or formatted text
 
-**Error messages**:
-- Element not found: "Element ref {ref} is not available - page may have changed."
-- Operation failed: "Failed to {action}: {error details}"
-- Invalid input: "{parameter} is empty/invalid"
+**Exceptions raised**:
+- Element not found: raises `StateError` with message "Element ref {ref} is not available - page may have changed."
+- Operation failed: raises `OperationError` with message "Failed to {action}: {error details}"
+- Invalid input: raises `InvalidInputError` with message "{parameter} is empty/invalid"
 
 **Verification tools** use special prefixes:
 - Success: "PASS: {description}"
@@ -103,13 +99,12 @@ Use **coordinate-based tools** (e.g., `mouse_click`) when:
 """
 
 # ==================== Tool Spec and Builder ====================
+from .._constants import ToolCategory
 from ._browser_tool_spec import BrowserToolSpec
-from .._constants import ToolPreset
 from ._browser_tool_set_builder import BrowserToolSetBuilder
 
 __all__ = [
-    # Core classes
+    "ToolCategory",
     "BrowserToolSpec",
     "BrowserToolSetBuilder",
-    "ToolPreset",
 ]

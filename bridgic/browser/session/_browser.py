@@ -3,9 +3,10 @@ import base64
 import json
 import logging
 import os
+import sys
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Union, NoReturn
 
 if TYPE_CHECKING:
     try:
@@ -31,23 +32,85 @@ from ._browser_model import FullPageInfo, PageDesc, PageInfo, PageSizeInfo
 from ._stealth import StealthConfig, StealthArgsBuilder
 from ._download import DownloadManager, DownloadedFile
 from ..utils import find_page_by_id, generate_page_id, model_to_llm_string
+from ..errors import (
+    BridgicBrowserError,
+    InvalidInputError,
+    OperationError,
+    StateError,
+    VerificationError,
+)
 
 logger = logging.getLogger(__name__)
 
 _MAX_CHAR_LIMIT = int(os.environ.get("BRIDGIC_MAX_CHARS", "30000"))
 
-# Storage for console messages, network requests, and dialog handlers per page
-# Module-level so data persists across method calls on the same page object
-_console_messages: dict = {}
-_network_requests: dict = {}
-_console_handlers: dict = {}
-_network_handlers: dict = {}
-_dialog_handlers: dict = {}
 
-# Storage for tracing and video state per context
-_tracing_state: dict = {}
-_video_state: dict = {}
+def _raise_invalid_input(
+    message: str,
+    *,
+    code: str = "INVALID_INPUT",
+    details: Optional[Dict[str, Any]] = None,
+    retryable: bool = False,
+) -> NoReturn:
+    raise InvalidInputError(
+        message,
+        code=code,
+        details=details,
+        retryable=retryable,
+    )
 
+
+def _raise_state_error(
+    message: str,
+    *,
+    code: str = "INVALID_STATE",
+    details: Optional[Dict[str, Any]] = None,
+    retryable: bool = True,
+) -> NoReturn:
+    raise StateError(
+        message,
+        code=code,
+        details=details,
+        retryable=retryable,
+    )
+
+
+def _raise_operation_error(
+    message: str,
+    *,
+    code: str = "OPERATION_FAILED",
+    details: Optional[Dict[str, Any]] = None,
+    retryable: bool = False,
+) -> NoReturn:
+    current_exc = sys.exc_info()[1]
+    if isinstance(current_exc, BridgicBrowserError):
+        raise current_exc
+
+    raise OperationError(
+        message,
+        code=code,
+        details=details,
+        retryable=retryable,
+    )
+
+
+def _raise_verification_error(
+    message: str,
+    *,
+    code: str = "VERIFICATION_FAILED",
+    details: Optional[Dict[str, Any]] = None,
+    retryable: bool = False,
+) -> NoReturn:
+    current_exc = sys.exc_info()[1]
+    if isinstance(current_exc, BridgicBrowserError):
+        raise current_exc
+
+    raise VerificationError(
+        message,
+        code=code,
+        details=details,
+        retryable=retryable,
+    )
 
 def _get_page_key(page) -> str:
     """Get a unique key for a page."""
@@ -57,40 +120,6 @@ def _get_page_key(page) -> str:
 def _get_context_key(context) -> str:
     """Get a unique key for a context."""
     return str(id(context))
-
-
-def _clear_page_scoped_state(page: Optional[Page], errors: Optional[List[str]] = None) -> None:
-    """Detach page-scoped listeners and drop cached state for one page."""
-    if page is None:
-        return
-
-    page_key = _get_page_key(page)
-
-    if page_key in _console_handlers:
-        handler = _console_handlers.pop(page_key)
-        try:
-            page.remove_listener("console", handler)
-        except Exception as e:
-            if errors is not None:
-                errors.append(f"console.remove_listener: {e}")
-    _console_messages.pop(page_key, None)
-
-    if page_key in _network_handlers:
-        handler = _network_handlers.pop(page_key)
-        try:
-            page.remove_listener("request", handler)
-        except Exception as e:
-            if errors is not None:
-                errors.append(f"network.remove_listener: {e}")
-    _network_requests.pop(page_key, None)
-
-    if page_key in _dialog_handlers:
-        handler = _dialog_handlers.pop(page_key)
-        try:
-            page.remove_listener("dialog", handler)
-        except Exception as e:
-            if errors is not None:
-                errors.append(f"dialog.remove_listener: {e}")
 
 
 def _css_attr_equals(name: str, value: str) -> str:
@@ -367,7 +396,19 @@ class Browser:
     ):
         # Store all parameters
         self._headless = headless
-        self._viewport = viewport or {"width": 1920, "height": 1080}
+        self._no_viewport = bool(kwargs.get("no_viewport", False))
+        if devtools:
+            self._headless = False
+        if self._no_viewport:
+            if viewport is not None:
+                raise InvalidInputError(
+                    "viewport must be None when no_viewport=True",
+                    code="VIEWPORT_CONFLICT",
+                    details={"viewport": viewport},
+                )
+            self._viewport = None
+        else:
+            self._viewport = viewport or {"width": 1920, "height": 1080}
         self._user_data_dir = Path(user_data_dir).expanduser() if user_data_dir else None
 
         # Stealth configuration
@@ -422,9 +463,24 @@ class Browser:
         self._last_snapshot: Optional[EnhancedSnapshot] = None
         self._last_snapshot_url: Optional[str] = None
         self._snapshot_generator: Optional[SnapshotGenerator] = None
+        self._snapshot_lock = asyncio.Lock()
         # Artifacts auto-saved during shutdown (trace/video)
         self._last_shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
         self._last_shutdown_errors: List[str] = []
+
+        # Page-scoped state (keyed by _get_page_key)
+        self._console_messages: Dict[str, List[Dict[str, Any]]] = {}
+        self._network_requests: Dict[str, List[Dict[str, Any]]] = {}
+        self._console_handlers: Dict[str, Any] = {}
+        self._network_handlers: Dict[str, Any] = {}
+        self._dialog_handlers: Dict[str, Any] = {}
+        # Context-scoped state (keyed by _get_context_key)
+        self._tracing_state: Dict[str, bool] = {}
+        self._video_state: Dict[str, bool] = {}
+        # Deferred video save requests from stop_video(): context_key → target filename.
+        # None means save to the Playwright temp path (stop_video called without filename).
+        # Key absent means stop_video was not called for this context.
+        self._pending_video_save_path: Dict[str, Optional[str]] = {}
 
     # ==================== Properties ====================
 
@@ -474,8 +530,8 @@ class Browser:
         return self._headless
 
     @property
-    def viewport(self) -> ViewportSize:
-        """Current viewport size configuration."""
+    def viewport(self) -> Optional[ViewportSize]:
+        """Current viewport size configuration (None when no_viewport=True)."""
         return self._viewport
 
     @property
@@ -499,6 +555,7 @@ class Browser:
         config = {
             "headless": self._headless,
             "viewport": self._viewport,
+            "no_viewport": self._no_viewport,
             "user_data_dir": str(self._user_data_dir) if self._user_data_dir else None,
             "stealth_enabled": self.stealth_enabled,
             "channel": self._channel,
@@ -542,8 +599,10 @@ class Browser:
 
         # Add stealth args first (if enabled)
         if self._stealth_builder:
-            viewport_width = self._viewport.get("width", 1920)
-            viewport_height = self._viewport.get("height", 1080)
+            fallback_viewport = {"width": 1920, "height": 1080}
+            viewport = self._viewport or fallback_viewport
+            viewport_width = viewport.get("width", 1920)
+            viewport_height = viewport.get("height", 1080)
             stealth_args = self._stealth_builder.build_args(viewport_width, viewport_height)
             args_list.extend(stealth_args)
 
@@ -627,7 +686,7 @@ class Browser:
                 options["screen"] = self._viewport.copy()
 
         # Add non-None context parameters (user values override stealth defaults)
-        if self._viewport is not None:
+        if self._viewport is not None and not self._no_viewport:
             options["viewport"] = self._viewport
         if self._user_agent is not None:
             options["user_agent"] = self._user_agent
@@ -729,44 +788,97 @@ class Browser:
             )
             logger.info(f"Stealth mode enabled (extensions={extensions_enabled})")
 
-        self._playwright = await async_playwright().start()
+        try:
+            self._playwright = await async_playwright().start()
 
-        if self.use_persistent_context:
-            # Mode 1: Persistent context (with user_data_dir or stealth extensions)
-            logger.info("Using persistent context mode")
-            persistent_options = self._get_persistent_context_options()
-            logger.debug(f"Persistent context options: {persistent_options}")
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                **persistent_options
+            if self.use_persistent_context:
+                # Mode 1: Persistent context (with user_data_dir or stealth extensions)
+                logger.info("Using persistent context mode")
+                persistent_options = self._get_persistent_context_options()
+                logger.debug(f"Persistent context options: {persistent_options}")
+                self._context = await self._playwright.chromium.launch_persistent_context(
+                    **persistent_options
+                )
+                self._browser = self._context.browser
+            else:
+                # Mode 2: Normal launch + new_context (without user_data_dir)
+                logger.info("Using normal launch mode")
+                launch_options = self._get_launch_options()
+                logger.debug(f"Launch options: {launch_options}")
+                self._browser = await self._playwright.chromium.launch(**launch_options)
+
+                context_options = self._get_context_options()
+                logger.debug(f"Context options: {context_options}")
+                self._context = await self._browser.new_context(**context_options)
+
+            # Auto create a new page if no page is open
+            pages = self._context.pages
+            if len(pages) > 0:
+                self._page = pages[0]
+            else:
+                self._page = await self._context.new_page()
+
+            # Attach download manager to handle downloads with correct filenames
+            if self._download_manager:
+                self._download_manager.attach_to_context(self._context)
+                logger.info(
+                    f"Download manager attached, saving to: {self._download_manager.downloads_path}"
+                )
+
+            logger.info(
+                f"Playwright started (persistent_context={self.use_persistent_context}, "
+                f"stealth={self.stealth_enabled})"
             )
-            self._browser = self._context.browser
-        else:
-            # Mode 2: Normal launch + new_context (without user_data_dir)
-            logger.info("Using normal launch mode")
-            launch_options = self._get_launch_options()
-            logger.debug(f"Launch options: {launch_options}")
-            self._browser = await self._playwright.chromium.launch(**launch_options)
+        except Exception:
+            logger.exception("Failed to start browser; rolling back partial startup state")
+            try:
+                await self.stop()
+            except Exception:
+                logger.exception("Failed to roll back browser startup state")
+            raise
 
-            context_options = self._get_context_options()
-            logger.debug(f"Context options: {context_options}")
-            self._context = await self._browser.new_context(**context_options)
+    # Timeout (seconds) applied to individual page.close() calls during
+    # shutdown so that a hung beforeunload handler cannot block forever.
+    _PAGE_CLOSE_TIMEOUT = 5.0
+    _TRACE_STOP_TIMEOUT = 10.0
+    _VIDEO_PATH_TIMEOUT = 10.0
+    _VIDEO_SAVE_AS_TIMEOUT = 120.0  # save_as copies a file; large recordings need more time
+    _CONTEXT_CLOSE_TIMEOUT = 10.0
+    _BROWSER_CLOSE_TIMEOUT = 10.0
+    _PLAYWRIGHT_STOP_TIMEOUT = 10.0
 
-        # Auto create a new page if no page is open
-        pages = self._context.pages
-        if len(pages) > 0:
-            self._page = pages[0]
-        else:
-            self._page = await self._context.new_page()
+    def _clear_page_scoped_state(self, page: Optional[Page], errors: Optional[List[str]] = None) -> None:
+        """Detach page-scoped listeners and drop cached state for one page."""
+        if page is None:
+            return
 
-        # Attach download manager to handle downloads with correct filenames
-        if self._download_manager:
-            self._download_manager.attach_to_context(self._context)
-            logger.info(f"Download manager attached, saving to: {self._download_manager.downloads_path}")
+        page_key = _get_page_key(page)
 
-        logger.info(
-            f"Playwright started (persistent_context={self.use_persistent_context}, "
-            f"stealth={self.stealth_enabled})"
-        )
+        if page_key in self._console_handlers:
+            handler = self._console_handlers.pop(page_key)
+            try:
+                page.remove_listener("console", handler)
+            except Exception as e:
+                if errors is not None:
+                    errors.append(f"console.remove_listener: {e}")
+        self._console_messages.pop(page_key, None)
+
+        if page_key in self._network_handlers:
+            handler = self._network_handlers.pop(page_key)
+            try:
+                page.remove_listener("request", handler)
+            except Exception as e:
+                if errors is not None:
+                    errors.append(f"network.remove_listener: {e}")
+        self._network_requests.pop(page_key, None)
+
+        if page_key in self._dialog_handlers:
+            handler = self._dialog_handlers.pop(page_key)
+            try:
+                page.remove_listener("dialog", handler)
+            except Exception as e:
+                if errors is not None:
+                    errors.append(f"dialog.remove_listener: {e}")
 
     async def stop(self) -> None:
         """Stop the browser and clean up all resources.
@@ -783,14 +895,14 @@ class Browser:
         Cleans up temporary user data directory if one was created for stealth
         extensions.
         """
-        errors = []
+        errors: List[str] = []
         shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
         context_key: Optional[str] = None
 
         # Auto-stop active tracing before context/page teardown so trace data is saved.
         if self._context:
             context_key = _get_context_key(self._context)
-            if _tracing_state.get(context_key):
+            if self._tracing_state.get(context_key):
                 output_path: Optional[str] = None
                 try:
                     os.makedirs(BRIDGIC_TMP_DIR, exist_ok=True)
@@ -800,8 +912,20 @@ class Browser:
                         dir=str(BRIDGIC_TMP_DIR),
                     )
                     os.close(fd)
-                    await self._context.tracing.stop(path=output_path)
+                    await asyncio.wait_for(
+                        self._context.tracing.stop(path=output_path),
+                        timeout=self._TRACE_STOP_TIMEOUT,
+                    )
                     shutdown_artifacts["trace"].append(os.path.abspath(output_path))
+                except asyncio.TimeoutError:
+                    if output_path and os.path.exists(output_path):
+                        try:
+                            os.remove(output_path)
+                        except Exception as cleanup_exc:
+                            errors.append(f"tracing.tmp_cleanup: {cleanup_exc}")
+                    errors.append(
+                        f"tracing.stop: timeout after {self._TRACE_STOP_TIMEOUT:.1f}s"
+                    )
                 except Exception as e:
                     if output_path and os.path.exists(output_path):
                         try:
@@ -810,34 +934,73 @@ class Browser:
                             errors.append(f"tracing.tmp_cleanup: {cleanup_exc}")
                     errors.append(f"tracing.stop: {e}")
                 finally:
-                    _tracing_state[context_key] = False
+                    self._tracing_state[context_key] = False
 
             # Always clear page-scoped listeners/caches for every context page.
             for page in list(self._context.pages):
-                _clear_page_scoped_state(page, errors)
+                self._clear_page_scoped_state(page, errors)
 
-            # Auto-save videos only when video_start() was called for this context.
-            if _video_state.get(context_key):
-                for page in list(self._context.pages):
-                    video = getattr(page, "video", None)
-                    if video is None:
-                        continue
-                    try:
-                        await page.close()
-                        video_path = await video.path()
-                        shutdown_artifacts["video"].append(os.path.abspath(str(video_path)))
-                    except Exception as e:
-                        errors.append(f"video.finalize: {e}")
-                _video_state[context_key] = False
+            # Save videos when: (a) video_start() was called and never stopped, or
+            # (b) stop_video() deferred the save to close time.
+            # Use a sentinel because pop() returns None both for "absent" and "stored None".
+            _absent: Any = object()
+            pending_save_raw = self._pending_video_save_path.pop(context_key, _absent)
+            has_pending_save = pending_save_raw is not _absent
+            pending_filename: Optional[str] = pending_save_raw if has_pending_save else None  # type: ignore[assignment]
+
+            if self._video_state.get(context_key) or has_pending_save:
+                pages_with_video = [
+                    (p, p.video)
+                    for p in list(self._context.pages)
+                    if getattr(p, "video", None) is not None
+                ]
+
+                need_suffix = len(pages_with_video) > 1
+                dest_dir: Optional[str] = None
+                dest_stem: Optional[str] = None
+                dest_ext = ".webm"
+                if pending_filename:
+                    dest_dir = os.path.dirname(pending_filename)
+                    dest_stem = os.path.splitext(os.path.basename(pending_filename))[0]
+
+                async def _finalize_video(page_: Any, video_: Any, idx: int) -> Optional[str]:
+                    await asyncio.wait_for(page_.close(), timeout=self._PAGE_CLOSE_TIMEOUT)
+                    if dest_dir is not None and dest_stem is not None:
+                        suffix = f"_{idx}" if need_suffix else ""
+                        dest = os.path.join(dest_dir, f"{dest_stem}{suffix}{dest_ext}")
+                        await asyncio.wait_for(
+                            video_.save_as(dest),
+                            timeout=self._VIDEO_SAVE_AS_TIMEOUT,
+                        )
+                        return dest
+                    vp = await asyncio.wait_for(
+                        video_.path(),
+                        timeout=self._VIDEO_PATH_TIMEOUT,
+                    )
+                    return os.path.abspath(str(vp))
+
+                results = await asyncio.gather(
+                    *(_finalize_video(p, v, i + 1) for i, (p, v) in enumerate(pages_with_video)),
+                    return_exceptions=True,
+                )
+                for r in results:
+                    if isinstance(r, BaseException):
+                        errors.append(f"video.finalize: {r}")
+                    elif r is not None:
+                        shutdown_artifacts["video"].append(r)
+
+                self._video_state[context_key] = False
                 # We may have closed the current page above.
                 self._page = None
         else:
-            _clear_page_scoped_state(self._page, errors)
+            self._clear_page_scoped_state(self._page, errors)
 
-        # Close page
+        # Close page (with timeout to guard against hung beforeunload handlers)
         if self._page:
             try:
-                await self._page.close()
+                await asyncio.wait_for(
+                    self._page.close(), timeout=self._PAGE_CLOSE_TIMEOUT,
+                )
             except Exception as e:
                 errors.append(f"page.close: {e}")
             self._page = None
@@ -853,7 +1016,14 @@ class Browser:
         # NOTE: In persistent context mode, closing context will auto close browser
         if self._context:
             try:
-                await self._context.close()
+                await asyncio.wait_for(
+                    self._context.close(),
+                    timeout=self._CONTEXT_CLOSE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                errors.append(
+                    f"context.close: timeout after {self._CONTEXT_CLOSE_TIMEOUT:.1f}s"
+                )
             except Exception as e:
                 errors.append(f"context.close: {e}")
             self._context = None
@@ -862,7 +1032,14 @@ class Browser:
         # In persistent context mode, browser is None or already closed
         if self._browser:
             try:
-                await self._browser.close()
+                await asyncio.wait_for(
+                    self._browser.close(),
+                    timeout=self._BROWSER_CLOSE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                errors.append(
+                    f"browser.close: timeout after {self._BROWSER_CLOSE_TIMEOUT:.1f}s"
+                )
             except Exception as e:
                 errors.append(f"browser.close: {e}")
             self._browser = None
@@ -870,20 +1047,32 @@ class Browser:
         # Stop playwright
         if self._playwright:
             try:
-                await self._playwright.stop()
+                await asyncio.wait_for(
+                    self._playwright.stop(),
+                    timeout=self._PLAYWRIGHT_STOP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                errors.append(
+                    f"playwright.stop: timeout after {self._PLAYWRIGHT_STOP_TIMEOUT:.1f}s"
+                )
             except Exception as e:
                 errors.append(f"playwright.stop: {e}")
             self._playwright = None
 
-        # Clean up temporary user data directory (created for stealth extensions)
+        # Clean up temporary user data directory in a thread so the synchronous
+        # shutil.rmtree (potentially large cache trees) does not block the loop.
         if self._temp_user_data_dir:
+            tmp_dir = self._temp_user_data_dir
+            self._temp_user_data_dir = None
             try:
                 import shutil
-                shutil.rmtree(self._temp_user_data_dir, ignore_errors=True)
-                logger.debug(f"Cleaned up temporary user data dir: {self._temp_user_data_dir}")
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None, lambda: shutil.rmtree(tmp_dir, ignore_errors=True),
+                )
+                logger.debug(f"Cleaned up temporary user data dir: {tmp_dir}")
             except Exception as e:
                 errors.append(f"temp_dir cleanup: {e}")
-            self._temp_user_data_dir = None
 
         # Clear snapshot cache
         self._last_snapshot = None
@@ -893,8 +1082,18 @@ class Browser:
 
         # Clear context-scoped state caches once the context is gone.
         if context_key is not None:
-            _tracing_state.pop(context_key, None)
-            _video_state.pop(context_key, None)
+            self._tracing_state.pop(context_key, None)
+            self._video_state.pop(context_key, None)
+
+        # Flush all remaining state so a stopped instance holds no stale refs.
+        self._console_messages.clear()
+        self._network_requests.clear()
+        self._console_handlers.clear()
+        self._network_handlers.clear()
+        self._dialog_handlers.clear()
+        self._tracing_state.clear()
+        self._video_state.clear()
+        self._pending_video_save_path.clear()
 
         if errors:
             logger.warning(f"Browser stopped with errors: {errors}")
@@ -923,13 +1122,13 @@ class Browser:
         url: str,
         wait_until: Literal["domcontentloaded", "load", "networkidle", "commit"] = "domcontentloaded",
         timeout: Optional[float] = None,
-    ) -> None:
-        """Navigate current page to the specified URL.
+    ) -> str:
+        """Navigate to URL in current tab. Use new_tab(url) for new tab.
 
         Parameters
         ----------
         url : str
-            The URL to navigate to.
+            URL to navigate to. Auto-prepends "http://" if missing protocol.
         wait_until : str, default "domcontentloaded"
             When to consider navigation complete.
             - "domcontentloaded": DOM is parsed (fast, recommended for SPAs).
@@ -938,22 +1137,55 @@ class Browser:
             - "commit": Response received from server.
         timeout : float, optional
             Maximum time in milliseconds. Defaults to Playwright's 30000ms.
-        """
-        if not self._page:
-            logger.warning("No page is open, creating a new page")
-            if self._context:
-                self._page = await self._context.new_page()
-            else:
-                await self.start()
 
-        logger.info(f"Navigating to {url}")
-        kwargs: Dict[str, Any] = {"wait_until": wait_until}
-        if timeout is not None:
-            kwargs["timeout"] = timeout
-        await self._page.goto(url, **kwargs)
-        # Update cache
-        self._last_snapshot = None
-        self._last_snapshot_url = None
+        Returns
+        -------
+        str
+            Result message.
+        """
+        try:
+            logger.info(f"[navigate_to] start url={url}")
+
+            url = url.strip()
+            if not url:
+                _raise_invalid_input("URL cannot be empty", code="URL_EMPTY")
+
+            url_lower = url.lower()
+            has_scheme = "://" in url or url_lower.startswith(("data:", "about:", "javascript:", "vbscript:"))
+            if not has_scheme:
+                if not url.startswith("/"):
+                    url = f"http://{url}"
+                # else: URLs starting with '/' are absolute paths; passed as-is and will
+                # fail at navigation time with a clear Playwright error (intentional).
+
+            if not self._page:
+                if not self._context:
+                    _raise_state_error(
+                        "No browser context is open. Call start() first.",
+                        code="NO_BROWSER_CONTEXT",
+                    )
+                logger.info("No page is open, creating a new page in existing context")
+                self._page = await self._context.new_page()
+
+            kwargs: Dict[str, Any] = {"wait_until": wait_until}
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            await self._page.goto(url, **kwargs)
+            # Update cache
+            self._last_snapshot = None
+            self._last_snapshot_url = None
+            page = await self.get_current_page()
+            actual_url = page.url if page else url
+            result = f"Navigated to: {actual_url}"
+
+            logger.info(f"[navigate_to] done {result}")
+            return result
+        except BridgicBrowserError:
+            raise
+        except Exception as e:
+            error_msg = f"Navigation failed: {str(e)}"
+            logger.error(f"[navigate_to] {error_msg}")
+            _raise_operation_error(error_msg)
 
     async def new_page(
         self,
@@ -962,8 +1194,10 @@ class Browser:
         timeout: Optional[float] = None,
     ) -> Optional[Page]:
         if not self._context:
-            logger.warning("No context is open, starting playwright")
-            await self.start()
+            _raise_state_error(
+                "No browser context is open. Call start() first.",
+                code="NO_BROWSER_CONTEXT",
+            )
         self._page = await self._context.new_page()
         if url:
             await self.navigate_to(url, wait_until=wait_until, timeout=timeout)
@@ -1297,7 +1531,7 @@ class Browser:
         self,
         interactive: bool = False,
         full_page: bool = True,
-    ) -> Optional[EnhancedSnapshot]:
+    ) -> EnhancedSnapshot:
         """Get accessibility snapshot of the current page.
 
         Parameters
@@ -1310,26 +1544,38 @@ class Browser:
 
         Returns
         -------
-        Optional[EnhancedSnapshot]
-            Snapshot with tree string and refs dictionary, or None if failed.
+        EnhancedSnapshot
+            Snapshot with tree string and refs dictionary.
+
+        Raises
+        ------
+        StateError
+            If no active page is available.
+        OperationError
+            If snapshot generation fails.
         """
-        if not self._page:
-            logger.warning("No page is open, can't get snapshot")
-            return None
         try:
-            options = SnapshotOptions(
-                interactive=interactive,
-                full_page=full_page,
-            )
-            if self._snapshot_generator is None:
-                self._snapshot_generator = SnapshotGenerator()
-            current_url = self.get_current_page_url()
-            self._last_snapshot = await self._snapshot_generator.get_enhanced_snapshot_async(self._page, options)
-            self._last_snapshot_url = current_url
-            return self._last_snapshot
+            if not self._page:
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
+            async with self._snapshot_lock:
+                options = SnapshotOptions(
+                    interactive=interactive,
+                    full_page=full_page,
+                )
+                if self._snapshot_generator is None:
+                    self._snapshot_generator = SnapshotGenerator()
+                current_url = self.get_current_page_url()
+                self._last_snapshot = await self._snapshot_generator.get_enhanced_snapshot_async(
+                    self._page, options
+                )
+                self._last_snapshot_url = current_url
+                return self._last_snapshot
+        except BridgicBrowserError:
+            raise
         except Exception as e:
-            logger.warning("Failed to get snapshot: %s", e, exc_info=True)
-            return None
+            error_msg = f"Failed to get snapshot: {str(e)}"
+            logger.error(f"[get_snapshot] {error_msg}", exc_info=True)
+            _raise_operation_error(error_msg)
     
     async def get_element_by_ref(self, ref: str, _fallback_depth: int = 0) -> Optional[Locator]:
         if not self._page:
@@ -1629,7 +1875,8 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         start_from_char : int, optional
-            Pagination offset. Use `next_start_char` from truncation notice.
+            Pagination offset, must be >= 0. Use `next_start_char` from
+            truncation notice.
         interactive : bool, optional
             If True, only return clickable/editable elements (buttons, links,
             inputs, checkboxes, elements with cursor:pointer, etc.).
@@ -1641,8 +1888,20 @@ Before you return the element ref, reason about the state and elements for a sen
         str
             Tree with refs like: `- button "Submit" [ref=e1]`
             Use refs with click_element_by_ref, input_text_by_ref, etc.
+
+        Raises
+        ------
+        InvalidInputError
+            If `start_from_char` is negative or beyond the available text range.
         """
         try:
+            if start_from_char < 0:
+                _raise_invalid_input(
+                    "start_from_char must be >= 0",
+                    code="INVALID_START_FROM_CHAR",
+                    details={"start_from_char": start_from_char},
+                )
+
             snapshot = await self.get_snapshot(
                 interactive=interactive,
                 full_page=full_page,
@@ -1650,19 +1909,25 @@ Before you return the element ref, reason about the state and elements for a sen
             if snapshot is None:
                 error_msg = "Failed to get interface information"
                 logger.error(f"[get_snapshot_text] {error_msg}")
-                return error_msg
+                _raise_operation_error(error_msg)
+            _page = getattr(self, "_page", None)
+            page_url = _page.url if _page else ""
+            page_title = await _page.title() if _page else ""
+            header = f"[Page: {page_url} | {page_title}]\n"
             full_text = snapshot.tree
 
             total_length = len(full_text)
 
             if start_from_char > 0:
                 if start_from_char >= total_length:
-                    error_msg = (
-                        f"start_from_char ({start_from_char}) exceeds total page state length "
-                        f"of {total_length} characters."
+                    _raise_invalid_input(
+                        (
+                            f"start_from_char ({start_from_char}) exceeds total page state length "
+                            f"of {total_length} characters."
+                        ),
+                        code="START_FROM_CHAR_OUT_OF_RANGE",
+                        details={"start_from_char": start_from_char, "total_length": total_length},
                     )
-                    logger.error(f"[get_snapshot_text] {error_msg}")
-                    return error_msg
                 text = full_text[start_from_char:]
             else:
                 text = full_text
@@ -1705,11 +1970,11 @@ Before you return the element ref, reason about the state and elements for a sen
                 text = f"{text}{notice}"
 
             logger.info("[get_snapshot_text] Successfully retrieved interface information")
-            return text
+            return header + text
         except Exception as e:
             error_msg = f"Failed to get interface information: {e}"
             logger.error(f"[get_snapshot_text] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     # ==================== Navigation Tools ====================
 
@@ -1747,7 +2012,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             query = query.strip()
             if not query:
-                return "Search query cannot be empty"
+                _raise_invalid_input("Search query cannot be empty", code="QUERY_EMPTY")
             engine = engine.strip().lower() if engine else "duckduckgo"
 
             import urllib.parse
@@ -1763,7 +2028,11 @@ Before you return the element ref, reason about the state and elements for a sen
             if engine not in search_engines:
                 error_msg = f'Unsupported search engine: {engine}. Options: duckduckgo, google, bing'
                 logger.error(f'[search] {error_msg}')
-                return error_msg
+                _raise_invalid_input(
+                    error_msg,
+                    code="UNSUPPORTED_SEARCH_ENGINE",
+                    details={"engine": engine},
+                )
 
             search_url = search_engines[engine]
 
@@ -1775,70 +2044,11 @@ Before you return the element ref, reason about the state and elements for a sen
             except Exception as e:
                 logger.error(f"[search] failed engine={engine} error={type(e).__name__}: {e}")
                 error_msg = f'Search on {engine} failed for "{query}": {str(e)}'
-                return error_msg
+                _raise_operation_error(error_msg)
         except Exception as e:
             error_msg = f"Search failed: {str(e)}"
             logger.error(f"[search] failed error={type(e).__name__}: {error_msg}")
-            return error_msg
-
-    async def navigate_to_url(
-        self,
-        url: str,
-        wait_until: str = "domcontentloaded",
-        timeout: Optional[float] = None,
-    ) -> str:
-        """Navigate to URL in current tab. Use new_tab(url) for new tab.
-
-        Parameters
-        ----------
-        url : str
-            URL to navigate to. Auto-prepends "http://" if missing protocol.
-        wait_until : str, default "domcontentloaded"
-            When to consider navigation complete:
-            - "domcontentloaded": DOM parsed (fast, good for modern SPAs).
-            - "load": Full page load including images/styles.
-            - "networkidle": No network activity for 500ms (may timeout on SPAs).
-            - "commit": Response received from server.
-        timeout : float, optional
-            Maximum time in milliseconds. Defaults to Playwright's 30000ms.
-
-        Returns
-        -------
-        str
-            Result message.
-        """
-        try:
-            logger.info(f"[navigate_to_url] start url={url}")
-
-            url = url.strip()
-            if not url:
-                return "URL cannot be empty"
-
-            blocked_schemes = ["javascript:", "data:", "vbscript:", "about:"]
-            url_lower = url.lower()
-            for scheme in blocked_schemes:
-                if url_lower.startswith(scheme):
-                    error_msg = f"URL scheme '{scheme}' is not allowed for security reasons"
-                    logger.warning(f"[navigate_to_url] blocked: {error_msg}")
-                    return error_msg
-
-            if not (url.startswith("http://") or url.startswith("https://") or url.startswith("file://")):
-                if not url.startswith("/"):
-                    url = f"http://{url}"
-                # else: URLs starting with '/' are absolute paths; passed as-is and will
-                # fail at navigation time with a clear Playwright error (intentional).
-
-            await self.navigate_to(url, wait_until=wait_until, timeout=timeout)
-            page = await self.get_current_page()
-            actual_url = page.url if page else url
-            result = f"Navigated to: {actual_url}"
-
-            logger.info(f"[navigate_to_url] done {result}")
-            return result
-        except Exception as e:
-            error_msg = f"Navigation failed: {str(e)}"
-            logger.error(f"[navigate_to_url] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def go_back(self) -> str:
         """Navigate back to previous page in history.
@@ -1853,7 +2063,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             await page.go_back()
             result = f"Navigated back to: {page.url}"
@@ -1865,8 +2075,8 @@ Before you return the element ref, reason about the state and elements for a sen
             if "Cannot navigate" in str(e) or "no previous entry" in str(e):
                 result = "Cannot navigate back: no previous page in history"
                 logger.info(f"[go_back] {result}")
-                return result
-            return error_msg
+                _raise_state_error(result, code="NO_HISTORY_ENTRY", retryable=False)
+            _raise_operation_error(error_msg)
 
     async def go_forward(self) -> str:
         """Navigate forward to next page in history.
@@ -1881,7 +2091,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
             await page.go_forward()
             result = f"Navigated forward to: {page.url}"
             logger.info(f"[go_forward] done {result}")
@@ -1889,7 +2099,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to navigate forward: {str(e)}"
             logger.error(f"[go_forward] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     # ==================== Page and Tab Management Tools ====================
 
@@ -1921,7 +2131,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
             kwargs: Dict[str, Any] = {"wait_until": wait_until}
             if timeout is not None:
                 kwargs["timeout"] = timeout
@@ -1933,7 +2143,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to reload page: {str(e)}"
             logger.error(f"[reload_page] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def get_current_page_info_str(self) -> str:
         """Get current page info: URL, title, viewport size, scroll position.
@@ -1950,7 +2160,7 @@ Before you return the element ref, reason about the state and elements for a sen
             if page_info is None:
                 error_msg = "No active page available"
                 logger.error(f"[get_current_page_info] {error_msg}")
-                return error_msg
+                _raise_operation_error(error_msg)
             result = (
                 f"url={page_info.url!r}, title={page_info.title!r}, "
                 f"viewport={page_info.viewport_width}x{page_info.viewport_height}, "
@@ -1962,7 +2172,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to get current page info: {str(e)}"
             logger.error(f"[get_current_page_info] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def press_key(self, key: str) -> str:
         """Press a keyboard key or combination (e.g., "Enter", "Control+A").
@@ -1982,11 +2192,11 @@ Before you return the element ref, reason about the state and elements for a sen
 
             key = key.strip()
             if not key:
-                return "Key name cannot be empty"
+                _raise_invalid_input("Key name cannot be empty", code="KEY_EMPTY")
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             await page.keyboard.press(key)
             result = f"Pressed key: {key}"
@@ -1995,7 +2205,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to press key: {str(e)}"
             logger.error(f"[press_key] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def scroll_to_text(self, text: str) -> str:
         """Scroll to make the specified text visible on page.
@@ -2015,11 +2225,11 @@ Before you return the element ref, reason about the state and elements for a sen
 
             text = text.strip()
             if not text:
-                return "Text to find cannot be empty"
+                _raise_invalid_input("Text to find cannot be empty", code="TEXT_EMPTY")
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             try:
                 locator = page.get_by_text(text, exact=False).first
@@ -2040,7 +2250,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to scroll to text: {str(e)}"
             logger.error(f"[scroll_to_text] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def evaluate_javascript(self, code: str) -> str:
         """Execute JavaScript in page context. **Only run trusted code.**
@@ -2060,11 +2270,11 @@ Before you return the element ref, reason about the state and elements for a sen
 
             code = code.strip()
             if not code:
-                return "JavaScript code cannot be empty"
+                _raise_invalid_input("JavaScript code cannot be empty", code="CODE_EMPTY")
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             result = await page.evaluate(code)
 
@@ -2086,7 +2296,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to execute JavaScript: {str(e)}"
             logger.error(f"[evaluate_javascript] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     # ==================== Tab Management ====================
 
@@ -2125,7 +2335,9 @@ Before you return the element ref, reason about the state and elements for a sen
                     url = None
 
             if url:
-                if not (url.startswith("http://") or url.startswith("https://") or url.startswith("file://")):
+                url_lower = url.lower()
+                has_scheme = "://" in url or url_lower.startswith(("data:", "about:"))
+                if not has_scheme:
                     if not url.startswith("/"):
                         url = f"http://{url}"
                     # else: URLs starting with '/' are absolute paths; passed as-is and will
@@ -2142,7 +2354,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to create new tab: {str(e)}"
             logger.error(f"[new_tab] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def get_tabs(self) -> str:
         """Get information about all open tabs.
@@ -2150,7 +2362,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Returns
         -------
         str
-            List of JSON strings with tab info (page_id, url, title), or error message.
+            List of JSON strings with tab info (page_id, url, title).
         """
         try:
             logger.info(f"[get_tabs] start")
@@ -2169,7 +2381,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to get tabs info: {str(e)}"
             logger.error(f"[get_tabs] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def switch_tab(self, page_id: str) -> str:
         """Switch to specified tab.
@@ -2195,13 +2407,17 @@ Before you return the element ref, reason about the state and elements for a sen
             success, result = await self.switch_to_page(page_id)
             if not success:
                 logger.error(f"[switch_tab] {result}")
-                return result
+                _raise_state_error(
+                    result,
+                    code="TAB_NOT_FOUND" if "not found" in result.lower() else "INVALID_STATE",
+                    details={"page_id": page_id},
+                )
             logger.info(f"[switch_tab] done page_id={page_id}")
             return result
         except Exception as e:
             error_msg = f"Failed to switch tab: {str(e)}"
             logger.error(f"[switch_tab] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def close_tab(self, page_id: Optional[str] = None) -> str:
         """Close a tab.
@@ -2229,17 +2445,25 @@ Before you return the element ref, reason about the state and elements for a sen
             if page_id is None:
                 page = await self.get_current_page()
                 if page is None:
-                    return "No active page available"
+                    _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
                 success, closed_result = await self.close_page(page)
                 if not success:
                     logger.error(f"[close_tab] {closed_result}")
-                    return closed_result
+                    _raise_state_error(
+                        closed_result,
+                        code="TAB_CLOSE_FAILED",
+                        details={"page_id": page_id},
+                    )
                 result = closed_result
             else:
                 success, closed_result = await self.close_page(page_id)
                 if not success:
                     logger.error(f"[close_tab] {closed_result}")
-                    return closed_result
+                    _raise_state_error(
+                        closed_result,
+                        code="TAB_NOT_FOUND" if "not found" in closed_result.lower() else "TAB_CLOSE_FAILED",
+                        details={"page_id": page_id},
+                    )
                 result = closed_result
 
             logger.info(f"[close_tab] done {result}")
@@ -2247,7 +2471,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to close tab: {str(e)}"
             logger.error(f"[close_tab] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     # ==================== Browser Control Tools ====================
 
@@ -2286,7 +2510,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to close browser: {str(e)}"
             logger.error(f"[browser_close] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def browser_resize(self, width: int, height: int) -> str:
         """Resize the browser viewport.
@@ -2308,7 +2532,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             await page.set_viewport_size({"width": width, "height": height})
 
@@ -2318,7 +2542,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to resize browser: {str(e)}"
             logger.error(f"[browser_resize] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     # ==================== Wait ====================
 
@@ -2378,7 +2602,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             if text is not None:
                 locator = page.get_by_text(text, exact=False)
@@ -2401,11 +2625,11 @@ Before you return the element ref, reason about the state and elements for a sen
                 logger.info(f"[wait_for] done {result}")
                 return result
 
-            return "No wait condition specified"
+            _raise_invalid_input("No wait condition specified", code="INVALID_WAIT_CONDITION")
         except Exception as e:
             error_msg = f"Wait condition not met: {str(e)}"
             logger.error(f"[wait_for] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     # ==================== Element Action Tools (by ref) ====================
 
@@ -2445,7 +2669,7 @@ Before you return the element ref, reason about the state and elements for a sen
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
                 logger.warning(f'[input_text_by_ref] {msg}')
-                return msg
+                _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
             is_vis = await locator.is_visible()
 
@@ -2507,7 +2731,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             logger.error(f'[input_text_by_ref] Failed to input text: {type(e).__name__}: {e}')
             error_msg = f'Failed to input text to element {ref}: {e}'
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def click_element_by_ref(self, ref: str) -> str:
         """Click an element by ref.
@@ -2527,7 +2751,7 @@ Before you return the element ref, reason about the state and elements for a sen
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
                 logger.warning(f'[click_element_by_ref] {msg}')
-                return msg
+                _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
             bbox = await locator.bounding_box()
             if bbox is not None:
@@ -2569,7 +2793,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             logger.error(f'[click_element_by_ref] Failed to click element: {type(e).__name__}: {e}')
             error_msg = f'Failed to click element {ref}: {str(e)}'
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def get_dropdown_options_by_ref(self, ref: str) -> str:
         """Get all options from a dropdown/select element.
@@ -2589,12 +2813,12 @@ Before you return the element ref, reason about the state and elements for a sen
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
                 logger.warning(f'[get_dropdown_options_by_ref] {msg}')
-                return msg
+                _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
             page = await self.get_current_page()
             options = await _get_dropdown_option_locators(page, locator)
             if not options:
-                return 'This dropdown has no options'
+                _raise_state_error('This dropdown has no options', code='ELEMENT_STATE_ERROR')
 
             # Detect currently selected option(s)
             selected_values = set()
@@ -2622,7 +2846,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             logger.error(f'[get_dropdown_options_by_ref] Failed to get dropdown options: {type(e).__name__}: {e}')
             error_msg = f'Failed to get dropdown options for element {ref}: {str(e)}'
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def select_dropdown_option_by_ref(self, ref: str, text: str) -> str:
         """Select an option from a dropdown by visible text or value.
@@ -2644,7 +2868,7 @@ Before you return the element ref, reason about the state and elements for a sen
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
                 logger.warning(f'[select_dropdown_option_by_ref] {msg}')
-                return msg
+                _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
             tag_name = await locator.evaluate("el => el.tagName.toLowerCase()")
 
@@ -2666,7 +2890,11 @@ Before you return the element ref, reason about the state and elements for a sen
                     options = await _get_dropdown_option_locators(page, locator)
 
                 if not options:
-                    return f'Failed to find dropdown options for element {ref}'
+                    _raise_operation_error(
+                        f'Failed to find dropdown options for element {ref}',
+                        code='ELEMENT_STATE_ERROR',
+                        details={"ref": ref, "text": text},
+                    )
 
                 chosen_option = None
                 for option in options:
@@ -2686,7 +2914,7 @@ Before you return the element ref, reason about the state and elements for a sen
                             break
 
                 if chosen_option is None:
-                    return f'Failed to find dropdown option "{text}" for element {ref}'
+                    _raise_operation_error(f'Failed to find dropdown option "{text}" for element {ref}', code='ELEMENT_STATE_ERROR')
 
                 if await chosen_option.is_visible():
                     await chosen_option.click()
@@ -2700,7 +2928,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             logger.error(f'[select_dropdown_option_by_ref] Failed to select dropdown option: {type(e).__name__}: {e}')
             error_msg = f'Failed to select dropdown option "{text}" for element {ref}: {str(e)}'
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def hover_element_by_ref(self, ref: str) -> str:
         """Hover mouse over an element by ref.
@@ -2720,7 +2948,7 @@ Before you return the element ref, reason about the state and elements for a sen
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
                 logger.warning(f'[hover_element_by_ref] {msg}')
-                return msg
+                _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
             bbox = await locator.bounding_box()
             if bbox is not None:
@@ -2759,7 +2987,11 @@ Before you return the element ref, reason about the state and elements for a sen
                         'no screen coordinates'
                     )
                     logger.warning(f'[hover_element_by_ref] {msg}')
-                    return msg
+                    _raise_operation_error(
+                        msg,
+                        code="ELEMENT_NOT_VISIBLE",
+                        details={"ref": ref},
+                    )
                 else:
                     await locator.hover()
 
@@ -2770,7 +3002,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             logger.error(f'[hover_element_by_ref] Failed to hover element: {type(e).__name__}: {e}')
             error_msg = f'Failed to hover element {ref}: {str(e)}'
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def focus_element_by_ref(self, ref: str) -> str:
         """Focus an element by ref.
@@ -2790,7 +3022,7 @@ Before you return the element ref, reason about the state and elements for a sen
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
                 logger.warning(f'[focus_element_by_ref] {msg}')
-                return msg
+                _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
             if await locator.is_visible():
                 await locator.focus()
@@ -2808,7 +3040,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             logger.error(f'[focus_element_by_ref] Failed to focus element: {type(e).__name__}: {e}')
             error_msg = f'Failed to focus element {ref}: {str(e)}'
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def evaluate_javascript_on_ref(self, ref: str, code: str) -> str:
         """Execute JavaScript on an element.
@@ -2832,7 +3064,7 @@ Before you return the element ref, reason about the state and elements for a sen
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
                 logger.warning(f'[evaluate_javascript_on_ref] {msg}')
-                return msg
+                _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
             result = await locator.evaluate(code)
 
@@ -2849,7 +3081,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             logger.error(f'[evaluate_javascript_on_ref] Failed to execute JavaScript: {type(e).__name__}: {e}')
             error_msg = f'Failed to execute JavaScript on element {ref}: {str(e)}'
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def upload_file_by_ref(self, ref: str, file_path: str) -> str:
         """Upload a file to a file input element by ref.
@@ -2870,13 +3102,13 @@ Before you return the element ref, reason about the state and elements for a sen
             if not os.path.exists(file_path):
                 msg = f'File {file_path} does not exist'
                 logger.error(f'[upload_file_by_ref] {msg}')
-                return msg
+                _raise_operation_error(msg, code="NOT_FOUND", details={"path": file_path})
 
             locator = await self.get_element_by_ref(ref)
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
                 logger.warning(f'[upload_file_by_ref] {msg}')
-                return msg
+                _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
             tag_name = await locator.evaluate("el => el.tagName.toLowerCase()")
             input_type = await locator.get_attribute("type") if tag_name == "input" else None
@@ -2892,7 +3124,11 @@ Before you return the element ref, reason about the state and elements for a sen
                 else:
                     msg = f'Element ref {ref} is not a file input element (tag: {tag_name}, type: {input_type})'
                     logger.error(f'[upload_file_by_ref] {msg}')
-                    return msg
+                    _raise_operation_error(
+                        msg,
+                        code="ELEMENT_TYPE_MISMATCH",
+                        details={"ref": ref, "tag_name": tag_name, "input_type": input_type},
+                    )
 
             await locator.set_input_files(file_path)
 
@@ -2903,7 +3139,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             logger.error(f'[upload_file_by_ref] Failed to upload file: {type(e).__name__}: {e}')
             error_msg = f'Failed to upload file to element {ref}: {str(e)}'
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def drag_element_by_ref(self, start_ref: str, end_ref: str) -> str:
         """Drag element from start_ref and drop on end_ref.
@@ -2927,13 +3163,13 @@ Before you return the element ref, reason about the state and elements for a sen
             if source_locator is None:
                 msg = f'Source element ref {start_ref} is not available - page may have changed.'
                 logger.warning(f'[drag_element_by_ref] {msg}')
-                return msg
+                _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"start_ref": start_ref})
 
             target_locator = await self.get_element_by_ref(end_ref)
             if target_locator is None:
                 msg = f'Target element ref {end_ref} is not available - page may have changed.'
                 logger.warning(f'[drag_element_by_ref] {msg}')
-                return msg
+                _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"end_ref": end_ref})
 
             await source_locator.drag_to(target_locator)
 
@@ -2944,7 +3180,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             logger.error(f'[drag_element_by_ref] Failed to drag element: {type(e).__name__}: {e}')
             error_msg = f'Failed to drag element from {start_ref} to {end_ref}: {str(e)}'
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def check_checkbox_by_ref(self, ref: str) -> str:
         """Check a checkbox or radio button by ref.
@@ -2966,7 +3202,7 @@ Before you return the element ref, reason about the state and elements for a sen
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
                 logger.warning(f'[check_checkbox_by_ref] {msg}')
-                return msg
+                _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
             is_native = await _is_native_checkbox_or_radio(locator)
             already_checked = await _is_checked(locator)
@@ -3015,7 +3251,11 @@ Before you return the element ref, reason about the state and elements for a sen
             if not await _is_checked(locator):
                 msg = f'Failed to check element {ref}: state is still unchecked'
                 logger.warning(f'[check_checkbox_by_ref] {msg}')
-                return msg
+                _raise_operation_error(
+                    msg,
+                    code="ELEMENT_STATE_ERROR",
+                    details={"ref": ref, "expected": "checked"},
+                )
 
             msg = f'Checked element {ref} (confirmed: checked=true)'
             logger.info(f'[check_checkbox_by_ref] {msg}')
@@ -3024,7 +3264,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             logger.error(f'[check_checkbox_by_ref] Failed to check element: {type(e).__name__}: {e}')
             error_msg = f'Failed to check element {ref}: {str(e)}'
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def uncheck_checkbox_by_ref(self, ref: str) -> str:
         """Uncheck a checkbox by ref.
@@ -3046,7 +3286,7 @@ Before you return the element ref, reason about the state and elements for a sen
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
                 logger.warning(f'[uncheck_checkbox_by_ref] {msg}')
-                return msg
+                _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
             is_native = await _is_native_checkbox_or_radio(locator)
             already_checked = await _is_checked(locator)
@@ -3096,7 +3336,11 @@ Before you return the element ref, reason about the state and elements for a sen
             if not is_native_radio and await _is_checked(locator):
                 msg = f'Failed to uncheck element {ref}: state is still checked'
                 logger.warning(f'[uncheck_checkbox_by_ref] {msg}')
-                return msg
+                _raise_operation_error(
+                    msg,
+                    code="ELEMENT_STATE_ERROR",
+                    details={"ref": ref, "expected": "unchecked"},
+                )
 
             msg = f'Unchecked element {ref} (confirmed: checked=false)'
             logger.info(f'[uncheck_checkbox_by_ref] {msg}')
@@ -3105,7 +3349,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             logger.error(f'[uncheck_checkbox_by_ref] Failed to uncheck element: {type(e).__name__}: {e}')
             error_msg = f'Failed to uncheck element {ref}: {str(e)}'
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def double_click_element_by_ref(self, ref: str) -> str:
         """Double-click an element by ref.
@@ -3127,7 +3371,7 @@ Before you return the element ref, reason about the state and elements for a sen
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
                 logger.warning(f'[double_click_element_by_ref] {msg}')
-                return msg
+                _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
             bbox = await locator.bounding_box()
             if bbox is not None:
@@ -3174,7 +3418,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             logger.error(f'[double_click_element_by_ref] Failed to double-click element: {type(e).__name__}: {e}')
             error_msg = f'Failed to double-click element {ref}: {str(e)}'
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def scroll_element_into_view_by_ref(self, ref: str) -> str:
         """Scroll page to make element visible in viewport.
@@ -3196,7 +3440,7 @@ Before you return the element ref, reason about the state and elements for a sen
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
                 logger.warning(f'[scroll_element_into_view_by_ref] {msg}')
-                return msg
+                _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
             await locator.scroll_into_view_if_needed()
 
@@ -3207,7 +3451,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             logger.error(f'[scroll_element_into_view_by_ref] Failed to scroll element into view: {type(e).__name__}: {e}')
             error_msg = f'Failed to scroll element {ref} into view: {str(e)}'
-            return error_msg
+            _raise_operation_error(error_msg)
 
     # ==================== Mouse Tools (coordinate-based) ====================
 
@@ -3231,7 +3475,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             await page.mouse.move(x, y)
             result = f"Moved mouse to coordinates ({x}, {y})"
@@ -3240,7 +3484,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to move mouse: {str(e)}"
             logger.error(f"[mouse_move] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def mouse_click(
         self,
@@ -3272,7 +3516,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             await page.mouse.click(x, y, button=button, click_count=click_count)
 
@@ -3283,7 +3527,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to click mouse: {str(e)}"
             logger.error(f"[mouse_click] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def mouse_drag(
         self,
@@ -3315,7 +3559,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             await page.mouse.move(start_x, start_y)
             await page.mouse.down()
@@ -3328,7 +3572,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to drag mouse: {str(e)}"
             logger.error(f"[mouse_drag] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def mouse_down(self, button: Literal["left", "right", "middle"] = "left") -> str:
         """Press and hold a mouse button.
@@ -3348,7 +3592,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             await page.mouse.down(button=button)
             result = f"Mouse {button} button pressed down"
@@ -3357,7 +3601,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to press mouse button: {str(e)}"
             logger.error(f"[mouse_down] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def mouse_up(self, button: Literal["left", "right", "middle"] = "left") -> str:
         """Release a mouse button.
@@ -3377,7 +3621,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             await page.mouse.up(button=button)
             result = f"Mouse {button} button released"
@@ -3386,7 +3630,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to release mouse button: {str(e)}"
             logger.error(f"[mouse_up] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def mouse_wheel(self, delta_x: float = 0, delta_y: float = 0) -> str:
         """Scroll the mouse wheel.
@@ -3411,7 +3655,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             await page.mouse.wheel(delta_x=delta_x, delta_y=delta_y)
             result = f"Scrolled mouse wheel: delta_x={delta_x}, delta_y={delta_y}"
@@ -3420,7 +3664,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to scroll mouse wheel: {str(e)}"
             logger.error(f"[mouse_wheel] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     # ==================== Keyboard Tools ====================
 
@@ -3447,7 +3691,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             for char in text:
                 await page.keyboard.press(char)
@@ -3462,7 +3706,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to type sequentially: {str(e)}"
             logger.error(f"[type_text] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def key_down(self, key: str) -> str:
         """Press and hold a key.
@@ -3486,7 +3730,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             await page.keyboard.down(key)
             result = f"Key '{key}' pressed down"
@@ -3495,7 +3739,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to press key down: {str(e)}"
             logger.error(f"[key_down] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def key_up(self, key: str) -> str:
         """Release a held key.
@@ -3515,7 +3759,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             await page.keyboard.up(key)
             result = f"Key '{key}' released"
@@ -3524,7 +3768,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to release key: {str(e)}"
             logger.error(f"[key_up] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def fill_form(
         self,
@@ -3551,7 +3795,7 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f"[fill_form] start fields_count={len(fields)} submit={submit}")
 
             if not fields:
-                return "No fields provided to fill"
+                _raise_invalid_input("No fields provided to fill", code="INVALID_FIELDS")
 
             filled_refs = []
             errors = []
@@ -3595,7 +3839,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to fill form: {str(e)}"
             logger.error(f"[fill_form] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def insert_text(self, text: str) -> str:
         """Insert text at the current cursor position.
@@ -3619,7 +3863,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             await page.keyboard.insert_text(text)
             result = f"Inserted text ({len(text)} characters)"
@@ -3628,7 +3872,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to insert text: {str(e)}"
             logger.error(f"[insert_text] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     # ==================== Screenshot and PDF Tools ====================
 
@@ -3664,14 +3908,20 @@ Before you return the element ref, reason about the state and elements for a sen
             On success:
             - With filename: "Screenshot saved to: /path/to/file.png"
             - Without filename: Base64 data URL "data:image/png;base64,iVBORw0..."
-            On failure: Error message starting with "Failed to".
+        
+        Raises
+        ------
+        StateError
+            If no active page is available or the provided ref cannot be resolved.
+        OperationError
+            If screenshot capture fails.
         """
         try:
             logger.info(f"[take_screenshot] start filename={filename} ref={ref} full_page={full_page} type={type}")
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             screenshot_options = {
                 "type": type,
@@ -3686,7 +3936,7 @@ Before you return the element ref, reason about the state and elements for a sen
                 if locator is None:
                     msg = f'Element ref {ref} is not available - page may have changed.'
                     logger.warning(f'[take_screenshot] {msg}')
-                    return msg
+                    _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
                 target = locator
             else:
                 target = page
@@ -3712,7 +3962,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to take screenshot: {str(e)}"
             logger.error(f"[take_screenshot] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def save_pdf(
         self,
@@ -3759,7 +4009,13 @@ Before you return the element ref, reason about the state and elements for a sen
         -------
         str
             On success: Returns the file path where PDF was saved.
-            On failure: Returns an error message.
+
+        Raises
+        ------
+        StateError
+            If no active page is available.
+        OperationError
+            If PDF generation fails.
 
         Notes
         -----
@@ -3770,7 +4026,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             output_path: Optional[str] = None
             temp_output_created = False
@@ -3829,7 +4085,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to save PDF: {str(e)}"
             logger.error(f"[save_pdf] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     # ==================== Network and Console Tools ====================
 
@@ -3839,7 +4095,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Returns
         -------
         str
-            "Console message capture started" or error message.
+            "Console message capture started".
 
         Notes
         -----
@@ -3851,28 +4107,28 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             page_key = _get_page_key(page)
 
-            if page_key in _console_handlers:
+            if page_key in self._console_handlers:
                 try:
-                    page.remove_listener("console", _console_handlers[page_key])
+                    page.remove_listener("console", self._console_handlers[page_key])
                 except Exception:
                     pass
 
-            _console_messages[page_key] = []
+            self._console_messages[page_key] = []
 
             def handle_console(msg):
-                if page_key in _console_messages:
-                    _console_messages[page_key].append({
+                if page_key in self._console_messages:
+                    self._console_messages[page_key].append({
                         "type": msg.type,
                         "text": msg.text,
                         "location": str(msg.location) if msg.location else None,
                     })
 
             page.on("console", handle_console)
-            _console_handlers[page_key] = handle_console
+            self._console_handlers[page_key] = handle_console
 
             result = "Console message capture started"
             logger.info(f"[start_console_capture] done {result}")
@@ -3880,7 +4136,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to start console capture: {str(e)}"
             logger.error(f"[start_console_capture] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def stop_console_capture(self) -> str:
         """Stop capturing console messages and clean up resources.
@@ -3895,18 +4151,20 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             page_key = _get_page_key(page)
 
-            if page_key in _console_handlers:
-                try:
-                    page.remove_listener("console", _console_handlers[page_key])
-                except Exception:
-                    pass
-                del _console_handlers[page_key]
+            if page_key not in self._console_handlers:
+                _raise_state_error("No active console capture. Use console-start first.", code="NO_ACTIVE_CAPTURE")
 
-            _console_messages.pop(page_key, None)
+            try:
+                page.remove_listener("console", self._console_handlers[page_key])
+            except Exception:
+                pass
+            del self._console_handlers[page_key]
+
+            self._console_messages.pop(page_key, None)
 
             result = "Console capture stopped"
             logger.info(f"[stop_console_capture] done {result}")
@@ -3914,7 +4172,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to stop console capture: {str(e)}"
             logger.error(f"[stop_console_capture] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def get_console_messages(
         self,
@@ -3945,16 +4203,16 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             page_key = _get_page_key(page)
-            messages = _console_messages.get(page_key, [])
+            messages = self._console_messages.get(page_key, [])
 
             if type_filter:
                 messages = [m for m in messages if m["type"] == type_filter]
 
-            if clear and page_key in _console_messages:
-                _console_messages[page_key] = []
+            if clear and page_key in self._console_messages:
+                self._console_messages[page_key] = []
 
             result = json.dumps(messages, indent=2)
             logger.info(f"[get_console_messages] done count={len(messages)}")
@@ -3962,7 +4220,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to get console messages: {str(e)}"
             logger.error(f"[get_console_messages] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def start_network_capture(self) -> str:
         """Start capturing network requests from the current page.
@@ -3970,7 +4228,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Returns
         -------
         str
-            "Network request capture started" or error message.
+            "Network request capture started".
 
         Notes
         -----
@@ -3982,21 +4240,21 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             page_key = _get_page_key(page)
 
-            if page_key in _network_handlers:
+            if page_key in self._network_handlers:
                 try:
-                    page.remove_listener("request", _network_handlers[page_key])
+                    page.remove_listener("request", self._network_handlers[page_key])
                 except Exception:
                     pass
 
-            _network_requests[page_key] = []
+            self._network_requests[page_key] = []
 
             def handle_request(request):
-                if page_key in _network_requests:
-                    _network_requests[page_key].append({
+                if page_key in self._network_requests:
+                    self._network_requests[page_key].append({
                         "url": request.url,
                         "method": request.method,
                         "resource_type": request.resource_type,
@@ -4006,7 +4264,7 @@ Before you return the element ref, reason about the state and elements for a sen
                     })
 
             page.on("request", handle_request)
-            _network_handlers[page_key] = handle_request
+            self._network_handlers[page_key] = handle_request
 
             result = "Network request capture started"
             logger.info(f"[start_network_capture] done {result}")
@@ -4014,7 +4272,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to start network capture: {str(e)}"
             logger.error(f"[start_network_capture] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def stop_network_capture(self) -> str:
         """Stop capturing network requests and clean up resources.
@@ -4029,18 +4287,20 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             page_key = _get_page_key(page)
 
-            if page_key in _network_handlers:
-                try:
-                    page.remove_listener("request", _network_handlers[page_key])
-                except Exception:
-                    pass
-                del _network_handlers[page_key]
+            if page_key not in self._network_handlers:
+                _raise_state_error("No active network capture. Use network-start first.", code="NO_ACTIVE_CAPTURE")
 
-            _network_requests.pop(page_key, None)
+            try:
+                page.remove_listener("request", self._network_handlers[page_key])
+            except Exception:
+                pass
+            del self._network_handlers[page_key]
+
+            self._network_requests.pop(page_key, None)
 
             result = "Network capture stopped"
             logger.info(f"[stop_network_capture] done {result}")
@@ -4048,7 +4308,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to stop network capture: {str(e)}"
             logger.error(f"[stop_network_capture] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def get_network_requests(
         self,
@@ -4079,17 +4339,17 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             page_key = _get_page_key(page)
-            requests = _network_requests.get(page_key, [])
+            requests = self._network_requests.get(page_key, [])
 
             if not include_static:
                 static_types = {"image", "stylesheet", "script", "font", "media"}
                 requests = [r for r in requests if r["resource_type"] not in static_types]
 
-            if clear and page_key in _network_requests:
-                _network_requests[page_key] = []
+            if clear and page_key in self._network_requests:
+                self._network_requests[page_key] = []
 
             result = json.dumps(requests, indent=2)
             logger.info(f"[get_network_requests] done count={len(requests)}")
@@ -4097,7 +4357,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to get network requests: {str(e)}"
             logger.error(f"[get_network_requests] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def wait_for_network_idle(self, timeout: float = 30000) -> str:
         """Wait for network to become idle.
@@ -4117,7 +4377,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             await page.wait_for_load_state("networkidle", timeout=timeout)
 
@@ -4127,7 +4387,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to wait for network idle: {str(e)}"
             logger.error(f"[wait_for_network_idle] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     # ==================== Dialog Tools ====================
 
@@ -4160,7 +4420,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             page_key = _get_page_key(page)
 
@@ -4177,10 +4437,10 @@ Before you return the element ref, reason about the state and elements for a sen
                 else:
                     await dialog.dismiss()
 
-            if page_key in _dialog_handlers:
-                page.remove_listener("dialog", _dialog_handlers[page_key])
+            if page_key in self._dialog_handlers:
+                page.remove_listener("dialog", self._dialog_handlers[page_key])
 
-            _dialog_handlers[page_key] = handle_dialog
+            self._dialog_handlers[page_key] = handle_dialog
             page.on("dialog", handle_dialog)
 
             result = f"Dialog handler set up with default action: {default_action}"
@@ -4189,7 +4449,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to setup dialog handler: {str(e)}"
             logger.error(f"[setup_dialog_handler] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def handle_dialog(
         self,
@@ -4225,24 +4485,24 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             # If an auto-handler (setup_dialog_handler) is already active for
             # this page, both listeners would fire on the same dialog — the
             # second accept()/dismiss() call will throw.  Remove the auto-handler
             # first so only the one-time handler runs.
             page_key = _get_page_key(page)
-            if page_key in _dialog_handlers:
+            if page_key in self._dialog_handlers:
                 logger.warning(
                     "[handle_dialog] An auto dialog handler is already active — "
                     "removing it so the one-time handler takes precedence. "
                     "Call setup_dialog_handler() again if you need auto-handling to resume."
                 )
                 try:
-                    page.remove_listener("dialog", _dialog_handlers[page_key])
+                    page.remove_listener("dialog", self._dialog_handlers[page_key])
                 except Exception:
                     pass
-                del _dialog_handlers[page_key]
+                del self._dialog_handlers[page_key]
 
             handled = {"done": False, "type": None, "message": None}
 
@@ -4271,7 +4531,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to set up dialog handler: {str(e)}"
             logger.error(f"[handle_dialog] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def remove_dialog_handler(self) -> str:
         """Remove the automatic dialog handler.
@@ -4286,13 +4546,13 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             page_key = _get_page_key(page)
 
-            if page_key in _dialog_handlers:
-                page.remove_listener("dialog", _dialog_handlers[page_key])
-                del _dialog_handlers[page_key]
+            if page_key in self._dialog_handlers:
+                page.remove_listener("dialog", self._dialog_handlers[page_key])
+                del self._dialog_handlers[page_key]
                 result = "Dialog handler removed"
             else:
                 result = "No dialog handler was set up"
@@ -4302,7 +4562,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to remove dialog handler: {str(e)}"
             logger.error(f"[remove_dialog_handler] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     # ==================== Storage Tools ====================
 
@@ -4318,14 +4578,13 @@ Before you return the element ref, reason about the state and elements for a sen
         -------
         str
             On success: Returns the file path where state was saved.
-            On failure: Returns an error message.
         """
         try:
             logger.info(f"[save_storage_state] start filename={filename}")
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             context = page.context
 
@@ -4349,7 +4608,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to save storage state: {str(e)}"
             logger.error(f"[save_storage_state] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def restore_storage_state(self, filename: str) -> str:
         """Restore browser storage state from a file.
@@ -4363,17 +4622,16 @@ Before you return the element ref, reason about the state and elements for a sen
         -------
         str
             On success: Returns a confirmation message.
-            On failure: Returns an error message.
         """
         try:
             logger.info(f"[restore_storage_state] start filename={filename}")
 
             if not os.path.exists(filename):
-                return f"Storage state file not found: {filename}"
+                _raise_operation_error(f"Storage state file not found: {filename}", code="NOT_FOUND")
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             context = page.context
 
@@ -4404,7 +4662,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to restore storage state: {str(e)}"
             logger.error(f"[restore_storage_state] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def clear_cookies(self) -> str:
         """Clear all cookies from the browser context.
@@ -4419,7 +4677,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             context = page.context
             await context.clear_cookies()
@@ -4430,7 +4688,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to clear cookies: {str(e)}"
             logger.error(f"[clear_cookies] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def get_cookies(self, urls: Optional[list] = None) -> str:
         """Get cookies from the browser context.
@@ -4450,7 +4708,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             context = page.context
 
@@ -4465,7 +4723,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to get cookies: {str(e)}"
             logger.error(f"[get_cookies] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def set_cookie(
         self,
@@ -4512,10 +4770,10 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             if not url and not domain:
-                return "Either url or domain must be specified"
+                _raise_invalid_input("Either url or domain must be specified", code="INVALID_COOKIE_TARGET")
 
             context = page.context
 
@@ -4531,7 +4789,7 @@ Before you return the element ref, reason about the state and elements for a sen
                 cookie["url"] = url
             if domain:
                 cookie["domain"] = domain
-            if expires:
+            if expires is not None:
                 cookie["expires"] = expires
             if same_site:
                 cookie["sameSite"] = same_site
@@ -4544,7 +4802,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to set cookie: {str(e)}"
             logger.error(f"[set_cookie] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     # ==================== Verification Tools ====================
 
@@ -4568,14 +4826,21 @@ Before you return the element ref, reason about the state and elements for a sen
         Returns
         -------
         str
-            "PASS: ..." on success, "FAIL: ..." on failure.
+            "PASS: ..." on success.
+
+        Raises
+        ------
+        StateError
+            If no active page is available.
+        VerificationError
+            If the target element is not visible.
         """
         try:
             logger.info(f"[verify_element_visible] start role={role} name={accessible_name}")
 
             page = await self.get_current_page()
             if page is None:
-                return "FAIL: No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             locator = page.get_by_role(role, name=accessible_name)
 
@@ -4587,11 +4852,16 @@ Before you return the element ref, reason about the state and elements for a sen
             except Exception:
                 result = f"FAIL: Element with role '{role}' and name '{accessible_name}' is not visible"
                 logger.warning(f"[verify_element_visible] {result}")
-                return result
+                _raise_verification_error(
+                    result,
+                    details={"role": role, "name": accessible_name, "timeout": timeout},
+                )
         except Exception as e:
-            error_msg = f"FAIL: Verification error: {str(e)}"
+            if isinstance(e, (StateError, VerificationError)):
+                raise
+            error_msg = f"Verification error: {str(e)}"
             logger.error(f"[verify_element_visible] {error_msg}")
-            return error_msg
+            _raise_verification_error(error_msg)
 
     async def verify_text_visible(
         self,
@@ -4613,14 +4883,21 @@ Before you return the element ref, reason about the state and elements for a sen
         Returns
         -------
         str
-            "PASS: ..." on success, "FAIL: ..." on failure.
+            "PASS: ..." on success.
+
+        Raises
+        ------
+        StateError
+            If no active page is available.
+        VerificationError
+            If the target text is not visible.
         """
         try:
             logger.info(f"[verify_text_visible] start text={text!r} exact={exact}")
 
             page = await self.get_current_page()
             if page is None:
-                return "FAIL: No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             locator = page.get_by_text(text, exact=exact)
 
@@ -4632,11 +4909,16 @@ Before you return the element ref, reason about the state and elements for a sen
             except Exception:
                 result = f"FAIL: Text '{text}' is not visible on the page"
                 logger.warning(f"[verify_text_visible] {result}")
-                return result
+                _raise_verification_error(
+                    result,
+                    details={"text": text, "exact": exact, "timeout": timeout},
+                )
         except Exception as e:
-            error_msg = f"FAIL: Verification error: {str(e)}"
+            if isinstance(e, (StateError, VerificationError)):
+                raise
+            error_msg = f"Verification error: {str(e)}"
             logger.error(f"[verify_text_visible] {error_msg}")
-            return error_msg
+            _raise_verification_error(error_msg)
 
     async def verify_value(
         self,
@@ -4658,14 +4940,25 @@ Before you return the element ref, reason about the state and elements for a sen
         Returns
         -------
         str
-            "PASS: ..." on success, "FAIL: ..." on failure.
+            "PASS: ..." on success.
+
+        Raises
+        ------
+        StateError
+            If the element ref cannot be resolved.
+        VerificationError
+            If the actual value/attribute does not match.
         """
         try:
             logger.info(f"[verify_value] start ref={ref} expected={value} attr={attribute}")
 
             locator = await self.get_element_by_ref(ref)
             if locator is None:
-                return f"FAIL: Element ref {ref} is not available"
+                _raise_state_error(
+                    f"Element ref {ref} is not available",
+                    code="REF_NOT_AVAILABLE",
+                    details={"ref": ref},
+                )
 
             if attribute == "value":
                 actual = await locator.input_value()
@@ -4685,12 +4978,18 @@ Before you return the element ref, reason about the state and elements for a sen
             else:
                 result = f"FAIL: Element {ref} {attribute} mismatch. Expected: '{value}', Actual: '{actual}'"
                 logger.warning(f"[verify_value] {result}")
+                _raise_verification_error(
+                    result,
+                    details={"ref": ref, "attribute": attribute, "expected": value, "actual": actual},
+                )
 
             return result
         except Exception as e:
-            error_msg = f"FAIL: Verification error: {str(e)}"
+            if isinstance(e, (StateError, VerificationError)):
+                raise
+            error_msg = f"Verification error: {str(e)}"
             logger.error(f"[verify_value] {error_msg}")
-            return error_msg
+            _raise_verification_error(error_msg)
 
     async def verify_element_state(
         self,
@@ -4710,14 +5009,27 @@ Before you return the element ref, reason about the state and elements for a sen
         Returns
         -------
         str
-            "PASS: ..." on success, "FAIL: ..." on failure.
+            "PASS: ..." on success.
+
+        Raises
+        ------
+        InvalidInputError
+            If the requested state is unsupported.
+        StateError
+            If the element ref cannot be resolved.
+        VerificationError
+            If the element does not match the expected state.
         """
         try:
             logger.info(f"[verify_element_state] start ref={ref} state={state}")
 
             locator = await self.get_element_by_ref(ref)
             if locator is None:
-                return f"FAIL: Element ref {ref} is not available"
+                _raise_state_error(
+                    f"Element ref {ref} is not available",
+                    code="REF_NOT_AVAILABLE",
+                    details={"ref": ref},
+                )
 
             result = ""
             try:
@@ -4750,17 +5062,34 @@ Before you return the element ref, reason about the state and elements for a sen
                     result = f"PASS: Element {ref} is editable" if is_editable else f"FAIL: Element {ref} is not editable"
 
                 else:
-                    result = f"FAIL: Unknown state '{state}'"
+                    _raise_invalid_input(
+                        f"Unknown state '{state}'",
+                        code="INVALID_STATE_VALUE",
+                        details={"state": state},
+                    )
 
             except Exception as e:
+                if isinstance(e, InvalidInputError):
+                    raise
                 result = f"FAIL: Could not check state '{state}' for element {ref}: {str(e)}"
+                _raise_verification_error(
+                    result,
+                    details={"ref": ref, "state": state},
+                )
 
             logger.info(f"[verify_element_state] {result}")
+            if result.startswith("FAIL:"):
+                _raise_verification_error(
+                    result,
+                    details={"ref": ref, "state": state},
+                )
             return result
         except Exception as e:
-            error_msg = f"FAIL: Verification error: {str(e)}"
+            if isinstance(e, (StateError, InvalidInputError, VerificationError)):
+                raise
+            error_msg = f"Verification error: {str(e)}"
             logger.error(f"[verify_element_state] {error_msg}")
-            return error_msg
+            _raise_verification_error(error_msg)
 
     async def verify_url(self, expected_url: str, exact: bool = False) -> str:
         """Verify the current page URL.
@@ -4775,14 +5104,21 @@ Before you return the element ref, reason about the state and elements for a sen
         Returns
         -------
         str
-            "PASS: ..." on success, "FAIL: ..." on failure.
+            "PASS: ..." on success.
+
+        Raises
+        ------
+        StateError
+            If no active page is available.
+        VerificationError
+            If the URL does not match expectation.
         """
         try:
             logger.info(f"[verify_url] start expected={expected_url} exact={exact}")
 
             page = await self.get_current_page()
             if page is None:
-                return "FAIL: No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             actual_url = page.url
 
@@ -4797,12 +5133,18 @@ Before you return the element ref, reason about the state and elements for a sen
             else:
                 result = f"FAIL: URL mismatch. Expected: '{expected_url}', Actual: '{actual_url}'"
                 logger.warning(f"[verify_url] {result}")
+                _raise_verification_error(
+                    result,
+                    details={"expected_url": expected_url, "actual_url": actual_url, "exact": exact},
+                )
 
             return result
         except Exception as e:
-            error_msg = f"FAIL: Verification error: {str(e)}"
+            if isinstance(e, (StateError, VerificationError)):
+                raise
+            error_msg = f"Verification error: {str(e)}"
             logger.error(f"[verify_url] {error_msg}")
-            return error_msg
+            _raise_verification_error(error_msg)
 
     async def verify_title(self, expected_title: str, exact: bool = False) -> str:
         """Verify the current page title.
@@ -4817,14 +5159,21 @@ Before you return the element ref, reason about the state and elements for a sen
         Returns
         -------
         str
-            "PASS: ..." on success, "FAIL: ..." on failure.
+            "PASS: ..." on success.
+
+        Raises
+        ------
+        StateError
+            If no active page is available.
+        VerificationError
+            If the title does not match expectation.
         """
         try:
             logger.info(f"[verify_title] start expected={expected_title} exact={exact}")
 
             page = await self.get_current_page()
             if page is None:
-                return "FAIL: No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             actual_title = await page.title()
 
@@ -4839,12 +5188,18 @@ Before you return the element ref, reason about the state and elements for a sen
             else:
                 result = f"FAIL: Title mismatch. Expected: '{expected_title}', Actual: '{actual_title}'"
                 logger.warning(f"[verify_title] {result}")
+                _raise_verification_error(
+                    result,
+                    details={"expected_title": expected_title, "actual_title": actual_title, "exact": exact},
+                )
 
             return result
         except Exception as e:
-            error_msg = f"FAIL: Verification error: {str(e)}"
+            if isinstance(e, (StateError, VerificationError)):
+                raise
+            error_msg = f"Verification error: {str(e)}"
             logger.error(f"[verify_title] {error_msg}")
-            return error_msg
+            _raise_verification_error(error_msg)
 
     # ==================== DevTools (Tracing and Video) ====================
 
@@ -4879,13 +5234,13 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             context = page.context
             context_key = _get_context_key(context)
 
-            if context_key in _tracing_state and _tracing_state[context_key]:
-                return "Tracing is already active. Stop the current trace first."
+            if context_key in self._tracing_state and self._tracing_state[context_key]:
+                _raise_state_error("Tracing is already active. Stop the current trace first.", code="TRACING_ALREADY_ACTIVE")
 
             await context.tracing.start(
                 screenshots=screenshots,
@@ -4893,7 +5248,7 @@ Before you return the element ref, reason about the state and elements for a sen
                 sources=sources,
             )
 
-            _tracing_state[context_key] = True
+            self._tracing_state[context_key] = True
 
             result = "Tracing started"
             logger.info(f"[start_tracing] done {result}")
@@ -4901,7 +5256,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to start tracing: {str(e)}"
             logger.error(f"[start_tracing] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def stop_tracing(self, filename: Optional[str] = None) -> str:
         """Stop browser tracing and save the trace file.
@@ -4915,20 +5270,19 @@ Before you return the element ref, reason about the state and elements for a sen
         -------
         str
             On success: Returns the file path where trace was saved.
-            On failure: Returns an error message.
         """
         try:
             logger.info(f"[stop_tracing] start filename={filename}")
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             context = page.context
             context_key = _get_context_key(context)
 
-            if context_key not in _tracing_state or not _tracing_state[context_key]:
-                return "No active tracing to stop. Start tracing first."
+            if context_key not in self._tracing_state or not self._tracing_state[context_key]:
+                _raise_state_error("No active tracing to stop. Start tracing first.", code="NO_ACTIVE_TRACING")
 
             if filename:
                 if not filename.lower().endswith(".zip"):
@@ -4943,7 +5297,7 @@ Before you return the element ref, reason about the state and elements for a sen
                 os.close(fd)
 
             await context.tracing.stop(path=output_path)
-            _tracing_state[context_key] = False
+            self._tracing_state[context_key] = False
 
             result = f"Trace saved to: {output_path}"
             logger.info(f"[stop_tracing] done {result}")
@@ -4951,7 +5305,7 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to stop tracing: {str(e)}"
             logger.error(f"[stop_tracing] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def start_video(
         self,
@@ -4982,98 +5336,98 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             context = page.context
             context_key = _get_context_key(context)
 
             if page.video:
-                _video_state[context_key] = True
+                self._video_state[context_key] = True
                 result = "Video recording started"
                 logger.info(f"[start_video] done {result}")
                 return result
             else:
-                return "No video recording available for this page"
+                _raise_state_error("No video recording available for this page", code="NO_ACTIVE_RECORDING")
         except Exception as e:
             error_msg = f"Failed to start video: {str(e)}"
             logger.error(f"[start_video] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def stop_video(self, filename: Optional[str] = None) -> str:
-        """Stop video recording and save the video file.
+        """Stop video recording.
 
-        Playwright finalises the video only when the page is closed, so this
-        method closes the current page, waits for the video file to be written,
-        and then — if *filename* is provided — moves (or copies) it to the
-        requested path.  A new blank page is opened automatically afterward so
-        the browser remains usable.
+        Marks the current recording session as stopped and registers the
+        destination path.  The actual video files are written by Playwright
+        when pages close, so saving is deferred to ``browser_close()`` /
+        ``close_tab()`` — no pages are touched here.
 
         Parameters
         ----------
         filename : Optional[str], optional
-            Destination path for the video file.  Accepts a file path
+            Destination path for the video file(s).  Accepts a file path
             (``./videos/demo.webm``) or a directory (``./videos/``).
             The ``.webm`` extension is added automatically when missing.
-            If not provided, returns the original path written by Playwright.
+            If not provided, Playwright writes files to the temporary
+            recording directory automatically on page close.
 
         Returns
         -------
         str
-            On success: ``Video saved to: <path>``
-            On failure: An error message.
+            Confirmation that recording was stopped and where files will be
+            saved (``Video will be saved to: <path> on browser close``).
         """
         try:
             logger.info(f"[stop_video] start filename={filename}")
 
-            page = await self.get_current_page()
-            if page is None:
-                return "No active page available"
-            context_key = _get_context_key(page.context)
+            if self._context is None:
+                _raise_state_error("No context is open", code="NO_CONTEXT")
+            context_key = _get_context_key(self._context)
 
-            if not page.video:
-                return "No video recording available for this page"
+            if not self._video_state.get(context_key):
+                _raise_state_error("No active video recording. Use video-start first.", code="NO_ACTIVE_RECORDING")
 
-            # Grab video handle before closing — page.video is still valid
-            # after close, but we need the reference.
-            video = page.video
-
+            # Resolve destination path now (before any context changes) and
+            # create the directory so the user gets an early error if the path
+            # is invalid.  Actual file writing is deferred to browser close.
+            resolved: Optional[str] = None
             if filename:
-                # If filename looks like a directory (ends with / or is an
-                # existing directory), generate a timestamped file inside it.
                 if filename.endswith(os.sep) or os.path.isdir(filename):
-                    import time
-                    ts = time.strftime("%Y%m%d_%H%M%S")
-                    filename = os.path.join(filename, f"video_{ts}.webm")
+                    import time as _time
+                    dest_dir = os.path.abspath(filename)
+                    resolved = os.path.join(dest_dir, f"video_{_time.strftime('%Y%m%d_%H%M%S')}.webm")
+                else:
+                    if not filename.lower().endswith(".webm"):
+                        filename = f"{filename}.webm"
+                    resolved = os.path.abspath(filename)
+                dest_dir = os.path.dirname(resolved)
+                if dest_dir:
+                    os.makedirs(dest_dir, exist_ok=True)
 
-                if not filename.lower().endswith(".webm"):
-                    filename = f"{filename}.webm"
+            # Defer the actual save; no pages are closed or navigated here.
+            self._pending_video_save_path[context_key] = resolved
+            self._video_state[context_key] = False
 
-                dest = os.path.abspath(filename)
-                dirname = os.path.dirname(dest)
-                if dirname:
-                    os.makedirs(dirname, exist_ok=True)
-
-                # close page first so Playwright finalises the video file,
-                # then save_as() copies the finished file to dest.
-                await page.close()
-                await video.save_as(dest)
-                result = f"Video saved to: {dest}"
+            if resolved:
+                dest_dir_display = os.path.dirname(resolved)
+                stem_display = os.path.splitext(os.path.basename(resolved))[0]
+                result = (
+                    f"Video recording stopped. "
+                    f"Files will be saved to {dest_dir_display}/ "
+                    f"as {stem_display}.webm (single tab) or "
+                    f"{stem_display}_1.webm, {stem_display}_2.webm, ... (multiple tabs) "
+                    f"when browser closes."
+                )
             else:
-                # No destination — return the original path in ~/.bridgic/tmp
-                video_path = await video.path()
-                await page.close()
-                result = f"Video saved to: {os.path.abspath(str(video_path))}"
-
-            # Open a fresh page so the browser stays usable
-            self._page = await self._context.new_page()
-            _video_state[context_key] = False
-
-            logger.info(f"[stop_video] done {result}")
+                result = (
+                    "Video recording stopped. "
+                    "Files will be auto-saved to the recording directory when browser closes."
+                )
+            logger.info(f"[stop_video] done (deferred) {result}")
             return result
         except Exception as e:
             error_msg = f"Failed to stop video: {str(e)}"
             logger.error(f"[stop_video] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)
 
     async def add_trace_chunk(self, title: Optional[str] = None) -> str:
         """Add a new chunk to the trace.
@@ -5093,13 +5447,13 @@ Before you return the element ref, reason about the state and elements for a sen
 
             page = await self.get_current_page()
             if page is None:
-                return "No active page available"
+                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             context = page.context
             context_key = _get_context_key(context)
 
-            if context_key not in _tracing_state or not _tracing_state[context_key]:
-                return "No active tracing. Start tracing first."
+            if context_key not in self._tracing_state or not self._tracing_state[context_key]:
+                _raise_state_error("No active tracing. Start tracing first.", code="NO_ACTIVE_TRACING")
 
             await context.tracing.start_chunk(title=title)
 
@@ -5109,4 +5463,4 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to add trace chunk: {str(e)}"
             logger.error(f"[add_trace_chunk] {error_msg}")
-            return error_msg
+            _raise_operation_error(error_msg)

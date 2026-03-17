@@ -1,13 +1,8 @@
 """
-Tests for `get_snapshot_text` (integration: require real browser).
+Tests for `get_snapshot_text`.
 
-This file focuses on `get_snapshot_text` behavior across different options:
-- pagination via start_from_char
-- truncation notice when snapshot text is too long
-- real snapshot differences for interactive / full_page
-
-These tests use a real `Browser` instance via the `browser_instance` fixture,
-so they are marked as integration. Run with: pytest -m integration
+Integration tests (require real browser) are marked with @pytest.mark.integration.
+Run with: pytest -m integration
 For unit-only (no browser): pytest -m "not integration" or make test-quick.
 If browser tests are disabled (SKIP_BROWSER_TESTS=1), the fixture will skip.
 """
@@ -19,13 +14,13 @@ from urllib.parse import quote
 
 import pytest
 
+from bridgic.browser.errors import InvalidInputError
 from bridgic.browser.session import EnhancedSnapshot
 import bridgic.browser.session._browser as _browser_module
 from bridgic.browser.session._browser import Browser
 
 
 def _data_url(html: str) -> str:
-    # Keep it simple + robust for Playwright's page.goto(...)
     return "data:text/html;charset=utf-8," + quote(html)
 
 
@@ -127,9 +122,9 @@ async def test_get_snapshot_text_pagination_start_from_char_exceeds_total_length
     await browser_instance.navigate_to(_data_url(html))
 
     full = await browser_instance.get_snapshot_text()
-    result = await browser_instance.get_snapshot_text(start_from_char=len(full) + 1)
-
-    assert "exceeds total page state length" in result.lower()
+    with pytest.raises(InvalidInputError) as exc_info:
+        await browser_instance.get_snapshot_text(start_from_char=len(full) + 1)
+    assert exc_info.value.code == "START_FROM_CHAR_OUT_OF_RANGE"
 
 
 @pytest.mark.asyncio
@@ -188,4 +183,3 @@ async def test_get_snapshot_text_truncation_notice_preserves_snapshot_mode_param
 
     assert "interactive=True, full_page=False" in result
     assert "bridgic-browser snapshot -i -F -s 120" in result
-

@@ -49,11 +49,11 @@ bridgic/browser/
 │   ├── _download.py      # DownloadManager
 │   └── _browser_model.py # Data models
 ├── tools/            # 67 automation tools (all implemented in _browser.py)
-│   ├── _browser_tool_set_builder.py  # BrowserToolSetBuilder + ToolPreset
+│   ├── _browser_tool_set_builder.py  # BrowserToolSetBuilder (category/name selection)
 │   └── _browser_tool_spec.py         # BrowserToolSpec (wraps tool for agents)
 └── cli/              # CLI tool (bridgic-browser command)
     ├── __init__.py       # Exports main()
-    ├── _commands.py      # Click command definitions (67 commands, SectionedGroup)
+    ├── _commands.py      # Click command definitions (68 commands incl. utility metadata command, SectionedGroup)
     ├── _client.py        # Socket client: send_command(), ensure_daemon_running()
     └── _daemon.py        # Daemon: asyncio Unix socket server + Browser instance
 ```
@@ -81,27 +81,21 @@ Refs (`e1`, `e2`, …) are generated during snapshot and stored in `EnhancedSnap
 `BrowserToolSetBuilder` supports multiple selection strategies:
 
 ```python
-# By preset
-builder = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)
-tools = builder.build()["tool_specs"]
-
 # By category
 builder = BrowserToolSetBuilder.for_categories(browser, "navigation", "element_interaction")
 tools = builder.build()["tool_specs"]
 
-# By function reference
-builder = BrowserToolSetBuilder.for_funcs(
-    browser, browser.click_element_by_ref, browser.input_text_by_ref
+# By tool name
+builder = BrowserToolSetBuilder.for_tool_names(
+    browser, "click_element_by_ref", "input_text_by_ref"
 )
 tools = builder.build()["tool_specs"]
 
 # Combine multiple for_* selections
-builder1 = BrowserToolSetBuilder.for_preset(browser, ToolPreset.INTERACTIVE)
+builder1 = BrowserToolSetBuilder.for_categories(browser, "navigation", "element_interaction", "capture")
 builder2 = BrowserToolSetBuilder.for_tool_names(browser, "verify_url")
 tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 ```
-
-**`ToolPreset` sizes**: MINIMAL (9), NAVIGATION (3), SCRAPING (10), FORM_FILLING (18), TESTING (26), INTERACTIVE (32), DEVELOPER (23), COMPLETE (67).
 
 ### Snapshot modes
 

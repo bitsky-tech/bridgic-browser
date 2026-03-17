@@ -186,11 +186,11 @@ PyPI indexing can take a few minutes. Wait and try again.
 
 ## Automated Releases (CI/CD)
 
-For automated releases via GitHub Actions, see `.github/workflows/publish.yml`.
+This repository currently uses manual publishing (`make publish ...`) and does
+not include a dedicated GitHub Actions publish workflow.
 
-The workflow is triggered by:
-- Pushing a version tag (e.g., `v0.1.0`)
-- Manual workflow dispatch
+Current CI workflow:
+- `.github/workflows/multi-version-test.yml` (test matrix only)
 
 ## Rollback
 

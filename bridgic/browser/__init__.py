@@ -3,9 +3,25 @@
 from importlib.metadata import version
 
 from .utils._logging import configure_logging
-
-# Auto-configure logging on package import
-configure_logging()
+from .session._browser import Browser
+from .errors import (
+    BridgicBrowserError,
+    BridgicBrowserCommandError,
+    InvalidInputError,
+    StateError,
+    OperationError,
+    VerificationError,
+)
 
 __version__ = version("bridgic-browser")
-__all__ = ["__version__", "configure_logging"]
+__all__ = [
+    "__version__",
+    "configure_logging",
+    "Browser",
+    "BridgicBrowserError",
+    "BridgicBrowserCommandError",
+    "InvalidInputError",
+    "StateError",
+    "OperationError",
+    "VerificationError",
+]
