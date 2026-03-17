@@ -110,9 +110,12 @@ async def test_get_snapshot_text_pagination_start_from_char_slices_text(browser_
     full = await browser_instance.get_snapshot_text(start_from_char=0)
     assert len(full) > 20
 
+    # The header line ([Page: url | title]\n) is always prepended regardless of
+    # start_from_char. Offsets are relative to snapshot.tree (post-header).
+    header_len = full.index('\n') + 1
     start = 10
     sliced = await browser_instance.get_snapshot_text(start_from_char=start)
-    assert sliced == full[start:]
+    assert sliced == full[:header_len] + full[header_len + start:]
 
 
 @pytest.mark.integration

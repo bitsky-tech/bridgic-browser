@@ -47,6 +47,7 @@ import pytest_asyncio
 
 pytestmark = pytest.mark.integration
 
+from bridgic.browser.errors import VerificationError
 from bridgic.browser.session import Browser
 
 # ==================== Constants ====================
@@ -689,10 +690,11 @@ class TestVerificationTools:
 
     @pytest.mark.asyncio
     async def test_verify_element_visible_not_found(self, browser):
-        result = await browser.verify_element_visible(
-            "heading", "NonExistent Element XYZ", timeout=1000,
-        )
-        assert "FAIL" in result
+        with pytest.raises(VerificationError) as exc_info:
+            await browser.verify_element_visible(
+                "heading", "NonExistent Element XYZ", timeout=1000,
+            )
+        assert "FAIL" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_verify_text_visible(self, browser):
@@ -701,10 +703,11 @@ class TestVerificationTools:
 
     @pytest.mark.asyncio
     async def test_verify_text_visible_exact(self, browser):
-        result = await browser.verify_text_visible(
-            "Nonexistent text XYZ", exact=True, timeout=1000,
-        )
-        assert "FAIL" in result
+        with pytest.raises(VerificationError) as exc_info:
+            await browser.verify_text_visible(
+                "Nonexistent text XYZ", exact=True, timeout=1000,
+            )
+        assert "FAIL" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_verify_url(self, browser):

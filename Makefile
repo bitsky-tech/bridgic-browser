@@ -33,6 +33,7 @@ init-dev:
 # Uses wheel install + PYTHONPATH so bridgic namespace (browser + core + llms) is used from site-packages.
 test:
 	@uv sync --group dev
+	@rm -f dist/bridgic_browser-*.whl dist/bridgic_browser-*.tar.gz
 	@uv build --out-dir dist
 	@uv pip install dist/bridgic_browser-*.whl --force-reinstall -q
 	@SITE=$$(.venv/bin/python -c "import site; print(site.getsitepackages()[0])"); \
