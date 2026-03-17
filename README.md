@@ -87,6 +87,20 @@ async def create_agent():
     return browser, tools
 ```
 
+#### AI Coding Assistants (Skill)
+
+Install this repo’s Skill using the `npx skills` CLI:
+
+```bash
+# From this repository checkout
+npx skills add . --skill bridgic-browser
+
+# Or from GitHub
+npx skills add bitsky-tech/bridgic-browser --skill bridgic-browser
+```
+
+After installation, the Skill will appear in your project’s agent directories (for example, Claude Code typically under `.claude/skills/bridgic-browser/SKILL.md`, and Cursor under `.agents/skills/bridgic-browser/SKILL.md`).
+
 ### CLI Tool
 
 `bridgic-browser` ships with a command-line interface for controlling a browser from the terminal without writing Python. A persistent daemon process holds the browser; each CLI invocation connects over a Unix socket and exits immediately.
@@ -522,6 +536,20 @@ async def create_agent():
     # 工具包括：导航、点击、输入文本、滚动等
     return browser, tools
 ```
+
+#### AI 编程助手（Skill）
+
+使用 `npx skills` 命令行安装本仓库的 Skill：
+
+```bash
+# 在本仓库目录下
+npx skills add . --skill bridgic-browser
+
+# 或从 GitHub 安装
+npx skills add bitsky-tech/bridgic-browser --skill bridgic-browser
+```
+
+安装完成后，Skill 会出现在项目内对应 agent 的技能目录（例如 Claude Code 通常为 `.claude/skills/bridgic-browser/SKILL.md`，Cursor 通常为 `.agents/skills/bridgic-browser/SKILL.md`）。
 
 ### CLI 工具
 
