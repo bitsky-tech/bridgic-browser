@@ -651,7 +651,7 @@ class TestStorageTools:
         # Use the current page URL for cookie setting
         result = await browser.set_cookie(
             name="test_cookie", value="test_value",
-            url="http://localhost", domain="localhost",
+            url="http://localhost",
         )
         assert result is not None
 

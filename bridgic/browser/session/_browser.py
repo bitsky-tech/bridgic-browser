@@ -4774,13 +4774,14 @@ Before you return the element ref, reason about the state and elements for a sen
 
             if not url and not domain:
                 _raise_invalid_input("Either url or domain must be specified", code="INVALID_COOKIE_TARGET")
+            if url and domain:
+                _raise_invalid_input("Provide either url or domain, not both", code="INVALID_COOKIE_TARGET")
 
             context = page.context
 
             cookie: Dict[str, Any] = {
                 "name": name,
                 "value": value,
-                "path": path,
                 "httpOnly": http_only,
                 "secure": secure,
             }
@@ -4789,6 +4790,7 @@ Before you return the element ref, reason about the state and elements for a sen
                 cookie["url"] = url
             if domain:
                 cookie["domain"] = domain
+                cookie["path"] = path
             if expires is not None:
                 cookie["expires"] = expires
             if same_site:
