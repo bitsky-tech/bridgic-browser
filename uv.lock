@@ -215,7 +215,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "bridgic-core", specifier = ">=0.3.0b1,<0.4.0" },
+    { name = "bridgic-core", specifier = ">=0.3.0,<0.4.0" },
     { name = "bridgic-llms-openai", specifier = ">=0.1.1,<0.2.0" },
     { name = "click", specifier = ">=8.0" },
     { name = "playwright", specifier = ">=1.57.0,<1.58.0" },
@@ -231,7 +231,7 @@ dev = [
 
 [[package]]
 name = "bridgic-core"
-version = "0.3.0b1"
+version = "0.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cloudpickle" },
@@ -241,9 +241,9 @@ dependencies = [
     { name = "msgpack" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ef/54/93650695398ddb608446bac4cb635281e15070eb39078d5b59b98861036e/bridgic_core-0.3.0b1.tar.gz", hash = "sha256:e3c6a288a3a82a28ce076b93dbc58b3985f70413cf4d74e100f6fff2618c5087", size = 94764, upload-time = "2026-01-28T07:20:31.079Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3b/cf/81aeb1082498e595b5a0df966c52779c76ff2ddaa81b13a3a68606b578b7/bridgic_core-0.3.0.tar.gz", hash = "sha256:a5e78436eea9ccb07295159d68fd24ca4da817f896c4241eb23613f34282d28b", size = 96634, upload-time = "2026-03-17T07:16:56.686Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8f/20/696c6f8fee8a557740392f3b7641bc8a08ce85bad4c68cabb23f5376b06a/bridgic_core-0.3.0b1-py3-none-any.whl", hash = "sha256:99bb1d9a95ddca3608ec76f5edcdb28c749e4db9f0e0acb4f8c6074c5593bff5", size = 127452, upload-time = "2026-01-28T07:20:29.38Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/bb/c0e333d537f95d0c8686fb061ec0760a2995d0e0b6dc33fdc575fce115e2/bridgic_core-0.3.0-py3-none-any.whl", hash = "sha256:ab587eb1396a3cc808860e92c3964182f0cd7f73a53d79a07c3fd09bd5db8c70", size = 130295, upload-time = "2026-03-17T07:16:58.377Z" },
 ]
 
 [[package]]
