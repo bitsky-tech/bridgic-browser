@@ -74,7 +74,8 @@ jobs:
         run: |
           $out = uv run bridgic-browser snapshot
           Write-Output $out
-          if (-not ($out -match '\[ref=e\d+\]')) {
+          $hasRef = $out | Where-Object { $_ -match '\[ref=e\d+\]' }
+          if (-not $hasRef) {
             Write-Error "snapshot output contains no refs"
             exit 1
           }
@@ -92,9 +93,11 @@ jobs:
         shell: pwsh
         run: |
           $snap = uv run bridgic-browser snapshot -i
-          # Extract first ref from snapshot output (e.g. [ref=e3])
-          if ($snap -match '\[ref=(e\d+)\]') {
-            $ref = $Matches[1]
+          # Avoid relying on $Matches automatic variable (can be null for collection matches).
+          $snapText = ($snap -join "`n")
+          $refMatch = [regex]::Match($snapText, '\[ref=(e\d+)\]')
+          if ($refMatch.Success) {
+            $ref = $refMatch.Groups[1].Value
             Write-Output "Clicking ref: $ref"
             uv run bridgic-browser click $ref
           } else {
@@ -157,10 +160,15 @@ jobs:
         run: |
           $out = uv run bridgic-browser new-tab https://example.com
           Write-Output $out
-          # Extract page_id and close it
-          if ($out -match 'page_id[=:]\s*(\S+)') {
-            $pid = $Matches[1].Trim('.,;')
-            uv run bridgic-browser close-tab $pid
+          # page_id is always a plain integer; match digits only to avoid capturing trailing punctuation
+          $outText = ($out -join "`n")
+          $pidMatch = [regex]::Match($outText, 'page_id:\s*(\d+)')
+          if ($pidMatch.Success) {
+            $tabId = $pidMatch.Groups[1].Value
+            Write-Output "Closing tab: $tabId"
+            uv run bridgic-browser close-tab $tabId
+          } else {
+            Write-Output "Could not extract page_id, skipping close-tab"
           }
 
       # ── Storage ────────────────────────────────────────────────────────────
