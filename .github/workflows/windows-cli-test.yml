@@ -81,7 +81,9 @@ jobs:
         run: |
           $out = uv run bridgic-browser snapshot
           Write-Output $out
-          $hasRef = $out | Where-Object { $_ -match '\[ref=e\d+\]' }
+          $outText = ($out | Out-String)
+          # Accept any ref token shape, e.g. e123 or 8-char hash-like ids.
+          $hasRef = $outText -match '\[ref=[^\]\r\n]+\]'
           if (-not $hasRef) {
             Write-Error "snapshot output contains no refs"
             exit 1
@@ -101,8 +103,8 @@ jobs:
         run: |
           $snap = uv run bridgic-browser snapshot -i
           # Avoid relying on $Matches automatic variable (can be null for collection matches).
-          $snapText = ($snap -join "`n")
-          $refMatch = [regex]::Match($snapText, '\[ref=(e\d+)\]')
+          $snapText = ($snap | Out-String)
+          $refMatch = [regex]::Match($snapText, '\[ref=([^\]\r\n]+)\]')
           if ($refMatch.Success) {
             $ref = $refMatch.Groups[1].Value
             Write-Output "Clicking ref: $ref"
@@ -167,9 +169,9 @@ jobs:
         run: |
           $out = uv run bridgic-browser new-tab https://example.com
           Write-Output $out
-          # page_id is always a plain integer; match digits only to avoid capturing trailing punctuation
-          $outText = ($out -join "`n")
-          $pidMatch = [regex]::Match($outText, 'page_id:\s*(\d+)')
+          # page_id is always an integer; allow page_id: 2, page_id=2, or "page_id": 2.
+          $outText = ($out | Out-String)
+          $pidMatch = [regex]::Match($outText, '(?m)\b"?page_id"?\b\s*[:=]\s*(\d+)')
           if ($pidMatch.Success) {
             $tabId = $pidMatch.Groups[1].Value
             Write-Output "Closing tab: $tabId"
