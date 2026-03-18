@@ -94,10 +94,12 @@ def _err(err: Exception | str) -> None:
 
 @click.group(cls=SectionedGroup, context_settings=CONTEXT_SETTINGS)
 def cli() -> None:
-    """Bridgic Browser CLI — control a persistent browser session.
+    """Bridgic Browser CLI — a comprehensive set of browser automation tools for AI agents.
 
-    Workflow: open/search -> snapshot -> interact by ref -> verify/capture(optional).
+    Workflow: open/search -> snapshot -> interact by ref -> verify (optional) -> close.
     Refs are from the latest snapshot; run `snapshot` again after page changes.
+
+    Use `bridgic-browser COMMAND --help` for command-specific help.
     """
 
 
@@ -120,7 +122,7 @@ def _resolve_section(section: str) -> ToolCategory:
 @click.option("--headed", is_flag=True, default=False,
               help="Launch the browser in headed (visible) mode.")
 def cmd_open(url: str, headed: bool) -> None:
-    """Navigate to URL (starts browser if needed)."""
+    """Navigate to URL (starts a browser session if needed)."""
     try:
         _ok(send_command("open", {"url": url}, headed=headed))
     except Exception as exc:
@@ -164,7 +166,7 @@ def cmd_reload() -> None:
 @click.option("--headed", is_flag=True, default=False,
               help="Launch the browser in headed (visible) mode.")
 def cmd_search(query: str, engine: str, headed: bool) -> None:
-    """Search the web using a search engine."""
+    """Search the web using a search engine (starts a browser session if needed)."""
     try:
         _ok(send_command("search", {"query": query, "engine": engine}, headed=headed))
     except Exception as exc:
@@ -186,11 +188,11 @@ def cmd_info() -> None:
 @click.option("-i", "--interactive", is_flag=True, default=False,
               help="Only show clickable/editable elements.")
 @click.option("-f/-F", "--full-page/--no-full-page", default=True,
-              help="Include elements outside the viewport (default: true). -F = viewport only.")
-@click.option("-s", "--start-from-char", default=0, type=click.IntRange(min=0),
-              help="Pagination offset. Use next_start_char from the truncation notice.")
+              help="Include elements outside the viewport (default: full-page). -F = viewport only.")
+@click.option("-s", "--start-from-char", default=0, type=click.INT,
+              help="Pagination offset. Get the offset value from the truncation notice when the page is too long.")
 def cmd_snapshot(interactive: bool, full_page: bool, start_from_char: int) -> None:
-    """Print the current accessibility tree snapshot."""
+    """Get an accessibility tree representation of the current page with refs (like e1, e2)."""
     try:
         _ok(send_command("snapshot", {
             "interactive": interactive,
@@ -278,7 +280,7 @@ def cmd_check(ref: str) -> None:
 @cli.command("uncheck", context_settings=CONTEXT_SETTINGS)
 @click.argument("ref")
 def cmd_uncheck(ref: str) -> None:
-    """Uncheck a checkbox by ref (radios usually require selecting another option)."""
+    """Uncheck a checkbox by ref (radio usually cannot be unchecked)."""
     try:
         _ok(send_command("uncheck", {"ref": _strip_ref(ref)}, start_if_needed=False))
     except Exception as exc:
@@ -471,7 +473,7 @@ def cmd_mouse_up(button: str) -> None:
 @click.option("--gone", is_flag=True, default=False,
               help="Wait for VALUE text to disappear instead of appear.")
 def cmd_wait(value: str, gone: bool) -> None:
-    """Wait for SECONDS or until TEXT appears (--gone: disappears).
+    """Wait for SECONDS or until TEXT appears or disappears.
 
     \b
     If VALUE is a number, wait that many seconds (max 60).
@@ -915,7 +917,7 @@ def cmd_video_stop(path: str | None) -> None:
 
 @cli.command("close", context_settings=CONTEXT_SETTINGS)
 def cmd_close() -> None:
-    """Close the browser and stop the daemon."""
+    """Close/Stop the browser session."""
     try:
         click.echo("Closing browser session...", err=True)
         _ok(send_command("close", {}, start_if_needed=False))

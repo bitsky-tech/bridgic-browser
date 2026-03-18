@@ -1960,7 +1960,7 @@ Before you return the element ref, reason about the state and elements for a sen
                 cli_cmd = "bridgic-browser snapshot " + " ".join(cli_flags)
 
                 notice = (
-                    "\n\n[notice] Current page state text is too long, returned portion starting "
+                    "\n\n[notice] Current page text is too long, returned portion starting "
                     f"from character {start_from_char} (this segment length {len(text)} / total "
                     f"length {total_length} characters). To continue getting subsequent content: "
                     f"call get_snapshot_text(start_from_char={next_start_char}, "

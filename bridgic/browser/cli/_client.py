@@ -127,7 +127,7 @@ def _raise_no_browser_session(command: str, *, cause: Optional[str] = None) -> N
         code="NO_BROWSER_SESSION",
         message=(
             "No browser session is running. "
-            "Use 'bridgic-browser open <url>' to start one."
+            "Use `bridgic-browser open <url>` or `bridgic-browser search <query>` to start one."
         ),
         details=details,
         retryable=True,
