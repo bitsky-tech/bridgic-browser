@@ -87,9 +87,6 @@ from bridgic.browser.cli._daemon import (
     _handle_video_stop,
     _handle_resize,
     _is_browser_closed_error,
-    # re-exported from _transport for backward compatibility
-    _default_socket_path,
-    _safe_remove_socket,
 )
 from bridgic.browser.cli._transport import (
     RUN_INFO_PATH,
@@ -97,6 +94,8 @@ from bridgic.browser.cli._transport import (
     TcpTransport,
     UnixTransport,
     get_transport,
+    _default_socket_path,
+    _safe_remove_socket,
     read_run_info,
     remove_run_info,
     write_run_info,
@@ -122,6 +121,93 @@ def invoke_raw(args: list[str]):
     return runner.invoke(cli, args, catch_exceptions=False)
 
 
+# Minimal valid invocations for every CLI command (ensures full coverage).
+CLI_COMMAND_SAMPLE_ARGS: dict[str, list[str]] = {
+    # Navigation
+    "open": ["open", "https://example.com"],
+    "search": ["search", "query"],
+    "info": ["info"],
+    "reload": ["reload"],
+    "back": ["back"],
+    "forward": ["forward"],
+    # Snapshot
+    "snapshot": ["snapshot"],
+    # Element interaction
+    "click": ["click", "@e1"],
+    "double-click": ["double-click", "@e1"],
+    "hover": ["hover", "@e1"],
+    "focus": ["focus", "@e1"],
+    "fill": ["fill", "@e1", "hello"],
+    "select": ["select", "@e1", "Option"],
+    "options": ["options", "@e1"],
+    "check": ["check", "@e1"],
+    "uncheck": ["uncheck", "@e1"],
+    "scroll-to": ["scroll-to", "@e1"],
+    "drag": ["drag", "@e1", "@e2"],
+    "upload": ["upload", "@e1", "file.txt"],
+    "fill-form": ["fill-form", '[{"ref":"e1","value":"hi"}]'],
+    # Tabs
+    "tabs": ["tabs"],
+    "new-tab": ["new-tab"],
+    "switch-tab": ["switch-tab", "page-1"],
+    "close-tab": ["close-tab"],
+    # Evaluate
+    "eval": ["eval", "return 1;"],
+    "eval-on": ["eval-on", "@e1", "return 1;"],
+    # Keyboard
+    "press": ["press", "Enter"],
+    "type": ["type", "hello"],
+    "key-down": ["key-down", "Shift"],
+    "key-up": ["key-up", "Shift"],
+    # Mouse
+    "scroll": ["scroll"],
+    "mouse-move": ["mouse-move", "1", "2"],
+    "mouse-click": ["mouse-click", "1", "2"],
+    "mouse-drag": ["mouse-drag", "1", "2", "3", "4"],
+    "mouse-down": ["mouse-down"],
+    "mouse-up": ["mouse-up"],
+    # Wait
+    "wait": ["wait", "1"],
+    # Capture
+    "screenshot": ["screenshot", "out.png"],
+    "pdf": ["pdf", "out.pdf"],
+    # Network
+    "network-start": ["network-start"],
+    "network": ["network"],
+    "network-stop": ["network-stop"],
+    "wait-network": ["wait-network"],
+    # Dialog
+    "dialog-setup": ["dialog-setup"],
+    "dialog": ["dialog"],
+    "dialog-remove": ["dialog-remove"],
+    # Storage
+    "cookies": ["cookies"],
+    "cookie-set": ["cookie-set", "sid", "abc123"],
+    "cookies-clear": ["cookies-clear"],
+    "storage-save": ["storage-save", "state.json"],
+    "storage-load": ["storage-load", "state.json"],
+    # Verify
+    "verify-text": ["verify-text", "Hello"],
+    "verify-visible": ["verify-visible", "button", "Submit"],
+    "verify-value": ["verify-value", "@e1", "expected"],
+    "verify-state": ["verify-state", "@e1", "visible"],
+    "verify-url": ["verify-url", "example.com"],
+    "verify-title": ["verify-title", "Example"],
+    # Developer
+    "console-start": ["console-start"],
+    "console": ["console"],
+    "console-stop": ["console-stop"],
+    "trace-start": ["trace-start"],
+    "trace-chunk": ["trace-chunk", "step-1"],
+    "trace-stop": ["trace-stop", "trace.zip"],
+    "video-start": ["video-start"],
+    "video-stop": ["video-stop"],
+    # Lifecycle
+    "close": ["close"],
+    "resize": ["resize", "800", "600"],
+}
+
+
 def make_reader(data: bytes) -> asyncio.StreamReader:
     reader = asyncio.StreamReader()
     reader.feed_data(data)
@@ -143,7 +229,7 @@ def make_browser() -> MagicMock:
     b.get_snapshot = AsyncMock()
     b.get_element_by_ref = AsyncMock(return_value=None)
     b.navigate_to = AsyncMock()
-    b.browser_close = AsyncMock(return_value="Browser closed successfully")
+    b.stop = AsyncMock(return_value="Browser closed successfully")
     return b
 
 
@@ -184,19 +270,22 @@ class TestSectionedGroupHelp:
         assert SectionedGroup.SECTIONS == CLI_HELP_SECTIONS
 
     def test_registered_commands_match_catalog(self):
-        # `commands` is intentionally unsectioned and appears under "Other".
-        assert set(CLI_ALL_COMMANDS).issubset(set(cli.commands.keys()))
-        assert "commands" in cli.commands
+        registered = set(cli.commands.keys())
+        expected = set(CLI_ALL_COMMANDS)
+        assert expected.issubset(registered)
+        assert registered == expected
 
     def test_h_shorthand_on_group(self):
         result = invoke_raw(["-h"])
         assert result.exit_code == 0
         assert "Usage:" in result.output
+        assert "[OPTIONS]" not in result.output
 
     def test_help_longhand_on_group(self):
         result = invoke_raw(["--help"])
         assert result.exit_code == 0
         assert "Usage:" in result.output
+        assert "[OPTIONS]" not in result.output
 
     def test_h_shorthand_on_subcommand(self):
         result = invoke_raw(["open", "-h"])
@@ -210,7 +299,7 @@ class TestSectionedGroupHelp:
             "Navigation", "Snapshot", "Element Interaction",
             "Keyboard", "Mouse", "Wait", "Tabs", "Evaluate", "Capture",
             "Network", "Dialog", "Storage", "Verify",
-            "Developer", "Lifecycle", "Other",
+            "Developer", "Lifecycle",
         ):
             assert section in out, f"Section '{section}' missing from help"
 
@@ -250,8 +339,6 @@ class TestSectionedGroupHelp:
             "video-start", "video-stop",
             # Lifecycle
             "close", "resize",
-            # Utility metadata
-            "commands",
         ]
         for cmd in expected_commands:
             assert cmd in out, f"Command '{cmd}' missing from help output"
@@ -281,25 +368,6 @@ class TestSectionedGroupHelp:
             assert not line.rstrip().endswith("e.g."), (
                 f"Help text truncated at 'e.g.' — fix docstring: {line!r}"
             )
-
-
-class TestCommandsMetadata:
-    def test_commands_without_args_shows_usage_hint(self):
-        result = invoke_raw(["commands"])
-        assert result.exit_code == 0
-        assert "Use --list-sections or --section NAME." in result.output
-
-    def test_commands_list_sections(self):
-        result = invoke_raw(["commands", "--list-sections"])
-        assert result.exit_code == 0
-        assert "Sections:" in result.output
-        assert "navigation" in result.output
-        assert "lifecycle" in result.output
-
-    def test_commands_with_unknown_section(self):
-        result = invoke_raw(["commands", "--section", "not_real"])
-        assert result.exit_code == 1
-        assert "Unknown section" in result.output
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -402,7 +470,11 @@ class TestCliCommandRouting:
 
     def test_fill(self):
         _, sc = invoke(["fill", "@e3", "hello"])
-        sc.assert_called_once_with("fill", {"ref": "e3", "text": "hello"}, start_if_needed=False)
+        sc.assert_called_once_with("fill", {"ref": "e3", "text": "hello", "submit": False}, start_if_needed=False)
+
+    def test_fill_with_submit(self):
+        _, sc = invoke(["fill", "@e3", "hello", "--submit"])
+        sc.assert_called_once_with("fill", {"ref": "e3", "text": "hello", "submit": True}, start_if_needed=False)
 
     def test_select(self):
         _, sc = invoke(["select", "@e7", "Option A"])
@@ -633,11 +705,11 @@ class TestCliCommandRouting:
 
     def test_wait_network_defaults(self):
         _, sc = invoke(["wait-network"])
-        sc.assert_called_once_with("wait_network", {"timeout": 30000.0}, start_if_needed=False)
+        sc.assert_called_once_with("wait_network", {"timeout": 30.0}, start_if_needed=False)
 
     def test_wait_network_custom_timeout(self):
-        _, sc = invoke(["wait-network", "--timeout", "5000"])
-        sc.assert_called_once_with("wait_network", {"timeout": 5000.0}, start_if_needed=False)
+        _, sc = invoke(["wait-network", "2.5"])
+        sc.assert_called_once_with("wait_network", {"timeout": 2.5}, start_if_needed=False)
 
     # ── Dialog ────────────────────────────────────────────────────────────────
 
@@ -679,15 +751,39 @@ class TestCliCommandRouting:
 
     def test_cookies_clear(self):
         _, sc = invoke(["cookies-clear"])
-        sc.assert_called_once_with("cookies_clear", start_if_needed=False)
+        sc.assert_called_once_with("cookies_clear", None, start_if_needed=False)
 
     def test_cookies_no_filter(self):
         _, sc = invoke(["cookies"])
-        sc.assert_called_once_with("cookies", {"url": None}, start_if_needed=False)
+        sc.assert_called_once_with(
+            "cookies",
+            {"domain": None, "path": None, "name": None},
+            start_if_needed=False,
+        )
 
-    def test_cookies_with_url(self):
-        _, sc = invoke(["cookies", "--url", "https://example.com"])
-        sc.assert_called_once_with("cookies", {"url": "https://example.com"}, start_if_needed=False)
+    def test_cookies_with_domain_path_name(self):
+        _, sc = invoke(["cookies", "--domain", "example.com", "--path", "/app", "--name", "sid"])
+        sc.assert_called_once_with(
+            "cookies",
+            {"domain": "example.com", "path": "/app", "name": "sid"},
+            start_if_needed=False,
+        )
+
+    def test_cookies_clear_with_name(self):
+        _, sc = invoke(["cookies-clear", "--name", "sid"])
+        sc.assert_called_once_with(
+            "cookies_clear",
+            {"name": "sid"},
+            start_if_needed=False,
+        )
+
+    def test_cookies_clear_with_domain_path(self):
+        _, sc = invoke(["cookies-clear", "--domain", "example.com", "--path", "/app"])
+        sc.assert_called_once_with(
+            "cookies_clear",
+            {"domain": "example.com", "path": "/app"},
+            start_if_needed=False,
+        )
 
     def test_cookie_set_minimal(self):
         _, sc = invoke(["cookie-set", "sid", "abc123"])
@@ -699,12 +795,12 @@ class TestCliCommandRouting:
     def test_cookie_set_full(self):
         _, sc = invoke([
             "cookie-set", "sid", "abc123",
-            "--url", "https://example.com",
+            "--domain", "example.com",
             "--http-only", "--secure",
             "--same-site", "Strict",
         ])
         sc.assert_called_once_with("cookie_set", {
-            "name": "sid", "value": "abc123", "url": "https://example.com", "domain": None,
+            "name": "sid", "value": "abc123", "url": None, "domain": "example.com",
             "path": "/", "expires": None, "http_only": True, "secure": True, "same_site": "Strict",
         }, start_if_needed=False)
 
@@ -712,19 +808,19 @@ class TestCliCommandRouting:
 
     def test_verify_visible(self):
         _, sc = invoke(["verify-visible", "button", "Submit"])
-        sc.assert_called_once_with("verify_visible", {"role": "button", "name": "Submit", "timeout": 5000.0}, start_if_needed=False)
+        sc.assert_called_once_with("verify_visible", {"role": "button", "name": "Submit", "timeout": 5.0}, start_if_needed=False)
 
     def test_verify_visible_custom_timeout(self):
-        _, sc = invoke(["verify-visible", "button", "OK", "--timeout", "10000"])
-        sc.assert_called_once_with("verify_visible", {"role": "button", "name": "OK", "timeout": 10000.0}, start_if_needed=False)
+        _, sc = invoke(["verify-visible", "button", "OK", "--timeout", "10"])
+        sc.assert_called_once_with("verify_visible", {"role": "button", "name": "OK", "timeout": 10.0}, start_if_needed=False)
 
     def test_verify_text(self):
         _, sc = invoke(["verify-text", "Hello world"])
-        sc.assert_called_once_with("verify_text", {"text": "Hello world", "exact": False, "timeout": 5000.0}, start_if_needed=False)
+        sc.assert_called_once_with("verify_text", {"text": "Hello world", "exact": False, "timeout": 5.0}, start_if_needed=False)
 
     def test_verify_text_exact(self):
         _, sc = invoke(["verify-text", "Hello", "--exact"])
-        sc.assert_called_once_with("verify_text", {"text": "Hello", "exact": True, "timeout": 5000.0}, start_if_needed=False)
+        sc.assert_called_once_with("verify_text", {"text": "Hello", "exact": True, "timeout": 5.0}, start_if_needed=False)
 
     def test_verify_value(self):
         _, sc = invoke(["verify-value", "@e1", "expected"])
@@ -823,7 +919,6 @@ class TestCliCommandRouting:
         ):
             result = runner.invoke(cli, ["open", "https://example.com"])
         assert "Error[NO_BROWSER_SESSION]: No browser session is running." in result.output
-        assert "Details:" in result.output
         assert result.exit_code != 0
 
     def test_result_printed_on_success(self):
@@ -834,6 +929,19 @@ class TestCliCommandRouting:
             result = runner.invoke(cli, ["open", "https://example.com"])
         assert "Navigated to: https://example.com" in result.output
         assert result.exit_code == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Coverage: every CLI command is invokable
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_all_cli_commands_invokable():
+    assert set(CLI_ALL_COMMANDS) == set(CLI_COMMAND_SAMPLE_ARGS)
+    for command in CLI_ALL_COMMANDS:
+        args = CLI_COMMAND_SAMPLE_ARGS[command]
+        result, sc = invoke(args)
+        assert result.exit_code == 0, f"Command failed: {args}"
+        assert sc.called, f"send_command not called for: {args}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1220,7 +1328,7 @@ class TestDaemonHandlers:
         result = await _handle_snapshot(browser, {})
 
         browser.get_snapshot_text.assert_awaited_once_with(
-            start_from_char=0, interactive=False, full_page=True
+            start_from_char=0, interactive=False, full_page=True, from_cli=True
         )
         assert result == "- heading 'Example' [ref=e1]"
 
@@ -1231,7 +1339,7 @@ class TestDaemonHandlers:
         await _handle_snapshot(browser, {"interactive": True})
 
         browser.get_snapshot_text.assert_awaited_once_with(
-            start_from_char=0, interactive=True, full_page=True
+            start_from_char=0, interactive=True, full_page=True, from_cli=True
         )
 
     async def test_handle_snapshot_full_page_false(self):
@@ -1240,7 +1348,7 @@ class TestDaemonHandlers:
         browser.get_snapshot_text = AsyncMock(return_value="- button [ref=e1]")
         result = await _handle_snapshot(browser, {"full_page": False})
         browser.get_snapshot_text.assert_awaited_once_with(
-            start_from_char=0, interactive=False, full_page=False
+            start_from_char=0, interactive=False, full_page=False, from_cli=True
         )
         assert result == "- button [ref=e1]"
 
@@ -1250,7 +1358,7 @@ class TestDaemonHandlers:
         browser.get_snapshot_text = AsyncMock(return_value="A" * 90)
         result = await _handle_snapshot(browser, {"start_from_char": 10})
         browser.get_snapshot_text.assert_awaited_once_with(
-            start_from_char=10, interactive=False, full_page=True
+            start_from_char=10, interactive=False, full_page=True, from_cli=True
         )
         assert result == "A" * 90
 
@@ -1265,8 +1373,14 @@ class TestDaemonHandlers:
         browser = make_browser()
         browser.input_text_by_ref = AsyncMock(return_value="Input text 'hello'")
         result = await _handle_fill(browser, {"ref": "e3", "text": "hello"})
-        browser.input_text_by_ref.assert_awaited_once_with("e3", "hello")
+        browser.input_text_by_ref.assert_awaited_once_with("e3", "hello", submit=False)
         assert "hello" in result
+
+    async def test_handle_fill_with_submit(self):
+        browser = make_browser()
+        browser.input_text_by_ref = AsyncMock(return_value="Input text 'hello'")
+        await _handle_fill(browser, {"ref": "e3", "text": "hello", "submit": True})
+        browser.input_text_by_ref.assert_awaited_once_with("e3", "hello", submit=True)
 
     async def test_handle_screenshot_passes_full_page(self):
         browser = make_browser()
@@ -1410,8 +1524,8 @@ class TestDaemonHandlers:
     async def test_handle_wait_network(self):
         browser = make_browser()
         browser.wait_for_network_idle = AsyncMock(return_value="Network idle")
-        await _handle_wait_network(browser, {"timeout": 5000})
-        browser.wait_for_network_idle.assert_awaited_once_with(timeout=5000)
+        await _handle_wait_network(browser, {"timeout": 5.0})
+        browser.wait_for_network_idle.assert_awaited_once_with(timeout=5.0)
 
     async def test_handle_console_start(self):
         browser = make_browser()
@@ -1491,19 +1605,29 @@ class TestDaemonHandlers:
         browser = make_browser()
         browser.clear_cookies = AsyncMock(return_value="Cookies cleared")
         await _handle_cookies_clear(browser, {})
-        browser.clear_cookies.assert_awaited_once()
+        browser.clear_cookies.assert_awaited_once_with(name=None, domain=None, path=None)
 
     async def test_handle_cookies_no_url(self):
         browser = make_browser()
         browser.get_cookies = AsyncMock(return_value="[]")
         await _handle_cookies(browser, {})
-        browser.get_cookies.assert_awaited_once_with(urls=None)
+        browser.get_cookies.assert_awaited_once_with(urls=None, name=None, domain=None, path=None)
 
     async def test_handle_cookies_with_url(self):
         browser = make_browser()
         browser.get_cookies = AsyncMock(return_value="[]")
         await _handle_cookies(browser, {"url": "https://example.com"})
-        browser.get_cookies.assert_awaited_once_with(urls=["https://example.com"])
+        browser.get_cookies.assert_awaited_once_with(
+            urls=["https://example.com"], name=None, domain=None, path=None
+        )
+
+    async def test_handle_cookies_with_filters(self):
+        browser = make_browser()
+        browser.get_cookies = AsyncMock(return_value="[]")
+        await _handle_cookies(browser, {"domain": "example.com", "path": "/app", "name": "sid"})
+        browser.get_cookies.assert_awaited_once_with(
+            urls=None, name="sid", domain="example.com", path="/app"
+        )
 
     async def test_handle_cookie_set(self):
         browser = make_browser()
@@ -1520,17 +1644,17 @@ class TestDaemonHandlers:
     async def test_handle_verify_visible(self):
         browser = make_browser()
         browser.verify_element_visible = AsyncMock(return_value="PASS: element visible")
-        result = await _handle_verify_visible(browser, {"role": "button", "name": "Submit", "timeout": 5000})
+        result = await _handle_verify_visible(browser, {"role": "button", "name": "Submit", "timeout": 5.0})
         browser.verify_element_visible.assert_awaited_once_with(
-            role="button", accessible_name="Submit", timeout=5000
+            role="button", accessible_name="Submit", timeout=5.0
         )
         assert result == "PASS: element visible"
 
     async def test_handle_verify_text(self):
         browser = make_browser()
         browser.verify_text_visible = AsyncMock(return_value="PASS: text visible")
-        await _handle_verify_text(browser, {"text": "Hello", "exact": True, "timeout": 3000})
-        browser.verify_text_visible.assert_awaited_once_with(text="Hello", exact=True, timeout=3000)
+        await _handle_verify_text(browser, {"text": "Hello", "exact": True, "timeout": 3.0})
+        browser.verify_text_visible.assert_awaited_once_with(text="Hello", exact=True, timeout=3.0)
 
     async def test_handle_verify_value(self):
         browser = make_browser()

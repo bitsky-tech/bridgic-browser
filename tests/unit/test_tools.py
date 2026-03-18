@@ -74,7 +74,7 @@ def mock_browser():
     browser.get_tabs = AsyncMock(return_value="Tab 1")
     browser.switch_tab = AsyncMock(return_value="Switched to tab")
     browser.close_tab = AsyncMock(return_value="Closed tab")
-    browser.browser_close = AsyncMock(return_value="Browser closed")
+    browser.stop = AsyncMock(return_value="Browser closed")
     browser.browser_resize = AsyncMock(return_value="Resized browser to 800x600")
     browser.wait_for = AsyncMock(return_value="Waited")
     browser.get_snapshot_text = AsyncMock(return_value="- button 'Submit' [ref=e1]")
@@ -1213,7 +1213,7 @@ class TestNetworkTools:
         result = await Browser.wait_for_network_idle(mock_browser)
 
         mock_page = mock_browser.get_current_page.return_value
-        mock_page.wait_for_load_state.assert_called()
+        mock_page.wait_for_load_state.assert_called_once_with("networkidle", timeout=30000.0)
         assert "idle" in result.lower() or "network" in result.lower()
 
 # ==================== Dialog Tools Tests ====================
@@ -1287,20 +1287,75 @@ class TestStorageTools:
         result = await Browser.clear_cookies(mock_browser)
 
         mock_context = mock_browser._context
-        mock_context.clear_cookies.assert_called_once()
+        mock_context.clear_cookies.assert_called_once_with(name=None, domain=None, path=None)
         assert "cleared" in result.lower() or "cookies" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_clear_cookies_filtered(self, mock_browser):
+        """Test clearing cookies with filters."""
+        await Browser.clear_cookies(mock_browser, name="sid")
+        mock_browser._context.clear_cookies.assert_called_once_with(name="sid", domain=None, path=None)
 
     @pytest.mark.asyncio
     async def test_get_cookies(self, mock_browser):
         """Test getting cookies."""
 
         mock_browser._context.cookies.return_value = [
-            {"name": "session", "value": "abc123", "domain": "example.com"}
+            {
+                "name": "session",
+                "value": "abc123",
+                "domain": "example.com",
+                "path": "/",
+                "expires": 1773809665.0,
+                "httpOnly": False,
+                "secure": True,
+                "sameSite": "None",
+            }
         ]
 
         result = await Browser.get_cookies(mock_browser)
 
         assert isinstance(result, str)
+        payload = json.loads(result)
+        assert isinstance(payload, list)
+        assert payload and isinstance(payload[0], dict)
+        for key in ("name", "value", "domain", "path"):
+            assert key in payload[0]
+
+    @pytest.mark.asyncio
+    async def test_get_cookies_filters(self, mock_browser):
+        """Test cookie filtering by name/domain/path."""
+        mock_browser._context.cookies.return_value = [
+            {
+                "name": "sid",
+                "value": "abc123",
+                "domain": "sub.example.com",
+                "path": "/app",
+                "expires": -1,
+                "httpOnly": False,
+                "secure": True,
+                "sameSite": "None",
+            },
+            {
+                "name": "other",
+                "value": "zzz",
+                "domain": "example.com",
+                "path": "/other",
+                "expires": -1,
+                "httpOnly": False,
+                "secure": False,
+                "sameSite": "Lax",
+            },
+        ]
+
+        result = await Browser.get_cookies(
+            mock_browser, name="sid", domain="example.com", path="/app"
+        )
+        payload = json.loads(result)
+        assert len(payload) == 1
+        assert payload[0]["name"] == "sid"
+        assert "example.com" in payload[0]["domain"]
+        assert payload[0]["path"].startswith("/app")
 
     @pytest.mark.asyncio
     async def test_set_cookie(self, mock_browser):

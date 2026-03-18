@@ -24,8 +24,6 @@ from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 from .._constants import BRIDGIC_HOME
 from ..errors import BridgicBrowserError, InvalidInputError
 from ._transport import (
-    _default_socket_path,
-    _safe_remove_socket,
     get_transport,
     write_run_info,
     remove_run_info,
@@ -112,6 +110,7 @@ async def _handle_snapshot(browser: "Browser", args: Dict[str, Any]) -> str:
         start_from_char=args.get("start_from_char", 0),
         interactive=args.get("interactive", False),
         full_page=args.get("full_page", True),
+        from_cli=True,
     )
 
 
@@ -137,7 +136,8 @@ async def _handle_focus(browser: "Browser", args: Dict[str, Any]) -> str:
 async def _handle_fill(browser: "Browser", args: Dict[str, Any]) -> str:
     ref = args.get("ref", "")
     text = args.get("text", "")
-    return await browser.input_text_by_ref(ref, text)
+    submit = args.get("submit", False)
+    return await browser.input_text_by_ref(ref, text, submit=submit)
 
 
 async def _handle_select(browser: "Browser", args: Dict[str, Any]) -> str:
@@ -150,7 +150,6 @@ async def _handle_check(browser: "Browser", args: Dict[str, Any]) -> str:
 
 async def _handle_uncheck(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.uncheck_checkbox_by_ref(args.get("ref", ""))
-
 
 
 async def _handle_scroll_into_view(browser: "Browser", args: Dict[str, Any]) -> str:
@@ -299,7 +298,7 @@ async def _handle_network(browser: "Browser", args: Dict[str, Any]) -> str:
 
 
 async def _handle_wait_network(browser: "Browser", args: Dict[str, Any]) -> str:
-    return await browser.wait_for_network_idle(timeout=args.get("timeout", 30000))
+    return await browser.wait_for_network_idle(timeout=args.get("timeout", 30.0))
 
 
 # ── Dialog ────────────────────────────────────────────────────────────────────
@@ -330,14 +329,23 @@ async def _handle_storage_load(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.restore_storage_state(args.get("path", ""))
 
 
-async def _handle_cookies_clear(browser: "Browser", _args: Dict[str, Any]) -> str:
-    return await browser.clear_cookies()
+async def _handle_cookies_clear(browser: "Browser", args: Dict[str, Any]) -> str:
+    return await browser.clear_cookies(
+        name=args.get("name"),
+        domain=args.get("domain"),
+        path=args.get("path"),
+    )
 
 
 async def _handle_cookies(browser: "Browser", args: Dict[str, Any]) -> str:
     url = args.get("url")
     urls = [url] if url else None
-    return await browser.get_cookies(urls=urls)
+    return await browser.get_cookies(
+        urls=urls,
+        name=args.get("name"),
+        domain=args.get("domain"),
+        path=args.get("path"),
+    )
 
 
 async def _handle_cookie_set(browser: "Browser", args: Dict[str, Any]) -> str:
@@ -360,7 +368,7 @@ async def _handle_verify_visible(browser: "Browser", args: Dict[str, Any]) -> st
     return await browser.verify_element_visible(
         role=args.get("role", ""),
         accessible_name=args.get("name", ""),
-        timeout=args.get("timeout", 5000),
+        timeout=args.get("timeout", 5.0),
     )
 
 
@@ -368,7 +376,7 @@ async def _handle_verify_text(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.verify_text_visible(
         text=args.get("text", ""),
         exact=args.get("exact", False),
-        timeout=args.get("timeout", 5000),
+        timeout=args.get("timeout", 5.0),
     )
 
 
@@ -444,7 +452,7 @@ async def _handle_video_stop(browser: "Browser", args: Dict[str, Any]) -> str:
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 async def _handle_close(browser: "Browser", _args: Dict[str, Any]) -> str:
-    return await browser.browser_close()
+    return await browser.stop()
 
 
 async def _handle_resize(browser: "Browser", args: Dict[str, Any]) -> str:
@@ -592,7 +600,7 @@ def _setup_signal_handlers(stop_event: asyncio.Event) -> None:
         loop.add_signal_handler(signal.SIGTERM, stop_event.set)
         loop.add_signal_handler(signal.SIGINT, stop_event.set)
     else:
-        def _handler(signum: int, frame: object) -> None:
+        def _handler(_signum: int, _frame: object) -> None:
             loop.call_soon_threadsafe(stop_event.set)
         signal.signal(signal.SIGTERM, _handler)
         signal.signal(signal.SIGINT, _handler)

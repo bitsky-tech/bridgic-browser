@@ -30,7 +30,8 @@ def configure_logging(
     -----
     This function configures the ``bridgic`` logger namespace (e.g. loggers whose
     names start with ``bridgic.``) instead of the global root logger, so that
-    setting ``BRIDGIC_LOG_LEVEL`` 不会影响到宿主应用或其他第三方库的日志输出。
+    setting ``BRIDGIC_LOG_LEVEL`` does not affect the host application or
+    other third-party library log output.
 
     Examples
     --------

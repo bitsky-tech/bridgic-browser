@@ -34,12 +34,12 @@ ROLE_TEXT_MATCH_CASE_PATH = FIXTURES_DIR / "role_text_match_case.html"
 # ==================== Helpers ====================
 
 _REF_PATTERN = re.compile(
-    r'- (\w+)\s+"([^"]*?)"\s+\[ref=(e\d+)\]'    # type "name" [ref=eXX]
+    r'- (\w+)\s+"([^"]*?)"\s+\[ref=([a-zA-Z0-9]+)\]'    # type "name" [ref=XXXX]
     r'|'
-    r'- (\w+)\s+\[ref=(e\d+)\]'                   # type [ref=eXX]  (unnamed)
+    r'- (\w+)\s+\[ref=([a-zA-Z0-9]+)\]'                   # type [ref=XXXX]  (unnamed)
 )
 
-_SUFFIX_PATTERN = re.compile(r'\[ref=e\d+\]\s*(.*)')
+_SUFFIX_PATTERN = re.compile(r'\[ref=[a-zA-Z0-9]+\]\s*(.*)')
 
 
 def parse_snapshot(snapshot: str) -> Dict[str, dict]:

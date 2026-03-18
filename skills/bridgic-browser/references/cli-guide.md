@@ -55,19 +55,20 @@ bridgic-browser close
 | Verify | `verify-text`, `verify-visible`, `verify-url`, `verify-title`, `verify-state`, `verify-value` |
 | Developer | `console-start`, `console`, `console-stop`, `trace-start`, `trace-chunk`, `trace-stop`, `video-start`, `video-stop` |
 | Lifecycle | `close`, `resize` |
-| Utility | `commands` |
 
 Use `-h` on any command for exact flags:
 
 ```bash
 bridgic-browser -h
 bridgic-browser snapshot -h
-bridgic-browser commands --list-sections
 ```
 
 ## High-Frequency Examples
 
 ```bash
+# Fill and press Enter in one step
+bridgic-browser fill @e3 "hello@example.com" --submit
+
 # Snapshot only interactive elements
 bridgic-browser snapshot -i
 
@@ -102,6 +103,8 @@ Config precedence (low -> high):
 | `BRIDGIC_HEADLESS` | `0` means headed mode |
 | `BRIDGIC_MAX_CHARS` | Max chars per `snapshot` page before pagination notice |
 
+Environment variables and login state persistence are documented in `env-vars.md`.
+
 ## Non-Obvious CLI Behavior
 
 - Refs come from the latest snapshot. If page changed, re-run `snapshot` before ref operations.
@@ -111,9 +114,9 @@ Config precedence (low -> high):
   - `bridgic-browser close`
   - run next command (`open`, `search`, etc.) to auto-start again.
 - For `network-start`, start capture before navigation if page-load requests are needed.
-- `commands` is CLI section metadata; it does not execute browser actions.
 
 ## When to Load Other References
 
 - Need Python code instead of CLI commands: read `sdk-guide.md`.
 - Need CLI and SDK translation (for example, CLI steps -> SDK automation code): read `cli-sdk-api-mapping.md`.
+- Need environment variables or login state persistence details: read `env-vars.md`.

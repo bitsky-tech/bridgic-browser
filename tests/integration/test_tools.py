@@ -32,7 +32,7 @@ Tool Coverage (67 tools, aligned with CLI sections):
               verify_title, verify_element_state, verify_value
 - Developer (8): start_console_capture, get_console_messages, stop_console_capture,
                  start_tracing, add_trace_chunk, stop_tracing, start_video, stop_video
-- Lifecycle (2): browser_close, browser_resize
+- Lifecycle (2): stop, browser_resize
 """
 
 import asyncio
@@ -63,29 +63,28 @@ SNAPSHOT_FILES = {
 
 def extract_refs_from_snapshot(snapshot: str) -> Dict[str, Dict[str, str]]:
     """Extract element refs from snapshot text."""
+    REF = r'[a-zA-Z0-9]+'
     refs: Dict[str, Dict[str, str]] = {}
-    patterns = [
-        r'- (\w+) "([^"]+)" \[ref=(e\d+)\]',
-        r'- (\w+) \[ref=(e\d+)\][^:]*:\s*"([^"]+)"',
-        r'- (\w+) \[ref=(e\d+)\][^:]*:\s*([^\n"]+)',
-        r'- (\w+) \[ref=(e\d+)\]',
-    ]
-    for pattern in patterns:
-        for match in re.finditer(pattern, snapshot):
-            if len(match.groups()) == 3:
-                groups = match.groups()
-                if groups[2].startswith('e'):
-                    elem_type, name, ref = groups
-                else:
-                    elem_type, ref, text = groups
-                    if ref not in refs:
-                        refs[ref] = {"type": elem_type, "name": text.strip(), "ref": ref}
-                    continue
-                refs[ref] = {"type": elem_type, "name": name, "ref": ref}
-            else:
-                elem_type, ref = match.groups()
-                if ref not in refs:
-                    refs[ref] = {"type": elem_type, "name": "", "ref": ref}
+    # Pattern order matters: more specific first so refs already captured are not overwritten.
+    # Pattern 1: - type "name" [ref=XXXX]
+    for m in re.finditer(rf'- (\w+) "([^"]+)" \[ref=({REF})\]', snapshot):
+        elem_type, name, ref = m.groups()
+        refs[ref] = {"type": elem_type, "name": name, "ref": ref}
+    # Pattern 2: - type [ref=XXXX]: "text"
+    for m in re.finditer(rf'- (\w+) \[ref=({REF})\][^:]*:\s*"([^"]+)"', snapshot):
+        elem_type, ref, text = m.groups()
+        if ref not in refs:
+            refs[ref] = {"type": elem_type, "name": text.strip(), "ref": ref}
+    # Pattern 3: - type [ref=XXXX]: text (unquoted)
+    for m in re.finditer(rf'- (\w+) \[ref=({REF})\][^:]*:\s*([^\n"]+)', snapshot):
+        elem_type, ref, text = m.groups()
+        if ref not in refs:
+            refs[ref] = {"type": elem_type, "name": text.strip(), "ref": ref}
+    # Pattern 4: - type [ref=XXXX]  (unnamed)
+    for m in re.finditer(rf'- (\w+) \[ref=({REF})\]', snapshot):
+        elem_type, ref = m.groups()
+        if ref not in refs:
+            refs[ref] = {"type": elem_type, "name": "", "ref": ref}
     return refs
 
 def find_ref_by_type_and_name(
@@ -217,7 +216,7 @@ class TestPageTools:
 # ==================== 3. Control Tools (3 tools) ====================
 
 class TestControlTools:
-    """Tests: browser_resize, wait_for, browser_close"""
+    """Tests: browser_resize, wait_for, stop"""
 
     @pytest.mark.asyncio
     async def test_browser_resize(self, browser):
@@ -242,15 +241,15 @@ class TestControlTools:
     @pytest.mark.asyncio
     async def test_wait_for_text(self, browser):
         """wait_for with text waits for visible text."""
-        result = await browser.wait_for(text="Bridgic Browser Test Page", timeout_ms=5000)
+        result = await browser.wait_for(text="Bridgic Browser Test Page", timeout=5.0)
         assert "wait" in result.lower() or "found" in result.lower() or result
 
     @pytest.mark.asyncio
-    async def test_browser_close(self):
-        """browser_close kills the browser instance (separate browser to avoid fixture conflict)."""
+    async def test_stop(self):
+        """stop() kills the browser instance (separate browser to avoid fixture conflict)."""
         b = Browser(headless=True, stealth=False, viewport={"width": 800, "height": 600})
         await b.start()
-        result = await b.browser_close()
+        result = await b.stop()
         assert "close" in result.lower() or "browser" in result.lower() or result
 
 # ==================== 4. Action Tools (13 tools) ====================
@@ -590,7 +589,7 @@ class TestNetworkTools:
 
     @pytest.mark.asyncio
     async def test_wait_for_network_idle(self, browser):
-        result = await browser.wait_for_network_idle(timeout=5000)
+        result = await browser.wait_for_network_idle(timeout=5.0)
         assert result is not None
 
 # ==================== 9. Dialog Tools (3 tools) ====================
@@ -692,7 +691,7 @@ class TestVerificationTools:
     async def test_verify_element_visible_not_found(self, browser):
         with pytest.raises(VerificationError) as exc_info:
             await browser.verify_element_visible(
-                "heading", "NonExistent Element XYZ", timeout=1000,
+                "heading", "NonExistent Element XYZ", timeout=1.0,
             )
         assert "FAIL" in exc_info.value.message
 
@@ -705,7 +704,7 @@ class TestVerificationTools:
     async def test_verify_text_visible_exact(self, browser):
         with pytest.raises(VerificationError) as exc_info:
             await browser.verify_text_visible(
-                "Nonexistent text XYZ", exact=True, timeout=1000,
+                "Nonexistent text XYZ", exact=True, timeout=1.0,
             )
         assert "FAIL" in exc_info.value.message
 

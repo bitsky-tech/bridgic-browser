@@ -21,7 +21,6 @@ from ..errors import BridgicBrowserCommandError
 from ._client import send_command
 from .._cli_catalog import (
     CLI_COMMAND_META,
-    CLI_HELP_SECTION_SPECS,
     CLI_HELP_SECTIONS,
 )
 from .._constants import ToolCategory
@@ -42,6 +41,18 @@ class SectionedGroup(click.Group):
         if isinstance(row, tuple) and len(row) == 2 and isinstance(row[1], str):
             return row[1]
         return cmd.get_short_help_str(limit=width)
+
+    def _has_non_help_options(self, ctx: click.Context) -> bool:
+        for param in self.get_params(ctx):
+            if isinstance(param, click.Option) and param.name != "help":
+                return True
+        return False
+
+    def format_usage(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        pieces = self.collect_usage_pieces(ctx)
+        if not self._has_non_help_options(ctx):
+            pieces = [piece for piece in pieces if piece != "[OPTIONS]"]
+        formatter.write_usage(ctx.command_path, " ".join(pieces))
 
     def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         assigned: set[str] = set()
@@ -85,8 +96,9 @@ def _ok(result: str) -> None:
 def _err(err: Exception | str) -> None:
     if isinstance(err, BridgicBrowserCommandError):
         click.echo(f"Error[{err.code}]: {err.message}", err=True)
-        if err.details:
-            click.echo(f"Details: {json.dumps(err.details, ensure_ascii=False)}", err=True)
+        # for cli user, we don't need to show the details
+        # if err.details:
+        #     click.echo(f"Details: {json.dumps(err.details, ensure_ascii=False)}", err=True)
     else:
         click.echo(f"Error: {err}", err=True)
     sys.exit(1)
@@ -101,18 +113,6 @@ def cli() -> None:
 
     Use `bridgic-browser COMMAND --help` for command-specific help.
     """
-
-
-def _resolve_section(section: str) -> ToolCategory:
-    """Resolve a section name/label to ToolCategory."""
-    normalized = section.strip().replace("-", " ").replace("_", " ").lower()
-    for category, _commands in CLI_HELP_SECTION_SPECS:
-        if normalized in {
-            category.name.lower().replace("_", " "),
-            category.value.lower(),
-        }:
-            return category
-    raise ValueError(f"Unknown section: {section}")
 
 
 # ── Navigation ────────────────────────────────────────────────────────────────
@@ -189,7 +189,7 @@ def cmd_info() -> None:
               help="Only show clickable/editable elements.")
 @click.option("-f/-F", "--full-page/--no-full-page", default=True,
               help="Include elements outside the viewport (default: full-page). -F = viewport only.")
-@click.option("-s", "--start-from-char", default=0, type=click.INT,
+@click.option("-s", "--start-from-char", default=0, type=click.IntRange(min=0),
               help="Pagination offset. Get the offset value from the truncation notice when the page is too long.")
 def cmd_snapshot(interactive: bool, full_page: bool, start_from_char: int) -> None:
     """Get an accessibility tree representation of the current page with refs (like e1, e2)."""
@@ -248,10 +248,12 @@ def cmd_focus(ref: str) -> None:
 @cli.command("fill", context_settings=CONTEXT_SETTINGS)
 @click.argument("ref")
 @click.argument("text")
-def cmd_fill(ref: str, text: str) -> None:
+@click.option("--submit", is_flag=True, default=False,
+              help="Press Enter after filling.")
+def cmd_fill(ref: str, text: str, submit: bool) -> None:
     """Fill an input element by ref with TEXT."""
     try:
-        _ok(send_command("fill", {"ref": _strip_ref(ref), "text": text}, start_if_needed=False))
+        _ok(send_command("fill", {"ref": _strip_ref(ref), "text": text, "submit": submit}, start_if_needed=False))
     except Exception as exc:
         _err(exc)
 
@@ -605,12 +607,11 @@ def cmd_network(include_static: bool, no_clear: bool) -> None:
 
 
 @cli.command("wait-network", context_settings=CONTEXT_SETTINGS)
-@click.option("--timeout", default=30000, type=float,
-              help="Maximum wait time in milliseconds (default: 30000).")
-def cmd_wait_network(timeout: float) -> None:
-    """Wait until the network is idle."""
+@click.argument("seconds", required=False, default=30.0, type=float)
+def cmd_wait_network(seconds: float) -> None:
+    """Wait until the network is idle (SECONDS, default: 30)."""
     try:
-        _ok(send_command("wait_network", {"timeout": timeout}, start_if_needed=False))
+        _ok(send_command("wait_network", {"timeout": float(seconds)}, start_if_needed=False))
     except Exception as exc:
         _err(exc)
 
@@ -676,20 +677,36 @@ def cmd_storage_load(path: str) -> None:
 
 
 @cli.command("cookies-clear", context_settings=CONTEXT_SETTINGS)
-def cmd_cookies_clear() -> None:
-    """Clear all cookies from the browser context."""
+@click.option("--name", default=None, help="Only clear cookies with this name.")
+@click.option("--domain", default=None, help="Only clear cookies matching this domain substring.")
+@click.option("--path", "cookie_path", default=None, help="Only clear cookies matching this path prefix.")
+def cmd_cookies_clear(name: str | None, domain: str | None, cookie_path: str | None) -> None:
+    """Clear cookies from the browser context (optionally filtered by name, domain, or path)."""
     try:
-        _ok(send_command("cookies_clear", start_if_needed=False))
+        args: dict = {}
+        if name is not None:
+            args["name"] = name
+        if domain is not None:
+            args["domain"] = domain
+        if cookie_path is not None:
+            args["path"] = cookie_path
+        _ok(send_command("cookies_clear", args or None, start_if_needed=False))
     except Exception as exc:
         _err(exc)
 
 
 @cli.command("cookies", context_settings=CONTEXT_SETTINGS)
-@click.option("--url", default=None, help="Filter cookies by URL.")
-def cmd_cookies(url: str | None) -> None:
+@click.option("--domain", default=None, help="Filter cookies by domain substring.")
+@click.option("--path", "cookie_path", default=None, help="Filter cookies by path prefix.")
+@click.option("--name", default=None, help="Filter cookies by exact name.")
+def cmd_cookies(domain: str | None, cookie_path: str | None, name: str | None) -> None:
     """Get cookies from the browser context."""
     try:
-        _ok(send_command("cookies", {"url": url}, start_if_needed=False))
+        _ok(send_command("cookies", {
+            "domain": domain,
+            "path": cookie_path,
+            "name": name,
+        }, start_if_needed=False))
     except Exception as exc:
         _err(exc)
 
@@ -697,7 +714,6 @@ def cmd_cookies(url: str | None) -> None:
 @cli.command("cookie-set", context_settings=CONTEXT_SETTINGS)
 @click.argument("name")
 @click.argument("value")
-@click.option("--url", default=None, help="URL to associate the cookie with.")
 @click.option("--domain", default=None, help="Cookie domain.")
 @click.option("--path", "cookie_path", default="/", help="Cookie path (default: /).")
 @click.option("--expires", default=None, type=float, help="Unix timestamp when the cookie expires.")
@@ -707,13 +723,13 @@ def cmd_cookies(url: str | None) -> None:
               type=click.Choice(["Strict", "Lax", "None"], case_sensitive=True),
               help="SameSite attribute.")
 def cmd_cookie_set(
-    name: str, value: str, url: str | None, domain: str | None, cookie_path: str,
+    name: str, value: str, domain: str | None, cookie_path: str,
     expires: float | None, http_only: bool, secure: bool, same_site: str | None,
 ) -> None:
     """Set a cookie in the browser context."""
     try:
         _ok(send_command("cookie_set", {
-            "name": name, "value": value, "url": url, "domain": domain,
+            "name": name, "value": value, "url": None, "domain": domain,
             "path": cookie_path, "expires": expires, "http_only": http_only,
             "secure": secure, "same_site": same_site,
         }, start_if_needed=False))
@@ -726,8 +742,8 @@ def cmd_cookie_set(
 @cli.command("verify-visible", context_settings=CONTEXT_SETTINGS)
 @click.argument("role")
 @click.argument("name")
-@click.option("--timeout", default=5000, type=float,
-              help="Maximum wait time in milliseconds (default: 5000).")
+@click.option("--timeout", default=5.0, type=float,
+              help="Maximum wait time in seconds (default: 5.0).")
 def cmd_verify_visible(role: str, name: str, timeout: float) -> None:
     """Verify an element with ROLE and NAME is visible on the page."""
     try:
@@ -740,8 +756,8 @@ def cmd_verify_visible(role: str, name: str, timeout: float) -> None:
 @click.argument("text")
 @click.option("--exact", is_flag=True, default=False,
               help="Match TEXT exactly (default: substring match).")
-@click.option("--timeout", default=5000, type=float,
-              help="Maximum wait time in milliseconds (default: 5000).")
+@click.option("--timeout", default=5.0, type=float,
+              help="Maximum wait time in seconds (default: 5.0).")
 def cmd_verify_text(text: str, exact: bool, timeout: float) -> None:
     """Verify that TEXT is visible on the page."""
     try:
@@ -917,7 +933,7 @@ def cmd_video_stop(path: str | None) -> None:
 
 @cli.command("close", context_settings=CONTEXT_SETTINGS)
 def cmd_close() -> None:
-    """Close/Stop the browser session."""
+    """Close the browser session."""
     try:
         click.echo("Closing browser session...", err=True)
         _ok(send_command("close", {}, start_if_needed=False))
@@ -934,46 +950,3 @@ def cmd_resize(width: int, height: int) -> None:
         _ok(send_command("resize", {"width": width, "height": height}, start_if_needed=False))
     except Exception as exc:
         _err(exc)
-
-
-# ── Utility ──────────────────────────────────────────────────────────────────
-
-@cli.command("commands", context_settings=CONTEXT_SETTINGS)
-@click.option("--section", "section_name", default=None,
-              help="Show CLI commands in one section (e.g. navigation, capture, verify).")
-@click.option("--list-sections", is_flag=True, default=False,
-              help="List available CLI sections.")
-def cmd_commands(
-    section_name: str | None,
-    list_sections: bool,
-) -> None:
-    """Show CLI section info and command descriptions."""
-    lines: list[str] = []
-
-    if list_sections:
-        lines.append("Sections:")
-        for category, commands in CLI_HELP_SECTION_SPECS:
-            lines.append(f"- {category.name.lower()}: {len(commands)} commands")
-
-    if section_name:
-        try:
-            category = _resolve_section(section_name)
-        except ValueError as exc:
-            _err(exc)
-            return
-
-        commands = []
-        for section_category, section_commands in CLI_HELP_SECTION_SPECS:
-            if section_category == category:
-                commands = section_commands
-                break
-        lines.append(f"Section {category.name.lower()} ({len(commands)} commands):")
-        for name in commands:
-            _meta = CLI_COMMAND_META.get(name)
-            desc = _meta[1] if _meta else ""
-            lines.append(f"- {name}: {desc}")
-
-    if not lines:
-        lines.append("Use --list-sections or --section NAME.")
-
-    _ok("\n".join(lines))

@@ -210,7 +210,7 @@ class TestGetLocatorFromRefAsync:
         role_locator.filter.return_value = filtered_locator
 
         refs = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector=f'get_by_role(\'{role}\', name="{name}", exact=True)',
                 role=role,
                 name=name,
@@ -219,7 +219,7 @@ class TestGetLocatorFromRefAsync:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is filtered_locator
         page.get_by_role.assert_called_once_with(role)
@@ -236,7 +236,7 @@ class TestGetLocatorFromRefAsync:
         row_locator.filter.return_value = filtered_locator
 
         refs = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector='get_by_role(\'row\', name="状态", exact=True)',
                 role="row",
                 name="状态",
@@ -245,7 +245,7 @@ class TestGetLocatorFromRefAsync:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is filtered_locator
         page.get_by_role.assert_called_once_with("row")
@@ -258,7 +258,7 @@ class TestGetLocatorFromRefAsync:
         role_locator = Mock()
         page.get_by_role.return_value = role_locator
         refs = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector="get_by_role('cell')",
                 role="cell",
                 name="   ",
@@ -267,7 +267,7 @@ class TestGetLocatorFromRefAsync:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is role_locator
         # Blank name is normalized to None → unnamed locator uses empty-name regex
@@ -283,7 +283,7 @@ class TestGetLocatorFromRefAsync:
         role_locator = Mock()
         page.get_by_role.return_value = role_locator
         refs = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector="get_by_role('generic')",
                 role="generic",
                 name="   ",
@@ -292,7 +292,7 @@ class TestGetLocatorFromRefAsync:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is role_locator
         page.get_by_role.assert_called_once_with("generic")
@@ -306,7 +306,7 @@ class TestGetLocatorFromRefAsync:
         page.locator.return_value = css_locator
         css_locator.filter.return_value = filtered_locator
         refs = {
-            "e28": RefData(
+            "c3d4e5f6": RefData(
                 selector="get_by_role('generic')",
                 role="generic",
                 name=None,
@@ -314,17 +314,17 @@ class TestGetLocatorFromRefAsync:
                 text_content=None,
                 parent_ref=None,
             ),
-            "e29": RefData(
+            "d4e5f6a7": RefData(
                 selector='get_by_text("ID", exact=True)',
                 role="text",
                 name="ID",
                 nth=None,
                 text_content=None,
-                parent_ref="e28",
+                parent_ref="c3d4e5f6",
             ),
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e28", refs)
+        locator = gen.get_locator_from_ref_async(page, "c3d4e5f6", refs)
 
         assert locator is filtered_locator
         page.locator.assert_called_once_with('div:not([role]), legend, [role="generic"]')
@@ -346,7 +346,7 @@ class TestGetLocatorFromRefAsync:
         page.locator.return_value = css_locator
         css_locator.filter.return_value = filtered_locator
         refs = {
-            "e28": RefData(
+            "c3d4e5f6": RefData(
                 selector="get_by_role('generic')",
                 role="generic",
                 name=None,
@@ -356,17 +356,17 @@ class TestGetLocatorFromRefAsync:
                 text_content=None,
                 parent_ref=None,
             ),
-            "e29": RefData(
+            "d4e5f6a7": RefData(
                 selector='get_by_text("ID", exact=True)',
                 role="text",
                 name="ID",
                 nth=None,
                 text_content=None,
-                parent_ref="e28",
+                parent_ref="c3d4e5f6",
             ),
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e28", refs)
+        locator = gen.get_locator_from_ref_async(page, "c3d4e5f6", refs)
 
         assert locator is filtered_locator
         page.locator.assert_called_once_with('div:not([role]), legend, [role="generic"]')
@@ -380,7 +380,7 @@ class TestGetLocatorFromRefAsync:
         role_locator = Mock()
         page.get_by_role.return_value = role_locator
         refs = {
-            "e28": RefData(
+            "c3d4e5f6": RefData(
                 selector="get_by_role('generic')",
                 role="generic",
                 name=None,
@@ -390,7 +390,7 @@ class TestGetLocatorFromRefAsync:
             ),
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e28", refs)
+        locator = gen.get_locator_from_ref_async(page, "c3d4e5f6", refs)
 
         assert locator is role_locator
         page.get_by_role.assert_called_once_with("generic")
@@ -405,7 +405,7 @@ class TestGetLocatorFromRefAsync:
         filtered_locator.nth.return_value = nth_locator
 
         refs = {
-            "e2": RefData(
+            "b2c3d4e5": RefData(
                 selector='get_by_role(\'listitem\', name="待处理", exact=True)',
                 role="listitem",
                 name="待处理",
@@ -414,7 +414,7 @@ class TestGetLocatorFromRefAsync:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e2", refs)
+        locator = gen.get_locator_from_ref_async(page, "b2c3d4e5", refs)
 
         assert locator is nth_locator
         filtered_locator.nth.assert_called_once_with(1)
@@ -424,7 +424,7 @@ class TestGetLocatorFromRefAsync:
         role_locator = Mock()
         page.get_by_role.return_value = role_locator
         refs = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector='get_by_role(\'button\', name="Submit", exact=True)',
                 role="button",
                 name="Submit",
@@ -433,7 +433,7 @@ class TestGetLocatorFromRefAsync:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is role_locator
         page.get_by_role.assert_called_once_with("button", name="Submit", exact=True)
@@ -447,7 +447,7 @@ class TestGetLocatorFromRefAsync:
         page.locator.return_value = css_locator
         css_locator.filter.return_value = filtered_locator
         refs = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector='get_by_text("Username", exact=True)',
                 role="generic",
                 name="Username",
@@ -456,7 +456,7 @@ class TestGetLocatorFromRefAsync:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is filtered_locator
         page.locator.assert_called_once_with('div:not([role]), legend, [role="generic"]')
@@ -481,7 +481,7 @@ class TestGetLocatorFromRefAsync:
         css_locator.filter.return_value = filtered_locator
         filtered_locator.nth.return_value = nth_locator
         refs = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector='get_by_text("Pending", exact=True)',
                 role="generic",
                 name="Pending",
@@ -490,7 +490,7 @@ class TestGetLocatorFromRefAsync:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is nth_locator
         page.locator.assert_called_once_with('div:not([role]), legend, [role="generic"]')
@@ -503,7 +503,7 @@ class TestGetLocatorFromRefAsync:
         text_locator = Mock()
         page.get_by_text.return_value = text_locator
         refs = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector='get_by_text("自动检测", exact=True)',
                 role="button",
                 name=None,
@@ -512,7 +512,7 @@ class TestGetLocatorFromRefAsync:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is text_locator
         page.get_by_text.assert_called_once_with("自动检测", exact=True)
@@ -528,7 +528,7 @@ class TestGetLocatorFromRefAsync:
         text_locator = Mock()
         page.get_by_text.return_value = text_locator
         refs = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector='get_by_text("Click me", exact=True)',
                 role="button",
                 name=None,
@@ -537,7 +537,7 @@ class TestGetLocatorFromRefAsync:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is text_locator
         page.get_by_text.assert_called_once_with("Click me", exact=True)
@@ -548,7 +548,7 @@ class TestGetLocatorFromRefAsync:
         role_locator = Mock()
         page.get_by_role.return_value = role_locator
         refs = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector="get_by_role('separator')",
                 role="separator",
                 name=None,
@@ -557,7 +557,7 @@ class TestGetLocatorFromRefAsync:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is role_locator
         # Unnamed element → uses empty-name regex to avoid key-space mismatch
@@ -573,7 +573,7 @@ class TestGetLocatorFromRefAsync:
         text_locator = Mock()
         page.get_by_text.return_value = text_locator
         refs = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector='get_by_text("Hello", exact=True)',
                 role="text",
                 name="Hello",
@@ -582,7 +582,7 @@ class TestGetLocatorFromRefAsync:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is text_locator
         page.get_by_text.assert_called_once_with("Hello", exact=True)
@@ -602,7 +602,7 @@ class TestGetLocatorFromRefAsync:
         text_locator = Mock()
         page.get_by_text.return_value = text_locator
         refs = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector='get_by_text("Label", exact=True)',
                 role="text",
                 name="Label",
@@ -611,7 +611,7 @@ class TestGetLocatorFromRefAsync:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is text_locator
         page.get_by_text.assert_called_once_with("Label", exact=True)
@@ -949,11 +949,13 @@ class TestProcessPageSnapshotForAI:
         result = gen._process_page_snapshot_for_ai(raw, refs, options)
 
         assert 'button "Submit"' in result
-        assert "[ref=e1]" in result
         assert "[cursor=pointer]" in result
-        assert "e1" in refs
-        assert refs["e1"].role == "button"
-        assert refs["e1"].name == "Submit"
+        ref_match = re.search(r'\[ref=([0-9a-f]{8})\]', result)
+        assert ref_match, "Expected a stable hash ref in output"
+        ref_key = ref_match.group(1)
+        assert ref_key in refs
+        assert refs[ref_key].role == "button"
+        assert refs[ref_key].name == "Submit"
 
     def test_heading_with_level(self, gen: SnapshotGenerator) -> None:
         raw = '- heading "Title" [ref=e1] [level=1]'
@@ -1694,8 +1696,8 @@ class TestIframeHandling:
         assert "[ref=e5]" not in result
         assert "[ref=f2e3]" not in result
         assert "[ref=f2e7]" not in result
-        # But our assigned eN refs are present
-        assert re.search(r'\[ref=e\d+\]', result) is not None
+        # But our assigned stable hash refs are present
+        assert re.search(r'\[ref=[0-9a-f]{8}\]', result) is not None
         # Content is preserved
         assert "Main" in result
         assert "Search" in result
@@ -1720,7 +1722,7 @@ class TestIframeHandling:
         nth_frame.get_by_role.return_value = scoped_locator
 
         refs: Dict[str, RefData] = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector="get_by_role('button', name=\"Go\", exact=True)",
                 role="button",
                 name="Go",
@@ -1730,7 +1732,7 @@ class TestIframeHandling:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is scoped_locator
         page.frame_locator.assert_called_once_with("iframe")
@@ -1747,7 +1749,7 @@ class TestIframeHandling:
         page.get_by_role.return_value = role_locator
 
         refs: Dict[str, RefData] = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector="get_by_role('button', name=\"Submit\", exact=True)",
                 role="button",
                 name="Submit",
@@ -1757,7 +1759,7 @@ class TestIframeHandling:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is role_locator
         page.get_by_role.assert_called_once_with("button", name="Submit", exact=True)
@@ -1775,7 +1777,7 @@ class TestIframeHandling:
         nth_frame.get_by_role.return_value = scoped_locator
 
         refs: Dict[str, RefData] = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector="get_by_role('textbox', name=\"Input\", exact=True)",
                 role="textbox",
                 name="Input",
@@ -1785,7 +1787,7 @@ class TestIframeHandling:
             )
         }
 
-        gen.get_locator_from_ref_async(page, "e1", refs)
+        gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         page.frame_locator.assert_called_once_with("iframe")
         frame_locator_obj.nth.assert_called_once_with(1)
@@ -1804,7 +1806,7 @@ class TestIframeHandling:
         nth_frame.get_by_text.return_value = text_locator
 
         refs: Dict[str, RefData] = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector='get_by_text("Hello", exact=True)',
                 role="text",
                 name="Hello",
@@ -1814,7 +1816,7 @@ class TestIframeHandling:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is text_locator
         nth_frame.get_by_text.assert_called_once_with("Hello", exact=True)
@@ -1834,7 +1836,7 @@ class TestIframeHandling:
         base_locator.nth.return_value = nth_locator
 
         refs: Dict[str, RefData] = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector="get_by_role('button', name=\"OK\", exact=True)",
                 role="button",
                 name="OK",
@@ -1844,7 +1846,7 @@ class TestIframeHandling:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is nth_locator
         page.frame_locator.assert_called_once_with("iframe")
@@ -2062,7 +2064,7 @@ class TestIframeHandling:
         inner_nth.get_by_role.return_value = scoped_locator
 
         refs: Dict[str, RefData] = {
-            "e1": RefData(
+            "a1b2c3d4": RefData(
                 selector="get_by_role('button', name=\"Play\", exact=True)",
                 role="button",
                 name="Play",
@@ -2072,7 +2074,7 @@ class TestIframeHandling:
             )
         }
 
-        locator = gen.get_locator_from_ref_async(page, "e1", refs)
+        locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is scoped_locator
         page.frame_locator.assert_called_once_with("iframe")
@@ -2231,3 +2233,64 @@ class TestIframeHandling:
         # Main-frame buttons before and after iframe are still present
         assert "Above" in filtered
         assert "Below" in filtered
+
+
+# ---------------------------------------------------------------------------
+# 8. Stable ref system
+# ---------------------------------------------------------------------------
+
+class TestStableRefs:
+    """Tests for the stable hash-based ref generation system."""
+
+    def test_same_input_same_refs(self, gen: SnapshotGenerator) -> None:
+        """Same raw snapshot produces identical refs across multiple calls."""
+        raw = '- button "Submit" [ref=f1e1] [cursor=pointer]'
+        refs1: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw, refs1, SnapshotOptions())
+        refs2: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw, refs2, SnapshotOptions())
+        assert set(refs1.keys()) == set(refs2.keys())
+
+    def test_ref_format(self, gen: SnapshotGenerator) -> None:
+        """Generated refs match the stable hash format: e + 7 hex digits."""
+        raw = '- button "Go" [ref=e1]'
+        refs: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw, refs, SnapshotOptions())
+        for ref_key in refs:
+            assert re.match(r'^[0-9a-f]{8}$', ref_key), f"Bad ref format: {ref_key!r}"
+
+    def test_different_name_different_ref(self, gen: SnapshotGenerator) -> None:
+        """Elements with different names get different refs."""
+        raw1 = '- button "Submit" [ref=e1]'
+        raw2 = '- button "Cancel" [ref=e1]'
+        refs1: Dict[str, RefData] = {}
+        refs2: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw1, refs1, SnapshotOptions())
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw2, refs2, SnapshotOptions())
+        assert set(refs1.keys()) != set(refs2.keys())
+
+    def test_different_role_different_ref(self, gen: SnapshotGenerator) -> None:
+        """Elements with same name but different roles get different refs."""
+        raw1 = '- button "OK" [ref=e1]'
+        raw2 = '- link "OK" [ref=e1]'
+        refs1: Dict[str, RefData] = {}
+        refs2: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw1, refs1, SnapshotOptions())
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw2, refs2, SnapshotOptions())
+        assert set(refs1.keys()) != set(refs2.keys())
+
+    def test_duplicate_elements_get_distinct_refs(self, gen: SnapshotGenerator) -> None:
+        """Two identical elements (same role+name) get distinct refs via nth."""
+        raw = '- button "Reset" [ref=e1]\n- button "Reset" [ref=e2]'
+        refs: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw, refs, SnapshotOptions())
+        assert len(refs) == 2
+        assert len(set(refs.keys())) == 2

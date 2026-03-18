@@ -14,6 +14,7 @@ import pytest_asyncio
 
 from bridgic.browser.errors import InvalidInputError, OperationError, StateError
 from bridgic.browser.session import Browser, StealthConfig
+import bridgic.browser.session._browser as _browser_module
 
 
 class TestBrowserInitialization:
@@ -71,6 +72,15 @@ class TestBrowserInitialization:
         assert browser.stealth_enabled is True
         assert browser.stealth_config.enable_extensions is False
         assert browser.stealth_config.disable_security is True
+
+    def test_strip_playwright_call_log(self):
+        message = (
+            "Wait condition not met: Locator.wait_for: Timeout 30000ms exceeded.\n"
+            "Call Log:\n- waiting for get_by_text(\"Golden3\").first to be visible"
+        )
+        stripped = _browser_module._strip_playwright_call_log(message)
+        assert "Call Log" not in stripped
+        assert stripped.endswith("Timeout 30000ms exceeded.")
 
     def test_devtools_forces_headless_false(self):
         """Test that devtools forces headless=False."""
@@ -393,8 +403,8 @@ class TestBrowserStartStop:
             assert context_key not in browser._video_state
 
     @pytest.mark.asyncio
-    async def test_browser_close_reports_auto_saved_paths(self, mock_playwright):
-        """browser_close() should include auto-saved artifact paths in the result."""
+    async def test_stop_reports_auto_saved_paths(self, mock_playwright):
+        """stop() should include auto-saved artifact paths in the result."""
         from bridgic.browser.session import _browser as browser_module
 
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
@@ -421,15 +431,15 @@ class TestBrowserStartStop:
 
             with patch.object(browser_module.tempfile, "mkstemp", return_value=(88, "/tmp/auto_trace_2.zip")):
                 with patch.object(browser_module.os, "close"):
-                    result = await browser.browser_close()
+                    result = await browser.stop()
 
             assert "Browser closed successfully" in result
             assert os.path.abspath("/tmp/auto_trace_2.zip") in result
             assert os.path.abspath("/tmp/auto_video.webm") in result
 
     @pytest.mark.asyncio
-    async def test_browser_close_warns_on_trace_finalize_failure(self, mock_playwright):
-        """browser_close() should report warnings when trace auto-save fails."""
+    async def test_stop_warns_on_trace_finalize_failure(self, mock_playwright):
+        """stop() should report warnings when trace auto-save fails."""
         from bridgic.browser.session import _browser as browser_module
 
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
@@ -459,7 +469,7 @@ class TestBrowserStartStop:
                 with patch.object(browser_module.os, "close"):
                     with patch.object(browser_module.os.path, "exists", side_effect=_exists):
                         with patch.object(browser_module.os, "remove") as mock_remove:
-                            result = await browser.browser_close()
+                            result = await browser.stop()
 
             mock_remove.assert_called_once_with(temp_trace_path)
             assert "Browser closed with warnings" in result

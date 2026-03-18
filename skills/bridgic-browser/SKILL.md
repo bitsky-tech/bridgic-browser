@@ -18,19 +18,21 @@ Use progressive disclosure. Do not load every reference file by default.
 
 ## Reference Files
 
-Three reference files cover all use cases. Load only the one(s) relevant to the task:
+Reference files cover all use cases. Load only the one(s) relevant to the task:
 
 | File | When to load |
 |------|-------------|
 | [references/cli-guide.md](references/cli-guide.md) | User wants to **directly control the browser via terminal** (`bridgic-browser open ...`, `bridgic-browser snapshot`, etc.) |
 | [references/sdk-guide.md](references/sdk-guide.md) | User wants **Python automation code** (`Browser`, `BrowserToolSetBuilder`, agent integration) |
 | [references/cli-sdk-api-mapping.md](references/cli-sdk-api-mapping.md) | User needs to understand **CLI ↔ SDK correspondence**: migration, comparison, or **generating SDK code from CLI action steps** |
+| [references/env-vars.md](references/env-vars.md) | User needs **environment variable behavior** or **login state persistence** details |
 
 ## Reference Routing
 
 - **Direct terminal control** → read `cli-guide.md`.
 - **Python code / agent integration** → read `sdk-guide.md`.
 - **CLI and SDK relationship** (migration, "what's the SDK equivalent of this command?", "convert these CLI steps to Python") → read `cli-sdk-api-mapping.md`.
+- **Environment variables or login state persistence** → read `env-vars.md`.
 - **CLI exploration + SDK code output** (user is operating via CLI but needs the final deliverable as runnable Python) → read `cli-sdk-api-mapping.md` first to translate steps, then `sdk-guide.md` for final code shape.
 - For mixed tasks, load only the needed sections from each relevant reference.
 

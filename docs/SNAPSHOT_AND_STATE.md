@@ -97,12 +97,12 @@ Browser method used to supply the page state to an LLM. It calls `browser.get_sn
 When the full tree is longer than the limit (default 30,000 characters), the returned string is cut at a natural break (e.g. paragraph or sentence) and a notice is appended, for example:
 
 ```
-[notice] Current page state text is too long, returned portion starting from character 0 (this segment length 30000 / total length 45000 characters). To continue getting subsequent content, use start_from_char=30000 to call get_snapshot_text again.
+[notice] Current page text is too long, returned portion starting from character 0 (this segment length 30000 / total length 45000 characters). To continue getting subsequent content: call get_snapshot_text(start_from_char=30000, interactive=False, full_page=True)
 ```
 
 Use the given `start_from_char` (e.g. `30000`) in the next call to get the rest.
 
-The character limit can be adjusted via the `BRIDGIC_MAX_CHARS` environment variable (default `30000`).
+The character limit is configured via `BRIDGIC_MAX_CHARS`; see `skills/bridgic-browser/references/env-vars.md`.
 
 ### Relation to get_snapshot
 
@@ -151,6 +151,4 @@ bridgic-browser snapshot -i -F -s 10000  # combined
 
 ### Environment variables
 
-| Variable           | Default | Description |
-|--------------------|---------|-------------|
-| `BRIDGIC_MAX_CHARS` | `30000` | Max characters returned per `snapshot`/`get_snapshot_text` call before pagination kicks in. |
+See `skills/bridgic-browser/references/env-vars.md` for environment variable details.

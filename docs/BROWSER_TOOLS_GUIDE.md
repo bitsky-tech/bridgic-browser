@@ -37,7 +37,7 @@ This guide helps you choose the right tools for different browser automation sce
 When the full tree exceeds the character limit, the tool returns a segment and appends a notice like:
 
 ```
-[notice] Current page state text is too long, returned portion starting from character 0 (this segment length 30000 / total length 45000 characters). To continue getting subsequent content, use start_from_char=30000 to call get_snapshot_text again.
+[notice] Current page text is too long, returned portion starting from character 0 (this segment length 30000 / total length 45000 characters). To continue getting subsequent content: call get_snapshot_text(start_from_char=30000, interactive=False, full_page=True)
 ```
 
 Use the given `start_from_char` in the next call to continue reading.
@@ -259,22 +259,22 @@ Flexible waiting with multiple conditions. Only one condition is used; priority 
 # Wait for time (seconds, max 60)
 await browser.wait_for(time_seconds=2.0)
 
-# Wait for text to appear (timeout_ms in milliseconds)
-await browser.wait_for(text="Loading complete", timeout_ms=10000)
+# Wait for text to appear (timeout in seconds)
+await browser.wait_for(text="Loading complete", timeout=10.0)
 
 # Wait for text to disappear
-await browser.wait_for(text_gone="Please wait...", timeout_ms=10000)
+await browser.wait_for(text_gone="Please wait...", timeout=10.0)
 
 # Wait for element state
-await browser.wait_for(selector=".modal", state="visible", timeout_ms=5000)
+await browser.wait_for(selector=".modal", state="visible", timeout=5.0)
 ```
 
 ### `wait_for_network_idle`
 
-Wait for network activity to settle. **timeout** is in milliseconds.
+Wait for network activity to settle. **timeout** is in seconds.
 
 ```python
-await browser.wait_for_network_idle(timeout=30000)  # 30 seconds
+await browser.wait_for_network_idle(timeout=30.0)
 ```
 
 ## Verification Tools

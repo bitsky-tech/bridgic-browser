@@ -12,10 +12,10 @@ Key Features:
 - Provides locator reconstruction from refs for element interaction
 
 Example Output:
-    - heading "Example Domain" [ref=e1] [level=1]
+    - heading "Example Domain" [ref=a1b2c3d4] [level=1]
     - paragraph: Some text content
-    - button "Submit" [ref=e2]
-    - textbox "Email" [ref=e3]
+    - button "Submit" [ref=e5f6a7b8]
+    - textbox "Email" [ref=c9d0e1f2]
 
 Usage:
     from playwright.async_api import async_playwright
@@ -55,6 +55,7 @@ import re
 import math
 import logging
 import time
+import hashlib
 from typing import Dict, Optional, Set, List, Tuple, Any
 from dataclasses import dataclass
 from playwright.async_api import FrameLocator as AsyncFrameLocator, Page as AsyncPage, Locator as AsyncLocator
@@ -180,10 +181,10 @@ class SnapshotGenerator:
     IMPORTANT USAGE NOTES:
 
     1. Thread/Coroutine Safety:
-       This class uses instance-level state (_ref_counter) that is reset at the
-       start of each snapshot generation. Do NOT share a single SnapshotGenerator
-       instance across concurrent coroutines. Create a new instance per concurrent
-       operation, or ensure sequential access.
+       This class is stateless with respect to ref generation — refs are derived
+       purely from element semantics via a deterministic hash. Multiple coroutines
+       may share an instance safely as long as they don't call get_enhanced_snapshot_async
+       concurrently (Playwright page objects are not thread-safe).
 
     2. Regex Handling:
        The line parsing regex uses `(?:[^"\\]|\\.)*` to correctly handle escaped quotes
@@ -368,18 +369,38 @@ class SnapshotGenerator:
         'directory',
     }
 
+    # Namespace salt baked into every fingerprint.
+    # Changing this value invalidates all existing refs (intentional for major versions).
+    _REF_NAMESPACE = "bridgic-browser-v1"
+
     def __init__(self):
         """Initialize the snapshot generator."""
-        self._ref_counter = 0
-    
+
     def _reset_refs(self) -> None:
-        """Reset ref counter (call at start of each snapshot)."""
-        self._ref_counter = 0
-    
-    def _next_ref(self) -> str:
-        """Generate next ref ID."""
-        self._ref_counter += 1
-        return f"e{self._ref_counter}"
+        """No-op: ref generation is stateless (pure hash, no instance state)."""
+
+    @staticmethod
+    def _compute_stable_ref(role: str, name: Optional[str],
+                             frame_path: Optional[List[int]],
+                             nth: int) -> str:
+        """Derive a stable 8-hex-char ref from element semantics.
+
+        Uses a fixed namespace salt + CRC32 over all disambiguating fields.
+        With 32-bit output and a typical page of ~1 000 elements, the birthday
+        collision probability is ~N²/2³² ≈ 0.012 %, low enough to ignore.
+        \x1f (ASCII Unit Separator) is safe as a field delimiter: it cannot
+        appear in HTML accessible names.
+        """
+        frame_str = ",".join(str(x) for x in frame_path) if frame_path else ""
+        raw = (
+            f"{SnapshotGenerator._REF_NAMESPACE}"
+            f"\x1f{role}\x1f{name or ''}\x1f{frame_str}\x1f{nth}"
+        )
+        # SHA-256 has uniform distribution and no structural bias for similar inputs.
+        # First 4 bytes (32 bits) → 8 hex chars; collision prob ≈ N²/2³² for N elements
+        # (~0.012% for a typical page of 1 000 elements — safely negligible).
+        digest = hashlib.sha256(raw.encode("utf-8")).digest()
+        return digest[:4].hex()
     
     def _build_selector(self, role: str, name: Optional[str] = None, text_content: Optional[str] = None) -> str:
         """Build a selector string for storing in the ref map.
@@ -1399,9 +1420,10 @@ class SnapshotGenerator:
                 enhanced += f' "{name}"'
 
             if should_have_ref:
-                ref = self._next_ref()
-                current_ref = ref
+                current_frame_path = iframe_stack[-1][1] if iframe_stack else None
                 nth = tracker.get_next_index(role_lower, name)
+                ref = self._compute_stable_ref(role_lower, name, current_frame_path, nth)
+                current_ref = ref
                 tracker.track_ref(role_lower, name, ref)
 
                 # Extract inline text content for unnamed elements
@@ -1412,7 +1434,6 @@ class SnapshotGenerator:
                         text_content = text_match.group(1).strip()
 
                 parent_ref = get_nearest_parent_ref(original_depth)
-                current_frame_path = iframe_stack[-1][1] if iframe_stack else None
 
                 refs[ref] = RefData(
                     selector=self._build_selector(role_lower, name, text_content),
@@ -1736,12 +1757,12 @@ class SnapshotGenerator:
 
     @staticmethod
     def parse_ref(arg: str) -> Optional[str]:
-        """Parse a ref string (e.g., ``@e1`` -> ``e1``).
+        """Parse a ref string (e.g., ``@3ad7b2c1`` -> ``3ad7b2c1``).
 
         Parameters
         ----------
         arg : str
-            Reference string in various formats (``@e1``, ``ref=e1``, ``e1``).
+            Reference string in various formats (``@3ad7b2c1``, ``ref=3ad7b2c1``, ``3ad7b2c1``).
 
         Returns
         -------
@@ -1753,9 +1774,7 @@ class SnapshotGenerator:
             return arg[1:]
         if arg.startswith('ref='):
             return arg[4:]
-        if arg.isdigit():
-            return f"e{arg}"
-        if re.match(r'^e\d+$', arg):
+        if re.match(r'^[0-9a-f]{8}$', arg):
             return arg
         return None
     
@@ -1785,7 +1804,7 @@ class SnapshotGenerator:
         page : playwright.async_api.Page
             Playwright page object (async_api).
         ref_arg : str
-            Reference string (``e1``, ``@e1``, ``ref=e1``).
+            Reference string (``a1b2c3d4``, ``@a1b2c3d4``, ``ref=a1b2c3d4``).
         refs : Dict[str, RefData]
             Ref map dictionary from snapshot.
 

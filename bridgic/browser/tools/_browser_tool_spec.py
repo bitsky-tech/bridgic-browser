@@ -115,7 +115,7 @@ class BrowserToolSpec(ToolSpec):
         if not tool_parameters:
             tool_parameters = create_func_params_json_schema(
                 func,
-                ignore_params=["self", "cls", "browser"]
+                ignore_params=["self", "cls", "browser", "from_cli"]
             )
 
         return cls(
@@ -175,6 +175,8 @@ class BrowserToolSpec(ToolSpec):
 
     @override
     def dump_to_dict(self) -> Dict[str, Any]:
+        # browser_name / browser_id are included for debugging purposes only.
+        # load_from_dict is not supported — use BrowserToolSetBuilder to recreate.
         state_dict = super().dump_to_dict()
         state_dict["func"] = self._func.__module__ + "." + self._func.__qualname__
         if self._browser is not None:
@@ -190,8 +192,5 @@ class BrowserToolSpec(ToolSpec):
         )
 
     def __repr__(self) -> str:
-        return (
-            f"<BrowserToolSpec("
-            f"tool_name={self._tool_name!r}, "
-            f")>"
-        )
+        browser_info = f", browser=<{self._browser.__class__.__name__}>" if self._browser is not None else ""
+        return f"<BrowserToolSpec(tool_name={self._tool_name!r}{browser_info})>"

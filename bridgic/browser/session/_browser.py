@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import tempfile
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Union, NoReturn
 
@@ -43,6 +44,17 @@ from ..errors import (
 logger = logging.getLogger(__name__)
 
 _MAX_CHAR_LIMIT = int(os.environ.get("BRIDGIC_MAX_CHARS", "30000"))
+
+
+def _strip_playwright_call_log(message: str) -> str:
+    marker = "Call Log:"
+    idx = message.find(marker)
+    if idx == -1:
+        marker = "Call log:"
+        idx = message.find(marker)
+    if idx == -1:
+        return message
+    return message[:idx].rstrip()
 
 
 def _raise_invalid_input(
@@ -86,6 +98,7 @@ def _raise_operation_error(
     if isinstance(current_exc, BridgicBrowserError):
         raise current_exc
 
+    message = _strip_playwright_call_log(message)
     raise OperationError(
         message,
         code=code,
@@ -105,6 +118,7 @@ def _raise_verification_error(
     if isinstance(current_exc, BridgicBrowserError):
         raise current_exc
 
+    message = _strip_playwright_call_log(message)
     raise VerificationError(
         message,
         code=code,
@@ -275,7 +289,7 @@ class Browser:
     proxy : ProxySettings, optional
         Network proxy settings: {"server": str, "bypass"?: str, "username"?: str, "password"?: str}.
     timeout : float, optional
-        Maximum time in milliseconds to wait for browser to start. Default 30000.
+        Maximum time in seconds to wait for browser to start. Default 30.
     slow_mo : float, optional
         Slows down Playwright operations by specified milliseconds. Useful for debugging.
     args : Sequence[str], optional
@@ -640,7 +654,7 @@ class Browser:
         if self._channel is not None:
             options["channel"] = self._channel
         if self._timeout is not None:
-            options["timeout"] = self._timeout
+            options["timeout"] = self._timeout * 1000.0
         if self._headless is not None:
             options["headless"] = self._headless
         if self._devtools is not None:
@@ -880,20 +894,20 @@ class Browser:
                 if errors is not None:
                     errors.append(f"dialog.remove_listener: {e}")
 
-    async def stop(self) -> None:
-        """Stop the browser and clean up all resources.
+    async def stop(self) -> str:
+        """Close the browser.
 
-        Handles both launch modes:
-        - Persistent context: Closing context automatically closes browser
-        - Normal launch: Must close browser separately
+        Stops the browser and cleans up all resources. Automatically removes
+        active page-scoped event listeners (console capture, network capture,
+        dialog handlers) — no need to call ``stop_*`` / ``remove_*`` methods
+        beforehand. Active tracing/video sessions are auto-finalized and their
+        paths included in the result.
 
-        Also automatically removes any active page-scoped event listeners
-        (console capture, network capture, dialog handlers) so callers do not
-        need to call the corresponding ``stop_*`` / ``remove_*`` methods before
-        stopping. Active tracing/video sessions are auto-finalized and saved to
-        absolute paths, which are exposed via ``_last_shutdown_artifacts``.
-        Cleans up temporary user data directory if one was created for stealth
-        extensions.
+        Returns
+        -------
+        str
+            Operation result message. Includes auto-saved trace/video paths
+            when active sessions were finalized during close.
         """
         errors: List[str] = []
         shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
@@ -1012,6 +1026,19 @@ class Browser:
             except Exception as e:
                 errors.append(f"download_manager.detach: {e}")
 
+        # Close all remaining pages in context before closing context.
+        # This avoids context.close() hanging on beforeunload handlers of extra
+        # tabs the user may have opened manually (or pages we didn't track).
+        if self._context:
+            for extra_page in list(self._context.pages):
+                try:
+                    await asyncio.wait_for(
+                        extra_page.close(run_before_unload=False),
+                        timeout=self._PAGE_CLOSE_TIMEOUT,
+                    )
+                except Exception:
+                    pass  # best-effort; context.close() will handle it
+
         # Close context
         # NOTE: In persistent context mode, closing context will auto close browser
         if self._context:
@@ -1095,10 +1122,27 @@ class Browser:
         self._video_state.clear()
         self._pending_video_save_path.clear()
 
+        trace_paths = shutdown_artifacts.get("trace", [])
+        video_paths = shutdown_artifacts.get("video", [])
+        if errors:
+            lines = ["Browser closed with warnings", "Shutdown warnings:"]
+            lines.extend(errors)
+        else:
+            lines = ["Browser closed successfully"]
+        if trace_paths:
+            lines.append("Auto-saved trace files:")
+            lines.extend(trace_paths)
+        if video_paths:
+            lines.append("Auto-saved video files:")
+            lines.extend(video_paths)
+        result = "\n".join(lines)
+
         if errors:
             logger.warning(f"Browser stopped with errors: {errors}")
         else:
             logger.info("Browser stopped")
+
+        return result
 
     async def __aenter__(self) -> "Browser":
         """Async context manager entry - starts the browser.
@@ -1136,7 +1180,7 @@ class Browser:
             - "networkidle": No network activity for 500ms (may timeout on SPAs).
             - "commit": Response received from server.
         timeout : float, optional
-            Maximum time in milliseconds. Defaults to Playwright's 30000ms.
+            Maximum time in seconds. Defaults to Playwright's 30s.
 
         Returns
         -------
@@ -1169,7 +1213,7 @@ class Browser:
 
             kwargs: Dict[str, Any] = {"wait_until": wait_until}
             if timeout is not None:
-                kwargs["timeout"] = timeout
+                kwargs["timeout"] = timeout * 1000.0
             await self._page.goto(url, **kwargs)
             # Update cache
             self._last_snapshot = None
@@ -1867,6 +1911,7 @@ Before you return the element ref, reason about the state and elements for a sen
         start_from_char: int = 0,
         interactive: bool = False,
         full_page: bool = True,
+        from_cli: bool = False,
     ) -> str:
         """Get page accessibility tree with element refs for interaction.
 
@@ -1882,6 +1927,9 @@ Before you return the element ref, reason about the state and elements for a sen
             inputs, checkboxes, elements with cursor:pointer, etc.).
         full_page : bool, optional
             If True (default), include elements outside viewport.
+        from_cli : bool, optional
+            If True, truncation notice will only show the CLI continuation command.
+            This is primarily for CLI output formatting.
 
         Returns
         -------
@@ -1906,10 +1954,6 @@ Before you return the element ref, reason about the state and elements for a sen
                 interactive=interactive,
                 full_page=full_page,
             )
-            if snapshot is None:
-                error_msg = "Failed to get interface information"
-                logger.error(f"[get_snapshot_text] {error_msg}")
-                _raise_operation_error(error_msg)
             _page = getattr(self, "_page", None)
             page_url = _page.url if _page else ""
             page_title = await _page.title() if _page else ""
@@ -1951,21 +1995,27 @@ Before you return the element ref, reason about the state and elements for a sen
                 next_start_char = start_from_char + truncate_at
 
             if truncated and next_start_char is not None:
-                cli_flags = []
-                if interactive:
-                    cli_flags.append("-i")
-                if not full_page:
-                    cli_flags.append("-F")
-                cli_flags.append(f"-s {next_start_char}")
-                cli_cmd = "bridgic-browser snapshot " + " ".join(cli_flags)
+                continuation: str
+                if from_cli:
+                    cli_flags = []
+                    if interactive:
+                        cli_flags.append("-i")
+                    if not full_page:
+                        cli_flags.append("-F")
+                    cli_flags.append(f"-s {next_start_char}")
+                    cli_cmd = "bridgic-browser snapshot " + " ".join(cli_flags)
+                    continuation = f"run: {cli_cmd}"
+                else:
+                    continuation = (
+                        f"call get_snapshot_text(start_from_char={next_start_char}, "
+                        f"interactive={interactive}, full_page={full_page})"
+                    )
 
                 notice = (
                     "\n\n[notice] Current page text is too long, returned portion starting "
                     f"from character {start_from_char} (this segment length {len(text)} / total "
                     f"length {total_length} characters). To continue getting subsequent content: "
-                    f"call get_snapshot_text(start_from_char={next_start_char}, "
-                    f"interactive={interactive}, full_page={full_page}) "
-                    f"or run: {cli_cmd}"
+                    f"{continuation}"
                 )
                 text = f"{text}{notice}"
 
@@ -2000,7 +2050,7 @@ Before you return the element ref, reason about the state and elements for a sen
             - "networkidle": No network activity for 500ms (may timeout on SPAs).
             - "commit": Response received from server.
         timeout : float, optional
-            Maximum time in milliseconds. Defaults to Playwright's 30000ms.
+            Maximum time in seconds. Defaults to Playwright's 30s.
 
         Returns
         -------
@@ -2119,7 +2169,7 @@ Before you return the element ref, reason about the state and elements for a sen
             - "networkidle": No network activity for 500ms (may timeout on SPAs).
             - "commit": Response received from server.
         timeout : float, optional
-            Maximum time in milliseconds. Defaults to Playwright's 30000ms.
+            Maximum time in seconds. Defaults to Playwright's 30s.
 
         Returns
         -------
@@ -2134,7 +2184,7 @@ Before you return the element ref, reason about the state and elements for a sen
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
             kwargs: Dict[str, Any] = {"wait_until": wait_until}
             if timeout is not None:
-                kwargs["timeout"] = timeout
+                kwargs["timeout"] = timeout * 1000.0
             await page.reload(**kwargs)
             title = await page.title()
             result = f"Page reloaded: {page.url} (title: {title})"
@@ -2475,43 +2525,6 @@ Before you return the element ref, reason about the state and elements for a sen
 
     # ==================== Browser Control Tools ====================
 
-    async def browser_close(self) -> str:
-        """Close the browser.
-
-        Returns
-        -------
-        str
-            Operation result message. Includes auto-saved trace/video paths
-            when active sessions were finalized during close.
-        """
-        try:
-            logger.info("[browser_close] start")
-
-            await self.stop()
-            trace_paths = self._last_shutdown_artifacts.get("trace", [])
-            video_paths = self._last_shutdown_artifacts.get("video", [])
-            shutdown_errors = self._last_shutdown_errors
-
-            if shutdown_errors:
-                lines = ["Browser closed with warnings", "Shutdown warnings:"]
-                lines.extend(shutdown_errors)
-            else:
-                lines = ["Browser closed successfully"]
-            if trace_paths:
-                lines.append("Auto-saved trace files:")
-                lines.extend(trace_paths)
-            if video_paths:
-                lines.append("Auto-saved video files:")
-                lines.extend(video_paths)
-
-            result = "\n".join(lines)
-            logger.info(f"[browser_close] done {result}")
-            return result
-        except Exception as e:
-            error_msg = f"Failed to close browser: {str(e)}"
-            logger.error(f"[browser_close] {error_msg}")
-            _raise_operation_error(error_msg)
-
     async def browser_resize(self, width: int, height: int) -> str:
         """Resize the browser viewport.
 
@@ -2553,7 +2566,7 @@ Before you return the element ref, reason about the state and elements for a sen
         text_gone: Optional[str] = None,
         selector: Optional[str] = None,
         state: str = "visible",
-        timeout_ms: float = 30000,
+        timeout: float = 30.0,
     ) -> str:
         """Wait for a condition: time delay, text appearance/disappearance, or element state.
 
@@ -2573,9 +2586,9 @@ Before you return the element ref, reason about the state and elements for a sen
         state : str, optional
             Element state when using selector: "visible" (default), "hidden",
             "attached", "detached".
-        timeout_ms : float, optional
-            Maximum wait time in MILLISECONDS for text/selector conditions.
-            Default is 30000 (30 seconds). Does not apply to time_seconds.
+        timeout : float, optional
+            Maximum wait time in SECONDS for text/selector conditions.
+            Default is 30.0. Does not apply to time_seconds.
 
         Returns
         -------
@@ -2603,6 +2616,8 @@ Before you return the element ref, reason about the state and elements for a sen
             page = await self.get_current_page()
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
+
+            timeout_ms = timeout * 1000.0
 
             if text is not None:
                 locator = page.get_by_text(text, exact=False)
@@ -4359,13 +4374,13 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.error(f"[get_network_requests] {error_msg}")
             _raise_operation_error(error_msg)
 
-    async def wait_for_network_idle(self, timeout: float = 30000) -> str:
+    async def wait_for_network_idle(self, timeout: float = 30.0) -> str:
         """Wait for network to become idle.
 
         Parameters
         ----------
         timeout : float, optional
-            Maximum time to wait in milliseconds. Default is 30000 (30 seconds).
+            Maximum time to wait in seconds. Default is 30.0.
 
         Returns
         -------
@@ -4373,13 +4388,14 @@ Before you return the element ref, reason about the state and elements for a sen
             Operation result message.
         """
         try:
-            logger.info(f"[wait_for_network_idle] start timeout={timeout}")
+            logger.info(f"[wait_for_network_idle] start timeout_seconds={timeout}")
 
             page = await self.get_current_page()
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
-            await page.wait_for_load_state("networkidle", timeout=timeout)
+            timeout_ms = float(timeout) * 1000.0
+            await page.wait_for_load_state("networkidle", timeout=timeout_ms)
 
             result = "Network is idle"
             logger.info(f"[wait_for_network_idle] done {result}")
@@ -4664,8 +4680,13 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.error(f"[restore_storage_state] {error_msg}")
             _raise_operation_error(error_msg)
 
-    async def clear_cookies(self) -> str:
-        """Clear all cookies from the browser context.
+    async def clear_cookies(
+        self,
+        name: Optional[str] = None,
+        domain: Optional[str] = None,
+        path: Optional[str] = None,
+    ) -> str:
+        """Clear cookies from the browser context.
 
         Returns
         -------
@@ -4673,16 +4694,19 @@ Before you return the element ref, reason about the state and elements for a sen
             Operation result message.
         """
         try:
-            logger.info("[clear_cookies] start")
+            logger.info(f"[clear_cookies] start name={name} domain={domain} path={path}")
 
             page = await self.get_current_page()
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             context = page.context
-            await context.clear_cookies()
+            await context.clear_cookies(name=name, domain=domain, path=path)
 
-            result = "All cookies cleared"
+            if name or domain or path:
+                result = "Cookies cleared (filtered)"
+            else:
+                result = "All cookies cleared"
             logger.info(f"[clear_cookies] done {result}")
             return result
         except Exception as e:
@@ -4690,13 +4714,26 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.error(f"[clear_cookies] {error_msg}")
             _raise_operation_error(error_msg)
 
-    async def get_cookies(self, urls: Optional[list] = None) -> str:
+    async def get_cookies(
+        self,
+        urls: Optional[list] = None,
+        *,
+        name: Optional[str] = None,
+        domain: Optional[str] = None,
+        path: Optional[str] = None,
+    ) -> str:
         """Get cookies from the browser context.
 
         Parameters
         ----------
         urls : Optional[list], optional
             List of URLs to get cookies for. If not provided, returns all cookies.
+        name : Optional[str], optional
+            Filter cookies by exact name.
+        domain : Optional[str], optional
+            Filter cookies by domain substring match.
+        path : Optional[str], optional
+            Filter cookies by path prefix match.
 
         Returns
         -------
@@ -4704,7 +4741,9 @@ Before you return the element ref, reason about the state and elements for a sen
             JSON string containing the cookies.
         """
         try:
-            logger.info(f"[get_cookies] start urls={urls}")
+            logger.info(
+                f"[get_cookies] start urls={urls} name={name} domain={domain} path={path}"
+            )
 
             page = await self.get_current_page()
             if page is None:
@@ -4716,6 +4755,21 @@ Before you return the element ref, reason about the state and elements for a sen
                 cookies = await context.cookies(urls)
             else:
                 cookies = await context.cookies()
+
+            if name:
+                cookies = [cookie for cookie in cookies if cookie.get("name") == name]
+            if domain:
+                cookies = [
+                    cookie
+                    for cookie in cookies
+                    if domain in (cookie.get("domain") or "")
+                ]
+            if path:
+                cookies = [
+                    cookie
+                    for cookie in cookies
+                    if (cookie.get("path") or "").startswith(path)
+                ]
 
             result = json.dumps(cookies, indent=2)
             logger.info(f"[get_cookies] done count={len(cookies)}")
@@ -4773,7 +4827,15 @@ Before you return the element ref, reason about the state and elements for a sen
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
             if not url and not domain:
-                _raise_invalid_input("Either url or domain must be specified", code="INVALID_COOKIE_TARGET")
+                page_url = getattr(page, "url", "")
+                parsed = urlparse(page_url)
+                if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                    _raise_invalid_input(
+                        "Either url or domain must be specified (current page URL has no host)",
+                        code="INVALID_COOKIE_TARGET",
+                        details={"page_url": page_url},
+                    )
+                domain = parsed.hostname
             if url and domain:
                 _raise_invalid_input("Provide either url or domain, not both", code="INVALID_COOKIE_TARGET")
 
@@ -4812,7 +4874,7 @@ Before you return the element ref, reason about the state and elements for a sen
         self,
         role: str,
         accessible_name: str,
-        timeout: float = 5000,
+        timeout: float = 5.0,
     ) -> str:
         """Verify that an element with the given role and name is visible.
 
@@ -4823,7 +4885,7 @@ Before you return the element ref, reason about the state and elements for a sen
         accessible_name : str
             Accessible name of the element (usually its text content or aria-label).
         timeout : float, optional
-            Maximum time to wait for the element in milliseconds. Default is 5000.
+            Maximum time to wait for the element in seconds. Default is 5.0.
 
         Returns
         -------
@@ -4847,7 +4909,7 @@ Before you return the element ref, reason about the state and elements for a sen
             locator = page.get_by_role(role, name=accessible_name)
 
             try:
-                await locator.wait_for(state="visible", timeout=timeout)
+                await locator.wait_for(state="visible", timeout=timeout * 1000.0)
                 result = f"PASS: Element with role '{role}' and name '{accessible_name}' is visible"
                 logger.info(f"[verify_element_visible] {result}")
                 return result
@@ -4869,7 +4931,7 @@ Before you return the element ref, reason about the state and elements for a sen
         self,
         text: str,
         exact: bool = False,
-        timeout: float = 5000,
+        timeout: float = 5.0,
     ) -> str:
         """Verify that specific text is visible on the page.
 
@@ -4880,7 +4942,7 @@ Before you return the element ref, reason about the state and elements for a sen
         exact : bool, optional
             Whether to match the text exactly. Default is False (substring match).
         timeout : float, optional
-            Maximum time to wait for the text in milliseconds. Default is 5000.
+            Maximum time to wait for the text in seconds. Default is 5.0.
 
         Returns
         -------
@@ -4904,7 +4966,7 @@ Before you return the element ref, reason about the state and elements for a sen
             locator = page.get_by_text(text, exact=exact)
 
             try:
-                await locator.first.wait_for(state="visible", timeout=timeout)
+                await locator.first.wait_for(state="visible", timeout=timeout * 1000.0)
                 result = f"PASS: Text '{text}' is visible on the page"
                 logger.info(f"[verify_text_visible] {result}")
                 return result

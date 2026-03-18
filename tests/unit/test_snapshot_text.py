@@ -145,7 +145,8 @@ async def test_get_snapshot_text_truncates_and_adds_notice_with_next_start_char(
 
     assert "[notice]" in result
     assert "start_from_char=250" in result
-    assert "bridgic-browser snapshot -s 250" in result
+    assert "call get_snapshot_text(" in result
+    assert "run: bridgic-browser snapshot" not in result
 
 
 @pytest.mark.asyncio
@@ -185,4 +186,26 @@ async def test_get_snapshot_text_truncation_notice_preserves_snapshot_mode_param
     )
 
     assert "interactive=True, full_page=False" in result
-    assert "bridgic-browser snapshot -i -F -s 120" in result
+    assert "call get_snapshot_text(" in result
+    assert "run: bridgic-browser snapshot" not in result
+
+
+@pytest.mark.asyncio
+async def test_get_snapshot_text_truncation_notice_cli_only(monkeypatch) -> None:
+    monkeypatch.setattr(_browser_module, "_MAX_CHAR_LIMIT", 120)
+    long_tree = "q" * 500
+    mock_browser = MagicMock(spec=Browser)
+    mock_browser.get_snapshot = AsyncMock(
+        return_value=EnhancedSnapshot(tree=long_tree, refs={})
+    )
+
+    result = await Browser.get_snapshot_text(
+        mock_browser,
+        start_from_char=0,
+        interactive=True,
+        full_page=False,
+        from_cli=True,
+    )
+
+    assert "run: bridgic-browser snapshot -i -F -s 120" in result
+    assert "call get_snapshot_text(" not in result

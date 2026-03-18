@@ -123,9 +123,7 @@ Browser options are read at daemon startup from the following sources, in priori
 | Defaults | `headless=True` |
 | `~/.bridgic/bridgic-browser.json` | User-level persistent config |
 | `./bridgic-browser.json` | Project-local config (in cwd at daemon start) |
-| `BRIDGIC_BROWSER_JSON` env var | Full JSON override for any `Browser` parameter |
-| `BRIDGIC_HEADLESS` env var | `0` = show window, any other value = headless |
-| `BRIDGIC_MAX_CHARS` env var | Max characters per `snapshot`/`get_snapshot_text` response before pagination (default `30000`) |
+| Environment variables | See `skills/bridgic-browser/references/env-vars.md` |
 
 The JSON sources accept any `Browser` constructor parameter:
 
@@ -165,9 +163,7 @@ BRIDGIC_BROWSER_JSON='{"channel":"chrome","headless":false}' bridgic-browser ope
 | Developer | `console-start`, `console-stop`, `console`, `trace-start`, `trace-stop`, `trace-chunk`, `video-start`, `video-stop` |
 | Lifecycle | `close`, `resize` |
 
-Utility command: `commands [--section|--list-sections]`.
-
-Use `-h` or `--help` on any command for details. For agent-oriented planning, prefer `bridgic-browser commands --section SECTION`:
+Use `-h` or `--help` on any command for details:
 
 ```bash
 bridgic-browser -h
@@ -345,7 +341,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `go_back()` / `go_forward()` - Browser history navigation
 
 **Snapshot (1 tool):**
-- `get_snapshot_text(start_from_char=0, interactive=False, full_page=True)` - Get page state string for LLM (accessibility tree with refs). **start_from_char** must be `>= 0` and is used for pagination when the page is long: if the return value is truncated, a `[notice]` at the end gives **next_start_char** to call again. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default). Output is truncated at the `BRIDGIC_MAX_CHARS` limit (default 30,000 chars) with a notice explaining how to continue.
+- `get_snapshot_text(start_from_char=0, interactive=False, full_page=True)` - Get page state string for LLM (accessibility tree with refs). **start_from_char** must be `>= 0` and is used for pagination when the page is long: if the return value is truncated, a `[notice]` at the end gives **next_start_char** to call again. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default). Output is truncated at the configured limit; see `skills/bridgic-browser/references/env-vars.md` for `BRIDGIC_MAX_CHARS`.
 
 **Element Interaction (13 tools) - by ref:**
 - `click_element_by_ref(ref)` - Click element
@@ -381,7 +377,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `mouse_down()` / `mouse_up()` - Mouse button control
 
 **Wait (1 tool):**
-- `wait_for(time_seconds, text, text_gone, selector, state, timeout_ms)` - Wait for conditions
+- `wait_for(time_seconds, text, text_gone, selector, state, timeout)` - Wait for conditions
 
 **Capture (2 tools):**
 - `take_screenshot(filename=None, ref=None, full_page=False, type="png")` - Capture screenshot
@@ -413,7 +409,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `start_video()` / `stop_video()` - Video recording
 
 **Lifecycle (2 tools):**
-- `browser_close()` - Stop browser (calls `stop()`)
+- `stop()` - Stop browser
 - `browser_resize(width, height)` - Resize viewport
 
 ### Stealth Mode
@@ -573,9 +569,7 @@ bridgic-browser close                       # 停止 daemon
 | 默认值 | `headless=True` |
 | `~/.bridgic/bridgic-browser.json` | 用户级持久配置 |
 | `./bridgic-browser.json` | 项目本地配置（daemon 启动时的工作目录） |
-| `BRIDGIC_BROWSER_JSON` 环境变量 | 完整 JSON，支持所有 `Browser` 参数 |
-| `BRIDGIC_HEADLESS` 环境变量 | `0` = 显示窗口，其他值 = 无头模式 |
-| `BRIDGIC_MAX_CHARS` 环境变量 | `snapshot`/`get_snapshot_text` 每次响应的最大字符数（超出则分页，默认 `30000`） |
+| 环境变量 | 统一说明见 `skills/bridgic-browser/references/env-vars.md` |
 
 JSON 来源支持所有 `Browser` 构造参数：
 
@@ -615,9 +609,7 @@ BRIDGIC_BROWSER_JSON='{"channel":"chrome","headless":false}' bridgic-browser ope
 | 开发者 | `console-start`、`console-stop`、`console`、`trace-start`、`trace-stop`、`trace-chunk`、`video-start`、`video-stop` |
 | 生命周期 | `close`、`resize` |
 
-辅助命令：`commands [--section|--list-sections]`。
-
-使用 `-h` 或 `--help` 查看任意命令的详细说明。面向 Agent 的能力发现，推荐优先使用 `bridgic-browser commands --section SECTION`：
+使用 `-h` 或 `--help` 查看任意命令的详细说明：
 
 ```bash
 bridgic-browser -h
@@ -795,7 +787,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `go_back()` / `go_forward()` - 浏览器历史导航
 
 **快照（1 个工具）：**
-- `get_snapshot_text(start_from_char=0, interactive=False, full_page=True)` - 获取供 LLM 使用的页面状态字符串（带 ref 的可访问性树）。**start_from_char** 必须 `>= 0`，长页面可用它分页：若返回值被截断，末尾会有 `[notice]` 给出 **next_start_char** 供再次调用。**interactive** 与 **full_page** 与 `get_snapshot` 一致（默认全页面）。输出在 `BRIDGIC_MAX_CHARS` 上限处（默认 3 万字符）截断并附带续读说明。
+- `get_snapshot_text(start_from_char=0, interactive=False, full_page=True)` - 获取供 LLM 使用的页面状态字符串（带 ref 的可访问性树）。**start_from_char** 必须 `>= 0`，长页面可用它分页：若返回值被截断，末尾会有 `[notice]` 给出 **next_start_char** 供再次调用。**interactive** 与 **full_page** 与 `get_snapshot` 一致（默认全页面）。输出在配置的上限处截断并附带续读说明；`BRIDGIC_MAX_CHARS` 见 `skills/bridgic-browser/references/env-vars.md`。
 
 **元素交互（13 个工具）- 通过引用操作元素：**
 - `click_element_by_ref(ref)` - 点击元素
@@ -831,7 +823,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `mouse_down()` / `mouse_up()` - 鼠标按钮控制
 
 **等待（1 个工具）：**
-- `wait_for(time_seconds, text, text_gone, selector, state, timeout_ms)` - 等待条件
+- `wait_for(time_seconds, text, text_gone, selector, state, timeout)` - 等待条件
 
 **截图（2 个工具）：**
 - `take_screenshot(filename=None, ref=None, full_page=False, type="png")` - 截取屏幕截图
@@ -863,7 +855,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `start_video()` / `stop_video()` - 视频录制
 
 **生命周期（2 个工具）：**
-- `browser_close()` - 停止浏览器（调用 `stop()`）
+- `stop()` - 停止浏览器
 - `browser_resize(width, height)` - 调整视口大小
 
 ### 隐身模式
