@@ -1622,6 +1622,34 @@ class Browser:
             _raise_operation_error(error_msg)
     
     async def get_element_by_ref(self, ref: str, _fallback_depth: int = 0) -> Optional[Locator]:
+        """Resolve a snapshot ref to a Playwright Locator.
+
+        Parameters
+        ----------
+        ref : str
+            Element ref from the last snapshot (e.g., ``'e1'``, ``'e2'``).
+            Obtain refs by calling :meth:`get_snapshot` or :meth:`get_snapshot_text` first.
+        _fallback_depth : int, optional
+            Internal recursion guard for the recovery path. Do not pass this parameter.
+
+        Returns
+        -------
+        Optional[Locator]
+            Resolved Playwright ``Locator``, or ``None`` when:
+            - No page is open (``start()`` not called or browser closed).
+            - No snapshot has been taken yet.
+            - ``ref`` is not present in the last snapshot.
+            Returns ``None`` instead of raising so callers can decide how to handle
+            a stale or unknown ref.
+
+        Notes
+        -----
+        - When multiple elements share the same role+name, an automatic recovery
+          path selects the nth visible match from the snapshot; a fresh snapshot
+          via :meth:`get_snapshot` is the preferred fix for persistent ambiguity.
+        - For elements inside iframes, the locator is scoped through the correct
+          ``frame_locator`` chain derived from ``RefData.frame_path``.
+        """
         if not self._page:
             logger.warning("No page is open, can't get element by ref")
             return None
@@ -1936,11 +1964,14 @@ Before you return the element ref, reason about the state and elements for a sen
         str
             Tree with refs like: `- button "Submit" [ref=e1]`
             Use refs with click_element_by_ref, input_text_by_ref, etc.
+            Output is truncated to ``BRIDGIC_MAX_CHARS`` (default 30 000) characters.
+            When truncated, a notice at the end shows the ``next_start_char`` value
+            to pass to ``start_from_char`` for the next page.
 
         Raises
         ------
         InvalidInputError
-            If `start_from_char` is negative or beyond the available text range.
+            If ``start_from_char`` is negative or beyond the available text range.
         """
         try:
             if start_from_char < 0:
@@ -2369,7 +2400,7 @@ Before you return the element ref, reason about the state and elements for a sen
             - "networkidle": No network activity for 500ms (may timeout on SPAs).
             - "commit": Response received from server.
         timeout : float, optional
-            Maximum time in milliseconds. Defaults to Playwright's 30000ms.
+            Maximum time in seconds. Defaults to Playwright's 30s.
 
         Returns
         -------
@@ -2412,7 +2443,8 @@ Before you return the element ref, reason about the state and elements for a sen
         Returns
         -------
         str
-            List of JSON strings with tab info (page_id, url, title).
+            Newline-separated list of tab info strings, each containing
+            page_id, url, and title. The active tab is marked with "(active)".
         """
         try:
             logger.info(f"[get_tabs] start")
@@ -2588,7 +2620,8 @@ Before you return the element ref, reason about the state and elements for a sen
             "attached", "detached".
         timeout : float, optional
             Maximum wait time in SECONDS for text/selector conditions.
-            Default is 30.0. Does not apply to time_seconds.
+            Default is 30.0. Does not apply to ``time_seconds``.
+            Setting ``timeout=0`` disables the timeout (waits indefinitely).
 
         Returns
         -------
@@ -3293,6 +3326,17 @@ Before you return the element ref, reason about the state and elements for a sen
         -------
         str
             Result message.
+
+        Notes
+        -----
+        This method is idempotent: if the element is already unchecked, it
+        returns immediately without error.
+
+        Radio buttons cannot be unchecked directly (they work in exclusive
+        groups — selecting another radio in the group is the correct approach).
+        If a radio button ref is passed, this method will attempt the action
+        but will NOT raise an error if the state remains checked, and will NOT
+        confirm the state change.
         """
         try:
             logger.info(f'[uncheck_checkbox_by_ref] start ref={ref}')
@@ -3857,16 +3901,22 @@ Before you return the element ref, reason about the state and elements for a sen
             _raise_operation_error(error_msg)
 
     async def insert_text(self, text: str) -> str:
-        """Insert text at the current cursor position.
+        """Insert text at the current cursor position without per-character key events.
 
-        Insert text into the currently focused element without triggering
-        individual key events. This is faster than typing but may not
-        trigger certain event handlers.
+        Pastes the text directly into the currently focused element.  Unlike
+        :meth:`type_text`, no ``keydown``/``keyup`` events are fired per character,
+        so it is significantly faster for long strings but will not trigger
+        handlers that listen to individual keystrokes (e.g., autocomplete widgets
+        that react to ``onkeydown``).
+
+        Use :meth:`input_text_by_ref` to target a specific element by ref.
+        Use :meth:`type_text` when per-character key events must fire.
 
         Parameters
         ----------
         text : str
-            Text to insert at cursor position.
+            Text to insert at the current cursor position.  Requires an element
+            to already be focused (e.g., via :meth:`focus_element_by_ref`).
 
         Returns
         -------
@@ -4687,6 +4737,15 @@ Before you return the element ref, reason about the state and elements for a sen
         path: Optional[str] = None,
     ) -> str:
         """Clear cookies from the browser context.
+
+        Parameters
+        ----------
+        name : Optional[str], optional
+            Clear only cookies with this exact name. Default clears all.
+        domain : Optional[str], optional
+            Clear only cookies whose domain contains this string. Default clears all.
+        path : Optional[str], optional
+            Clear only cookies with this exact path. Default clears all.
 
         Returns
         -------

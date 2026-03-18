@@ -127,7 +127,7 @@ CLI_COMMAND_META: dict[str, tuple[ToolCategory, str]] = {
     "dialog-remove": (ToolCategory.DIALOG, "Remove the automatic dialog handler"),
     "storage-save": (ToolCategory.STORAGE, "Save browser storage state (cookies, localStorage) to PATH"),
     "storage-load": (ToolCategory.STORAGE, "Restore browser storage state from PATH"),
-    "cookies-clear": (ToolCategory.STORAGE, "Clear cookies [--name NAME]"),
+    "cookies-clear": (ToolCategory.STORAGE, "Clear cookies [--name NAME] [--domain DOMAIN] [--path PATH]"),
     "cookies": (ToolCategory.STORAGE, "Get cookies [--domain DOMAIN] [--path PATH] [--name NAME]"),
     "cookie-set": (
         ToolCategory.STORAGE,

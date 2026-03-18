@@ -39,30 +39,29 @@ def test_browser_has_all_tool_methods():
         assert hasattr(Browser, method_name), f"Browser is missing method: {method_name}"
 
 
-def test_browser_has_get_snapshot_text():
-    assert hasattr(Browser, "get_snapshot_text")
-    assert not hasattr(Browser, "get_llm_repr"), "get_llm_repr should have been renamed"
-
-
 def test_browser_tool_set_builder():
-    from bridgic.browser.tools import BrowserToolSetBuilder
+    from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
     mock_browser = MagicMock(spec=Browser)
-    # Add all expected methods as mock async methods
     for name in EXPECTED_METHODS:
-        setattr(mock_browser, name, AsyncMock())
-    from bridgic.browser.tools import ToolCategory
+        mock_method = AsyncMock()
+        mock_method.__name__ = name
+        setattr(mock_browser, name, mock_method)
+
+    # ALL category should include all CLI-mapped tools (67 tools)
     builder = BrowserToolSetBuilder.for_categories(mock_browser, ToolCategory.ALL)
     specs = builder.build()["tool_specs"]
-    assert len(specs) > 0
+    tool_names = {s._tool_name for s in specs}
 
+    assert len(specs) >= 60, f"Expected >=60 tools, got {len(specs)}"
+    for expected in ("click_element_by_ref", "input_text_by_ref", "navigate_to", "get_snapshot_text", "browser_resize"):
+        assert expected in tool_names, f"Expected tool {expected!r} missing from ALL category"
 
-def test_browser_tool_spec_from_bound_method():
-    from bridgic.browser.tools import BrowserToolSpec
-    mock_browser = MagicMock(spec=Browser)
-    mock_browser.click_element_by_ref = AsyncMock()
-    # Test that from_raw works with a bound method (no browser arg required)
-    # We just test that it can be created without error
-    # In real usage: spec = BrowserToolSpec.from_raw(browser.click_element_by_ref)
+    # NAVIGATION category should include navigation tools only
+    nav_builder = BrowserToolSetBuilder.for_categories(mock_browser, ToolCategory.NAVIGATION)
+    nav_specs = nav_builder.build()["tool_specs"]
+    nav_names = {s._tool_name for s in nav_specs}
+    assert "navigate_to" in nav_names
+    assert "click_element_by_ref" not in nav_names
 
 
 # ---------------------------------------------------------------------------

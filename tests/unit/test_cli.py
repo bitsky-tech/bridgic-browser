@@ -1531,13 +1531,13 @@ class TestDaemonHandlers:
         browser = make_browser()
         browser.start_console_capture = AsyncMock(return_value="Console capture started")
         await _handle_console_start(browser, {})
-        browser.start_console_capture.assert_awaited_once()
+        browser.start_console_capture.assert_awaited_once_with()
 
     async def test_handle_console_stop(self):
         browser = make_browser()
         browser.stop_console_capture = AsyncMock(return_value="Console capture stopped")
         await _handle_console_stop(browser, {})
-        browser.stop_console_capture.assert_awaited_once()
+        browser.stop_console_capture.assert_awaited_once_with()
 
     async def test_handle_console(self):
         browser = make_browser()
@@ -1549,13 +1549,13 @@ class TestDaemonHandlers:
         browser = make_browser()
         browser.start_network_capture = AsyncMock(return_value="Network capture started")
         await _handle_network_start(browser, {})
-        browser.start_network_capture.assert_awaited_once()
+        browser.start_network_capture.assert_awaited_once_with()
 
     async def test_handle_network_stop(self):
         browser = make_browser()
         browser.stop_network_capture = AsyncMock(return_value="Network capture stopped")
         await _handle_network_stop(browser, {})
-        browser.stop_network_capture.assert_awaited_once()
+        browser.stop_network_capture.assert_awaited_once_with()
 
     async def test_handle_network(self):
         browser = make_browser()
@@ -1587,7 +1587,7 @@ class TestDaemonHandlers:
         browser = make_browser()
         browser.remove_dialog_handler = AsyncMock(return_value="Handler removed")
         await _handle_dialog_remove(browser, {})
-        browser.remove_dialog_handler.assert_awaited_once()
+        browser.remove_dialog_handler.assert_awaited_once_with()
 
     async def test_handle_storage_save(self):
         browser = make_browser()

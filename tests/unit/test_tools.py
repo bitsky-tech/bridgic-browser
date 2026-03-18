@@ -278,7 +278,7 @@ class TestNavigationTools:
 
         mock_page = mock_browser.get_current_page.return_value
         mock_page.go_back.assert_called_once()
-        assert "back" in result.lower()
+        assert result.startswith("Navigated back to:")
 
     @pytest.mark.asyncio
     async def test_go_forward(self, mock_browser):
@@ -288,7 +288,7 @@ class TestNavigationTools:
 
         mock_page = mock_browser.get_current_page.return_value
         mock_page.go_forward.assert_called_once()
-        assert "forward" in result.lower()
+        assert result.startswith("Navigated forward to:")
 
     @pytest.mark.asyncio
     async def test_reload_page(self, mock_browser):
@@ -298,6 +298,7 @@ class TestNavigationTools:
 
         mock_page = mock_browser.get_current_page.return_value
         mock_page.reload.assert_called_once()
+        assert result.startswith("Page reloaded:")
 
 # ==================== Page Control Tools Tests ====================
 
@@ -320,6 +321,7 @@ class TestPageControlTools:
         result = await Browser.scroll_to_text(mock_browser, "Some text")
 
         mock_page.get_by_text.assert_called_with("Some text", exact=False)
+        assert result.startswith("Scrolled to text:")
 
     @pytest.mark.asyncio
     async def test_evaluate_javascript(self, mock_browser):
@@ -343,7 +345,7 @@ class TestPageControlTools:
         elapsed = time.time() - start
 
         assert elapsed >= 0.5
-        assert "wait" in result.lower() or "0.5" in result
+        assert result.startswith("Waited for ")
 
     @pytest.mark.asyncio
     async def test_wait_for_text(self, mock_browser):
@@ -686,7 +688,7 @@ class TestElementInteractionTools:
         result = await Browser.check_checkbox_by_ref(mock_browser, ref="e1")
 
         mock_locator.check.assert_called_once()
-        assert "check" in result.lower()
+        assert result == "Checked element e1 (confirmed: checked=true)"
 
     @pytest.mark.asyncio
     async def test_uncheck_checkbox_by_ref(self, mock_browser):
@@ -703,7 +705,7 @@ class TestElementInteractionTools:
         result = await Browser.uncheck_checkbox_by_ref(mock_browser, ref="e1")
 
         mock_locator.uncheck.assert_called_once()
-        assert "uncheck" in result.lower()
+        assert result == "Unchecked element e1 (confirmed: checked=false)"
 
     @pytest.mark.asyncio
     async def test_uncheck_checkbox_by_ref_covered_uses_elementFromPoint(self, mock_browser):
@@ -857,7 +859,7 @@ class TestElementInteractionTools:
         result = await Browser.double_click_element_by_ref(mock_browser, ref="e1")
 
         mock_locator.dblclick.assert_called_once()
-        assert "double" in result.lower() or "click" in result.lower()
+        assert result == "Double-clicked element e1"
 
     @pytest.mark.asyncio
     async def test_scroll_element_into_view_by_ref(self, mock_browser):
@@ -870,7 +872,7 @@ class TestElementInteractionTools:
         result = await Browser.scroll_element_into_view_by_ref(mock_browser, ref="e1")
 
         mock_locator.scroll_into_view_if_needed.assert_called_once()
-        assert "scroll" in result.lower()
+        assert result == "Scrolled element e1 into view"
 
 # ==================== Mouse Tools Tests ====================
 
@@ -885,7 +887,7 @@ class TestMouseTools:
 
         mock_page = mock_browser.get_current_page.return_value
         mock_page.mouse.move.assert_called_once_with(100.0, 200.0)
-        assert "100" in result and "200" in result
+        assert result == "Moved mouse to coordinates (100, 200)"
 
     @pytest.mark.asyncio
     async def test_mouse_click(self, mock_browser):
@@ -895,7 +897,7 @@ class TestMouseTools:
 
         mock_page = mock_browser.get_current_page.return_value
         mock_page.mouse.click.assert_called_once()
-        assert "click" in result.lower()
+        assert result == "Mouse clicked at (150, 250) with left button"
 
     @pytest.mark.asyncio
     async def test_mouse_click_with_button(self, mock_browser):
@@ -917,7 +919,7 @@ class TestMouseTools:
             end_x=300, end_y=300
         )
 
-        assert result is not None
+        assert result.startswith("Dragged mouse from (")
 
     @pytest.mark.asyncio
     async def test_mouse_down(self, mock_browser):
@@ -927,7 +929,7 @@ class TestMouseTools:
 
         mock_page = mock_browser.get_current_page.return_value
         mock_page.mouse.down.assert_called_once()
-        assert "down" in result.lower() or "pressed" in result.lower()
+        assert result == "Mouse left button pressed down"
 
     @pytest.mark.asyncio
     async def test_mouse_up(self, mock_browser):
@@ -937,7 +939,7 @@ class TestMouseTools:
 
         mock_page = mock_browser.get_current_page.return_value
         mock_page.mouse.up.assert_called_once()
-        assert "up" in result.lower() or "released" in result.lower()
+        assert result == "Mouse left button released"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("delta_x,delta_y,direction", [
@@ -952,7 +954,7 @@ class TestMouseTools:
 
         mock_page = mock_browser.get_current_page.return_value
         mock_page.mouse.wheel.assert_called_once_with(delta_x=float(delta_x), delta_y=float(delta_y))
-        assert "scroll" in result.lower()
+        assert result.startswith("Scrolled mouse wheel:")
 
 # ==================== Keyboard Tools Tests ====================
 
@@ -988,7 +990,7 @@ class TestKeyboardTools:
 
         mock_page = mock_browser.get_current_page.return_value
         assert mock_page.keyboard.press.call_count == 5  # 4 chars + 1 Enter
-        assert "submit" in result.lower()
+        assert result == "Typed 4 characters sequentially and submitted"
 
     @pytest.mark.asyncio
     async def test_key_down(self, mock_browser):
@@ -1073,7 +1075,7 @@ class TestScreenshotTools:
 
         mock_page = mock_browser.get_current_page.return_value
         mock_page.screenshot.assert_called_once()
-        assert "screenshot" in result.lower() or "base64" in result.lower()
+        assert result.startswith("data:image/png;base64,")
 
     @pytest.mark.asyncio
     async def test_take_screenshot_full_page(self, mock_browser):
@@ -1095,7 +1097,7 @@ class TestScreenshotTools:
 
         mock_page = mock_browser.get_current_page.return_value
         mock_page.screenshot.assert_called_once()
-        assert "saved" in result.lower() or filepath in result
+        assert result == f"Screenshot saved to: {filepath}"
 
     @pytest.mark.asyncio
     async def test_save_pdf_headless_can_save(self, mock_browser):
@@ -1156,7 +1158,7 @@ class TestNetworkTools:
 
         result = await Browser.start_console_capture(mock_browser)
 
-        assert "started" in result.lower() or "capture" in result.lower()
+        assert result == "Console message capture started"
 
     @pytest.mark.asyncio
     async def test_get_console_messages(self, mock_browser):
@@ -1177,7 +1179,7 @@ class TestNetworkTools:
 
         result = await Browser.start_network_capture(mock_browser)
 
-        assert "started" in result.lower() or "capture" in result.lower() or "network" in result.lower()
+        assert result == "Network request capture started"
 
     @pytest.mark.asyncio
     async def test_get_network_requests(self, mock_browser):
@@ -1194,8 +1196,7 @@ class TestNetworkTools:
         await Browser.start_console_capture(mock_browser)
         result = await Browser.stop_console_capture(mock_browser)
 
-        assert isinstance(result, str)
-        assert "stop" in result.lower() or "console" in result.lower()
+        assert result == "Console capture stopped"
 
     @pytest.mark.asyncio
     async def test_stop_network_capture(self, mock_browser):
@@ -1203,8 +1204,7 @@ class TestNetworkTools:
         await Browser.start_network_capture(mock_browser)
         result = await Browser.stop_network_capture(mock_browser)
 
-        assert isinstance(result, str)
-        assert "stop" in result.lower() or "network" in result.lower()
+        assert result == "Network capture stopped"
 
     @pytest.mark.asyncio
     async def test_wait_for_network_idle(self, mock_browser):
@@ -1214,7 +1214,7 @@ class TestNetworkTools:
 
         mock_page = mock_browser.get_current_page.return_value
         mock_page.wait_for_load_state.assert_called_once_with("networkidle", timeout=30000.0)
-        assert "idle" in result.lower() or "network" in result.lower()
+        assert result == "Network is idle"
 
 # ==================== Dialog Tools Tests ====================
 
@@ -1227,7 +1227,7 @@ class TestDialogTools:
 
         result = await Browser.setup_dialog_handler(mock_browser, default_action="accept")
 
-        assert isinstance(result, str)
+        assert result == "Dialog handler set up with default action: accept"
 
     @pytest.mark.asyncio
     async def test_handle_dialog_accept(self, mock_browser):
@@ -1235,7 +1235,7 @@ class TestDialogTools:
 
         result = await Browser.handle_dialog(mock_browser, accept=True)
 
-        assert "accept" in result.lower() or "dialog" in result.lower() or "no" in result.lower()
+        assert result == "Dialog handler ready to accept the next dialog"
 
     @pytest.mark.asyncio
     async def test_handle_dialog_dismiss(self, mock_browser):
@@ -1243,7 +1243,7 @@ class TestDialogTools:
 
         result = await Browser.handle_dialog(mock_browser, accept=False)
 
-        assert "dismiss" in result.lower() or "dialog" in result.lower() or "no" in result.lower()
+        assert result == "Dialog handler ready to dismiss the next dialog"
 
     @pytest.mark.asyncio
     async def test_remove_dialog_handler(self, mock_browser):
@@ -1251,7 +1251,7 @@ class TestDialogTools:
 
         result = await Browser.remove_dialog_handler(mock_browser)
 
-        assert "removed" in result.lower() or "handler" in result.lower()
+        assert result in ("Dialog handler removed", "No dialog handler was set up")
 
 # ==================== Storage Tools Tests ====================
 
@@ -1267,7 +1267,7 @@ class TestStorageTools:
 
         mock_context = mock_browser._context
         mock_context.storage_state.assert_called()
-        assert "saved" in result.lower() or "storage" in result.lower()
+        assert result.startswith("Storage state saved to:")
 
     @pytest.mark.asyncio
     async def test_restore_storage_state(self, mock_browser, temp_dir):
@@ -1278,7 +1278,7 @@ class TestStorageTools:
 
         result = await Browser.restore_storage_state(mock_browser, filename=str(filepath))
 
-        assert "restored" in result.lower() or "storage" in result.lower() or "loaded" in result.lower()
+        assert result.startswith("Storage state restored from:")
 
     @pytest.mark.asyncio
     async def test_clear_cookies(self, mock_browser):
@@ -1288,7 +1288,7 @@ class TestStorageTools:
 
         mock_context = mock_browser._context
         mock_context.clear_cookies.assert_called_once_with(name=None, domain=None, path=None)
-        assert "cleared" in result.lower() or "cookies" in result.lower()
+        assert result == "All cookies cleared"
 
     @pytest.mark.asyncio
     async def test_clear_cookies_filtered(self, mock_browser):
@@ -1361,13 +1361,13 @@ class TestStorageTools:
     async def test_set_cookie(self, mock_browser):
         """Test setting a cookie."""
 
-        result = await Browser.set_cookie(mock_browser, 
+        result = await Browser.set_cookie(mock_browser,
             name="test_cookie",
             value="test_value",
             domain="example.com"
         )
 
-        assert result is not None
+        assert result == "Cookie 'test_cookie' set successfully"
 
     @pytest.mark.asyncio
     async def test_set_cookie_expires_zero_is_preserved(self, mock_browser):
@@ -1499,7 +1499,7 @@ class TestDevTools:
 
         mock_context = mock_browser._context
         mock_context.tracing.start.assert_called_once()
-        assert "started" in result.lower() or "tracing" in result.lower()
+        assert result == "Tracing started"
 
     @pytest.mark.asyncio
     async def test_stop_tracing(self, mock_browser, temp_dir):
@@ -1514,7 +1514,7 @@ class TestDevTools:
 
         result = await Browser.start_video(mock_browser)
 
-        assert "video" in result.lower() or "recording" in result.lower() or "not" in result.lower()
+        assert result == "Video recording started"
 
     @pytest.mark.asyncio
     async def test_stop_video(self, mock_browser):

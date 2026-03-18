@@ -49,10 +49,14 @@ Notes:
 
 ## Core SDK Decision: Raw Methods vs Tool Methods
 
-- Raw page/script automation: use methods like `navigate_to`, `get_snapshot`, `get_current_page`, `take_screenshot(filename=...)`.
-- Tool-style parity with CLI/agents: use methods like `navigate_to`, `get_snapshot_text`, `click_element_by_ref`, `wait_for`, `verify_*`.
+Two surfaces serve different purposes — pick the right one:
 
-Use tool-style methods for 1:1 parity with CLI behavior and for agent tool schemas.
+| Surface | When to use | Examples |
+|---|---|---|
+| **Raw methods** | Direct Playwright-level control in scripts | `get_current_page()`, `take_screenshot(filename=...)`, `get_snapshot()` |
+| **Tool methods** | Align with CLI behavior or expose to an LLM agent | `click_element_by_ref()`, `wait_for()`, `verify_*()`, `get_snapshot_text()` |
+
+Rule of thumb: if you're building an agent or want your script to behave like the CLI, prefer tool methods. If you need low-level page/script control, use raw methods.
 
 ## Snapshot and Ref Rules
 
@@ -100,6 +104,15 @@ builder = BrowserToolSetBuilder.for_tool_names(
     strict=True,
 )
 tools = builder.build()["tool_specs"]
+```
+
+```python
+# Combine multiple selections (categories + specific tool names)
+builder1 = BrowserToolSetBuilder.for_categories(
+    browser, ToolCategory.NAVIGATION, ToolCategory.ELEMENT_INTERACTION, ToolCategory.CAPTURE
+)
+builder2 = BrowserToolSetBuilder.for_tool_names(browser, "verify_url")
+tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 ```
 
 ## Non-Obvious SDK Behavior

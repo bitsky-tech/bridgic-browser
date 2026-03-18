@@ -15,12 +15,21 @@ Canonical source in this repo: `bridgic/browser/_cli_catalog.py` (`CLI_COMMAND_T
 3. [Parameter Translation Rules (Important for Code Generation)](#parameter-translation-rules-important-for-code-generation)
 4. [CLI-First -> SDK Code Generation Workflow](#cli-first---sdk-code-generation-workflow)
 5. [Example: Convert CLI Flow to SDK Code](#example-convert-cli-flow-to-sdk-code)
-6. [Practical Rule for Mixed Tasks](#practical-rule-for-mixed-tasks)
+6. [Behavior Differences (Non-1:1 Cases)](#behavior-differences-non-11-cases)
+7. [Practical Rule for Mixed Tasks](#practical-rule-for-mixed-tasks)
 
 ## Relationship Model
 
-- CLI command surface and SDK tool-method surface are intentionally aligned.
-- Most CLI commands are thin wrappers over one SDK method with parameter adaptation.
+CLI commands and SDK tool methods are **intentionally aligned**:
+- Most CLI commands are thin wrappers over exactly one SDK tool method with parameter adaptation.
+- Both surfaces share the same underlying `Browser` instance — CLI accesses it through the daemon process; SDK code holds a direct Python reference.
+- This means CLI behavior and SDK tool-method behavior are equivalent by design. Understanding one side gives you the other.
+
+State model difference:
+- **CLI**: browser state lives in the daemon process, persists across multiple short-lived CLI invocations, resets on `close`.
+- **SDK**: browser state lives in the Python process, scoped to the `Browser` object lifetime (`async with Browser(...) as browser:`).
+
+This model is the foundation of all correspondence in this guide.
 
 ## Canonical Command -> Method Mapping
 
@@ -168,6 +177,19 @@ async def run() -> None:
 if __name__ == "__main__":
     asyncio.run(run())
 ```
+
+## Behavior Differences (Non-1:1 Cases)
+
+These CLI behaviors have no direct SDK equivalent or work differently:
+
+| Behavior | CLI | SDK |
+|---|---|---|
+| File path resolution | `screenshot`, `pdf`, `upload`, `storage-save`, `storage-load`, `trace-stop` convert path to absolute on **client side** before sending to daemon | SDK caller is responsible for path; no automatic absolutization |
+| State persistence model | Daemon keeps browser alive across many short commands; restart daemon with `close` to reset | `Browser` instance lifetime; `async with Browser(...)` handles start/stop |
+| `scroll` argument style | `--dy`/`--dx` flag options (not positional) to allow negative values | `mouse_wheel(delta_x=X, delta_y=Y)` keyword args |
+| `fill-form` input format | JSON string on command line | Python list of dicts |
+| `take_screenshot` return value | CLI always writes to a file path | SDK: `filename=None` returns base64 data URL; `filename="path.png"` writes file |
+| Video file write timing | `video-stop` registers path; file is written when daemon/browser closes | Same for SDK: `.webm` is written when page closes via `stop()` or `close_tab()` |
 
 ## Practical Rule for Mixed Tasks
 

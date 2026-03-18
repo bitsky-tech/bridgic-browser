@@ -78,6 +78,11 @@ bridgic-browser snapshot -F
 # Continue truncated snapshot output
 bridgic-browser snapshot -s 30000
 
+# Scroll: use --dy / --dx (not positional), supports negative values
+bridgic-browser scroll --dy 500        # scroll down 500px
+bridgic-browser scroll --dy -300       # scroll up 300px
+bridgic-browser scroll --dx 200        # scroll right 200px
+
 # Wait modes
 bridgic-browser wait 2.5
 bridgic-browser wait "Submit"
@@ -88,6 +93,11 @@ bridgic-browser network-start
 bridgic-browser open https://example.com
 bridgic-browser network
 bridgic-browser network-stop
+
+# Dialog handling
+bridgic-browser dialog-setup --action accept
+bridgic-browser open https://example.com    # any alert triggered will be auto-accepted
+bridgic-browser dialog-remove
 ```
 
 ## Runtime and Configuration
@@ -109,10 +119,13 @@ Environment variables and login state persistence are documented in `env-vars.md
 
 - Refs come from the latest snapshot. If page changed, re-run `snapshot` before ref operations.
 - `snapshot` pagination is explicit: use `-s <offset>` from truncation notice.
+- `snapshot -i` returns only clickable/editable elements — use for action selection, not full-page inspection.
 - CLI uses a persistent daemon/browser. State survives across commands until `close`.
 - After local Python code changes, restart daemon to pick up new code:
   - `bridgic-browser close`
   - run next command (`open`, `search`, etc.) to auto-start again.
+- `scroll` uses `--dy`/`--dx` options (not positional arguments) so negative values work correctly.
+- `screenshot`, `pdf`, `upload`, `storage-save`, `storage-load`, `trace-stop` convert their path argument to an absolute path on the **client side** before sending to daemon (daemon's working directory may differ).
 - For `network-start`, start capture before navigation if page-load requests are needed.
 
 ## When to Load Other References

@@ -13,19 +13,21 @@ Use progressive disclosure. Do not load every reference file by default.
 - **Python**: >= 3.10
 - **Install package**: `pip install bridgic-browser`
 - **Install browser binaries** (one-time): `playwright install chromium`
-- The CLI tool (`bridgic-browser`) is installed automatically with the package.
-- The SDK (`from bridgic.browser.session import Browser`) is available in the same package.
+- **Dev mode** (repo): `make init-dev`
+
+The CLI tool (`bridgic-browser`) and the Python SDK (`from bridgic.browser.session import Browser`) come from the **same package** — installing one installs both.
 
 ## Reference Files
 
 Reference files cover all use cases. Load only the one(s) relevant to the task:
 
-| File | When to load |
-|------|-------------|
-| [references/cli-guide.md](references/cli-guide.md) | User wants to **directly control the browser via terminal** (`bridgic-browser open ...`, `bridgic-browser snapshot`, etc.) |
-| [references/sdk-guide.md](references/sdk-guide.md) | User wants **Python automation code** (`Browser`, `BrowserToolSetBuilder`, agent integration) |
-| [references/cli-sdk-api-mapping.md](references/cli-sdk-api-mapping.md) | User needs to understand **CLI ↔ SDK correspondence**: migration, comparison, or **generating SDK code from CLI action steps** |
-| [references/env-vars.md](references/env-vars.md) | User needs **environment variable behavior** or **login state persistence** details |
+| Scenario | Interface | Output | Load |
+|---|---|---|---|
+| Directly control browser from terminal | CLI | shell commands | [cli-guide.md](references/cli-guide.md) |
+| Write Python automation script | Python | `.py` code | [sdk-guide.md](references/sdk-guide.md) |
+| Explore via CLI, then generate SDK code | CLI → Python | `.py` code | [cli-sdk-api-mapping.md](references/cli-sdk-api-mapping.md) + [sdk-guide.md](references/sdk-guide.md) |
+| Migrate / compare / explain CLI ↔ SDK | Both | explanation or code | [cli-sdk-api-mapping.md](references/cli-sdk-api-mapping.md) |
+| Configure env vars or login state persistence | Either | config | [env-vars.md](references/env-vars.md) |
 
 ## Reference Routing
 
