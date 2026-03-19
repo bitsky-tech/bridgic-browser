@@ -529,13 +529,20 @@ class Browser:
         Returns True if:
         - user_data_dir is provided, OR
         - stealth mode with extensions is enabled (extensions need persistent context)
+          AND we're not using system Chrome (which dropped --load-extension in v137+)
         """
         # Explicit user_data_dir
         if self._user_data_dir is not None:
             return True
 
-        # Stealth with extensions needs persistent context (and headless=False)
-        if self._stealth_config and self._stealth_config.can_use_extensions(self._headless):
+        # Stealth with extensions needs persistent context (and headless=False).
+        # Skip for system Chrome (channel/executable_path) — extensions won't load.
+        if (
+            self._stealth_config
+            and self._stealth_config.can_use_extensions(self._headless)
+            and not self._channel
+            and not self._executable_path
+        ):
             return True
 
         return False
@@ -635,8 +642,16 @@ class Browser:
         # Build args list (merge stealth args with user args)
         args_list: List[str] = []
 
+        # When using system Chrome (channel or executable_path), skip stealth
+        # Chrome args and extension loading — system Chrome v137+ doesn't
+        # support --load-extension and many stealth flags cause "unsupported
+        # flag" warnings.  Anti-detection still works via ignore_default_args
+        # (removes --enable-automation) and the JS init script (patches
+        # navigator.webdriver, plugins, chrome object, etc.).
+        _is_system_chrome = bool(self._channel or self._executable_path)
+
         # Add stealth args first (if enabled)
-        if self._stealth_builder:
+        if self._stealth_builder and not _is_system_chrome:
             fallback_viewport = {"width": 1600, "height": 900}
             viewport = self._viewport or fallback_viewport
             viewport_width = viewport.get("width", 1600)
