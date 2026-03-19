@@ -336,7 +336,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 **Navigation (6 tools):**
 - `navigate_to(url)` - Navigate to URL
 - `search(query, engine)` - Search using search engine
-- `get_current_page_info_str()` - Get current page info (URL, title, etc.)
+- `get_current_page_info()` - Get current page info (URL, title, etc.)
 - `reload_page()` - Reload current page
 - `go_back()` / `go_forward()` - Browser history navigation
 
@@ -350,7 +350,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `scroll_element_into_view_by_ref(ref)` - Scroll element into view
 - `select_dropdown_option_by_ref(ref, value)` - Select dropdown option
 - `get_dropdown_options_by_ref(ref)` - Get dropdown options
-- `check_checkbox_by_ref(ref)` / `uncheck_checkbox_by_ref(ref)` - Checkbox control
+- `check_checkbox_or_radio_by_ref(ref)` / `uncheck_checkbox_by_ref(ref)` - Checkbox control
 - `focus_element_by_ref(ref)` - Focus element
 - `hover_element_by_ref(ref)` - Hover over element
 - `double_click_element_by_ref(ref)` - Double click
@@ -782,7 +782,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 **导航（6 个工具）：**
 - `navigate_to(url)` - 导航到 URL
 - `search(query, engine)` - 使用搜索引擎搜索
-- `get_current_page_info_str()` - 获取当前页面信息（URL、标题等）
+- `get_current_page_info()` - 获取当前页面信息（URL、标题等）
 - `reload_page()` - 重新加载当前页面
 - `go_back()` / `go_forward()` - 浏览器历史导航
 
@@ -796,7 +796,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `scroll_element_into_view_by_ref(ref)` - 滚动元素到可视区域
 - `select_dropdown_option_by_ref(ref, value)` - 选择下拉选项
 - `get_dropdown_options_by_ref(ref)` - 获取下拉选项
-- `check_checkbox_by_ref(ref)` / `uncheck_checkbox_by_ref(ref)` - 复选框控制
+- `check_checkbox_or_radio_by_ref(ref)` / `uncheck_checkbox_by_ref(ref)` - 复选框控制
 - `focus_element_by_ref(ref)` - 聚焦元素
 - `hover_element_by_ref(ref)` - 悬停在元素上
 - `double_click_element_by_ref(ref)` - 双击

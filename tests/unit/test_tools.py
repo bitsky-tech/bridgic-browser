@@ -56,7 +56,6 @@ def mock_browser():
     browser.switch_to_page = AsyncMock(return_value=(True, "Switched"))
     browser.close_page = AsyncMock(return_value=(True, "Closed"))
     browser.new_page = AsyncMock()
-    browser.get_current_page_info = AsyncMock()
     browser.get_snapshot = AsyncMock()
     browser.get_element_by_ref = AsyncMock()
 
@@ -69,7 +68,7 @@ def mock_browser():
     browser.scroll_to_text = AsyncMock(return_value="Scrolled to text")
     browser.press_key = AsyncMock(return_value="Pressed key")
     browser.evaluate_javascript = AsyncMock(return_value="result")
-    browser.get_current_page_info_str = AsyncMock(return_value="URL: https://example.com/test\nTitle: Test Page")
+    browser.get_current_page_info = AsyncMock(return_value="URL: https://example.com/test\nTitle: Test Page")
     browser.new_tab = AsyncMock(return_value="Created new blank tab")
     browser.get_tabs = AsyncMock(return_value="Tab 1")
     browser.switch_tab = AsyncMock(return_value="Switched to tab")
@@ -87,7 +86,7 @@ def mock_browser():
     browser.evaluate_javascript_on_ref = AsyncMock(return_value="result")
     browser.upload_file_by_ref = AsyncMock(return_value="Uploaded")
     browser.drag_element_by_ref = AsyncMock(return_value="Dragged")
-    browser.check_checkbox_by_ref = AsyncMock(return_value="Checked")
+    browser.check_checkbox_or_radio_by_ref = AsyncMock(return_value="Checked")
     browser.uncheck_checkbox_by_ref = AsyncMock(return_value="Unchecked")
     browser.double_click_element_by_ref = AsyncMock(return_value="Double-clicked")
     browser.scroll_element_into_view_by_ref = AsyncMock(return_value="Scrolled into view")
@@ -364,7 +363,7 @@ class TestPageControlTools:
 
     @pytest.mark.asyncio
     async def test_get_current_page_info(self, mock_browser):
-        """Test get_current_page_info_str."""
+        """Test get_current_page_info."""
 
         mock_browser._get_page_info = AsyncMock(return_value=MagicMock(
             url="https://example.com",
@@ -377,7 +376,7 @@ class TestPageControlTools:
             scroll_y=0,
         ))
 
-        result = await Browser.get_current_page_info_str(mock_browser)
+        result = await Browser.get_current_page_info(mock_browser)
 
         mock_browser._get_page_info.assert_called_once()
         assert "example.com" in result
@@ -685,7 +684,7 @@ class TestElementInteractionTools:
         mock_locator.get_attribute = AsyncMock(return_value="checkbox")
         mock_browser.get_element_by_ref.return_value = mock_locator
 
-        result = await Browser.check_checkbox_by_ref(mock_browser, ref="e1")
+        result = await Browser.check_checkbox_or_radio_by_ref(mock_browser, ref="e1")
 
         mock_locator.check.assert_called_once()
         assert result == "Checked element e1 (confirmed: checked=true)"
@@ -742,7 +741,7 @@ class TestElementInteractionTools:
         mock_locator.get_attribute = AsyncMock(return_value=None)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
-        result = await Browser.check_checkbox_by_ref(mock_browser, ref="e1")
+        result = await Browser.check_checkbox_or_radio_by_ref(mock_browser, ref="e1")
 
         mock_locator.check.assert_not_called()
         mock_locator.click.assert_called_once()
@@ -783,7 +782,7 @@ class TestElementInteractionTools:
         mock_browser.get_element_by_ref.return_value = mock_locator
 
         with pytest.raises(OperationError) as exc_info:
-            await Browser.check_checkbox_by_ref(mock_browser, ref="e1")
+            await Browser.check_checkbox_or_radio_by_ref(mock_browser, ref="e1")
         mock_locator.click.assert_called_once()
         assert "Failed to check element e1" in exc_info.value.message
 

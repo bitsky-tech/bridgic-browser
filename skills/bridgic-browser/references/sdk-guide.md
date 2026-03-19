@@ -73,7 +73,7 @@ Rule of thumb: if you're building an agent or want your script to behave like th
 | Navigate with explicit Playwright wait strategy | `navigate_to(url, wait_until=..., timeout=...)` |
 | Capture ref snapshot as string for LLM/tooling | `get_snapshot_text(interactive=..., full_page=..., start_from_char=...)` |
 | Capture structured snapshot object | `get_snapshot(interactive=..., full_page=...)` |
-| Interact with element by ref | `click_element_by_ref`, `input_text_by_ref(ref, text, clear=True, is_secret=False, slowly=False, submit=False)`, `select_dropdown_option_by_ref`, `check_checkbox_by_ref`, ... |
+| Interact with element by ref | `click_element_by_ref`, `input_text_by_ref(ref, text, clear=True, is_secret=False, slowly=False, submit=False)`, `select_dropdown_option_by_ref`, `check_checkbox_or_radio_by_ref`, ... |
 | Coordinate mouse operations | `mouse_click`, `mouse_move`, `mouse_drag`, `mouse_wheel` |
 | Waits | `wait_for(time_seconds=... | text=... | text_gone=... | selector=..., timeout=30.0)` |
 | Verification | `verify_text_visible`, `verify_element_visible`, `verify_url`, `verify_title`, `verify_element_state`, `verify_value` |

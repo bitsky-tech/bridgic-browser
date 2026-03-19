@@ -10,11 +10,11 @@ Test Organization:
 - ref-based tools use a pre-generated snapshot for consistent element references
 
 Tool Coverage (67 tools, aligned with CLI sections):
-- Navigation (6): navigate_to, search, get_current_page_info_str, reload_page, go_back, go_forward
+- Navigation (6): navigate_to, search, get_current_page_info, reload_page, go_back, go_forward
 - Snapshot (1): get_snapshot_text
 - Element Interaction (13): click_element_by_ref, input_text_by_ref, fill_form,
                scroll_element_into_view_by_ref, select_dropdown_option_by_ref,
-               get_dropdown_options_by_ref, check_checkbox_by_ref, uncheck_checkbox_by_ref,
+               get_dropdown_options_by_ref, check_checkbox_or_radio_by_ref, uncheck_checkbox_by_ref,
                focus_element_by_ref, hover_element_by_ref, double_click_element_by_ref,
                upload_file_by_ref, drag_element_by_ref
 - Tabs (4): get_tabs, new_tab, switch_tab, close_tab
@@ -152,18 +152,18 @@ class TestNavigationTools:
     async def test_search(self, browser):
         result = await browser.search("test query", "duckduckgo")
         assert "Searched on Duckduckgo" in result
-        info = await browser.get_current_page_info_str()
+        info = await browser.get_current_page_info()
         assert "duckduckgo.com" in info
 
 # ==================== 2. Page & Tab Tools (9 tools) ====================
 
 class TestPageTools:
-    """Tests: get_current_page_info, reload_page, scroll_to_text, press_key,
+    """Tests: reload_page, scroll_to_text, press_key,
     evaluate_javascript, new_tab, get_tabs, switch_tab, close_tab"""
 
     @pytest.mark.asyncio
     async def test_get_current_page_info(self, browser):
-        result = await browser.get_current_page_info_str()
+        result = await browser.get_current_page_info()
         assert "test_page.html" in result
 
     @pytest.mark.asyncio
@@ -256,7 +256,7 @@ class TestControlTools:
 
 class TestActionTools:
     """Tests: click_element_by_ref, input_text_by_ref, hover_element_by_ref,
-    focus_element_by_ref, check_checkbox_by_ref, uncheck_checkbox_by_ref,
+    focus_element_by_ref, check_checkbox_or_radio_by_ref, uncheck_checkbox_by_ref,
     double_click_element_by_ref, scroll_element_into_view_by_ref,
     get_dropdown_options_by_ref, select_dropdown_option_by_ref,
     upload_file_by_ref, drag_element_by_ref, evaluate_javascript_on_ref"""
@@ -303,7 +303,7 @@ class TestActionTools:
         cb_ref = find_ref_by_type_and_name(refs, "checkbox", "Technology")
         assert cb_ref is not None
 
-        await browser.check_checkbox_by_ref(cb_ref)
+        await browser.check_checkbox_or_radio_by_ref(cb_ref)
         result = await browser.verify_element_state(cb_ref, "checked")
         assert "PASS" in result
 

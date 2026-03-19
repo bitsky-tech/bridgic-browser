@@ -1,7 +1,7 @@
 ---
 name: bridgic-browser
 description: |
-  Use when tasks involve browser automation with bridgic-browser via terminal CLI (`bridgic-browser ...`) or Python SDK (`from bridgic.browser.session import Browser`, `from bridgic.browser.tools import BrowserToolSetBuilder`). Trigger for navigation, scraping, form filling, accessibility snapshot refs (`[ref=eN]`), e2e checks, stealth browsing, CLI-to-SDK migration, and generating SDK code from CLI action steps.
+  Use when tasks involve browser automation with bridgic-browser via terminal CLI (`bridgic-browser ...`) or Python SDK (`from bridgic.browser.session import Browser`, `from bridgic.browser.tools import BrowserToolSetBuilder`). Trigger for navigation, scraping, form filling, accessibility snapshot refs, e2e checks, stealth browsing, CLI-to-SDK migration, and generating SDK code from CLI action steps.
 ---
 
 # bridgic-browser
@@ -31,11 +31,11 @@ Reference files cover all use cases. Load only the one(s) relevant to the task:
 
 ## Reference Routing
 
-- **Direct terminal control** → read `cli-guide.md`.
-- **Python code / agent integration** → read `sdk-guide.md`.
-- **CLI and SDK relationship** (migration, "what's the SDK equivalent of this command?", "convert these CLI steps to Python") → read `cli-sdk-api-mapping.md`.
-- **Environment variables or login state persistence** → read `env-vars.md`.
-- **CLI exploration + SDK code output** (user is operating via CLI but needs the final deliverable as runnable Python) → read `cli-sdk-api-mapping.md` first to translate steps, then `sdk-guide.md` for final code shape.
+- **Direct terminal control** → read `references/cli-guide.md`.
+- **Python code / agent integration** → read `references/sdk-guide.md`.
+- **CLI and SDK relationship** (migration, "what's the SDK equivalent of this command?", "convert these CLI steps to Python") → read `references/cli-sdk-api-mapping.md`.
+- **Environment variables or login state persistence** → read `references/env-vars.md`.
+- **CLI exploration + SDK code output** (user is operating via CLI but needs the final deliverable as runnable Python) → read `references/cli-sdk-api-mapping.md` first to translate steps, then `references/sdk-guide.md` for final code shape.
 - For mixed tasks, load only the needed sections from each relevant reference.
 
 ## Interface Decision Rules

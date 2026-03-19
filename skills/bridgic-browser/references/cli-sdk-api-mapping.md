@@ -37,7 +37,7 @@ This model is the foundation of all correspondence in this guide.
 |---|---|
 | `open` | `navigate_to` |
 | `search` | `search` |
-| `info` | `get_current_page_info_str` |
+| `info` | `get_current_page_info` |
 | `reload` | `reload_page` |
 | `back` | `go_back` |
 | `forward` | `go_forward` |
@@ -48,7 +48,7 @@ This model is the foundation of all correspondence in this guide.
 | `scroll-to` | `scroll_element_into_view_by_ref` |
 | `select` | `select_dropdown_option_by_ref` |
 | `options` | `get_dropdown_options_by_ref` |
-| `check` | `check_checkbox_by_ref` |
+| `check` | `check_checkbox_or_radio_by_ref` |
 | `uncheck` | `uncheck_checkbox_by_ref` |
 | `focus` | `focus_element_by_ref` |
 | `hover` | `hover_element_by_ref` |

@@ -358,16 +358,6 @@ class TestRefStructure:
             f"Duplicate refs found: {[r for r in ref_ids if ref_ids.count(r) > 1]}"
 
     @pytest.mark.asyncio
-    async def test_refs_are_sequential(self, browser):
-        """Refs should be numbered sequentially starting from e1."""
-        snap = await browser.get_snapshot_text(interactive=False, full_page=True)
-        ref_ids = re.findall(r'\[ref=(e\d+)\]', snap)
-        numbers = sorted(int(r[1:]) for r in ref_ids)
-        expected = list(range(1, len(numbers) + 1))
-        assert numbers == expected, \
-            f"Refs not sequential. Missing: {set(expected) - set(numbers)}"
-
-    @pytest.mark.asyncio
     async def test_combobox_has_nested_options(self, browser):
         """Combobox should contain nested options with proper indentation."""
         snap = await browser.get_snapshot_text(interactive=False, full_page=True)
@@ -498,7 +488,7 @@ class TestLocatorResolution:
         assert "PASS" in result
 
         # Check
-        await browser.check_checkbox_by_ref(cb_ref)
+        await browser.check_checkbox_or_radio_by_ref(cb_ref)
         result = await browser.verify_element_state(cb_ref, "checked")
         assert "PASS" in result
 
@@ -696,7 +686,7 @@ class TestSnapshotAfterStateChange:
         # Initially should NOT have [checked]
         assert "[checked]" not in refs1[cb_ref]["suffix"]
 
-        await browser.check_checkbox_by_ref(cb_ref)
+        await browser.check_checkbox_or_radio_by_ref(cb_ref)
 
         # Fresh snapshot should show [checked]
         snap2 = await browser.get_snapshot_text(interactive=True, full_page=True)

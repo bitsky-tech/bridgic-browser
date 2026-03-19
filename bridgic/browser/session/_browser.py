@@ -1499,10 +1499,6 @@ class Browser:
         )
         return page_info
 
-    # Keep old name as alias for backward compatibility with existing code in this file
-    async def get_current_page_info(self) -> Optional[PageInfo]:
-        return await self._get_page_info()
-
     async def get_full_page_info(self,
         interactive: bool = False,
         full_page: bool = True,
@@ -2226,7 +2222,7 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.error(f"[reload_page] {error_msg}")
             _raise_operation_error(error_msg)
 
-    async def get_current_page_info_str(self) -> str:
+    async def get_current_page_info(self) -> str:
         """Get current page info: URL, title, viewport size, scroll position.
 
         Returns
@@ -2897,12 +2893,12 @@ Before you return the element ref, reason about the state and elements for a sen
             _raise_operation_error(error_msg)
 
     async def select_dropdown_option_by_ref(self, ref: str, text: str) -> str:
-        """Select an option from a dropdown by ref and option text.
+        """Select an option by its text from a dropdown element represented by ref.
 
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "1f79fe5e").
+            Element ref of dropdown from snapshot (e.g., "1f79fe5e").
         text : str
             Option text or value to select.
 
@@ -3230,7 +3226,7 @@ Before you return the element ref, reason about the state and elements for a sen
             error_msg = f'Failed to drag element from {start_ref} to {end_ref}: {str(e)}'
             _raise_operation_error(error_msg)
 
-    async def check_checkbox_by_ref(self, ref: str) -> str:
+    async def check_checkbox_or_radio_by_ref(self, ref: str) -> str:
         """Check a checkbox or radio button by ref.
 
         Parameters
@@ -3244,19 +3240,19 @@ Before you return the element ref, reason about the state and elements for a sen
             Result message.
         """
         try:
-            logger.info(f'[check_checkbox_by_ref] start ref={ref}')
+            logger.info(f'[check_checkbox_or_radio_by_ref] start ref={ref}')
 
             locator = await self.get_element_by_ref(ref)
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
-                logger.warning(f'[check_checkbox_by_ref] {msg}')
+                logger.warning(f'[check_checkbox_or_radio_by_ref] {msg}')
                 _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
             is_native = await _is_native_checkbox_or_radio(locator)
             already_checked = await _is_checked(locator)
             if already_checked:
                 msg = f'Checked element {ref} (was already checked)'
-                logger.info(f'[check_checkbox_by_ref] {msg}')
+                logger.info(f'[check_checkbox_or_radio_by_ref] {msg}')
                 return msg
 
             bbox = await locator.bounding_box()
@@ -3267,7 +3263,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
                     if not await locator.is_visible():
                         logger.debug(
-                            "[check_checkbox_by_ref] native input has bbox but is_visible()=False; "
+                            "[check_checkbox_or_radio_by_ref] native input has bbox but is_visible()=False; "
                             "using dispatch_event click"
                         )
                         await locator.dispatch_event("click")
@@ -3278,7 +3274,7 @@ Before you return the element ref, reason about the state and elements for a sen
                             f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
                         )
                         if covered:
-                            logger.debug("[check_checkbox_by_ref] covered at (%.1f, %.1f), clicking intercepting element", cx, cy)
+                            logger.debug("[check_checkbox_or_radio_by_ref] covered at (%.1f, %.1f), clicking intercepting element", cx, cy)
                             page = await self.get_current_page()
                             if page:
                                 await page.evaluate(f"document.elementFromPoint({cx}, {cy})?.click()")
@@ -3288,7 +3284,7 @@ Before you return the element ref, reason about the state and elements for a sen
                             await locator.check()
                 else:
                     if not await locator.is_visible():
-                        logger.debug("[check_checkbox_by_ref] native input bbox=None and is_visible()=False; using dispatch_event click")
+                        logger.debug("[check_checkbox_or_radio_by_ref] native input bbox=None and is_visible()=False; using dispatch_event click")
                         await locator.dispatch_event("click")
                     else:
                         await locator.check()
@@ -3298,7 +3294,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             if not await _is_checked(locator):
                 msg = f'Failed to check element {ref}: state is still unchecked'
-                logger.warning(f'[check_checkbox_by_ref] {msg}')
+                logger.warning(f'[check_checkbox_or_radio_by_ref] {msg}')
                 _raise_operation_error(
                     msg,
                     code="ELEMENT_STATE_ERROR",
@@ -3306,11 +3302,11 @@ Before you return the element ref, reason about the state and elements for a sen
                 )
 
             msg = f'Checked element {ref} (confirmed: checked=true)'
-            logger.info(f'[check_checkbox_by_ref] {msg}')
+            logger.info(f'[check_checkbox_or_radio_by_ref] {msg}')
             return msg
 
         except Exception as e:
-            logger.error(f'[check_checkbox_by_ref] Failed to check element: {type(e).__name__}: {e}')
+            logger.error(f'[check_checkbox_or_radio_by_ref] Failed to check element: {type(e).__name__}: {e}')
             error_msg = f'Failed to check element {ref}: {str(e)}'
             _raise_operation_error(error_msg)
 

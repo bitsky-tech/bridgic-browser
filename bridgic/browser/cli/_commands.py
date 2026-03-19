@@ -262,7 +262,7 @@ def cmd_fill(ref: str, text: str, submit: bool) -> None:
 @click.argument("ref")
 @click.argument("option")
 def cmd_select(ref: str, option: str) -> None:
-    """Select a dropdown option by ref and option text."""
+    """Select an option by its text from a dropdown element represented by ref."""
     try:
         _ok(send_command("select", {"ref": _strip_ref(ref), "text": option}, start_if_needed=False))
     except Exception as exc:

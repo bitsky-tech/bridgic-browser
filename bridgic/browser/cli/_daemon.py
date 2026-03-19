@@ -96,7 +96,7 @@ async def _handle_reload(browser: "Browser", _args: Dict[str, Any]) -> str:
 
 
 async def _handle_info(browser: "Browser", _args: Dict[str, Any]) -> str:
-    return await browser.get_current_page_info_str()
+    return await browser.get_current_page_info()
 
 
 async def _handle_search(browser: "Browser", args: Dict[str, Any]) -> str:
@@ -145,7 +145,7 @@ async def _handle_select(browser: "Browser", args: Dict[str, Any]) -> str:
 
 
 async def _handle_check(browser: "Browser", args: Dict[str, Any]) -> str:
-    return await browser.check_checkbox_by_ref(args.get("ref", ""))
+    return await browser.check_checkbox_or_radio_by_ref(args.get("ref", ""))
 
 
 async def _handle_uncheck(browser: "Browser", args: Dict[str, Any]) -> str:

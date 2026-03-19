@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Multi-page/tab support with page descriptions
 
 - **Tool System** (67 tools organized by category)
-  - Navigation: navigate_to, search, get_current_page_info_str, reload_page, go_back, go_forward
+  - Navigation: navigate_to, search, get_current_page_info, reload_page, go_back, go_forward
   - Snapshot: get_snapshot_text
   - Element Interaction: click, input_text, fill_form, scroll_into_view, select, options, check, uncheck, focus, hover, double_click, upload, drag (all by ref)
   - Tabs: get_tabs, new_tab, switch_tab, close_tab
