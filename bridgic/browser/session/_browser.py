@@ -45,6 +45,28 @@ logger = logging.getLogger(__name__)
 
 _MAX_CHAR_LIMIT = int(os.environ.get("BRIDGIC_MAX_CHARS", "30000"))
 
+_LAUNCH_DEBUG_LOG = os.path.expanduser("~/.bridgic/tmp/launch-debug.json")
+
+
+def _write_launch_debug_log(options: Dict[str, Any], mode: str) -> None:
+    """Write Chrome launch args to ~/.bridgic/tmp/launch-debug.json for debugging."""
+    import datetime, json as _json
+    try:
+        os.makedirs(os.path.dirname(_LAUNCH_DEBUG_LOG), exist_ok=True)
+        record = {
+            "time": datetime.datetime.now().isoformat(),
+            "mode": mode,
+            "args": options.get("args", []),
+            "ignore_default_args": options.get("ignore_default_args", []),
+            "headless": options.get("headless"),
+            "channel": options.get("channel"),
+            "executable_path": str(options["executable_path"]) if options.get("executable_path") else None,
+        }
+        with open(_LAUNCH_DEBUG_LOG, "w") as f:
+            _json.dump(record, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to write launch debug log: {e}")
+
 
 def _strip_playwright_call_log(message: str) -> str:
     marker = "Call Log:"
@@ -264,7 +286,7 @@ class Browser:
     headless : bool, default True
         Whether to run browser in headless mode.
     viewport : ViewportSize, optional
-        Viewport size. Defaults to {"width": 1920, "height": 1080}.
+        Viewport size. Defaults to {"width": 1600, "height": 900}.
     user_data_dir : str | Path, optional
         Path to user data directory for persistent context. If provided,
         uses `launch_persistent_context`; otherwise uses `launch` + `new_context`.
@@ -422,7 +444,7 @@ class Browser:
                 )
             self._viewport = None
         else:
-            self._viewport = viewport or {"width": 1920, "height": 1080}
+            self._viewport = viewport or {"width": 1600, "height": 900}
         self._user_data_dir = Path(user_data_dir).expanduser() if user_data_dir else None
 
         # Stealth configuration
@@ -430,6 +452,8 @@ class Browser:
         self._stealth_builder: Optional[StealthArgsBuilder] = None
         self._temp_user_data_dir: Optional[str] = None  # For auto-created temp dir
         self._temp_video_dir: Optional[str] = None  # For auto-created video dir
+        self._preallocated_trace_path: Optional[str] = None
+        self._close_session_dir: Optional[str] = None
 
         if stealth is True:
             self._stealth_config = StealthConfig()
@@ -613,10 +637,10 @@ class Browser:
 
         # Add stealth args first (if enabled)
         if self._stealth_builder:
-            fallback_viewport = {"width": 1920, "height": 1080}
+            fallback_viewport = {"width": 1600, "height": 900}
             viewport = self._viewport or fallback_viewport
-            viewport_width = viewport.get("width", 1920)
-            viewport_height = viewport.get("height", 1080)
+            viewport_width = viewport.get("width", 1600)
+            viewport_height = viewport.get("height", 900)
             stealth_args = self._stealth_builder.build_args(viewport_width, viewport_height)
             args_list.extend(stealth_args)
 
@@ -810,6 +834,7 @@ class Browser:
                 logger.info("Using persistent context mode")
                 persistent_options = self._get_persistent_context_options()
                 logger.debug(f"Persistent context options: {persistent_options}")
+                _write_launch_debug_log(persistent_options, mode="persistent_context")
                 self._context = await self._playwright.chromium.launch_persistent_context(
                     **persistent_options
                 )
@@ -819,11 +844,18 @@ class Browser:
                 logger.info("Using normal launch mode")
                 launch_options = self._get_launch_options()
                 logger.debug(f"Launch options: {launch_options}")
+                _write_launch_debug_log(launch_options, mode="launch")
                 self._browser = await self._playwright.chromium.launch(**launch_options)
 
                 context_options = self._get_context_options()
                 logger.debug(f"Context options: {context_options}")
                 self._context = await self._browser.new_context(**context_options)
+
+            # Inject JS stealth patches before any page script runs
+            if self._stealth_builder:
+                init_script = self._stealth_builder.get_init_script(locale=self._locale)
+                if init_script:
+                    await self._context.add_init_script(init_script)
 
             # Auto create a new page if no page is open
             pages = self._context.pages
@@ -894,6 +926,62 @@ class Browser:
                 if errors is not None:
                     errors.append(f"dialog.remove_listener: {e}")
 
+    def inspect_pending_close_artifacts(self) -> Dict[str, Any]:
+        """Create a unique close-session directory and pre-allocate artifact paths.
+
+        Called by the daemon before background teardown so paths can be reported
+        immediately to the client. Stores state for browser.stop() and the
+        post-close report writer to consume.
+
+        Returns
+        -------
+        Dict with keys:
+          session_dir : str         — unique per-close directory under BRIDGIC_TMP_DIR
+          trace       : List[str]   — pre-created trace path (if tracing is active)
+          video       : List[str]   — known video path (if user set a filename)
+          video_dir   : Optional[str] — auto-save directory (if no explicit filename)
+        """
+        import random
+        from datetime import datetime
+
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        session_name = f"close-{ts}-{random.randint(0, 0xffff):04x}"
+        session_dir = Path(str(BRIDGIC_TMP_DIR)) / session_name
+        session_dir.mkdir(parents=True, exist_ok=True)
+        self._close_session_dir = str(session_dir)
+
+        artifacts: Dict[str, Any] = {
+            "session_dir": str(session_dir),
+            "trace": [],
+            "video": [],
+            "video_dir": None,
+        }
+
+        if not self._context:
+            return artifacts
+
+        context_key = _get_context_key(self._context)
+
+        # Pre-allocate trace path inside session dir
+        if self._tracing_state.get(context_key):
+            trace_path = str(session_dir / "trace.zip")
+            Path(trace_path).touch()          # create empty file; tracing.stop() will overwrite
+            self._preallocated_trace_path = trace_path
+            artifacts["trace"].append(trace_path)
+
+        # Determine video artifact info
+        _absent: Any = object()
+        pending_raw = self._pending_video_save_path.get(context_key, _absent)
+        has_pending = pending_raw is not _absent
+
+        if self._video_state.get(context_key) or has_pending:
+            if has_pending and pending_raw:
+                artifacts["video"].append(os.path.abspath(str(pending_raw)))
+            else:
+                artifacts["video_dir"] = self._temp_video_dir or str(BRIDGIC_TMP_DIR)
+
+        return artifacts
+
     async def stop(self) -> str:
         """Close the browser.
 
@@ -902,6 +990,10 @@ class Browser:
         dialog handlers) — no need to call ``stop_*`` / ``remove_*`` methods
         beforehand. Active tracing/video sessions are auto-finalized and their
         paths included in the result.
+
+        Safe to call even when :meth:`start` was never called (all internal
+        handles are ``None`` and every teardown step is guarded by a null-check,
+        so the method returns immediately without raising).
 
         Returns
         -------
@@ -919,13 +1011,17 @@ class Browser:
             if self._tracing_state.get(context_key):
                 output_path: Optional[str] = None
                 try:
-                    os.makedirs(BRIDGIC_TMP_DIR, exist_ok=True)
-                    fd, output_path = tempfile.mkstemp(
-                        suffix=".zip",
-                        prefix="browser_trace_",
-                        dir=str(BRIDGIC_TMP_DIR),
-                    )
-                    os.close(fd)
+                    # Reuse pre-allocated path from inspect_pending_close_artifacts() if available
+                    output_path = self._preallocated_trace_path
+                    self._preallocated_trace_path = None
+                    if output_path is None:
+                        os.makedirs(BRIDGIC_TMP_DIR, exist_ok=True)
+                        fd, output_path = tempfile.mkstemp(
+                            suffix=".zip",
+                            prefix="browser_trace_",
+                            dir=str(BRIDGIC_TMP_DIR),
+                        )
+                        os.close(fd)
                     await asyncio.wait_for(
                         self._context.tracing.stop(path=output_path),
                         timeout=self._TRACE_STOP_TIMEOUT,
@@ -1173,6 +1269,8 @@ class Browser:
         ----------
         url : str
             URL to navigate to. Auto-prepends "http://" if missing protocol.
+            Schemes "data:", "about:", "javascript:", and "vbscript:" are passed
+            through unchanged. URLs starting with "/" are passed as-is.
         wait_until : str, default "domcontentloaded"
             When to consider navigation complete.
             - "domcontentloaded": DOM is parsed (fast, recommended for SPAs).
@@ -1185,7 +1283,17 @@ class Browser:
         Returns
         -------
         str
-            Result message.
+            "Navigated to: <actual_url>" where actual_url is the final URL
+            after any redirects.
+
+        Raises
+        ------
+        InvalidInputError
+            If url is empty.
+        StateError
+            If no browser context is open (call start() first).
+        OperationError
+            If navigation fails (network error, timeout, etc.).
         """
         try:
             logger.info(f"[navigate_to] start url={url}")
@@ -1572,20 +1680,34 @@ class Browser:
         interactive: bool = False,
         full_page: bool = True,
     ) -> EnhancedSnapshot:
-        """Get accessibility snapshot of the current page.
+        """Get accessibility snapshot of the current page (low-level API).
+
+        This is the underlying snapshot method.  For LLM agents and CLI use,
+        prefer :meth:`get_snapshot_text` which returns a formatted, paginated
+        string with a page header and truncation notice.
+
+        The result's ``refs`` dict is the source of truth for all ``*_by_ref``
+        tools.  After this call, element refs in the returned snapshot can be
+        passed to :meth:`get_element_by_ref`, :meth:`click_element_by_ref`, etc.
 
         Parameters
         ----------
-        interactive : bool
-            If True, only include interactive elements with flattened output.
-        full_page : bool
-            If True (default), include all elements regardless of viewport position.
-            If False, only include elements within the viewport.
+        interactive : bool, default False
+            If True, only include interactive elements (buttons, links, inputs,
+            checkboxes, elements with cursor:pointer, etc.) with a flattened
+            single-level output.  Best for action selection.
+        full_page : bool, default True
+            If True (default), include all elements regardless of viewport
+            position.  If False, only include elements within the viewport.
 
         Returns
         -------
         EnhancedSnapshot
-            Snapshot with tree string and refs dictionary.
+            Object with:
+
+            - ``.tree`` : str — accessibility tree as a multi-line string
+              (lines like ``- button "Submit" [ref=8d4b03a9]``).
+            - ``.refs`` : Dict[str, RefData] — maps ref IDs to locator data.
 
         Raises
         ------
@@ -1937,37 +2059,54 @@ Before you return the element ref, reason about the state and elements for a sen
         full_page: bool = True,
         from_cli: bool = False,
     ) -> str:
-        """Get page accessibility tree with element refs for interaction.
+        """Get the page accessibility tree as a formatted string with element refs.
 
-        **Call this first** to get refs (e.g., 1f79fe5e) before using action tools.
+        **Call this first** to obtain element refs (e.g., ``1f79fe5e``) before
+        using any action tool (``click_element_by_ref``, ``input_text_by_ref``,
+        etc.).  The returned string is what LLM agents and CLI users should
+        consume; for the raw ``EnhancedSnapshot`` object see :meth:`get_snapshot`.
+
+        Output format example::
+
+            [Page: https://example.com | Example Domain]
+            - heading "Example Domain" [ref=a1b2c3d4]
+            - button "Submit" [ref=8d4b03a9]
+            - textbox "Email" [ref=d6a530b4]
 
         Parameters
         ----------
         start_from_char : int, optional
-            Pagination offset, must be >= 0. Use `next_start_char` from
-            truncation notice.
+            Pagination offset (character index into the full tree text).
+            Must be >= 0.  Use the ``next_start_char`` value from the
+            truncation notice to get the next page of content.  Default is 0.
         interactive : bool, optional
-            If True, only return clickable/editable elements (buttons, links,
+            If True, only include clickable/editable elements (buttons, links,
             inputs, checkboxes, elements with cursor:pointer, etc.).
+            Best for action selection. Default is False.
         full_page : bool, optional
-            If True (default), include elements outside viewport.
+            If True (default), include elements outside the viewport.
+            If False, only include elements within the current viewport.
         from_cli : bool, optional
-            If True, truncation notice will only show the CLI continuation command.
-            This is primarily for CLI output formatting.
+            Internal flag.  When True, the truncation notice shows a
+            ``bridgic-browser snapshot`` CLI command instead of a Python call.
+            Do not set this in SDK usage.
 
         Returns
         -------
         str
-            Tree with refs like: `- button "Submit" [ref=8d4b03a9]`
-            Use refs with click_element_by_ref, input_text_by_ref, etc.
-            Output is truncated to ``BRIDGIC_MAX_CHARS`` (default 30 000) characters.
-            When truncated, a notice at the end shows the ``next_start_char`` value
-            to pass to ``start_from_char`` for the next page.
+            Page header followed by the accessibility tree.  Lines with
+            ``[ref=...]`` are interactive elements.
+
+            Output is truncated to ``BRIDGIC_MAX_CHARS`` (default 30 000)
+            characters.  When truncated, a ``[notice]`` at the end shows the
+            ``next_start_char`` value and the continuation call.
 
         Raises
         ------
         InvalidInputError
-            If ``start_from_char`` is negative or beyond the available text range.
+            If ``start_from_char`` is negative or beyond the total tree length.
+        OperationError
+            If snapshot generation fails.
         """
         try:
             if start_from_char < 0:
@@ -2128,12 +2267,20 @@ Before you return the element ref, reason about the state and elements for a sen
             _raise_operation_error(error_msg)
 
     async def go_back(self) -> str:
-        """Navigate back to previous page in history.
+        """Navigate back to the previous page in the tab's history.
 
         Returns
         -------
         str
-            Result message.
+            "Navigated back to: <url>" on success.
+
+        Raises
+        ------
+        StateError
+            If no active page is available, or if there is no previous page
+            in history (error code "NO_HISTORY_ENTRY", retryable=False).
+        OperationError
+            If navigation fails for another reason.
         """
         try:
             logger.info(f"[go_back] start")
@@ -2156,12 +2303,19 @@ Before you return the element ref, reason about the state and elements for a sen
             _raise_operation_error(error_msg)
 
     async def go_forward(self) -> str:
-        """Navigate forward to next page in history.
+        """Navigate forward to the next page in the tab's history.
 
         Returns
         -------
         str
-            Result message.
+            "Navigated forward to: <url>" on success.
+
+        Raises
+        ------
+        StateError
+            If no active page is available.
+        OperationError
+            If navigation fails (e.g., no forward history entry).
         """
         try:
             logger.info(f"[go_forward] start")
@@ -2228,7 +2382,20 @@ Before you return the element ref, reason about the state and elements for a sen
         Returns
         -------
         str
-            Page info string.
+            A single-line string in the format::
+
+                url='<url>', title='<title>', viewport=<W>x<H>, page=<PW>x<PH>, scroll=(<x>,<y>)
+
+            where ``viewport`` is the visible area (pixels), ``page`` is the
+            total scrollable content size (pixels), and ``scroll`` is the
+            current scroll offset from the top-left corner (pixels).
+
+        Raises
+        ------
+        StateError
+            If no active page is available.
+        OperationError
+            If page info retrieval fails.
         """
         try:
             logger.info(f"[get_current_page_info] start")
@@ -2285,17 +2452,34 @@ Before you return the element ref, reason about the state and elements for a sen
             _raise_operation_error(error_msg)
 
     async def scroll_to_text(self, text: str) -> str:
-        """Scroll to make the specified text visible on page.
+        """Scroll the page to make the specified text visible.
+
+        Finds the first occurrence of the text on the page and scrolls it
+        into view.  Unlike :meth:`scroll_element_into_view_by_ref`, this
+        method locates elements by their visible text content rather than a
+        snapshot ref.  When the text is not found or has no bounding box,
+        a "not found" message is returned (no exception is raised).
 
         Parameters
         ----------
         text : str
-            Text to find and scroll to.
+            Text string to find and scroll to (case-sensitive, substring match).
 
         Returns
         -------
         str
-            Result message.
+            "Scrolled to text: <text>" on success, or
+            "Text not found: <text>" / "Text '<text>' not found or not visible"
+            when the text cannot be located.
+
+        Raises
+        ------
+        InvalidInputError
+            If ``text`` is empty.
+        StateError
+            If no active page is available.
+        OperationError
+            If an unexpected error occurs.
         """
         try:
             logger.info(f"[scroll_to_text] start text={text!r}")
@@ -2383,12 +2567,16 @@ Before you return the element ref, reason about the state and elements for a sen
         wait_until: str = "domcontentloaded",
         timeout: Optional[float] = None,
     ) -> str:
-        """Create a new tab.
+        """Create a new browser tab and optionally navigate to a URL.
+
+        The new tab becomes the active tab.  Use :meth:`get_tabs` to list all
+        open tabs and retrieve the new tab's page_id.
 
         Parameters
         ----------
         url : Optional[str], optional
-            URL to open. If None or empty, creates a blank tab.
+            URL to open in the new tab. Auto-prepends "http://" if the
+            protocol is missing. If None or empty, creates a blank tab.
         wait_until : str, default "domcontentloaded"
             When to consider navigation complete (only used when url is provided):
             - "domcontentloaded": DOM parsed (fast, good for modern SPAs).
@@ -2396,12 +2584,20 @@ Before you return the element ref, reason about the state and elements for a sen
             - "networkidle": No network activity for 500ms (may timeout on SPAs).
             - "commit": Response received from server.
         timeout : float, optional
-            Maximum time in seconds. Defaults to Playwright's 30s.
+            Maximum time in seconds for navigation. Defaults to Playwright's 30s.
 
         Returns
         -------
         str
-            Operation result message.
+            "Opened new tab <page_id> at <url>" when url is provided, or
+            "Created new blank tab <page_id>" for a blank tab.
+
+        Raises
+        ------
+        StateError
+            If no browser context is open (call start() first).
+        OperationError
+            If tab creation or navigation fails.
         """
         try:
             logger.info(f"[new_tab] start url={url}")
@@ -2455,6 +2651,8 @@ Before you return the element ref, reason about the state and elements for a sen
                     line += " (active)"
                 lines.append(line)
             logger.info(f"[get_tabs] done tabs={len(lines)}")
+            if not lines:
+                return "No open tabs"
             return "\n".join(lines)
         except Exception as e:
             error_msg = f"Failed to get tabs info: {str(e)}"
@@ -2686,27 +2884,57 @@ Before you return the element ref, reason about the state and elements for a sen
         slowly: bool = False,
         submit: bool = False,
     ) -> str:
-        """Input text into an element by ref.
+        """Input text into a specific element identified by its snapshot ref.
+
+        This is the primary text-input tool for interacting with form fields by
+        ref.  Unlike :meth:`type_text` and :meth:`insert_text` which type into
+        the currently focused element, this method targets the element directly
+        via its ref and handles both visible and hidden (shadow-DOM) inputs.
+
+        Comparison:
+
+        - ``input_text_by_ref`` — target by ref; clears first; handles hidden
+          inputs via JS; fires ``input``/``change`` events; **preferred**.
+        - :meth:`type_text` — no ref; types into focused element
+          character-by-character via ``keyboard.press``; triggers per-character
+          ``keydown``/``keyup`` events (needed for autocomplete widgets).
+        - :meth:`insert_text` — no ref; pastes into focused element in one shot
+          without key events; fastest for long strings.
 
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "8d4b03a9").
+            Element ref from snapshot (e.g., "8d4b03a9"). Obtain refs by
+            calling :meth:`get_snapshot_text` first.
         text : str
-            Text to input.
+            Text to input. An empty string clears the field when ``clear=True``.
         clear : bool, optional
-            Clear field first. Default True.
+            Clear existing field content before typing. Default True.
+            When False, text is appended to whatever is already in the field.
         is_secret : bool, optional
-            Hide text in result message. Default False.
+            When True, the result message shows a generic confirmation instead
+            of the actual text (for passwords and tokens). Default False.
         slowly : bool, optional
-            Type with delays (simulates real typing). Default False.
+            When True, types character-by-character with ~100 ms delay between
+            keystrokes, triggering per-character ``keydown``/``keyup`` events.
+            Use for fields with live key-event handlers (e.g. autocomplete).
+            Falls back to JS value-set if the element is not visible. Default False.
         submit : bool, optional
-            Press Enter after typing. Default False.
+            Press Enter after typing to submit the form. Default False.
 
         Returns
         -------
         str
-            Result message.
+            "Input text '<text>'" on success, or "Successfully input sensitive
+            information" when ``is_secret=True``.  Appended with " and
+            submitted" when ``submit=True``.
+
+        Raises
+        ------
+        StateError
+            If the ref cannot be resolved (element gone or page changed).
+        OperationError
+            If text input fails.
         """
         try:
             locator = await self.get_element_by_ref(ref)
@@ -2778,17 +3006,38 @@ Before you return the element ref, reason about the state and elements for a sen
             _raise_operation_error(error_msg)
 
     async def click_element_by_ref(self, ref: str) -> str:
-        """Click an element by ref.
+        """Click an element identified by its snapshot ref.
+
+        Prefer this over :meth:`mouse_click` for accessible elements — it uses
+        the snapshot ref to target the element rather than screen coordinates,
+        which is more reliable when pages scroll or re-render.
+
+        Handles covered and hidden elements automatically:
+
+        - If the element is covered by another element (e.g. a Stripe accordion
+          overlay), the intercepting element is clicked instead.
+        - If the element has a bounding box but ``is_visible()`` is False
+          (shadow-DOM slot), a ``click`` event is dispatched directly.
+        - If the element has no bounding box and is not visible, a ``click``
+          event is dispatched.
 
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "8d4b03a9").
+            Element ref from snapshot (e.g., "8d4b03a9"). Obtain refs by
+            calling :meth:`get_snapshot_text` first.
 
         Returns
         -------
         str
-            Result message.
+            "Clicked element <ref>" on success.
+
+        Raises
+        ------
+        StateError
+            If the ref cannot be resolved (element gone or page changed).
+        OperationError
+            If the click fails.
         """
         try:
             locator = await self.get_element_by_ref(ref)
@@ -2893,19 +3142,43 @@ Before you return the element ref, reason about the state and elements for a sen
             _raise_operation_error(error_msg)
 
     async def select_dropdown_option_by_ref(self, ref: str, text: str) -> str:
-        """Select an option by its text from a dropdown element represented by ref.
+        """Select an option from a dropdown element by its visible text or value.
+
+        Supports native ``<select>`` elements and custom ARIA listbox/option
+        dropdowns (including portalized ones linked via ``aria-controls`` or
+        ``aria-owns``).
+
+        Matching order for custom dropdowns (non-native ``<select>``):
+
+        1. Exact match on option visible text.
+        2. Exact match on option ``value`` attribute.
+        3. Case-insensitive match on visible text.
+        4. Case-insensitive match on ``value`` attribute.
+
+        For native ``<select>`` elements, Playwright's ``select_option`` is
+        used (tries ``value`` first, then ``label``).
+
+        Call :meth:`get_dropdown_options_by_ref` first to see available options
+        and their values.
 
         Parameters
         ----------
         ref : str
-            Element ref of dropdown from snapshot (e.g., "1f79fe5e").
+            Element ref of the dropdown from snapshot (e.g., "1f79fe5e").
         text : str
-            Option text or value to select.
+            Visible option text or ``value`` attribute to select.
 
         Returns
         -------
         str
-            Result message.
+            "Selected option: <text>" on success.
+
+        Raises
+        ------
+        StateError
+            If the ref cannot be resolved.
+        OperationError
+            If no matching option is found or the click fails.
         """
         try:
             locator = await self.get_element_by_ref(ref)
@@ -3227,17 +3500,39 @@ Before you return the element ref, reason about the state and elements for a sen
             _raise_operation_error(error_msg)
 
     async def check_checkbox_or_radio_by_ref(self, ref: str) -> str:
-        """Check a checkbox or radio button by ref.
+        """Check a checkbox or radio button (or ARIA equivalent) by ref.
+
+        Works for:
+
+        - Native ``<input type="checkbox">`` and ``<input type="radio">``
+          elements.
+        - Custom ARIA checkboxes/toggles (``role="checkbox"`` with
+          ``aria-checked``).
+
+        This method is idempotent: if the element is already checked, it
+        returns immediately without error (see result message).
+
+        After clicking, the checked state is verified.  If it remains
+        unchecked, :exc:`OperationError` is raised.
 
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "8d4b03a9").
+            Element ref from snapshot (e.g., "8d4b03a9"). Obtain refs by
+            calling :meth:`get_snapshot_text` first.
 
         Returns
         -------
         str
-            Result message.
+            "Checked element <ref> (confirmed: checked=true)" on success, or
+            "Checked element <ref> (was already checked)" if already checked.
+
+        Raises
+        ------
+        StateError
+            If the ref cannot be resolved (element gone or page changed).
+        OperationError
+            If the element state is still unchecked after the interaction.
         """
         try:
             logger.info(f'[check_checkbox_or_radio_by_ref] start ref={ref}')
@@ -3407,17 +3702,28 @@ Before you return the element ref, reason about the state and elements for a sen
             _raise_operation_error(error_msg)
 
     async def double_click_element_by_ref(self, ref: str) -> str:
-        """Double-click an element by ref.
+        """Double-click an element by its snapshot ref.
+
+        Fires a ``dblclick`` event.  Handles covered and hidden elements using
+        the same strategy as :meth:`click_element_by_ref`.
 
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "09ea4f1e").
+            Element ref from snapshot (e.g., "09ea4f1e"). Obtain refs by
+            calling :meth:`get_snapshot_text` first.
 
         Returns
         -------
         str
-            Result message.
+            "Double-clicked element <ref>".
+
+        Raises
+        ------
+        StateError
+            If the ref cannot be resolved (element gone or page changed).
+        OperationError
+            If the double-click fails.
         """
         try:
             logger.info(f'[double_click_element_by_ref] start ref={ref}')
@@ -3476,17 +3782,30 @@ Before you return the element ref, reason about the state and elements for a sen
             _raise_operation_error(error_msg)
 
     async def scroll_element_into_view_by_ref(self, ref: str) -> str:
-        """Scroll page to make element visible in viewport.
+        """Scroll the page until the element identified by its ref is in view.
+
+        Unlike :meth:`scroll_to_text` which searches by visible text,
+        this method uses the element's snapshot ref for precise targeting.
+        Useful before taking an element screenshot or verifying visibility
+        of an off-screen element.
 
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "1f79fe5e").
+            Element ref from snapshot (e.g., "1f79fe5e"). Obtain refs by
+            calling :meth:`get_snapshot_text` first.
 
         Returns
         -------
         str
-            Result message.
+            "Scrolled element <ref> into view".
+
+        Raises
+        ------
+        StateError
+            If the ref cannot be resolved (element gone or page changed).
+        OperationError
+            If scrolling fails.
         """
         try:
             logger.info(f'[scroll_element_into_view_by_ref] start ref={ref}')
@@ -3548,23 +3867,38 @@ Before you return the element ref, reason about the state and elements for a sen
         button: Literal["left", "right", "middle"] = "left",
         click_count: int = 1,
     ) -> str:
-        """Click the mouse at specific coordinates.
+        """Click the mouse at specific viewport coordinates.
+
+        Use this for elements that are not in the accessibility tree (e.g.,
+        canvas-based UIs, custom rendered widgets).  For accessible elements
+        identified by a snapshot ref, prefer :meth:`click_element_by_ref`
+        which handles covered/hidden elements automatically.
 
         Parameters
         ----------
         x : float
-            X coordinate (horizontal position from left).
+            X coordinate in pixels (horizontal, measured from the left edge
+            of the viewport).
         y : float
-            Y coordinate (vertical position from top).
+            Y coordinate in pixels (vertical, measured from the top edge of
+            the viewport).
         button : {"left", "right", "middle"}, optional
             Mouse button to click. Default is "left".
         click_count : int, optional
-            Number of clicks. Default is 1. Use 2 for double-click.
+            Number of clicks. Default is 1. Use 2 for a double-click.
 
         Returns
         -------
         str
-            Operation result message.
+            "Mouse clicked at (<x>, <y>) with <button> button" (or
+            "double-clicked" when click_count is 2).
+
+        Raises
+        ------
+        StateError
+            If no active page is available.
+        OperationError
+            If the click fails.
         """
         try:
             logger.info(f"[mouse_click] start x={x} y={y} button={button} click_count={click_count}")
@@ -3688,7 +4022,7 @@ Before you return the element ref, reason about the state and elements for a sen
             _raise_operation_error(error_msg)
 
     async def mouse_wheel(self, delta_x: float = 0, delta_y: float = 0) -> str:
-        """Scroll the mouse wheel.
+        """Scroll the mouse wheel at the current mouse position.
 
         Positive delta_y scrolls down, negative delta_y scrolls up.
         Positive delta_x scrolls right, negative delta_x scrolls left.
@@ -3696,14 +4030,23 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         delta_x : float, optional
-            Horizontal scroll amount. Default is 0.
+            Horizontal scroll amount in pixels. Positive = right, negative = left.
+            Default is 0.
         delta_y : float, optional
-            Vertical scroll amount. Default is 0.
+            Vertical scroll amount in pixels. Positive = down, negative = up.
+            Default is 0.
 
         Returns
         -------
         str
-            Operation result message.
+            "Scrolled mouse wheel: delta_x=<delta_x>, delta_y=<delta_y>".
+
+        Raises
+        ------
+        StateError
+            If no active page is available.
+        OperationError
+            If scrolling fails.
         """
         try:
             logger.info(f"[mouse_wheel] start delta_x={delta_x} delta_y={delta_y}")
@@ -3724,19 +4067,44 @@ Before you return the element ref, reason about the state and elements for a sen
     # ==================== Keyboard Tools ====================
 
     async def type_text(self, text: str, submit: bool = False) -> str:
-        """Type text sequentially using keyboard press events.
+        """Type text into the currently focused element, one character at a time.
+
+        Each character fires ``keydown``, ``keypress``, and ``keyup`` events,
+        which is required for fields with per-keystroke handlers such as
+        autocomplete widgets.  This is slower than :meth:`insert_text` for
+        long strings.
+
+        An element must already be focused before calling this method (e.g.
+        via :meth:`focus_element_by_ref` or by clicking a field first).
+
+        Comparison:
+
+        - :meth:`input_text_by_ref` — target by ref; clears first; handles
+          hidden inputs; **preferred** for form filling.
+        - ``type_text`` — no ref; requires a pre-focused element; fires per-
+          character key events; use when those events are needed.
+        - :meth:`insert_text` — no ref; pastes in one shot without key events;
+          fastest for long strings.
 
         Parameters
         ----------
         text : str
             Text to type character by character.
         submit : bool, optional
-            Whether to press Enter after typing to submit. Default is False.
+            Whether to press Enter after typing. Default is False.
 
         Returns
         -------
         str
-            Operation result message.
+            "Typed <N> characters sequentially" (appended with " and submitted"
+            when ``submit=True``).
+
+        Raises
+        ------
+        StateError
+            If no active page is available.
+        OperationError
+            If typing fails.
         """
         try:
             logger.info(f"[type_text] start text_len={len(text)} submit={submit}")
@@ -3827,21 +4195,43 @@ Before you return the element ref, reason about the state and elements for a sen
         fields: List[Dict[str, str]],
         submit: bool = False,
     ) -> str:
-        """Fill multiple form fields all at once.
+        """Fill multiple form fields at once using their snapshot refs.
+
+        Iterates through the fields list and calls Playwright's ``locator.fill()``
+        on each.  Fields that fail are collected and reported rather than
+        aborting early.  Unlike :meth:`input_text_by_ref`, this method does not
+        apply the slowly/clear/is_secret options and does not fall back to JS
+        for hidden inputs — use :meth:`input_text_by_ref` for individual fields
+        that need those features.
 
         Parameters
         ----------
         fields : List[Dict[str, str]]
-            List of field specifications. Each dict should have:
-            - 'ref': Element ref from snapshot (e.g., "8d4a07a9")
-            - 'value': Value to fill into the field
+            List of field specifications. Each dict must have:
+
+            - ``"ref"`` : str — element ref from snapshot (e.g., "8d4a07a9").
+            - ``"value"`` : str — text to fill into the field.
+
         submit : bool, optional
-            Whether to press Enter after filling the last field. Default is False.
+            Press Enter after filling all fields. Default is False.
 
         Returns
         -------
         str
-            Operation result message.
+            Summary message in one of two forms:
+
+            - All succeeded: "Filled <N> fields: [ref1, ref2, ...]"
+            - Some failed: "Filled <K>/<N> fields. OK: [ref1]. Failed: [ref2: error]"
+
+            Appended with " and submitted" when ``submit=True``.
+
+        Raises
+        ------
+        InvalidInputError
+            If ``fields`` is empty.
+        OperationError
+            If an unexpected error occurs (individual field failures are
+            collected into the result message, not raised).
         """
         try:
             logger.info(f"[fill_form] start fields_count={len(fields)} submit={submit}")
@@ -3902,6 +4292,9 @@ Before you return the element ref, reason about the state and elements for a sen
         handlers that listen to individual keystrokes (e.g., autocomplete widgets
         that react to ``onkeydown``).
 
+        An element must already be focused before calling this method (e.g.
+        via :meth:`focus_element_by_ref`).
+
         Use :meth:`input_text_by_ref` to target a specific element by ref.
         Use :meth:`type_text` when per-character key events must fire.
 
@@ -3914,7 +4307,14 @@ Before you return the element ref, reason about the state and elements for a sen
         Returns
         -------
         str
-            Operation result message.
+            "Inserted text (<N> characters)".
+
+        Raises
+        ------
+        StateError
+            If no active page is available.
+        OperationError
+            If insertion fails.
         """
         try:
             logger.info(f"[insert_text] start text_len={len(text)}")
@@ -4041,32 +4441,37 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         filename : Optional[str], optional
-            Path to save the PDF. If not provided, saves to a temporary file.
+            Path to save the PDF.  The ``.pdf`` extension is added automatically
+            when missing.  If not provided, saves to a temporary file and
+            returns its path.
         display_header_footer : bool, optional
             Whether to display header and footer. Default is False.
         print_background : bool, optional
             Whether to print background graphics. Default is True.
         scale : float, optional
-            Scale of the webpage rendering. Default is 1.0.
+            Scale of the webpage rendering. Valid range is 0.1–2.0.
+            Default is 1.0.
         paper_width : Optional[str], optional
-            Paper width with units (e.g., "8.5in", "21cm").
+            Paper width with units (e.g., "8.5in", "21cm", "215mm").
+            Defaults to US Letter (8.5in) when omitted.
         paper_height : Optional[str], optional
-            Paper height with units (e.g., "11in", "29.7cm").
+            Paper height with units (e.g., "11in", "29.7cm", "297mm").
+            Defaults to US Letter (11in) when omitted.
         margin_top : Optional[str], optional
-            Top margin with units.
+            Top margin with units (e.g., "1in", "2cm"). Default is "1cm".
         margin_bottom : Optional[str], optional
-            Bottom margin with units.
+            Bottom margin with units. Default is "1cm".
         margin_left : Optional[str], optional
-            Left margin with units.
+            Left margin with units. Default is "1cm".
         margin_right : Optional[str], optional
-            Right margin with units.
+            Right margin with units. Default is "1cm".
         landscape : bool, optional
-            Whether to use landscape orientation. Default is False.
+            Whether to use landscape orientation. Default is False (portrait).
 
         Returns
         -------
         str
-            On success: Returns the file path where PDF was saved.
+            "PDF saved to: <path>" on success.
 
         Raises
         ------
@@ -4077,7 +4482,8 @@ Before you return the element ref, reason about the state and elements for a sen
 
         Notes
         -----
-        PDF generation support depends on the underlying browser/runtime.
+        PDF generation requires Chromium (headless). It is not supported on
+        Firefox or WebKit.
         """
         try:
             logger.info(f"[save_pdf] start filename={filename}")
@@ -4243,18 +4649,31 @@ Before you return the element ref, reason about the state and elements for a sen
         ----------
         type_filter : Optional[str], optional
             Filter messages by type. Options: "log", "debug", "info", "error",
-            "warning", "dir", "trace". Default is None (all types).
+            "warning", "dir", "trace". Default is None (return all types).
         clear : bool, optional
-            Whether to clear messages after retrieving. Default is True.
+            Whether to clear the captured buffer after retrieving. Default
+            is True (consume-and-clear pattern).
 
         Returns
         -------
         str
-            JSON string containing the captured console messages.
+            JSON array string.  Each element is an object with keys:
+
+            - ``"type"`` : str — console message type (e.g. "log", "error").
+            - ``"text"`` : str — message text.
+            - ``"location"`` : str | null — source location if available.
+
+        Raises
+        ------
+        StateError
+            If no active page is available.
+        OperationError
+            If retrieval fails.
 
         Notes
         -----
-        Console capture must be started first with start_console_capture().
+        Console capture must be started first with :meth:`start_console_capture`.
+        Returns an empty JSON array (``"[]"``) if no messages have been captured.
         """
         try:
             logger.info(f"[get_console_messages] start type_filter={type_filter} clear={clear}")
@@ -4379,18 +4798,37 @@ Before you return the element ref, reason about the state and elements for a sen
         ----------
         include_static : bool, optional
             Whether to include static resources (images, stylesheets, scripts,
-            fonts). Default is False (only document, xhr, fetch requests).
+            fonts, media).  Default is False (only document, xhr, and fetch
+            requests are returned).
         clear : bool, optional
-            Whether to clear requests after retrieving. Default is True.
+            Whether to clear the captured buffer after retrieving. Default
+            is True (consume-and-clear pattern).
 
         Returns
         -------
         str
-            JSON string containing the captured network requests.
+            JSON array string.  Each element is an object with keys:
+
+            - ``"url"`` : str — request URL.
+            - ``"method"`` : str — HTTP method (e.g. "GET", "POST").
+            - ``"resource_type"`` : str — Playwright resource type (e.g.
+              "document", "xhr", "fetch", "image", "stylesheet").
+            - ``"headers"`` : dict — request headers.
+            - ``"post_data"`` : str | null — request body for POST requests.
+
+        Raises
+        ------
+        StateError
+            If no active page is available.
+        OperationError
+            If retrieval fails.
 
         Notes
         -----
-        Network capture must be started first with start_network_capture().
+        Network capture must be started first with :meth:`start_network_capture`.
+        Call :meth:`start_network_capture` BEFORE navigation to capture all
+        requests from a page load.  Returns an empty JSON array (``"[]"``) if
+        no requests have been captured.
         """
         try:
             logger.info(f"[get_network_requests] start include_static={include_static} clear={clear}")
@@ -5213,21 +5651,25 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         expected_url : str
-            Expected URL or URL pattern.
+            Expected URL or URL substring.
         exact : bool, optional
-            Whether to match exactly. Default is False (contains check).
+            When True, the full URL must match exactly.
+            When False (default), checks that ``expected_url`` is a substring
+            of the actual URL (e.g., ``"/dashboard"`` matches
+            ``"https://app.example.com/dashboard?tab=1"``).
 
         Returns
         -------
         str
-            "PASS: ..." on success.
+            "PASS: URL matches. Current: <actual_url>" on success.
 
         Raises
         ------
         StateError
             If no active page is available.
         VerificationError
-            If the URL does not match expectation.
+            If the URL does not match the expectation, with the message:
+            "FAIL: URL mismatch. Expected: '<expected_url>', Actual: '<actual_url>'".
         """
         try:
             logger.info(f"[verify_url] start expected={expected_url} exact={exact}")
@@ -5428,24 +5870,38 @@ Before you return the element ref, reason about the state and elements for a sen
         width: Optional[int] = None,
         height: Optional[int] = None,
     ) -> str:
-        """Start video recording for new pages.
+        """Mark the current page's video recording session as active.
 
-        Video recording is always available — a temporary directory is used
-        automatically when no ``record_video_dir`` was provided at browser
-        creation.  Use ``stop_video(filename)`` to save the recording to a
-        specific path.
+        Video recording is always running — Playwright starts recording as soon
+        as a page is created (using the ``record_video_dir`` set at browser
+        creation, which defaults to ``~/.bridgic/tmp``).  This method simply
+        marks the session as "started" so that :meth:`stop_video` can later
+        register where to save the file.
+
+        Use ``stop_video(filename)`` to designate a save path; the actual file
+        is written when the browser closes.
 
         Parameters
         ----------
         width : Optional[int], optional
-            Video width. Default uses viewport width.
+            Accepted for API compatibility but **not used** — video resolution
+            is determined by ``record_video_size`` passed at ``Browser()``
+            creation time, not here.
         height : Optional[int], optional
-            Video height. Default uses viewport height.
+            Accepted for API compatibility but **not used** — see ``width``.
 
         Returns
         -------
         str
-            Operation result message.
+            "Video recording started".
+
+        Raises
+        ------
+        StateError
+            If no active page is available, or if no video is attached to the
+            current page (should not occur under normal operation).
+        OperationError
+            If an unexpected error occurs.
         """
         try:
             logger.info(f"[start_video] start width={width} height={height}")

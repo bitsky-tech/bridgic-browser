@@ -2,11 +2,7 @@
 Unit tests for the Stealth module.
 """
 
-import os
-import tempfile
 from pathlib import Path
-
-import pytest
 
 from bridgic.browser.session import StealthConfig, StealthArgsBuilder, create_stealth_config
 from bridgic.browser.session._stealth import (
@@ -73,7 +69,7 @@ class TestStealthConfig:
         assert config.extension_cache_dir == expected_dir
 
     def test_can_use_extensions_headless(self):
-        """Test that extensions can't be used in headless mode."""
+        """Test that extensions can't be used in headless mode (chromium-headless-shell limitation)."""
         config = StealthConfig(enable_extensions=True)
 
         assert config.can_use_extensions(headless=True) is False
@@ -86,11 +82,18 @@ class TestStealthConfig:
         assert config.can_use_extensions(headless=True) is False
         assert config.can_use_extensions(headless=False) is False
 
-    def test_docker_detection(self):
-        """Test Docker environment detection."""
-        # This test just verifies the field exists and is boolean
-        config = StealthConfig()
-        assert isinstance(config.in_docker, bool)
+    def test_docker_detection_reflects_cgroup(self):
+        """Test that in_docker=True activates Docker-specific Chrome args."""
+        config_docker = StealthConfig(in_docker=True)
+        config_normal = StealthConfig(in_docker=False)
+        assert config_docker.in_docker is True
+        assert config_normal.in_docker is False
+        # Docker config should produce --no-sandbox in build_args
+        from bridgic.browser.session import StealthArgsBuilder
+        docker_args = StealthArgsBuilder(config_docker).build_args()
+        normal_args = StealthArgsBuilder(config_normal).build_args()
+        assert "--no-sandbox" in docker_args
+        assert "--no-sandbox" not in normal_args
 
 
 class TestStealthArgsBuilder:
@@ -116,6 +119,20 @@ class TestStealthArgsBuilder:
 
         # Should include window-size arg
         assert "--window-size=1280,720" in args
+
+    def test_build_args_minimal_uses_universal(self):
+        """minimal_args=True uses CHROME_UNIVERSAL_ARGS instead of CHROME_STEALTH_ARGS."""
+        from bridgic.browser.session._stealth import CHROME_UNIVERSAL_ARGS
+        config = StealthConfig(minimal_args=True)
+        builder = StealthArgsBuilder(config)
+
+        args = builder.build_args()
+
+        # Universal args should be present
+        for ua in CHROME_UNIVERSAL_ARGS:
+            assert ua in args, f"Missing universal arg: {ua}"
+        # Full stealth args should NOT be present (e.g. --disable-blink-features is stealth-only)
+        assert "--disable-blink-features=AutomationControlled" not in args
 
     def test_build_args_disabled(self):
         """Test building args when stealth is disabled."""
@@ -208,6 +225,101 @@ class TestStealthArgsBuilder:
 
         assert options == {}
 
+    def test_get_init_script_returns_none_when_disabled(self):
+        """get_init_script() returns None when stealth is disabled."""
+        config = StealthConfig(enabled=False)
+        builder = StealthArgsBuilder(config)
+
+        assert builder.get_init_script() is None
+
+    def test_get_init_script_default_locale(self):
+        """get_init_script() defaults navigator.languages to ['en-US', 'en']."""
+        builder = StealthArgsBuilder(StealthConfig())
+
+        script = builder.get_init_script()
+
+        assert script is not None
+        assert '["en-US", "en"]' in script
+        assert "__BRIDGIC_LANGS__" not in script
+
+    def test_get_init_script_en_us_locale(self):
+        """Explicit en-US locale produces ['en-US', 'en']."""
+        builder = StealthArgsBuilder(StealthConfig())
+
+        script = builder.get_init_script(locale="en-US")
+
+        assert '["en-US", "en"]' in script
+
+    def test_get_init_script_non_english_locale(self):
+        """Non-English locale produces [locale, base, 'en'] for consistency with navigator.language."""
+        builder = StealthArgsBuilder(StealthConfig())
+
+        for locale, expected in [
+            ("zh-CN", '["zh-CN", "zh", "en"]'),
+            ("fr-FR", '["fr-FR", "fr", "en"]'),
+            ("de-DE", '["de-DE", "de", "en"]'),
+        ]:
+            script = builder.get_init_script(locale=locale)
+            assert expected in script, f"locale={locale!r}: expected {expected!r} in script"
+
+    def test_get_init_script_no_placeholder_remains(self):
+        """The __BRIDGIC_LANGS__ placeholder must always be substituted."""
+        builder = StealthArgsBuilder(StealthConfig())
+
+        for locale in [None, "en-US", "zh-CN", "fr-FR"]:
+            script = builder.get_init_script(locale=locale)
+            assert "__BRIDGIC_LANGS__" not in script, (
+                f"Placeholder not substituted for locale={locale!r}"
+            )
+
+    def test_get_init_script_empty_locale(self):
+        """Empty string locale falls through to default ['en-US', 'en']."""
+        builder = StealthArgsBuilder(StealthConfig())
+
+        script = builder.get_init_script(locale="")
+
+        assert '["en-US", "en"]' in script
+        assert "__BRIDGIC_LANGS__" not in script
+
+    def test_get_init_script_bare_language_locale(self):
+        """Bare language locale (no region) produces [locale, 'en'] without duplication."""
+        builder = StealthArgsBuilder(StealthConfig())
+
+        script = builder.get_init_script(locale="zh")
+
+        # base == normalized so no base appended; English fallback added
+        assert '["zh", "en"]' in script
+        assert "__BRIDGIC_LANGS__" not in script
+
+    def test_get_init_script_three_part_locale(self):
+        """Three-part locale (e.g. zh-Hans-CN) produces [locale, base, 'en']."""
+        builder = StealthArgsBuilder(StealthConfig())
+
+        script = builder.get_init_script(locale="zh-Hans-CN")
+
+        assert '["zh-Hans-CN", "zh", "en"]' in script
+        assert "__BRIDGIC_LANGS__" not in script
+
+    def test_get_init_script_has_languages_try_catch(self):
+        """navigator.languages defineProperty is wrapped in try/catch."""
+        builder = StealthArgsBuilder(StealthConfig())
+
+        script = builder.get_init_script()
+
+        # The try/catch guard must be present around the languages defineProperty
+        assert "try {" in script
+        assert "Object.defineProperty(navigator, 'languages'" in script
+
+    def test_get_init_script_chrome_guard_checks_csi_and_loadtimes(self):
+        """window.chrome guard checks csi and loadTimes, not just runtime."""
+        builder = StealthArgsBuilder(StealthConfig())
+
+        script = builder.get_init_script()
+
+        # Must check for csi and loadTimes so partial chrome objects are also patched
+        assert "!window.chrome.csi" in script
+        assert "!window.chrome.loadTimes" in script
+
 
 class TestStealthConstants:
     """Tests for stealth constant values."""
@@ -235,13 +347,13 @@ class TestStealthConstants:
 
     def test_extensions_defined(self):
         """Test that extensions are defined."""
-        assert len(STEALTH_EXTENSIONS) >= 4
+        assert len(STEALTH_EXTENSIONS) >= 3
         assert "ublock_origin" in STEALTH_EXTENSIONS
         assert "cookie_consent" in STEALTH_EXTENSIONS
 
     def test_extension_structure(self):
         """Test extension info structure."""
-        for key, ext_info in STEALTH_EXTENSIONS.items():
+        for ext_info in STEALTH_EXTENSIONS.values():
             assert "name" in ext_info
             assert "id" in ext_info
             assert "url" in ext_info

@@ -89,8 +89,6 @@ from bridgic.browser.cli._daemon import (
     _is_browser_closed_error,
 )
 from bridgic.browser.cli._transport import (
-    RUN_INFO_PATH,
-    BaseTransport,
     TcpTransport,
     UnixTransport,
     get_transport,
@@ -230,6 +228,12 @@ def make_browser() -> MagicMock:
     b.get_element_by_ref = AsyncMock(return_value=None)
     b.navigate_to = AsyncMock()
     b.stop = AsyncMock(return_value="Browser closed successfully")
+    b.inspect_pending_close_artifacts = MagicMock(return_value={
+        "session_dir": "/tmp/close-test",
+        "trace": [],
+        "video": [],
+        "video_dir": None,
+    })
     return b
 
 
@@ -1266,30 +1270,29 @@ class TestDaemonConnection:
         assert resp["success"] is True
         assert resp["error_code"] is None
 
-    async def test_close_command_timeout_still_sets_stop_event(self):
+    async def test_close_command_includes_report_path(self):
+        """close responds immediately with report path and sets stop_event."""
         browser = make_browser()
+        browser.inspect_pending_close_artifacts = MagicMock(return_value={
+            "session_dir": "/tmp/close-20240101-120000-abcd",
+            "trace": [],
+            "video": [],
+            "video_dir": None,
+        })
         stop = asyncio.Event()
         req = json.dumps({"command": "close", "args": {}}).encode() + b"\n"
         reader = make_reader(req)
         writer = make_writer()
 
-        async def _slow_dispatch(_browser, _command, _args):
-            await asyncio.sleep(1.0)
-            return {"status": "ok", "success": True, "result": "done"}
-
-        with (
-            patch("bridgic.browser.cli._daemon._dispatch", new=_slow_dispatch),
-            patch("bridgic.browser.cli._daemon._CLOSE_DISPATCH_TIMEOUT", 0.01),
-        ):
-            await _handle_connection(browser, reader, writer, stop)
+        await _handle_connection(browser, reader, writer, stop)
 
         assert stop.is_set()
         written = b"".join(call.args[0] for call in writer.write.call_args_list)
         resp = json.loads(written.decode().strip())
-        assert resp["status"] == "error"
-        assert resp["success"] is False
-        assert resp["error_code"] == "CLOSE_TIMEOUT"
-        assert "Close operation timed out" in resp["result"]
+        assert resp["status"] == "ok"
+        assert resp["success"] is True
+        assert "close-report.json" in resp["result"]
+        assert "Background" in resp["result"] or "background" in resp["result"]
 
     async def test_writer_always_closed(self):
         """writer.close() must be called even when an exception occurs."""
@@ -1962,6 +1965,7 @@ class TestBuildBrowserKwargs:
                 kwargs = _build_browser_kwargs()
         assert kwargs["headless"] is True
 
+
     def test_user_config_file_applied(self, tmp_path):
         """~/.bridgic/bridgic-browser.json values are loaded."""
         fake_home = tmp_path / ".bridgic"
@@ -2095,6 +2099,120 @@ class TestBuildBrowserKwargs:
         assert kwargs["proxy"] == {"server": "http://proxy:8080", "username": "u", "password": "p"}
         assert kwargs["viewport"] == {"width": 1280, "height": 720}
         assert kwargs["extra_http_headers"] == {"X-Custom": "value"}
+
+
+    def test_system_chrome_sets_minimal_args_when_stealth_absent(self, tmp_path):
+        """Auto-detected system Chrome sets StealthConfig(minimal_args=True) when stealth not in kwargs."""
+        from bridgic.browser.session._stealth import StealthConfig
+        fake_home = tmp_path / ".bridgic"
+        fake_home.mkdir()
+
+        with (
+            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
+            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
+            patch("bridgic.browser.cli._daemon._find_system_chrome", return_value="/usr/bin/google-chrome"),
+            patch.dict(os.environ, {"BRIDGIC_HEADLESS": "0"}, clear=False),
+        ):
+            mock_local = MagicMock()
+            mock_local.is_file.return_value = False
+            mock_path_cls.return_value = mock_local
+            os.environ.pop("BRIDGIC_BROWSER_JSON", None)
+            kwargs = _build_browser_kwargs()
+
+        assert kwargs["executable_path"] == "/usr/bin/google-chrome"
+        assert isinstance(kwargs["stealth"], StealthConfig)
+        assert kwargs["stealth"].minimal_args is True
+        assert kwargs.get("chromium_sandbox") is True
+
+    def test_system_chrome_overrides_stealth_true_to_minimal(self, tmp_path):
+        """When config has stealth=true (bool), system Chrome detection upgrades to StealthConfig(minimal_args=True)."""
+        from bridgic.browser.session._stealth import StealthConfig
+        fake_home = tmp_path / ".bridgic"
+        fake_home.mkdir()
+        cfg = fake_home / "bridgic-browser.json"
+        cfg.write_text(json.dumps({"headless": False, "stealth": True}))
+
+        with (
+            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
+            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
+            patch("bridgic.browser.cli._daemon._find_system_chrome", return_value="/usr/bin/google-chrome"),
+            patch.dict(os.environ, {}, clear=False),
+        ):
+            mock_local = MagicMock()
+            mock_local.is_file.return_value = False
+            mock_path_cls.return_value = mock_local
+            os.environ.pop("BRIDGIC_BROWSER_JSON", None)
+            os.environ.pop("BRIDGIC_HEADLESS", None)
+            kwargs = _build_browser_kwargs()
+
+        assert isinstance(kwargs["stealth"], StealthConfig)
+        assert kwargs["stealth"].minimal_args is True
+
+    def test_system_chrome_respects_stealth_false(self, tmp_path):
+        """When config has stealth=false, system Chrome detection does NOT override it."""
+        fake_home = tmp_path / ".bridgic"
+        fake_home.mkdir()
+        cfg = fake_home / "bridgic-browser.json"
+        cfg.write_text(json.dumps({"headless": False, "stealth": False}))
+
+        with (
+            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
+            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
+            patch("bridgic.browser.cli._daemon._find_system_chrome", return_value="/usr/bin/google-chrome"),
+            patch.dict(os.environ, {}, clear=False),
+        ):
+            mock_local = MagicMock()
+            mock_local.is_file.return_value = False
+            mock_path_cls.return_value = mock_local
+            os.environ.pop("BRIDGIC_BROWSER_JSON", None)
+            os.environ.pop("BRIDGIC_HEADLESS", None)
+            kwargs = _build_browser_kwargs()
+
+        assert kwargs["stealth"] is False
+
+    def test_system_chrome_skipped_when_channel_set(self, tmp_path):
+        """System Chrome detection is skipped when channel is explicitly set."""
+        fake_home = tmp_path / ".bridgic"
+        fake_home.mkdir()
+        cfg = fake_home / "bridgic-browser.json"
+        cfg.write_text(json.dumps({"headless": False, "channel": "chrome"}))
+
+        with (
+            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
+            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
+            patch("bridgic.browser.cli._daemon._find_system_chrome") as mock_find,
+            patch.dict(os.environ, {}, clear=False),
+        ):
+            mock_local = MagicMock()
+            mock_local.is_file.return_value = False
+            mock_path_cls.return_value = mock_local
+            os.environ.pop("BRIDGIC_BROWSER_JSON", None)
+            os.environ.pop("BRIDGIC_HEADLESS", None)
+            kwargs = _build_browser_kwargs()
+
+        mock_find.assert_not_called()
+        assert kwargs["channel"] == "chrome"
+        assert "executable_path" not in kwargs
+
+    def test_system_chrome_skipped_when_headless(self, tmp_path):
+        """System Chrome detection is skipped when headless=True (default)."""
+        fake_home = tmp_path / ".bridgic"
+        fake_home.mkdir()
+
+        with (
+            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
+            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
+            patch("bridgic.browser.cli._daemon._find_system_chrome") as mock_find,
+            patch.dict(os.environ, {}, clear=False),
+        ):
+            mock_local = MagicMock()
+            mock_local.is_file.return_value = False
+            mock_path_cls.return_value = mock_local
+            os.environ.pop("BRIDGIC_BROWSER_JSON", None)
+            os.environ.pop("BRIDGIC_HEADLESS", None)
+            _build_browser_kwargs()
+
+        mock_find.assert_not_called()
 
 
 def _non_existent() -> MagicMock:

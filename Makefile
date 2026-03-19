@@ -3,7 +3,7 @@ ROOT_DIR := $(shell git rev-parse --show-toplevel)
 VERSION_CHECK := $(ROOT_DIR)/scripts/version_check.py
 SET_CREDENTIALS := $(ROOT_DIR)/scripts/set_publish_credentials.sh
 
-.PHONY: init-dev test build publish clean
+.PHONY: init-dev test build publish clean download-extensions
 
 package_name := bridgic-browser
 repo ?= btsk
@@ -76,6 +76,11 @@ _publish_testpypi:
 
 _publish_pypi:
 	@uv publish dist/* --config-file $(ROOT_DIR)/uv.toml
+
+download-extensions:
+	@echo "==> Downloading stealth extensions into bridgic/browser/extensions/ ..."
+	@uv run python scripts/download_extensions.py
+	@echo "==> Commit bridgic/browser/extensions/extensions.zip to include it in the package."
 
 # Show help
 help:

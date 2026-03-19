@@ -98,6 +98,7 @@ def mock_context(mock_page: MagicMock) -> MagicMock:
     context.close = AsyncMock()
     context.browser = MagicMock()
     context.new_cdp_session = AsyncMock()
+    context.add_init_script = AsyncMock()
     return context
 
 

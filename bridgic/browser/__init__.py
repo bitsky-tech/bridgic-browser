@@ -18,6 +18,7 @@ from .errors import (
 )
 from .tools import BrowserToolSetBuilder, BrowserToolSpec, ToolCategory
 from ._constants import BRIDGIC_HOME, BRIDGIC_TMP_DIR
+from .cli._commands import SectionedGroup
 
 __version__ = version("bridgic-browser")
 __all__ = [
@@ -57,4 +58,6 @@ __all__ = [
     # Constants
     "BRIDGIC_HOME",
     "BRIDGIC_TMP_DIR",
+    # CLI
+    "SectionedGroup",
 ]

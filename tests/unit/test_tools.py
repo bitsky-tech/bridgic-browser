@@ -331,7 +331,7 @@ class TestPageControlTools:
 
         result = await Browser.evaluate_javascript(mock_browser, "return {result: 'test'}")
 
-        mock_page.evaluate.assert_called()
+        mock_page.evaluate.assert_called_once()
         assert "result" in result
 
     @pytest.mark.asyncio
@@ -398,13 +398,14 @@ class TestTabManagementTools:
 
     @pytest.mark.asyncio
     async def test_new_tab(self, mock_browser):
-        """Test new_tab."""
+        """Test new_tab with no URL opens a blank page."""
 
         mock_browser.new_page.return_value = MagicMock()
 
         result = await Browser.new_tab(mock_browser)
 
-        mock_browser.new_page.assert_called_once()
+        mock_browser.new_page.assert_called_once_with(None, wait_until="domcontentloaded", timeout=None)
+        assert "new" in result.lower() or "tab" in result.lower() or "blank" in result.lower()
 
     @pytest.mark.asyncio
     async def test_new_tab_with_url(self, mock_browser):
@@ -420,32 +421,39 @@ class TestTabManagementTools:
 
     @pytest.mark.asyncio
     async def test_get_tabs(self, mock_browser):
-        """Test get_tabs."""
+        """Test get_tabs returns a string listing all open tabs."""
+        from bridgic.browser.session._browser_model import PageDesc
 
         mock_browser.get_all_page_descs.return_value = [
-            MagicMock(url="https://example.com", title="Example", page_id="1"),
-            MagicMock(url="https://test.com", title="Test", page_id="2"),
+            PageDesc(url="https://example.com", title="Example", page_id="page_1"),
+            PageDesc(url="https://test.com", title="Test", page_id="page_2"),
         ]
 
         result = await Browser.get_tabs(mock_browser)
 
         mock_browser.get_all_page_descs.assert_called_once()
+        assert "example.com" in result
+        assert "test.com" in result
 
     @pytest.mark.asyncio
     async def test_switch_tab(self, mock_browser):
-        """Test switch_tab."""
+        """Test switch_tab switches to the given page and returns a confirmation string."""
 
         result = await Browser.switch_tab(mock_browser, "page_123")
 
         mock_browser.switch_to_page.assert_called_once_with("page_123")
+        assert isinstance(result, str)
+        assert len(result) > 0
 
     @pytest.mark.asyncio
     async def test_close_tab(self, mock_browser):
-        """Test close_tab."""
+        """Test close_tab closes the given page and returns a confirmation string."""
 
         result = await Browser.close_tab(mock_browser, "page_123")
 
         mock_browser.close_page.assert_called_once_with("page_123")
+        assert isinstance(result, str)
+        assert len(result) > 0
 
 # ==================== Element Interaction Tools Tests ====================
 
@@ -1182,11 +1190,13 @@ class TestNetworkTools:
 
     @pytest.mark.asyncio
     async def test_get_network_requests(self, mock_browser):
-        """Test getting captured network requests."""
+        """Test get_network_requests returns a JSON-formatted string when no requests captured."""
 
         result = await Browser.get_network_requests(mock_browser)
 
         assert isinstance(result, str)
+        # No requests captured → returns JSON empty array
+        assert result == "[]"
 
     @pytest.mark.asyncio
     async def test_stop_console_capture(self, mock_browser):
@@ -1561,7 +1571,7 @@ class TestStateTools:
         (True, True),
     ])
     async def test_get_snapshot_text_options(self, mock_browser, interactive, full_page):
-        """Test get_snapshot_text with various options."""
+        """Test get_snapshot_text passes interactive and full_page to get_snapshot."""
 
         mock_snapshot = MagicMock()
         mock_snapshot.tree = "- button 'Click me' [ref=e1]"
@@ -1572,7 +1582,10 @@ class TestStateTools:
             full_page=full_page,
         )
 
-        assert result is not None
+        mock_browser.get_snapshot.assert_called_once_with(
+            interactive=interactive, full_page=full_page
+        )
+        assert "button" in result or "Click me" in result
 
     @pytest.mark.asyncio
     async def test_get_snapshot_text_negative_start_from_char(self, mock_browser):

@@ -10,13 +10,154 @@ appear more like regular user browsers, helping bypass bot detection.
 from __future__ import annotations
 
 import io
+import json
 import os
+import sys
 import tempfile
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+
+
+# ========== JS Init Script — navigator/window property patches ==========
+# Injected into every page (main world) before any page script runs.
+# Targets the most common bot-detection signals as identified by Cloudflare,
+# DataDome, PerimeterX and the rebrowser-bot-detector test suite (2024-2025).
+_STEALTH_INIT_SCRIPT_TEMPLATE: str = """
+(function () {
+  // ── navigator.webdriver ────────────────────────────────────────────────────
+  // Belt-and-suspenders: --disable-blink-features=AutomationControlled already
+  // removes this at the Chrome level; the JS override covers sub-frames.
+  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+  // ── navigator.plugins / mimeTypes ─────────────────────────────────────────
+  // Headless Chrome exposes 0 plugins. Real Chrome has PDF Viewer entries.
+  const _makeMime = (type, suffixes, description) =>
+    ({ type, suffixes, description, enabledPlugin: null });
+
+  const _pdfMimes = [
+    _makeMime('application/pdf', 'pdf', 'Portable Document Format'),
+    _makeMime('text/pdf',        'pdf', 'Portable Document Format'),
+  ];
+
+  const _makePlugin = (name, description) => {
+    const p = { name, description, filename: 'internal-pdf-viewer', length: _pdfMimes.length };
+    // Create per-plugin mime copies so each plugin's enabledPlugin ref is correct
+    // (mutating shared _pdfMimes objects would cause all mimes to point to the last plugin)
+    _pdfMimes.forEach((m, i) => {
+      const localMime = { type: m.type, suffixes: m.suffixes, description: m.description, enabledPlugin: p };
+      Object.defineProperty(p, i, { value: localMime, enumerable: true });
+    });
+    p.item      = (i) => p[i] ?? null;
+    p.namedItem = (n) => { const idx = _pdfMimes.findIndex(m => m.type === n); return idx >= 0 ? p[idx] : null; };
+    return p;
+  };
+
+  const _plugins = [
+    _makePlugin('PDF Viewer',              'Portable Document Format'),
+    _makePlugin('Chrome PDF Viewer',       'Portable Document Format'),
+    _makePlugin('Chromium PDF Viewer',     'Portable Document Format'),
+    _makePlugin('Microsoft Edge PDF Viewer', 'Portable Document Format'),
+    _makePlugin('WebKit built-in PDF',     'Portable Document Format'),
+  ];
+
+  // Link global mimeTypes entries to the primary plugin (PDF Viewer), matching Chrome behaviour
+  _pdfMimes.forEach((m) => { m.enabledPlugin = _plugins[0]; });
+
+  const _pluginList = Object.assign([..._plugins], {
+    item:      (i) => _plugins[i] ?? null,
+    namedItem: (n) => _plugins.find(p => p.name === n) ?? null,
+    refresh:   () => {},
+    length:    _plugins.length,
+  });
+
+  Object.defineProperty(navigator, 'plugins', { get: () => _pluginList });
+
+  const _mimeList = Object.assign([..._pdfMimes], {
+    item:      (i) => _pdfMimes[i] ?? null,
+    namedItem: (n) => _pdfMimes.find(m => m.type === n) ?? null,
+    length:    _pdfMimes.length,
+  });
+
+  Object.defineProperty(navigator, 'mimeTypes', { get: () => _mimeList });
+
+  // ── navigator.languages ───────────────────────────────────────────────────
+  // __BRIDGIC_LANGS__ is replaced by get_init_script() based on the Browser locale setting.
+  // Keeping navigator.languages[0] consistent with navigator.language avoids a detectable mismatch.
+  try {
+    Object.defineProperty(navigator, 'languages', { get: () => __BRIDGIC_LANGS__ });
+  } catch (_) {}
+
+  // ── window.chrome ─────────────────────────────────────────────────────────
+  // Headless Chrome may have a missing or incomplete chrome object.
+  // Check all expected fields: a partial chrome (e.g. runtime present but csi/loadTimes absent)
+  // is equally detectable and must also be patched.
+  if (!window.chrome || !window.chrome.runtime || !window.chrome.csi || !window.chrome.loadTimes) {
+    const _chrome = {
+      app: {
+        isInstalled: false,
+        getDetails:     () => null,
+        getIsInstalled: () => false,
+        installState:   () => 'not_installed',
+      },
+      runtime: {
+        connect:     () => {},
+        sendMessage: () => {},
+      },
+      csi: () => ({
+        onloadT: Date.now(),
+        pageT:   Date.now() - (performance.timeOrigin ?? performance.timing?.navigationStart ?? 0),
+        startE:  Date.now() - 1000,
+        tran:    15,
+      }),
+      loadTimes: () => ({
+        commitLoadTime:          Date.now() / 1000 - 1,
+        connectionInfo:          'h2',
+        finishDocumentLoadTime:  Date.now() / 1000,
+        finishLoadTime:          Date.now() / 1000,
+        firstPaintAfterLoadTime: 0,
+        firstPaintTime:          Date.now() / 1000 - 0.5,
+        navigationType:          'Other',
+        npnNegotiatedProtocol:   'h2',
+        requestTime:             Date.now() / 1000 - 1,
+        startLoadTime:           Date.now() / 1000 - 1,
+        wasAlternateProtocolAvailable: false,
+        wasFetchedViaSpdy:       true,
+        wasNpnNegotiated:        true,
+      }),
+    };
+    try {
+      Object.defineProperty(window, 'chrome', {
+        value: _chrome, writable: false, enumerable: true, configurable: false,
+      });
+    } catch (_) { window.chrome = _chrome; }
+  }
+
+  // ── navigator.permissions ─────────────────────────────────────────────────
+  // Headless returns 'denied' for notification queries without ever prompting;
+  // real Chrome returns 'default' (not yet asked).
+  if (navigator.permissions && navigator.permissions.query) {
+    const _origQuery = navigator.permissions.query.bind(navigator.permissions);
+    navigator.permissions.query = (params) => {
+      if (params && params.name === 'notifications') {
+        return Promise.resolve({ state: Notification.permission === 'denied' ? 'default' : Notification.permission, onchange: null });
+      }
+      return _origQuery(params);
+    };
+  }
+
+  // ── window.outerWidth / outerHeight ───────────────────────────────────────
+  // Headless sets these to 0; real Chrome includes the browser chrome (~85px).
+  if (window.outerWidth === 0) {
+    try { Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth }); } catch (_) {}
+  }
+  if (window.outerHeight === 0) {
+    try { Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight + 85 }); } catch (_) {}
+  }
+})();
+"""
 
 
 # ========== Chrome Disabled Components (browser-use/profile.py:29-78) ==========
@@ -65,7 +206,6 @@ CHROME_STEALTH_ARGS: List[str] = [
     "--disable-component-extensions-with-background-pages",
     "--disable-component-update",
     "--no-default-browser-check",
-    "--disable-dev-shm-usage",
     "--disable-hang-monitor",
     "--disable-ipc-flooding-protection",
     "--disable-popup-blocking",
@@ -79,22 +219,19 @@ CHROME_STEALTH_ARGS: List[str] = [
     "--unsafely-disable-devtools-self-xss-warnings",
     "--enable-features=NetworkService,NetworkServiceInProcess",
     "--enable-network-information-downlink-max",
-    "--test-type=gpu",
     "--disable-sync",
     "--allow-legacy-extension-manifests",
     "--allow-pre-commit-input",
     "--disable-blink-features=AutomationControlled",
-    "--install-autogenerated-theme=0,0,0",
     "--log-level=2",
+    "--lang=en-US",
     "--disable-focus-on-load",
     "--disable-window-activation",
     "--generate-pdf-document-outline",
     "--no-pings",
-    "--ash-no-nudges",
     "--disable-infobars",
     "--simulate-outdated-no-au=Tue, 31 Dec 2099 23:59:59 GMT",
     "--hide-crash-restore-bubble",
-    "--suppress-message-center-popups",
     "--disable-domain-reliability",
     "--disable-datasaver-prompt",
     "--disable-speech-synthesis-api",
@@ -108,6 +245,38 @@ CHROME_STEALTH_ARGS: List[str] = [
     "--disable-extensions-http-throttling",
     "--extensions-on-chrome-urls",
     "--disable-default-apps",
+]
+
+# ========== Linux-only Chrome Args ==========
+# These flags are only valid on Linux. Applying them on macOS/Windows causes
+# "不支持的命令行标记" warnings in the Chrome title bar.
+CHROME_LINUX_ONLY_ARGS: List[str] = [
+    "--disable-dev-shm-usage",       # /dev/shm is Linux-specific shared memory
+    "--ash-no-nudges",               # ChromeOS Ash shell only
+    "--suppress-message-center-popups",  # ChromeOS message center only
+]
+
+# ========== Universal Chrome Args (agent-browser compatible) ==========
+# Minimal set of flags that every Chrome/Chromium build recognises on every
+# platform (macOS, Linux, Windows). Used when launching the system-installed
+# Chrome via executable_path so that no "不支持的命令行标记" warnings appear.
+# Based on agent-browser/cli/src/native/cdp/chrome.rs::build_chrome_args().
+CHROME_UNIVERSAL_ARGS: List[str] = [
+    "--disable-background-networking",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-component-update",
+    "--disable-default-apps",
+    "--disable-hang-monitor",
+    "--disable-popup-blocking",
+    "--disable-prompt-on-repost",
+    "--disable-sync",
+    "--disable-features=Translate",
+    "--enable-features=NetworkService,NetworkServiceInProcess",
+    "--metrics-recording-only",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--password-store=basic",
+    "--use-mock-keychain",
 ]
 
 # ========== Chrome Docker Args (browser-use/profile.py:84-94) ==========
@@ -142,20 +311,16 @@ CHROME_IGNORE_DEFAULT_ARGS: List[str] = [
 
 # ========== Extensions (browser-use/profile.py:944-981) ==========
 STEALTH_EXTENSIONS: Dict[str, Dict[str, str]] = {
+    # uBlock Origin Lite (MV3) — replaces uBlock Origin (MV2, deprecated in Chrome 127+)
     "ublock_origin": {
-        "name": "uBlock Origin",
-        "id": "cjpalhdlnbpafiamejdnhcphjbkeiagm",
-        "url": "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=133&acceptformat=crx3&x=id%3Dcjpalhdlnbpafiamejdnhcphjbkeiagm%26uc",
+        "name": "uBlock Origin Lite",
+        "id": "ddkjiahejlhfcafbddmgiahcphecmpfh",
+        "url": "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=133&acceptformat=crx3&x=id%3Dddkjiahejlhfcafbddmgiahcphecmpfh%26uc",
     },
     "cookie_consent": {
         "name": "I still don't care about cookies",
         "id": "edibdbjcniadpccecjdfdjjppcpchdlm",
         "url": "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=133&acceptformat=crx3&x=id%3Dedibdbjcniadpccecjdfdjjppcpchdlm%26uc",
-    },
-    "clear_urls": {
-        "name": "ClearURLs",
-        "id": "lckanjgmijmafbedllaakclkaicjfmnk",
-        "url": "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=133&acceptformat=crx3&x=id%3Dlckanjgmijmafbedllaakclkaicjfmnk%26uc",
     },
     "force_background_tab": {
         "name": "Force Background Tab",
@@ -205,7 +370,8 @@ class StealthConfig:
     enabled: bool = True
     enable_extensions: bool = True
     disable_security: bool = False
-    in_docker: bool = field(default_factory=lambda: os.path.exists("/.dockerenv"))
+    minimal_args: bool = False
+    in_docker: bool = field(default_factory=lambda: sys.platform != "darwin" and os.path.exists("/.dockerenv"))
     cookie_whitelist_domains: List[str] = field(
         default_factory=lambda: ["nature.com", "qatarairways.com"]
     )
@@ -219,7 +385,8 @@ class StealthConfig:
     def can_use_extensions(self, headless: bool) -> bool:
         """Check if extensions can be used with current settings.
 
-        Extensions require headless=False and persistent context.
+        Extensions require headless=False. Playwright's headless mode uses
+        chromium-headless-shell which does not support loading extensions.
         """
         return self.enable_extensions and not headless
 
@@ -231,7 +398,7 @@ class StealthArgsBuilder:
         self.config = config
         self._extension_paths: List[str] = []
 
-    def build_args(self, viewport_width: int = 1920, viewport_height: int = 1080) -> List[str]:
+    def build_args(self, viewport_width: int = 1600, viewport_height: int = 900) -> List[str]:
         """Build Chrome launch arguments for stealth mode.
 
         Parameters
@@ -249,7 +416,15 @@ class StealthArgsBuilder:
         if not self.config.enabled:
             return []
 
-        args = list(CHROME_STEALTH_ARGS)
+        if self.config.minimal_args:
+            # Minimal universal args (agent-browser style) — safe for system Chrome on any platform.
+            # Anti-detection relies entirely on the JS init script injected by get_init_script().
+            args = list(CHROME_UNIVERSAL_ARGS)
+        else:
+            args = list(CHROME_STEALTH_ARGS)
+            # Linux-only args (skip on macOS/Windows to avoid "unsupported flag" warnings)
+            if sys.platform == "linux":
+                args.extend(CHROME_LINUX_ONLY_ARGS)
 
         # Add disabled components
         args.append(f"--disable-features={','.join(CHROME_DISABLED_COMPONENTS)}")
@@ -327,8 +502,49 @@ class StealthArgsBuilder:
         }
         return options
 
+    def get_init_script(self, locale: Optional[str] = None) -> Optional[str]:
+        """Return a JS init script to patch navigator/window properties.
+
+        The script runs in the main world before any page script so that
+        property overrides are in place before bot-detection code runs.
+
+        Parameters
+        ----------
+        locale:
+            Browser locale (e.g. ``"zh-CN"``, ``"fr-FR"``). Used to build a
+            consistent ``navigator.languages`` array so that
+            ``navigator.language === navigator.languages[0]`` (a detectable
+            inconsistency when they diverge). When *None*, defaults to
+            ``["en-US", "en"]``.
+
+        Returns None when stealth is disabled.
+        """
+        if not self.config.enabled:
+            return None
+
+        # Build navigator.languages from the locale so it matches navigator.language
+        if locale:
+            normalized = locale.replace("_", "-")
+            parts = normalized.split("-")
+            base = parts[0]
+            langs: list[str] = [normalized]
+            if base != normalized:
+                langs.append(base)
+            # Always include English as fallback unless the locale is already English
+            if base.lower() != "en" and "en" not in langs:
+                langs.append("en")
+        else:
+            langs = ["en-US", "en"]
+
+        return _STEALTH_INIT_SCRIPT_TEMPLATE.replace("__BRIDGIC_LANGS__", json.dumps(langs))
+
     def _ensure_extensions(self) -> List[str]:
         """Download and extract extensions if needed.
+
+        Checks (in priority order):
+          1. Cache dir already has the extracted extension — reuse it directly.
+          2. Bundled zip in bridgic/browser/extensions/<id>.zip — extract once.
+          3. Network download as fallback.
 
         Returns
         -------
@@ -337,13 +553,32 @@ class StealthArgsBuilder:
         """
         cache_dir = self.config.extension_cache_dir
         cache_dir.mkdir(parents=True, exist_ok=True)
+        # bridgic/browser/extensions/ — zips shipped with the package, work offline
+        bundled_dir = Path(__file__).parent.parent / "extensions"
         paths = []
 
+        bundled_zip = bundled_dir / "extensions.zip"
         for key, ext_info in STEALTH_EXTENSIONS.items():
             ext_dir = cache_dir / ext_info["id"]
 
             if not (ext_dir / "manifest.json").exists():
-                self._download_and_extract_extension(ext_info, ext_dir)
+                if bundled_zip.exists():
+                    ext_dir.mkdir(parents=True, exist_ok=True)
+                    prefix = ext_info["id"] + "/"
+                    with zipfile.ZipFile(bundled_zip, "r") as zf:
+                        members = [m for m in zf.namelist() if m.startswith(prefix)]
+                        for member in members:
+                            rel = member[len(prefix):]
+                            if not rel:
+                                continue
+                            target = ext_dir / rel
+                            if member.endswith("/"):
+                                target.mkdir(parents=True, exist_ok=True)
+                            else:
+                                target.parent.mkdir(parents=True, exist_ok=True)
+                                target.write_bytes(zf.read(member))
+                else:
+                    self._download_and_extract_extension(ext_info, ext_dir)
 
             if key == "cookie_consent":
                 self._apply_cookie_extension_patch(ext_dir)
@@ -513,6 +748,8 @@ __all__ = [
     "StealthArgsBuilder",
     "create_stealth_config",
     "CHROME_STEALTH_ARGS",
+    "CHROME_LINUX_ONLY_ARGS",
+    "CHROME_UNIVERSAL_ARGS",
     "CHROME_DISABLED_COMPONENTS",
     "CHROME_DOCKER_ARGS",
     "CHROME_DISABLE_SECURITY_ARGS",

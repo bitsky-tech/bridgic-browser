@@ -35,6 +35,11 @@ make publish repo=testpypi   # or repo=btsk or repo=pypi
 make playwright-install
 ```
 
+**Stealth extensions** (maintainers only, commit result):
+```bash
+make download-extensions   # downloads + packs all extensions into bridgic/browser/extensions/extensions.zip
+```
+
 ## Architecture
 
 ### Package structure
@@ -106,10 +111,29 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 
 ### Stealth
 
-`StealthConfig` (default enabled) applies 50+ Chrome arguments to evade bot detection. Key options:
-- `enable_extensions=True` requires `headless=False`
+`StealthConfig` (default enabled) applies 50+ Chrome arguments to evade bot detection, plus a JS init script injected into every page via `context.add_init_script()`.
+
+Key options:
+- `enable_extensions=True` requires `headless=False` (Playwright's headless-shell does not support extensions)
 - `docker_mode=True` for container environments
 - `cookie_whitelist_domains` for selective cookie retention
+
+**JS init script** (`_STEALTH_INIT_SCRIPT_TEMPLATE` in `_stealth.py`) patches these navigator/window properties before any page script runs:
+- `navigator.webdriver` → `undefined`
+- `navigator.plugins` / `navigator.mimeTypes` → realistic PDF Viewer entries (5 plugins, 2 MIME types); each plugin holds its own per-plugin mime copies so `enabledPlugin` refs are correct
+- `navigator.languages` → derived from `Browser(locale=...)` to keep `navigator.language === navigator.languages[0]` (e.g. `["zh-CN", "zh", "en"]` for `locale="zh-CN"`); defaults to `["en-US", "en"]`
+- `window.chrome` → complete object with `runtime`, `csi()`, `loadTimes()`
+- `navigator.permissions.query` → returns `"default"` for notifications (not `"denied"`)
+- `window.outerWidth/Height` → matches `innerWidth/Height` (fixes headless zero-value)
+
+`get_init_script(locale=None)` accepts the locale and performs the `__BRIDGIC_LANGS__` substitution before returning the script. Called from `_browser.py:start()` with `self._locale`.
+
+**Extensions** (headed mode only, all MV3):
+- uBlock Origin Lite — content/ad blocking
+- I don't care about cookies — auto-dismiss cookie banners
+- Force Background Tab — prevent new-tab focus stealing
+
+Extensions are bundled as `bridgic/browser/extensions/extensions.zip` (shipped with the package). On first use they are extracted to `~/.cache/bridgic-browser/extensions/<id>/`. Subsequent launches reuse the cache. Network download only happens if the zip is absent.
 
 ### CLI architecture
 
@@ -130,6 +154,7 @@ Key implementation details:
 - **`_daemon.py`**: `run_daemon()` calls `_build_browser_kwargs()` then launches `Browser(**kwargs)`, writes `BRIDGIC_DAEMON_READY` to stdout, and serves one JSON command per connection. `asyncio.wait_for(reader.readline(), timeout=60)` prevents hanging on idle connections. Signal handling uses `loop.add_signal_handler()` (asyncio-safe).
 - **`_commands.py`**: 67 Click commands in 15 sections via `SectionedGroup`. `scroll` uses `--dy`/`--dx` options (not positional) to support negative values. `screenshot`/`pdf`/`upload`/`storage-save`/`storage-load`/`trace-stop` call `os.path.abspath()` on the client side before sending (daemon cwd may differ). `snapshot` supports `-i`/`--interactive`, `-f/-F`/`--full-page/--no-full-page`, and `-s`/`--start-from-char`; it delegates to `browser.get_snapshot_text()` (which adds truncation/pagination).
 - **`_build_browser_kwargs()`** priority chain (lowest → highest): defaults → `~/.bridgic/bridgic-browser.json` → `./bridgic-browser.json` → `BRIDGIC_BROWSER_JSON` env var → `BRIDGIC_HEADLESS` env var.
+- **`close` command fast-path**: the daemon calls `browser.inspect_pending_close_artifacts()` to pre-allocate a session dir and trace path, responds to the client immediately with those paths, then sets `stop_event`. Actual `browser.stop()` runs after the client disconnects. After stop, `_write_close_report()` writes `~/.bridgic/tmp/close-<timestamp>-<rand>/close-report.json` with status, artifact paths, and any errors.
 
 Socket path: `BRIDGIC_SOCKET` env var (default `~/.bridgic/run/bridgic-browser.sock`).
 The directory is created with `0o700` permissions on first use. Users upgrading from an older version that used `/tmp/bridgic-browser.sock` should stop any running daemon first (`bridgic-browser close`) before upgrading.

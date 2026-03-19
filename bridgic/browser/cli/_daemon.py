@@ -589,7 +589,6 @@ async def _dispatch(browser: "Browser", command: str, args: Dict[str, Any]) -> D
 
 
 _READ_TIMEOUT = 60.0  # seconds to wait for a command line from the client
-_CLOSE_DISPATCH_TIMEOUT = float(os.environ.get("BRIDGIC_CLOSE_DISPATCH_TIMEOUT", "45"))
 _DAEMON_STOP_TIMEOUT = float(os.environ.get("BRIDGIC_DAEMON_STOP_TIMEOUT", "45"))
 
 
@@ -678,23 +677,22 @@ async def _handle_connection(
             return
 
         if command == "close":
-            # Close the browser first so we can return auto-saved artifact paths,
-            # then signal daemon shutdown.
-            try:
-                resp = await asyncio.wait_for(
-                    _dispatch(browser, command, args),
-                    timeout=_CLOSE_DISPATCH_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                resp = _response(
-                    success=False,
-                    result=(
-                        "Close operation timed out after "
-                        f"{_CLOSE_DISPATCH_TIMEOUT:.0f} seconds; "
-                        "daemon shutdown will continue."
-                    ),
-                    error_code="CLOSE_TIMEOUT",
-                )
+            # Pre-allocate session dir + artifact paths; respond immediately
+            artifacts = browser.inspect_pending_close_artifacts()
+            session_dir = artifacts["session_dir"]
+
+            lines = ["Browser closing in background."]
+            if artifacts["trace"]:
+                lines.append("Trace (generating in background, check later):")
+                lines.extend(f"  {p}" for p in artifacts["trace"])
+            if artifacts["video"]:
+                lines.append("Video (generating in background, check later):")
+                lines.extend(f"  {p}" for p in artifacts["video"])
+            elif artifacts.get("video_dir"):
+                lines.append(f"Video (generating in background, check later): {artifacts['video_dir']}/")
+            lines.append(f"Close report: {session_dir}/close-report.json")
+
+            resp = _response(success=True, result="\n".join(lines))
             writer.write((json.dumps(resp) + "\n").encode())
             await writer.drain()
             stop_event.set()
@@ -711,6 +709,46 @@ async def _handle_connection(
             await writer.wait_closed()
         except Exception:
             pass
+
+
+def _write_close_report(
+    browser: "Browser",
+    *,
+    timed_out: bool = False,
+    stop_exc: Optional[Exception] = None,
+) -> None:
+    """Write close-report.json to the browser's close session directory."""
+    session_dir = getattr(browser, "_close_session_dir", None)
+    if not session_dir:
+        return
+
+    from datetime import datetime, timezone
+
+    artifacts = getattr(browser, "_last_shutdown_artifacts", {})
+    errors = list(getattr(browser, "_last_shutdown_errors", []))
+    if timed_out:
+        errors.append(f"browser.stop() timed out after {_DAEMON_STOP_TIMEOUT:.0f}s")
+    if stop_exc is not None:
+        errors.append(str(stop_exc))
+
+    status = "timeout" if timed_out else ("error" if errors else "success")
+    report = {
+        "status": status,
+        "closed_at": datetime.now(timezone.utc).isoformat(),
+        "trace_paths": artifacts.get("trace", []),
+        "video_paths": artifacts.get("video", []),
+        "warnings": [],
+        "errors": errors,
+    }
+
+    report_path = Path(session_dir) / "close-report.json"
+    try:
+        report_path.write_text(
+            json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        logger.info("[daemon] close-report written: %s", report_path)
+    except Exception as exc:
+        logger.warning("[daemon] failed to write close-report.json: %s", exc)
 
 
 def _build_browser_kwargs() -> Dict[str, Any]:
@@ -753,7 +791,76 @@ def _build_browser_kwargs() -> Dict[str, Any]:
     if "BRIDGIC_HEADLESS" in os.environ:
         kwargs["headless"] = os.environ["BRIDGIC_HEADLESS"] != "0"
 
+    # 5. Auto-detect system Chrome for headed mode (agent-browser style).
+    #    When the user runs headed without an explicit channel/executable_path,
+    #    find the system Chrome and launch it directly via executable_path.
+    #    This shows "Google Chrome" in the macOS Dock (not "Chromium") and avoids
+    #    "不支持的命令行标记" warnings by switching to the minimal universal arg set.
+    if (
+        kwargs.get("headless") is False
+        and not kwargs.get("channel")
+        and not kwargs.get("executable_path")
+    ):
+        chrome_path = _find_system_chrome()
+        if chrome_path:
+            kwargs["executable_path"] = chrome_path
+            # Use minimal args so system Chrome doesn't warn about unsupported flags.
+            # Stealth is still applied via the JS init script injected into every page.
+            from ..session._stealth import StealthConfig
+            existing_stealth = kwargs.get("stealth")
+            if existing_stealth is True or existing_stealth is None:
+                # Default or explicit True — replace with StealthConfig(minimal_args=True)
+                kwargs["stealth"] = StealthConfig(minimal_args=True)
+            elif isinstance(existing_stealth, StealthConfig):
+                # Preserve user's StealthConfig but enable minimal_args
+                existing_stealth.minimal_args = True
+            # Playwright adds --no-sandbox unless chromium_sandbox is explicitly True.
+            # System Chrome on macOS/Windows doesn't need --no-sandbox and shows a
+            # "不支持的命令行标记 --no-sandbox" warning if it receives it.
+            kwargs.setdefault("chromium_sandbox", True)
+
     return kwargs
+
+
+def _find_system_chrome() -> Optional[str]:
+    """Find the system-installed Chrome/Chromium executable (agent-browser style).
+
+    Priority (same order as agent-browser find_chrome()):
+      macOS  : Google Chrome → Chrome Canary → Chromium → Brave
+      Linux  : google-chrome-stable → google-chrome (PATH lookup)
+      Windows: Program Files → Program Files (x86) → %LOCALAPPDATA%
+    """
+    import shutil
+
+    if sys.platform == "darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        ]
+        for c in candidates:
+            if Path(c).exists():
+                return c
+
+    elif sys.platform.startswith("linux"):
+        for name in ("google-chrome-stable", "google-chrome", "chromium-browser", "chromium"):
+            path = shutil.which(name)
+            if path:
+                return path
+
+    elif sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA", "")
+        candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.join(local, r"Google\Chrome\Application\chrome.exe") if local else "",
+        ]
+        for c in candidates:
+            if c and Path(c).exists():
+                return c
+
+    return None
 
 
 async def run_daemon() -> None:
@@ -787,15 +894,18 @@ async def run_daemon() -> None:
         await stop_event.wait()
 
     logger.info("[daemon] shutting down")
+    _stop_timed_out = False
+    _stop_exc: Optional[Exception] = None
     try:
         await asyncio.wait_for(browser.stop(), timeout=_DAEMON_STOP_TIMEOUT)
     except asyncio.TimeoutError:
-        logger.error(
-            "[daemon] browser.stop() timed out after %.0fs; forcing daemon exit",
-            _DAEMON_STOP_TIMEOUT,
-        )
-    except Exception:
+        _stop_timed_out = True
+        logger.error("[daemon] browser.stop() timed out after %.0fs", _DAEMON_STOP_TIMEOUT)
+    except Exception as exc:
+        _stop_exc = exc
         logger.exception("[daemon] browser.stop() failed during shutdown")
+
+    _write_close_report(browser, timed_out=_stop_timed_out, stop_exc=_stop_exc)
 
     transport.cleanup()
     remove_run_info()

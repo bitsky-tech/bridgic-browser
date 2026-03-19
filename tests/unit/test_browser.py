@@ -25,7 +25,7 @@ class TestBrowserInitialization:
         browser = Browser()
 
         assert browser.headless is True
-        assert browser.viewport == {"width": 1920, "height": 1080}
+        assert browser.viewport == {"width": 1600, "height": 900}
         assert browser.user_data_dir is None
         assert browser.stealth_enabled is True  # Stealth is enabled by default
         assert browser.use_persistent_context is False
@@ -201,7 +201,7 @@ class TestBrowserContextOptions:
         browser = Browser(stealth=False)
         options = browser._get_context_options()
 
-        assert options["viewport"] == {"width": 1920, "height": 1080}
+        assert options["viewport"] == {"width": 1600, "height": 900}
 
     def test_context_options_no_viewport(self):
         """Test no_viewport disables viewport and passes through flag."""
@@ -633,8 +633,9 @@ class TestBrowserPageManagement:
 
             new_page = await browser.new_page()
 
-            assert new_page is not None
-            mock_context.new_page.assert_called()
+            mock_context.new_page.assert_called_once()
+            # new_page() returns the Playwright page from context.new_page()
+            assert new_page is mock_page
 
     @pytest.mark.asyncio
     async def test_new_page_without_context_raises_state_error(self):

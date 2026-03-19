@@ -125,6 +125,13 @@ Browser options are read at daemon startup from the following sources, in priori
 | `./bridgic-browser.json` | Project-local config (in cwd at daemon start) |
 | Environment variables | See `skills/bridgic-browser/references/env-vars.md` |
 
+**Headed browser note (macOS/Linux/Windows):**
+When `headless=false` and you did not explicitly set `channel` or `executable_path`, the daemon will **prefer launching the system-installed stable Chrome** when it can detect one.
+This avoids Playwright’s bundled “Chrome for Testing”.
+To force a specific browser, set either:
+- `channel` (recommended): e.g. `"chrome"`, `"msedge"`, `"chromium"`
+- `executable_path`: absolute path to a browser binary
+
 The JSON sources accept any `Browser` constructor parameter:
 
 ```json
@@ -207,7 +214,7 @@ from bridgic.browser.session import Browser
 # Isolated session (no persistence)
 browser = Browser(
     headless=True,
-    viewport={"width": 1920, "height": 1080},
+    viewport={"width": 1600, "height": 900},
 )
 
 # Persistent session (with user data)
@@ -223,7 +230,7 @@ browser = Browser(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `headless` | bool | True | Run in headless mode |
-| `viewport` | dict | 1920x1080 | Browser viewport size |
+| `viewport` | dict | 1600x900 | Browser viewport size |
 | `user_data_dir` | str/Path | None | Path for persistent context |
 | `stealth` | bool/StealthConfig | True | Stealth mode configuration |
 | `channel` | str | None | Browser channel (chrome, msedge, etc.) |
@@ -419,7 +426,7 @@ Stealth mode is **enabled by default** and includes:
 - 50+ Chrome arguments to disable automation detection
 - Disabled automation-revealing features (`navigator.webdriver`, etc.)
 - Human-like browser fingerprint
-- Optional extensions (uBlock Origin, Cookie Consent) for non-headless mode
+- Optional extensions (uBlock Origin Lite, I still don't care about cookies, Force Background Tab) for non-headless mode
 
 ```python
 # Stealth is ON by default
@@ -571,6 +578,13 @@ bridgic-browser close                       # 停止 daemon
 | `./bridgic-browser.json` | 项目本地配置（daemon 启动时的工作目录） |
 | 环境变量 | 统一说明见 `skills/bridgic-browser/references/env-vars.md` |
 
+**Headed 模式说明（macOS/Linux/Windows）：**
+当 `headless=false` 且你没有显式设置 `channel` 或 `executable_path` 时，daemon 会在检测到可用的情况下 **优先启动系统安装的稳定版 Chrome**。
+这样可以避免 Playwright 自带的 “Chrome for Testing”。
+如需强制指定浏览器，请显式设置：
+- `channel`（推荐）：例如 `"chrome"`、`"msedge"`、`"chromium"`
+- `executable_path`：浏览器可执行文件的绝对路径
+
 JSON 来源支持所有 `Browser` 构造参数：
 
 ```json
@@ -653,7 +667,7 @@ from bridgic.browser.session import Browser
 # 隔离会话（无持久化）
 browser = Browser(
     headless=True,
-    viewport={"width": 1920, "height": 1080},
+    viewport={"width": 1600, "height": 900},
 )
 
 # 持久化会话（带用户数据）
@@ -669,7 +683,7 @@ browser = Browser(
 | 参数 | 类型 | 默认值 | 描述 |
 |------|------|--------|------|
 | `headless` | bool | True | 无头模式运行 |
-| `viewport` | dict | 1920x1080 | 浏览器视口大小 |
+| `viewport` | dict | 1600x900 | 浏览器视口大小 |
 | `user_data_dir` | str/Path | None | 持久化上下文路径 |
 | `stealth` | bool/StealthConfig | True | 隐身模式配置 |
 | `channel` | str | None | 浏览器通道（chrome、msedge 等） |
@@ -865,7 +879,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - 50+ Chrome 参数禁用自动化检测
 - 禁用暴露自动化的特性（`navigator.webdriver` 等）
 - 类人的浏览器指纹
-- 可选扩展（uBlock Origin、Cookie Consent）用于非无头模式
+- 可选扩展（uBlock Origin Lite、I still don't care about cookies、Force Background Tab）用于非无头模式
 
 ```python
 # 隐身模式默认开启

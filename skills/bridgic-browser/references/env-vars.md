@@ -12,12 +12,12 @@ Use this reference when the task needs environment variable behavior or login st
 | `BRIDGIC_HEADLESS` | CLI daemon | unset | `0` forces headed mode; any other value = headless. Set by CLI `--headed`. |
 | `BRIDGIC_SOCKET` | CLI (Unix only) | platform default | Override Unix socket path for the daemon client/transport. |
 | `BRIDGIC_DAEMON_RESPONSE_TIMEOUT` | CLI client | `90` | Seconds to wait for a daemon response. |
-| `BRIDGIC_CLOSE_DISPATCH_TIMEOUT` | CLI daemon | `45` | Seconds to wait for in-flight commands during `close`. |
 | `BRIDGIC_DAEMON_STOP_TIMEOUT` | CLI daemon | `45` | Seconds to wait for daemon shutdown. |
 | `SKIP_BROWSER_TESTS` | Tests | unset | If `1/true/yes`, skip browser tests. |
 
 Notes:
 - Config file precedence for CLI (lowest -> highest): defaults, `~/.bridgic/bridgic-browser.json`, `./bridgic-browser.json`, `BRIDGIC_BROWSER_JSON`, `BRIDGIC_HEADLESS`.
+- When `headless=false` and neither `channel` nor `executable_path` is specified, the CLI daemon will *prefer* the system-installed stable Chrome when it can detect one (helps avoid Playwright’s bundled “Chrome for Testing”).
 
 ### Config Files and `BRIDGIC_BROWSER_JSON` Values
 
@@ -28,7 +28,7 @@ Notes:
 | Key | Type / values | Notes |
 |---|---|---|
 | `headless` | `true | false` | Default `true`. If `devtools=true`, headless is forced to `false`. |
-| `viewport` | `{ "width": int, "height": int }` or `null` | Default `1920x1080` when `no_viewport` is not set. |
+| `viewport` | `{ "width": int, "height": int }` or `null` | Default `1600x900` when `no_viewport` is not set. |
 | `user_data_dir` | string (path) | Enables persistent context. |
 | `stealth` | `true | false` or object | Object uses the StealthConfig keys below. |
 | `channel` | string | Examples: `"chrome"`, `"msedge"`, `"chromium"`. |
