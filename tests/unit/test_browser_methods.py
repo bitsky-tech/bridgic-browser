@@ -40,11 +40,14 @@ def test_browser_has_all_tool_methods():
 
 
 def test_browser_tool_set_builder():
+    import functools
     from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
     mock_browser = MagicMock(spec=Browser)
     for name in EXPECTED_METHODS:
+        real_method = getattr(Browser, name)
         mock_method = AsyncMock()
-        mock_method.__name__ = name
+        # Copy function metadata so inspect.signature works
+        functools.update_wrapper(mock_method, real_method)
         setattr(mock_browser, name, mock_method)
 
     # ALL category should include all CLI-mapped tools (67 tools)

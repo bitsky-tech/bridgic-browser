@@ -35,7 +35,7 @@ For more install options, see [uv's official documentation](https://docs.astral.
    ```
    This will:
    - Configure git hooks for code quality
-   - Create a Python 3.11 virtual environment
+   - Create a Python 3.10 virtual environment
    - Install all development dependencies
    - Install Playwright browsers (Chromium)
 

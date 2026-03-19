@@ -64,7 +64,7 @@ clean:
 # Publish package
 publish: build
 	@source $(SET_CREDENTIALS) && \
-	version=$$(uv run python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])") && \
+	version=$$(uv run python -c "import re, pathlib; m=re.search(r'version\s*=\s*\"([^\"]+)\"', pathlib.Path('pyproject.toml').read_text(encoding='utf-8')); print(m.group(1))") && \
 	uv run python $(VERSION_CHECK) --version "$$version" --repo "$(repo)" --package "$(package_name)" && \
 	$(MAKE) _publish_$(repo)
 
