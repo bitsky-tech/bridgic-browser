@@ -106,8 +106,8 @@ This model is the foundation of all correspondence in this guide.
 ## Parameter Translation Rules (Important for Code Generation)
 
 - Ref normalization:
-  - CLI accepts `@e2` and `e2`.
-  - SDK ref methods use plain `"e2"`.
+  - CLI accepts `@8d4b03a9` and `8d4b03a9`.
+  - SDK ref methods use plain `"8d4b03a9"`.
 - `snapshot`:
   - `-i` -> `interactive=True`
   - `-F` -> `full_page=False`
@@ -123,7 +123,7 @@ This model is the foundation of all correspondence in this guide.
 - `mouse-click X Y --button right --count 2` -> `mouse_click(X, Y, button="right", click_count=2)`
 - `fill-form '<json>'`:
   - CLI passes JSON string.
-  - SDK uses parsed list: `fill_form(fields=[{"ref":"e1","value":"..."}], submit=False)`
+  - SDK uses parsed list: `fill_form(fields=[{"ref":"1f79fe5e","value":"..."}], submit=False)`
 - `mouse-drag X1 Y1 X2 Y2` -> `mouse_drag(X1, Y1, X2, Y2)` (positional only; params named `start_x, start_y, end_x, end_y`)
 - `dialog --dismiss --text T` -> `handle_dialog(accept=False, prompt_text=T)`
 - `dialog-setup --action dismiss --text T` -> `setup_dialog_handler(default_action="dismiss", default_prompt_text=T)`
@@ -151,9 +151,9 @@ CLI flow:
 ```bash
 bridgic-browser open https://example.com/login
 bridgic-browser snapshot -i
-bridgic-browser fill @e3 "alice@example.com"
-bridgic-browser fill @e4 "secret"
-bridgic-browser click @e5
+bridgic-browser fill @d6a530b4 "alice@example.com"
+bridgic-browser fill @1f79fe5e "secret"
+bridgic-browser click @8d4b03a9
 bridgic-browser wait "Dashboard"
 bridgic-browser screenshot logged-in.png
 ```
@@ -168,9 +168,9 @@ async def run() -> None:
     async with Browser(headless=False) as browser:
         await browser.navigate_to("https://example.com/login")
         await browser.get_snapshot_text(interactive=True)
-        await browser.input_text_by_ref("e3", "alice@example.com")
-        await browser.input_text_by_ref("e4", "secret")
-        await browser.click_element_by_ref("e5")
+        await browser.input_text_by_ref("d6a530b4", "alice@example.com")
+        await browser.input_text_by_ref("1f79fe5e", "secret")
+        await browser.click_element_by_ref("8d4b03a9")
         await browser.wait_for(text="Dashboard")
         await browser.take_screenshot(filename="logged-in.png")
 

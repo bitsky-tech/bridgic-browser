@@ -50,7 +50,7 @@ Return Value Format
 All tools return a string message following a consistent format:
 
 **Success messages**:
-- Action confirmation: "Clicked element e1", "Navigated to https://..."
+- Action confirmation: "Clicked element 8d4b03a9", "Navigated to https://..."
 - Data results: JSON string or formatted text
 
 **Exceptions raised**:

@@ -38,8 +38,8 @@ Returned by `Browser.get_snapshot()`. Exposed from `bridgic.browser.session`.
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `tree`    | str  | Accessibility tree as a string. Lines look like `- role "name" [ref=e1]`. |
-| `refs`    | Dict[str, RefData] | Map from ref id (e.g. `"e1"`) to `RefData` used to resolve the element. |
+| `tree`    | str  | Accessibility tree as a string. Lines look like `- role "name" [ref=1f79fe5e]`. |
+| `refs`    | Dict[str, RefData] | Map from ref id (e.g. `"1f79fe5e"`) to `RefData` used to resolve the element. |
 
 ## RefData
 
@@ -70,7 +70,7 @@ generator = SnapshotGenerator()
 snapshot = await generator.get_enhanced_snapshot_async(page, SnapshotOptions(interactive=False, full_page=False))
 
 # Get a locator from a ref (requires the same page and the snapshot’s refs)
-locator = generator.get_locator_from_ref_async(page, "e2", snapshot.refs)
+locator = generator.get_locator_from_ref_async(page, "8d4b03a9", snapshot.refs)
 if locator:
     await locator.click()
 ```
@@ -111,7 +111,7 @@ The character limit is configured via `BRIDGIC_MAX_CHARS`; see `skills/bridgic-b
 
 ## get_element_by_ref
 
-- **Usage**: `locator = await browser.get_element_by_ref(ref)` (e.g. `ref="e1"`).
+- **Usage**: `locator = await browser.get_element_by_ref(ref)` (e.g. `ref="1f79fe5e"`).
 - **Returns**: A Playwright `Locator` or `None` if the ref is invalid or the element is not found.
 - **Depends on**: The **last** snapshot. You must call `get_snapshot()` or `get_snapshot_text()` (which triggers a snapshot) before using refs.
 
@@ -119,8 +119,8 @@ Typical flow:
 
 1. Navigate: `await browser.navigate_to(url)`.
 2. Get state: `state = await browser.get_snapshot_text()` (or `snapshot = await browser.get_snapshot()`).
-3. LLM (or your code) reads the tree and picks a ref, e.g. `e5`.
-4. Interact: use tools like `await browser.click_element_by_ref("e5")`.
+3. LLM (or your code) reads the tree and picks a ref, e.g. `8d4b03a9`.
+4. Interact: use tools like `await browser.click_element_by_ref("8d4b03a9")`.
 
 If the page changes (e.g. after navigation or dynamic update), take a new snapshot or call `get_snapshot_text` again so refs stay valid.
 

@@ -60,8 +60,8 @@ Rule of thumb: if you're building an agent or want your script to behave like th
 
 ## Snapshot and Ref Rules
 
-- Refs are emitted in snapshot tree entries like `[ref=e5]`.
-- Resolve refs with ref-based methods (for example `click_element_by_ref("e5")`).
+- Refs are emitted in snapshot tree entries like `[ref=8d4b03a9]`.
+- Resolve refs with ref-based methods (for example `click_element_by_ref("8d4b03a9")`).
 - `navigate_to(...)` clears cached snapshot refs. Take a new snapshot after page changes.
 - `get_element_by_ref(...)` depends on the last snapshot cache.
 

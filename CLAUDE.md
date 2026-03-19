@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Bridgic Browser** is an LLM-driven browser automation library built on Playwright with built-in stealth mode. It provides 67 browser tools organized into categories, an accessibility tree-based snapshot system, a stable element reference system (`e1`, `e2`, …) designed for reliable AI agent interactions, and a `bridgic-browser` CLI tool backed by a persistent daemon.
+**Bridgic Browser** is an LLM-driven browser automation library built on Playwright with built-in stealth mode. It provides 67 browser tools organized into categories, an accessibility tree-based snapshot system, a stable element reference system (refs like "1f79fe5e", "8d4b03a9", …) designed for reliable AI agent interactions, and a `bridgic-browser` CLI tool backed by a persistent daemon.
 
 ## Commands
 
@@ -65,7 +65,7 @@ bridgic/browser/
    - Persistent mode: `launch_persistent_context(user_data_dir)` (preserves cookies/session)
 
 2. **`await browser.get_snapshot()`** → returns `EnhancedSnapshot`:
-   - `.tree: str` — accessibility tree lines like `- button "Submit" [ref=e5]`
+   - `.tree: str` — accessibility tree lines like `- button "Submit" [ref=8d4b03a9]`
    - `.refs: Dict[str, RefData]` — maps ref IDs to locator data
 
 3. **`await browser.get_element_by_ref(ref)`** → returns a Playwright `Locator` resolved from the snapshot refs dict.
@@ -74,7 +74,7 @@ bridgic/browser/
 
 ### Element reference system
 
-Refs (`e1`, `e2`, …) are generated during snapshot and stored in `EnhancedSnapshot.refs`. They are the stable, accessibility-aware identifiers used by all `*_by_ref` tools. When a page changes, call `get_snapshot()` again to refresh refs.
+Refs (like `1f79fe5e`, `8d4b03a9`, …) are generated during snapshot and stored in `EnhancedSnapshot.refs`. They are the stable, accessibility-aware identifiers used by all `*_by_ref` tools. When a page changes, call `get_snapshot()` again to refresh refs.
 
 ### Tool selection
 
@@ -116,7 +116,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 The `bridgic-browser` CLI uses a **daemon + Unix socket** pattern so the Playwright `Browser` instance persists across multiple short-lived CLI invocations.
 
 ```
-bridgic-browser click @e2
+bridgic-browser click @8d4b03a9
        │
        ▼
   _client.py                 Unix socket                   _daemon.py

@@ -1167,7 +1167,7 @@ class Browser:
         wait_until: Literal["domcontentloaded", "load", "networkidle", "commit"] = "domcontentloaded",
         timeout: Optional[float] = None,
     ) -> str:
-        """Navigate to URL in current tab. Use new_tab(url) for new tab.
+        """Navigate to URL in current tab.
 
         Parameters
         ----------
@@ -1627,7 +1627,7 @@ class Browser:
         Parameters
         ----------
         ref : str
-            Element ref from the last snapshot (e.g., ``'e1'``, ``'e2'``).
+            Element ref from the last snapshot (e.g., "1f79fe5e", "8d4b03a9").
             Obtain refs by calling :meth:`get_snapshot` or :meth:`get_snapshot_text` first.
         _fallback_depth : int, optional
             Internal recursion guard for the recovery path. Do not pass this parameter.
@@ -1889,9 +1889,9 @@ Interactive Elements: All interactive elements will be provided in format as:
 - role "name" [ref=ref_id]
 
 Examples:
-- button "Submit" [ref=e2]
-- textbox "Email" [ref=e3]
-- link "Learn more" [ref=e5]
+- button "Submit" [ref=8d4b03a9]
+- textbox "Email" [ref=d6a530b4]
+- link "Learn more" [ref=1f79fe5e]
 
 Note that:
 - Only elements with [ref=...] are interactive
@@ -1943,7 +1943,7 @@ Before you return the element ref, reason about the state and elements for a sen
     ) -> str:
         """Get page accessibility tree with element refs for interaction.
 
-        **Call this first** to get refs (e.g., e1, e2) before using action tools.
+        **Call this first** to get refs (e.g., 1f79fe5e) before using action tools.
 
         Parameters
         ----------
@@ -1962,7 +1962,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Returns
         -------
         str
-            Tree with refs like: `- button "Submit" [ref=e1]`
+            Tree with refs like: `- button "Submit" [ref=8d4b03a9]`
             Use refs with click_element_by_ref, input_text_by_ref, etc.
             Output is truncated to ``BRIDGIC_MAX_CHARS`` (default 30 000) characters.
             When truncated, a notice at the end shows the ``next_start_char`` value
@@ -2071,7 +2071,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         query : str
-            Search query string.
+            Query string to search.
         engine : str, optional
             "duckduckgo" (default), "google", or "bing".
         wait_until : str, default "domcontentloaded"
@@ -2695,7 +2695,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "e1", "e2").
+            Element ref from snapshot (e.g., "8d4b03a9").
         text : str
             Text to input.
         clear : bool, optional
@@ -2787,7 +2787,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "e1", "e2").
+            Element ref from snapshot (e.g., "8d4b03a9").
 
         Returns
         -------
@@ -2849,7 +2849,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "e1").
+            Element ref from snapshot (e.g., "8d4b03a9").
 
         Returns
         -------
@@ -2897,12 +2897,12 @@ Before you return the element ref, reason about the state and elements for a sen
             _raise_operation_error(error_msg)
 
     async def select_dropdown_option_by_ref(self, ref: str, text: str) -> str:
-        """Select an option from a dropdown by visible text or value.
+        """Select an option from a dropdown by ref and option text.
 
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "e1").
+            Element ref from snapshot (e.g., "1f79fe5e").
         text : str
             Option text or value to select.
 
@@ -2984,7 +2984,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "e1").
+            Element ref from snapshot (e.g., "d8ae31b4").
 
         Returns
         -------
@@ -3058,7 +3058,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "e1").
+            Element ref from snapshot (e.g., "1fe9cf5e").
 
         Returns
         -------
@@ -3098,7 +3098,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "e1").
+            Element ref from snapshot (e.g., "8d4b03a9").
         code : str
             Arrow function receiving the element as first arg, e.g., "el => el.textContent".
 
@@ -3137,7 +3137,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "e1").
+            Element ref from snapshot (e.g., "1f79fe5e").
         file_path : str
             Path to the file to upload.
 
@@ -3195,9 +3195,9 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         start_ref : str
-            Element ref to drag (e.g., "e1").
+            Element ref to drag (e.g., "8d4b03a9").
         end_ref : str
-            Element ref of drop target (e.g., "e2").
+            Element ref of drop target (e.g., "1f79fe5e").
 
         Returns
         -------
@@ -3236,7 +3236,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "e1").
+            Element ref from snapshot (e.g., "8d4b03a9").
 
         Returns
         -------
@@ -3320,7 +3320,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "e1").
+            Element ref from snapshot (e.g., "1f79fe5e").
 
         Returns
         -------
@@ -3416,7 +3416,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "e1").
+            Element ref from snapshot (e.g., "09ea4f1e").
 
         Returns
         -------
@@ -3485,7 +3485,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         ref : str
-            Element ref from snapshot (e.g., "e1").
+            Element ref from snapshot (e.g., "1f79fe5e").
 
         Returns
         -------
@@ -3730,9 +3730,6 @@ Before you return the element ref, reason about the state and elements for a sen
     async def type_text(self, text: str, submit: bool = False) -> str:
         """Type text sequentially using keyboard press events.
 
-        Type text character by character using keyboard press events on the
-        currently focused element.
-
         Parameters
         ----------
         text : str
@@ -3834,13 +3831,13 @@ Before you return the element ref, reason about the state and elements for a sen
         fields: List[Dict[str, str]],
         submit: bool = False,
     ) -> str:
-        """Fill multiple form fields at once.
+        """Fill multiple form fields all at once.
 
         Parameters
         ----------
         fields : List[Dict[str, str]]
             List of field specifications. Each dict should have:
-            - 'ref': Element ref from snapshot (e.g., "e1")
+            - 'ref': Element ref from snapshot (e.g., "8d4a07a9")
             - 'value': Value to fill into the field
         submit : bool, optional
             Whether to press Enter after filling the last field. Default is False.
@@ -5054,7 +5051,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         ref : str
-            Element ref obtained from snapshot refs (e.g., "e1", "e2").
+            Element ref obtained from snapshot refs (e.g., "8d4b03a9").
         value : str
             Expected value.
         attribute : str, optional
@@ -5124,7 +5121,7 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         ref : str
-            Element ref obtained from snapshot refs (e.g., "e1", "e2").
+            Element ref obtained from snapshot refs (e.g., "1f79fe5e").
         state : str
             Expected state. Options: "visible", "hidden", "enabled",
             "disabled", "checked", "unchecked", "editable".

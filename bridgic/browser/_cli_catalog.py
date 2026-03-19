@@ -85,7 +85,7 @@ CLI_COMMAND_META: dict[str, tuple[ToolCategory, str]] = {
     "search": (ToolCategory.NAVIGATION, "Search the web using a search engine (starts a browser session if needed) [--headed] [--engine duckduckgo|google|bing]"),
     "info": (ToolCategory.NAVIGATION, "Show current page URL, title, viewport, scroll position"),
     "snapshot": (ToolCategory.SNAPSHOT, "Get accessibility tree of the current page (full-page by default) with refs [-i] [-F viewport-only] [-s OFFSET]"),
-    "click": (ToolCategory.ELEMENT_INTERACTION, "Click an element by ref (@e2 or e2)"),
+    "click": (ToolCategory.ELEMENT_INTERACTION, "Click an element by ref (@80365bf7 or 80365bf7)"),
     "double-click": (ToolCategory.ELEMENT_INTERACTION, "Double-click an element by ref"),
     "hover": (ToolCategory.ELEMENT_INTERACTION, "Hover over an element by ref"),
     "focus": (ToolCategory.ELEMENT_INTERACTION, "Focus an element by ref"),

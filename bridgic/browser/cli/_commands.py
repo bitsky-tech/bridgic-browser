@@ -4,8 +4,8 @@ Bridgic Browser CLI commands (click-based).
 Common usage examples:
     bridgic-browser open https://example.com
     bridgic-browser snapshot [-i] [-F]
-    bridgic-browser click @e2
-    bridgic-browser fill @e3 "test@example.com"
+    bridgic-browser click @8d4b03a9
+    bridgic-browser fill @d6a530b4 "test@example.com"
     bridgic-browser screenshot page.png
     bridgic-browser close
 """
@@ -192,7 +192,7 @@ def cmd_info() -> None:
 @click.option("-s", "--start-from-char", default=0, type=click.IntRange(min=0),
               help="Pagination offset. Get the offset value from the truncation notice when the page is too long.")
 def cmd_snapshot(interactive: bool, full_page: bool, start_from_char: int) -> None:
-    """Get an accessibility tree representation of the current page with refs (like e1, e2)."""
+    """Get an accessibility tree representation of the current page with refs (like 37edb785, 07eabf1e)."""
     try:
         _ok(send_command("snapshot", {
             "interactive": interactive,
@@ -208,7 +208,7 @@ def cmd_snapshot(interactive: bool, full_page: bool, start_from_char: int) -> No
 @cli.command("click", context_settings=CONTEXT_SETTINGS)
 @click.argument("ref")
 def cmd_click(ref: str) -> None:
-    """Click an element by ref (@e2 or e2)."""
+    """Click an element by ref (@80365bf7 or 80365bf7)."""
     try:
         _ok(send_command("click", {"ref": _strip_ref(ref)}, start_if_needed=False))
     except Exception as exc:
@@ -341,7 +341,7 @@ def cmd_upload(ref: str, path: str) -> None:
 @click.option("--submit", is_flag=True, default=False,
               help="Press Enter after filling the last field.")
 def cmd_fill_form(fields_json: str, submit: bool) -> None:
-    """Fill multiple form fields at once. FIELDS_JSON is a JSON array like '[{"ref":"e1","value":"hi"}]'."""
+    """Fill multiple form fields all at once. FIELDS_JSON is a JSON array like '[{"ref":"8d4a07a9","value":"hi"}]'."""
     try:
         _ok(send_command("fill_form", {"fields": fields_json, "submit": submit}, start_if_needed=False))
     except Exception as exc:

@@ -11,7 +11,7 @@ Short reference for the main session and download APIs. For tool lists and selec
 | `await browser.stop()` | Stop the browser, auto-cleans active capture listeners. |
 | `await browser.navigate_to(url, wait_until="domcontentloaded", timeout=None)` | Navigate to URL with optional auto-prefix when missing protocol. `wait_until`: `"domcontentloaded"` (default), `"load"`, `"networkidle"`, or `"commit"`. `timeout` in seconds. |
 | `await browser.get_snapshot(interactive=False, full_page=True)` | Get `EnhancedSnapshot` (`.tree`, `.refs`). Raises `StateError` if no active page, `OperationError` if generation fails. Never returns `None`. |
-| `await browser.get_element_by_ref(ref)` | Get Playwright `Locator` for ref (e.g. `"e1"`) or `None` if not found. Uses last cached snapshot refs — call `get_snapshot()` first. |
+| `await browser.get_element_by_ref(ref)` | Get Playwright `Locator` for ref (e.g. `"8d4b03a9"`) or `None` if not found. Uses last cached snapshot refs — call `get_snapshot()` first. |
 | `await browser.get_current_page()` | Get current Playwright `Page` or `None`. |
 | `await browser.get_current_page_title()` | Get current page title string, or `None` if no page is open. |
 | `browser.get_current_page_url()` | Get current page URL string, or `None` if no page is open. (sync) |

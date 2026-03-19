@@ -44,7 +44,7 @@ Usage:
             )
 
             # Get locator from ref for interaction
-            locator = generator.get_locator_from_ref_async(page, "@e2", snapshot.refs)
+            locator = generator.get_locator_from_ref_async(page, "@8d4b03a9", snapshot.refs)
             if locator:
                 await locator.click()
 
@@ -153,7 +153,7 @@ class RoleNameTracker:
         name : Optional[str]
             Accessible name.
         ref : str
-            Generated ref (e.g., ``e1``).
+            Generated ref (e.g., "8d4b03a9").
         """
         key = self.get_key(role, name)
         if key not in self.refs_by_key:
@@ -1790,7 +1790,7 @@ class SnapshotGenerator:
         The locator can then be used for interactions (click, fill, etc.).
 
         Locator Construction:
-        1. Parse ref string to extract ref ID (e.g., "@e1" -> "e1")
+        1. Parse ref string to extract ref ID (e.g., "@8d4b03a9" -> "8d4b03a9")
         2. Look up RefData from the refs dictionary
         3. Build locator using get_by_role(role, name=name, exact=True)
         4. Apply nth() if disambiguation is needed for duplicate role+name

@@ -51,10 +51,10 @@ async def main():
 
         # Get page snapshot for LLM (returns EnhancedSnapshot with .tree and .refs)
         snapshot = await browser.get_snapshot()
-        print(snapshot.tree)  # Tree format: - role "name" [ref=e1]
+        print(snapshot.tree)  # Tree format: - role "name" [ref=1f79fe5e]
 
         # Interact with elements by ref (use refs from the snapshot)
-        element = await browser.get_element_by_ref("e1")
+        element = await browser.get_element_by_ref("1f79fe5e")
         if element:
             await element.click()
     finally:
@@ -108,8 +108,8 @@ After installation, the Skill will appear in your project’s agent directories 
 ```bash
 bridgic-browser open https://example.com   # auto-starts daemon
 bridgic-browser snapshot                    # print accessibility tree
-bridgic-browser click @e2
-bridgic-browser fill @e3 "hello@example.com"
+bridgic-browser click @8d4b03a9
+bridgic-browser fill @d6a530b4 "hello@example.com"
 bridgic-browser screenshot page.png
 bridgic-browser close                       # stop the daemon
 ```
@@ -230,7 +230,7 @@ browser = Browser(
 | `proxy` | dict | None | Proxy settings |
 | `downloads_path` | str/Path | None | Download directory |
 
-**Snapshot:** Use `get_snapshot(interactive=False, full_page=True)` to get an `EnhancedSnapshot` with `.tree` (accessibility tree string) and `.refs` (ref → locator data). By default `full_page=True` includes all elements regardless of viewport position. Pass `interactive=True` for clickable/editable elements only (flattened output), or `full_page=False` to limit to viewport-only elements. Use `get_element_by_ref(ref)` to get a Playwright Locator from a ref (e.g. `"e1"`) for click, fill, etc.
+**Snapshot:** Use `get_snapshot(interactive=False, full_page=True)` to get an `EnhancedSnapshot` with `.tree` (accessibility tree string) and `.refs` (ref → locator data). By default `full_page=True` includes all elements regardless of viewport position. Pass `interactive=True` for clickable/editable elements only (flattened output), or `full_page=False` to limit to viewport-only elements. Use `get_element_by_ref(ref)` to get a Playwright Locator from a ref (e.g. "1f79fe5e") for click, fill, etc.
 
 #### StealthConfig
 
@@ -497,10 +497,10 @@ async def main():
 
         # 获取页面快照供 LLM 使用（返回 EnhancedSnapshot，含 .tree 和 .refs）
         snapshot = await browser.get_snapshot()
-        print(snapshot.tree)  # 树格式：- role "name" [ref=e1]
+        print(snapshot.tree)  # 树格式：- role "name" [ref=1f79fe5e]
 
         # 通过引用与元素交互（使用快照中的 ref）
-        element = await browser.get_element_by_ref("e1")
+        element = await browser.get_element_by_ref("1f79fe5e")
         if element:
             await element.click()
     finally:
@@ -554,8 +554,8 @@ npx skills add bitsky-tech/bridgic-browser --skill bridgic-browser
 ```bash
 bridgic-browser open https://example.com   # 自动启动 daemon
 bridgic-browser snapshot                    # 打印可访问性树
-bridgic-browser click @e2
-bridgic-browser fill @e3 "hello@example.com"
+bridgic-browser click @8d4b03a9
+bridgic-browser fill @d6a530b4 "hello@example.com"
 bridgic-browser screenshot page.png
 bridgic-browser close                       # 停止 daemon
 ```
@@ -676,7 +676,7 @@ browser = Browser(
 | `proxy` | dict | None | 代理设置 |
 | `downloads_path` | str/Path | None | 下载目录 |
 
-**快照：** 使用 `get_snapshot(interactive=False, full_page=True)` 获取 `EnhancedSnapshot`，含 `.tree`（可访问性树字符串）和 `.refs`（ref → 定位数据）。默认 `full_page=True` 包含所有元素（不限于视口）。`interactive=True` 仅包含可点击/可编辑元素（扁平输出），`full_page=False` 仅包含视口内元素。使用 `get_element_by_ref(ref)` 根据 ref（如 `"e1"`）获取 Playwright Locator 后进行 click、fill 等操作。
+**快照：** 使用 `get_snapshot(interactive=False, full_page=True)` 获取 `EnhancedSnapshot`，含 `.tree`（可访问性树字符串）和 `.refs`（ref → 定位数据）。默认 `full_page=True` 包含所有元素（不限于视口）。`interactive=True` 仅包含可点击/可编辑元素（扁平输出），`full_page=False` 仅包含视口内元素。使用 `get_element_by_ref(ref)` 根据 ref（如 "1f79fe5e"）获取 Playwright Locator 后进行 click、fill 等操作。
 
 #### StealthConfig
 

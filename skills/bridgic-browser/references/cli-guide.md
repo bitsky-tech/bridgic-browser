@@ -22,8 +22,8 @@ playwright install chromium
 ```bash
 bridgic-browser open https://example.com
 bridgic-browser snapshot
-bridgic-browser click @e2
-bridgic-browser fill @e3 "hello@example.com"
+bridgic-browser click @8d4b03a9
+bridgic-browser fill @d6a530b4 "hello@example.com"
 bridgic-browser screenshot page.png
 bridgic-browser close
 ```
@@ -67,7 +67,7 @@ bridgic-browser snapshot -h
 
 ```bash
 # Fill and press Enter in one step
-bridgic-browser fill @e3 "hello@example.com" --submit
+bridgic-browser fill @d6a530b4 "hello@example.com" --submit
 
 # Snapshot only interactive elements
 bridgic-browser snapshot -i

@@ -24,7 +24,7 @@ This guide helps you choose the right tools for different browser automation sce
 
 ## Page state and get_snapshot_text
 
-**Call `browser.get_snapshot_text()` first** to get element refs (e.g. `e1`, `e2`) before using ref-based action tools. It returns a string representation of the accessibility tree that you can pass to your LLM; refs in that string are stable for the current page and can be used with `click_element_by_ref`, `input_text_by_ref`, etc.
+**Call `browser.get_snapshot_text()` first** to get element refs (e.g. `1f79fe5e`, `8d4b03a9`) before using ref-based action tools. It returns a string representation of the accessibility tree that you can pass to your LLM; refs in that string are stable for the current page and can be used with `click_element_by_ref`, `input_text_by_ref`, etc.
 
 ### Parameters
 
@@ -61,15 +61,15 @@ state = await browser.get_snapshot_text(full_page=False)
 
 ### When to Use Ref-based Tools
 
-**Ref-based tools** use element references (e.g., "e1", "e2") from the page state:
+**Ref-based tools** use element references (e.g., "1f79fe5e", "8d4b03a9") from the page state:
 
 ```python
 # Get page state with element refs
 state = await browser.get_snapshot_text()
-# Tree lines look like: "- button 'Submit' [ref=e5]"
+# Tree lines look like: "- button 'Submit' [ref=8d4b03a9]"
 
 # Use ref to interact
-await browser.click_element_by_ref("e5")
+await browser.click_element_by_ref("8d4b03a9")
 ```
 
 **Advantages**:
@@ -116,14 +116,14 @@ await browser.mouse_drag(start_x=100, start_y=100, end_x=300, end_y=200)
 The **default choice** for most text input scenarios.
 
 ```python
-await browser.input_text_by_ref("e3", "hello@example.com")
+await browser.input_text_by_ref("d6a530b4", "hello@example.com")
 ```
 
 Full signature: `input_text_by_ref(ref, text, clear=True, is_secret=False, slowly=False, submit=False)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `ref` | str | — | Element ref from snapshot (e.g. `"e3"`) |
+| `ref` | str | — | Element ref from snapshot (e.g. `"d6a530b4"`) |
 | `text` | str | — | Text to input |
 | `clear` | bool | `True` | Clear the field before typing |
 | `is_secret` | bool | `False` | Hide text value in the result message (e.g. passwords) |
@@ -138,7 +138,7 @@ Full signature: `input_text_by_ref(ref, text, clear=True, is_secret=False, slowl
 For inputs that need character-by-character typing:
 
 ```python
-await browser.input_text_by_ref("e3", "search query", slowly=True)
+await browser.input_text_by_ref("d6a530b4", "search query", slowly=True)
 ```
 
 - Types each character with 100ms delay
@@ -172,7 +172,7 @@ await browser.type_text("hello world")
 
 ```python
 # Ref-based - preferred for standard elements
-await browser.click_element_by_ref("e5")
+await browser.click_element_by_ref("8d4b03a9")
 
 # Coordinate-based - for special cases
 await browser.mouse_click(x=500, y=300)
@@ -190,7 +190,7 @@ await browser.mouse_click(x=500, y=300)
 
 ```python
 # Ref-based
-await browser.double_click_element_by_ref("e5")
+await browser.double_click_element_by_ref("8d4b03a9")
 
 # Coordinate-based
 await browser.mouse_click(x=500, y=300, click_count=2)
@@ -235,7 +235,7 @@ await browser.mouse_wheel(delta_x=200)
 Drag one element to another:
 
 ```python
-await browser.drag_element_by_ref(start_ref="e3", end_ref="e7")
+await browser.drag_element_by_ref(start_ref="d6a530b4", end_ref="1f79fe5e")
 ```
 
 ### `mouse_drag`
@@ -397,9 +397,9 @@ tools = builder.build()["tool_specs"]
 ```python
 # Using fill_form for multiple fields
 await browser.fill_form([
-    {"ref": "e1", "value": "John Doe"},
-    {"ref": "e2", "value": "john@example.com"},
-    {"ref": "e3", "value": "secret123"},
+    {"ref": "1f79fe5e", "value": "John Doe"},
+    {"ref": "8d4b03a9", "value": "john@example.com"},
+    {"ref": "07ea3f1c", "value": "secret123"},
 ], submit=True)
 ```
 
@@ -407,13 +407,13 @@ await browser.fill_form([
 
 ```python
 # First, get available options
-options = await browser.get_dropdown_options_by_ref("e5")
+options = await browser.get_dropdown_options_by_ref("8d4b03a9")
 # Returns: "1. Option A (value: a)\n2. Option B (value: b)"
 
 # Then select by text or value
-await browser.select_dropdown_option_by_ref("e5", "Option A")
+await browser.select_dropdown_option_by_ref("8d4b03a9", "Option A")
 # or
-await browser.select_dropdown_option_by_ref("e5", "a")
+await browser.select_dropdown_option_by_ref("8d4b03a9", "a")
 ```
 
 ### File Upload
