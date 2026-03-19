@@ -204,8 +204,16 @@ jobs:
         shell: pwsh
         run: |
           $runInfo = "$env:USERPROFILE\.bridgic\run\bridgic-browser.json"
+          # Daemon responds to close immediately but cleans up asynchronously;
+          # poll for up to 30 seconds before declaring failure.
+          $timeout = 30
+          $elapsed = 0
+          while ((Test-Path $runInfo) -and ($elapsed -lt $timeout)) {
+            Start-Sleep -Seconds 1
+            $elapsed++
+          }
           if (Test-Path $runInfo) {
-            Write-Error "Run info still exists after close: $runInfo"
+            Write-Error "Run info still exists after close (waited ${elapsed}s): $runInfo"
             exit 1
           }
-          Write-Output "OK: daemon cleaned up correctly"
+          Write-Output "OK: daemon cleaned up correctly (${elapsed}s)"
