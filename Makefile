@@ -1,12 +1,11 @@
 SHELL := /bin/bash
 ROOT_DIR := $(shell git rev-parse --show-toplevel)
-VERSION_CHECK := $(ROOT_DIR)/scripts/version_check.py
-SET_CREDENTIALS := $(ROOT_DIR)/scripts/set_publish_credentials.sh
 
 .PHONY: init-dev test build publish clean download-extensions
 
 package_name := bridgic-browser
 repo ?= btsk
+version ?=
 
 # Install Playwright browser binaries used by tests.
 # Note: Playwright may use a separate `chromium_headless_shell` executable in headless mode,
@@ -61,21 +60,16 @@ clean:
 	@find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	@echo "==> Cleaned build artifacts"
 
-# Publish package
-publish: build
-	@source $(SET_CREDENTIALS) && \
-	version=$$(uv run python -c "import re, pathlib; m=re.search(r'version\s*=\s*\"([^\"]+)\"', pathlib.Path('pyproject.toml').read_text(encoding='utf-8')); print(m.group(1))") && \
-	uv run python $(VERSION_CHECK) --version "$$version" --repo "$(repo)" --package "$(package_name)" && \
-	$(MAKE) _publish_$(repo)
-
-_publish_btsk:
-	@uv publish dist/* --index btsk-repo --config-file $(ROOT_DIR)/uv.toml
-
-_publish_testpypi:
-	@uv publish dist/* --index test-pypi --config-file $(ROOT_DIR)/uv.toml
-
-_publish_pypi:
-	@uv publish dist/* --config-file $(ROOT_DIR)/uv.toml
+# Release: version check → update pyproject.toml → test → build → publish
+# Usage: make publish version=0.1.0 repo=pypi
+#        make publish repo=btsk  (uses current version from pyproject.toml)
+publish:
+	@ver="$(version)"; \
+	if [ -z "$$ver" ]; then \
+		ver=$$(uv run python -c "import re,pathlib;m=re.search(r'version\s*=\s*\"([^\"]+)\"',pathlib.Path('pyproject.toml').read_text());print(m.group(1))"); \
+		echo "==> No version specified, using current: $$ver"; \
+	fi; \
+	bash "$(ROOT_DIR)/scripts/release.sh" "$$ver" "$(repo)"
 
 download-extensions:
 	@echo "==> Downloading stealth extensions into bridgic/browser/extensions/ ..."
@@ -91,10 +85,11 @@ help:
 	@echo "  test-integration - Run integration tests only"
 	@echo "  build           - Build package"
 	@echo "  clean           - Clean build artifacts"
-	@echo "  publish         - Publish package (repo=btsk|testpypi|pypi)"
+	@echo "  publish         - Release package (version=<ver> repo=btsk|testpypi|pypi)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make init-dev"
 	@echo "  make test"
 	@echo "  make build"
-	@echo "  make publish repo=testpypi"
+	@echo "  make publish repo=btsk                  # uses current version from pyproject.toml"
+	@echo "  make publish version=0.1.0 repo=pypi"

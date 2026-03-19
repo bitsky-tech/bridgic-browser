@@ -26,8 +26,9 @@ uv run pytest tests/unit/test_tools.py::test_name -v
 
 **Build & publish**:
 ```bash
-make build
-make publish repo=testpypi   # or repo=btsk or repo=pypi
+make build                                    # Build only
+make publish version=0.1.0 repo=testpypi      # Full release: version check → test → build → publish
+./scripts/release.sh 0.1.0 pypi               # Or call release.sh directly
 ```
 
 **Playwright browser binaries**:
