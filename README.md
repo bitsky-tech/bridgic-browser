@@ -1,22 +1,19 @@
-# Bridgic Browser
-
-[English](#english) | [中文](#中文)
+[English](#bridgic-browser) | [中文](#中文文档)
 
 ---
 
-<a name="english"></a>
+## Bridgic Browser
 
-## English
-
-**Bridgic Browser** is a Python library for LLM-driven browser automation built on [Playwright](https://playwright.dev/). It provides a high-level API for building AI agents that can interact with web browsers, featuring built-in stealth mode for bypassing bot detection.
+**Bridgic Browser** is a Python library for LLM-driven browser automation built on [Playwright](https://playwright.dev/). It includes CLI tools, Python tools and skills for AI agents.
 
 ### Features
 
-- **LLM-Ready Browser Automation** - Designed for AI agents with structured page snapshots and element references
+- **Comprehensive CLI Tools** - 67 tools organized into 15 categories; Designed to integrate with any AI agent
+- **Python-based Tools** - Used for agent / workflow code generation; Easier integration with [Bridgic](https://github.com/bitsky-tech/bridgic) 
+- **Snapshot with Semantic Invariance** - A representation of page snapshot based on accessibility tree and a specially designed ref-generation algorithm that ensures element refs remain unchanged across page reloads
+- **Skills** - Used for guided exploration and code generation; Compatible with most of coding agents
 - **Stealth Mode (Enabled by Default)** - 50+ Chrome args and optimizations to bypass bot detection
 - **Dual Launch Mode** - Automatically switches between isolated sessions and persistent contexts
-- **Download Management** - Automatic download handling with proper filename preservation
-- **Comprehensive Tool Set** - Navigation, element interaction, tab management, and more
 
 ### Installation
 
@@ -32,64 +29,101 @@ playwright install chromium
 
 ### Quick Start
 
-#### Basic Usage
+#### CLI Tolls Usage
 
-```python
-import asyncio
-from bridgic.browser.session import Browser
-
-async def main():
-    # Create browser with stealth mode (enabled by default)
-    browser = Browser(headless=False)
-
-    # Start browser
-    await browser.start()
-
-    try:
-        # Navigate to a URL
-        await browser.navigate_to("https://example.com")
-
-        # Get page snapshot for LLM (returns EnhancedSnapshot with .tree and .refs)
-        snapshot = await browser.get_snapshot()
-        print(snapshot.tree)  # Tree format: - role "name" [ref=1f79fe5e]
-
-        # Interact with elements by ref (use refs from the snapshot)
-        element = await browser.get_element_by_ref("1f79fe5e")
-        if element:
-            await element.click()
-    finally:
-        await browser.stop()
-
-asyncio.run(main())
+```shell
+bridgic-browser open --headed https://example.com
+bridgic-browser snapshot
+# 'f0201d1c' is the ref value of the 'Learn more' link
+bridgic-browser click f0201d1c
+bridgic-browser screenshot page.png
+bridgic-browser close
 ```
 
-#### Using with AI Agents
+#### Python Tolls Integration
+
+First, build tools:
 
 ```python
 from bridgic.browser.session import Browser
 from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
 
-async def create_agent():
-    browser = Browser(headless=False)
-    await browser.start()
+# create a browser instance
+browser = Browser(headless=False)
 
+async def create_tools(browser):
     # Build a focused tool set for your agent
     builder = BrowserToolSetBuilder.for_categories(
         browser,
         ToolCategory.NAVIGATION,
+        ToolCategory.SNAPSHOT,
         ToolCategory.ELEMENT_INTERACTION,
         ToolCategory.CAPTURE,
+        ToolCategory.WAIT,
     )
     tools = builder.build()["tool_specs"]
-
-    # Use tools with your LLM agent
-    # tools include: navigate, click, input_text, scroll, etc.
-    return browser, tools
+    return tools
 ```
 
-#### AI Coding Assistants (Skill)
+Second (optional), build a [Bridgic](https://github.com/bitsky-tech/bridgic) agent that uses this tool set:
 
-Install this repo’s Skill using the `npx skills` CLI:
+```python
+import os
+from bridgic.llms.openai import OpenAILlm, OpenAIConfiguration
+async def create_llm():
+    _api_key = os.environ.get("OPENAI_API_KEY")
+    _model_name = os.environ.get("OPENAI_MODEL_NAME")
+
+    llm = OpenAILlm(
+        api_key=_api_key,
+        configuration=OpenAIConfiguration(model=_model_name),
+        timeout=60,
+    )
+    return llm
+
+from bridgic.core.agentic.recent import ReCentAutoma, StopCondition
+from bridgic.core.automa import RunningOptions
+async def create_agent(llm, tools):
+    browser_agent = ReCentAutoma(
+        llm=llm,
+        tools=tools,
+        stop_condition=StopCondition(max_iteration=10, max_consecutive_no_tool_selected=1),
+        running_options=RunningOptions(debug=True),
+    )
+    return browser_agent
+
+async def main():
+    tools = await create_tools(browser)
+    llm = await create_llm()
+    agent = await create_agent(llm, tools)
+    await browser.start()
+
+    result = await agent.arun(
+        goal=(
+            "Summarize the 'Learn more' page of example.com for me"
+        ),
+        guidance=(
+            "Do the following steps one by one:\n"
+            "1. Navigate to https://example.com\n"
+            "2. Click the 'Learn more' link\n"
+            "3. Take a screenshot of the 'Learn more' page\n"
+            "4. Summarize the page content in one sentence and tell me how to access the screenshot.\n"
+        ),
+    )
+    print("\n\n*** Final Result: ***\n\n")
+    print(result)
+
+    await browser.stop()
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
+```
+
+#### How to Install Skills?
+
+The skills of this repo can work with most of coding agents / AI assistant, such as Claude Code, Cursor, OpenClaw...
+Install using the `npx skills` CLI:
 
 ```bash
 # From this repository checkout
@@ -99,20 +133,39 @@ npx skills add . --skill bridgic-browser
 npx skills add bitsky-tech/bridgic-browser --skill bridgic-browser
 ```
 
-After installation, the Skill will appear in your project’s agent directories (for example, Claude Code typically under `.claude/skills/bridgic-browser/SKILL.md`, and Cursor under `.agents/skills/bridgic-browser/SKILL.md`).
+After installation, the Skill will appear in your project’s agent directories (for example, Claude Code typically under `.claude/skills/bridgic-browser/`, and Cursor under `.agents/skills/bridgic-browser/`).
 
-### CLI Tool
+#### Browser API Usage
 
-`bridgic-browser` ships with a command-line interface for controlling a browser from the terminal without writing Python. A persistent daemon process holds the browser; each CLI invocation connects over a Unix socket and exits immediately.
+You can also directly call the underlying `Browser` API to control the browser.
 
-```bash
-bridgic-browser open https://example.com   # auto-starts daemon
-bridgic-browser snapshot                    # print accessibility tree
-bridgic-browser click @8d4b03a9
-bridgic-browser fill @d6a530b4 "hello@example.com"
-bridgic-browser screenshot page.png
-bridgic-browser close                       # stop the daemon
+```python
+from bridgic.browser.session import Browser
+
+browser = Browser(headless=False)
+
+async def main():
+    await browser.start()
+    await browser.navigate_to("https://example.com")
+    snapshot = await browser.get_snapshot()
+    print(snapshot.tree)  # Tree format: - role "name" [ref=f0201d1c]
+    for ref, data in snapshot.refs.items():
+        if data.name == "Learn more":
+            learn_more_ref = ref
+            break
+    print(f"Found ref for 'Learn more': {learn_more_ref}")
+    await browser.click_element_by_ref(learn_more_ref)
+    await browser.take_screenshot(filename="page.png")
+    await browser.stop()
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
 ```
+
+### CLI Tools
+
+`bridgic-browser` ships with a command-line interface for controlling a browser from the terminal (67 tools organized into 15 categories). A persistent daemon process holds a browser instance; each CLI invocation connects over a Unix domain socket and exits immediately.
 
 #### Configuration
 
@@ -150,7 +203,7 @@ The JSON sources accept any `Browser` constructor parameter:
 BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open URL
 ```
 
-#### Commands
+#### Command List
 
 | Category | Commands |
 |----------|----------|
@@ -177,110 +230,16 @@ bridgic-browser -h
 bridgic-browser scroll -h
 ```
 
-### Error Model
+### Python Tools
 
-SDK and CLI share one structured error protocol.
+Bridgic Browser provides 67 tools organized into 15 categories. Use `BrowserToolSetBuilder` with category/name selection for scenario-focused tool sets.
 
-- Base type: `BridgicBrowserError`
-- Stable fields: `code`, `message`, `details`, `retryable`
-- Behavior subclasses:
-  - `InvalidInputError` (invalid arguments/user input)
-  - `StateError` (invalid runtime state, e.g. no active page/session)
-  - `OperationError` (operation execution failures)
-  - `VerificationError` (assertion/verification failures)
-
-Why keep a small number of behavior subclasses:
-
-- Lets callers catch by behavior when needed (e.g. retry only `StateError`)
-- Encodes default retry semantics close to the failure source
-- Avoids a large, hard-to-maintain class hierarchy while keeping error handling predictable
-
-Daemon protocol is also structured:
-
-- Success: `{"success": true, "result": "..."}`
-- Failure: `{"success": false, "error_code": "...", "result": "...", "data": {...}, "meta": {"retryable": false}}`
-
-CLI client converts daemon failures into `BridgicBrowserCommandError`, and CLI output keeps machine code visible as `Error[CODE]: ...`.
-
-### Core Components
-
-#### Browser
-
-The main class for browser automation with automatic launch mode selection:
-
-```python
-from bridgic.browser.session import Browser
-
-# Isolated session (no persistence)
-browser = Browser(
-    headless=True,
-    viewport={"width": 1600, "height": 900},
-)
-
-# Persistent session (with user data)
-browser = Browser(
-    headless=False,
-    user_data_dir="./user_data",
-    stealth=True,  # Enabled by default
-)
-```
-
-**Key Parameters:**
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `headless` | bool | True | Run in headless mode |
-| `viewport` | dict | 1600x900 | Browser viewport size |
-| `user_data_dir` | str/Path | None | Path for persistent context |
-| `stealth` | bool/StealthConfig | True | Stealth mode configuration |
-| `channel` | str | None | Browser channel (chrome, msedge, etc.) |
-| `proxy` | dict | None | Proxy settings |
-| `downloads_path` | str/Path | None | Download directory |
-
-**Snapshot:** Use `get_snapshot(interactive=False, full_page=True)` to get an `EnhancedSnapshot` with `.tree` (accessibility tree string) and `.refs` (ref → locator data). By default `full_page=True` includes all elements regardless of viewport position. Pass `interactive=True` for clickable/editable elements only (flattened output), or `full_page=False` to limit to viewport-only elements. Use `get_element_by_ref(ref)` to get a Playwright Locator from a ref (e.g. "1f79fe5e") for click, fill, etc.
-
-#### StealthConfig
-
-Configure stealth mode for bypassing bot detection:
-
-```python
-from bridgic.browser.session import StealthConfig, Browser
-
-# Custom stealth configuration
-config = StealthConfig(
-    enabled=True,
-    enable_extensions=True,  # Requires headless=False
-    disable_security=False,
-    cookie_whitelist_domains=["example.com"],
-)
-
-browser = Browser(stealth=config, headless=False)
-```
-
-#### DownloadManager
-
-Handle file downloads with proper filename preservation:
-
-```python
-# Pass downloads_path to Browser — it creates and manages the DownloadManager internally
-browser = Browser(downloads_path="./downloads", headless=True)
-await browser.start()
-
-# Access downloaded files via the built-in manager
-for file in browser.download_manager.downloaded_files:
-    print(f"Downloaded: {file.file_name} ({file.file_size} bytes)")
-```
-
-### Browser Tools
-
-Bridgic Browser provides 67 tools organized into categories. Use `BrowserToolSetBuilder` with category/name selection for scenario-focused tool sets.
-
-#### Quick Start with Categories
+#### Category-based Selection
 
 ```python
 from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
 
-# Focused set for common agent flows
+# Focused set for your specific agent flows
 builder = BrowserToolSetBuilder.for_categories(
     browser,
     ToolCategory.NAVIGATION,
@@ -291,16 +250,6 @@ tools = builder.build()["tool_specs"]
 
 # Include all available tools
 builder = BrowserToolSetBuilder.for_categories(browser, ToolCategory.ALL)
-tools = builder.build()["tool_specs"]
-```
-
-#### Category-based Selection
-
-```python
-# Select by category
-builder = BrowserToolSetBuilder.for_categories(
-    browser, "navigation", "element_interaction", "capture"
-)
 tools = builder.build()["tool_specs"]
 ```
 
@@ -326,11 +275,14 @@ builder = BrowserToolSetBuilder.for_tool_names(
 tools = builder.build()["tool_specs"]
 ```
 
-#### Combine `for_*` Builders
+#### Mixed Selection
 
 ```python
 builder1 = BrowserToolSetBuilder.for_categories(
-    browser, "navigation", "element_interaction", "capture"
+    browser,
+    ToolCategory.NAVIGATION,
+    ToolCategory.ELEMENT_INTERACTION,
+    ToolCategory.CAPTURE,
 )
 builder2 = BrowserToolSetBuilder.for_tool_names(
     browser, "verify_url", "verify_title"
@@ -338,7 +290,7 @@ builder2 = BrowserToolSetBuilder.for_tool_names(
 tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 ```
 
-#### Tool Categories
+#### Tool List
 
 **Navigation (6 tools):**
 - `navigate_to(url)` - Navigate to URL
@@ -419,6 +371,147 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `stop()` - Stop browser
 - `browser_resize(width, height)` - Resize viewport
 
+### CLI Tools -> Python Tools Mapping
+
+| CLI command | SDK tool method |
+|---|---|
+| `open` | `navigate_to` |
+| `search` | `search` |
+| `info` | `get_current_page_info` |
+| `reload` | `reload_page` |
+| `back` | `go_back` |
+| `forward` | `go_forward` |
+| `snapshot` | `get_snapshot_text` |
+| `click` | `click_element_by_ref` |
+| `fill` | `input_text_by_ref` |
+| `fill-form` | `fill_form` |
+| `scroll-to` | `scroll_element_into_view_by_ref` |
+| `select` | `select_dropdown_option_by_ref` |
+| `options` | `get_dropdown_options_by_ref` |
+| `check` | `check_checkbox_or_radio_by_ref` |
+| `uncheck` | `uncheck_checkbox_by_ref` |
+| `focus` | `focus_element_by_ref` |
+| `hover` | `hover_element_by_ref` |
+| `double-click` | `double_click_element_by_ref` |
+| `upload` | `upload_file_by_ref` |
+| `drag` | `drag_element_by_ref` |
+| `tabs` | `get_tabs` |
+| `new-tab` | `new_tab` |
+| `switch-tab` | `switch_tab` |
+| `close-tab` | `close_tab` |
+| `eval` | `evaluate_javascript` |
+| `eval-on` | `evaluate_javascript_on_ref` |
+| `press` | `press_key` |
+| `type` | `type_text` |
+| `key-down` | `key_down` |
+| `key-up` | `key_up` |
+| `scroll` | `mouse_wheel` |
+| `mouse-click` | `mouse_click` |
+| `mouse-move` | `mouse_move` |
+| `mouse-drag` | `mouse_drag` |
+| `mouse-down` | `mouse_down` |
+| `mouse-up` | `mouse_up` |
+| `wait` | `wait_for` |
+| `screenshot` | `take_screenshot` |
+| `pdf` | `save_pdf` |
+| `network-start` | `start_network_capture` |
+| `network` | `get_network_requests` |
+| `network-stop` | `stop_network_capture` |
+| `wait-network` | `wait_for_network_idle` |
+| `dialog-setup` | `setup_dialog_handler` |
+| `dialog` | `handle_dialog` |
+| `dialog-remove` | `remove_dialog_handler` |
+| `cookies` | `get_cookies` |
+| `cookie-set` | `set_cookie` |
+| `cookies-clear` | `clear_cookies` |
+| `storage-save` | `save_storage_state` |
+| `storage-load` | `restore_storage_state` |
+| `verify-text` | `verify_text_visible` |
+| `verify-visible` | `verify_element_visible` |
+| `verify-url` | `verify_url` |
+| `verify-title` | `verify_title` |
+| `verify-state` | `verify_element_state` |
+| `verify-value` | `verify_value` |
+| `console-start` | `start_console_capture` |
+| `console` | `get_console_messages` |
+| `console-stop` | `stop_console_capture` |
+| `trace-start` | `start_tracing` |
+| `trace-chunk` | `add_trace_chunk` |
+| `trace-stop` | `stop_tracing` |
+| `video-start` | `start_video` |
+| `video-stop` | `stop_video` |
+| `close` | `stop` |
+| `resize` | `browser_resize` |
+
+### Core Components
+
+#### Browser
+
+The main class for browser automation with automatic launch mode selection:
+
+```python
+from bridgic.browser.session import Browser
+
+# Isolated session (no persistence)
+browser = Browser(
+    headless=True,
+    viewport={"width": 1600, "height": 900},
+)
+
+# Persistent session (with user data)
+browser = Browser(
+    headless=False,
+    user_data_dir="./user_data",
+    stealth=True,  # Enabled by default
+)
+```
+
+**Key Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `headless` | bool | True | Run in headless mode |
+| `viewport` | dict | 1600x900 | Browser viewport size |
+| `user_data_dir` | str/Path | None | Path for persistent context |
+| `stealth` | bool/StealthConfig | True | Stealth mode configuration |
+| `channel` | str | None | Browser channel (chrome, msedge, etc.) |
+| `proxy` | dict | None | Proxy settings |
+| `downloads_path` | str/Path | None | Download directory |
+
+**Snapshot:** Use `get_snapshot(interactive=False, full_page=True)` to get an `EnhancedSnapshot` with `.tree` (accessibility tree string) and `.refs` (ref → locator data). By default `full_page=True` includes all elements regardless of viewport position. Pass `interactive=True` for clickable/editable elements only (flattened output), or `full_page=False` to limit to viewport-only elements. Use `get_element_by_ref(ref)` to get a Playwright Locator from a ref (e.g. "1f79fe5e") for click, fill, etc.
+
+#### StealthConfig
+
+Configure stealth mode for bypassing bot detection:
+
+```python
+from bridgic.browser.session import StealthConfig, Browser
+
+# Custom stealth configuration
+config = StealthConfig(
+    enabled=True,
+    enable_extensions=True,  # Requires headless=False
+    disable_security=False,
+    cookie_whitelist_domains=["example.com"],
+)
+
+browser = Browser(stealth=config, headless=False)
+```
+
+#### DownloadManager
+
+Handle file downloads with proper filename preservation:
+
+```python
+# Pass downloads_path to Browser — it creates and manages the DownloadManager internally
+browser = Browser(downloads_path="./downloads", headless=True)
+await browser.start()
+
+# Access downloaded files via the built-in manager
+for file in browser.download_manager.downloaded_files:
+    print(f"Downloaded: {file.file_name} ({file.file_size} bytes)")
+```
+
 ### Stealth Mode
 
 Stealth mode is **enabled by default** and includes:
@@ -445,6 +538,31 @@ config = create_stealth_config(
 browser = Browser(stealth=config)
 ```
 
+### Error Model
+
+SDK and CLI share one structured error protocol.
+
+- Base type: `BridgicBrowserError`
+- Stable fields: `code`, `message`, `details`, `retryable`
+- Behavior subclasses:
+  - `InvalidInputError` (invalid arguments/user input)
+  - `StateError` (invalid runtime state, e.g. no active page/session)
+  - `OperationError` (operation execution failures)
+  - `VerificationError` (assertion/verification failures)
+
+Why keep a small number of behavior subclasses:
+
+- Lets callers catch by behavior when needed (e.g. retry only `StateError`)
+- Encodes default retry semantics close to the failure source
+- Avoids a large, hard-to-maintain class hierarchy while keeping error handling predictable
+
+Daemon protocol is also structured:
+
+- Success: `{"success": true, "result": "..."}`
+- Failure: `{"success": false, "error_code": "...", "result": "...", "data": {...}, "meta": {"retryable": false}}`
+
+CLI client converts daemon failures into `BridgicBrowserCommandError`, and CLI output keeps machine code visible as `Error[CODE]: ...`.
+
 ### Requirements
 
 - Python 3.10+
@@ -457,9 +575,7 @@ MIT License
 
 ---
 
-<a name="中文"></a>
-
-## 中文
+## 中文文档
 
 **Bridgic Browser** 是一个基于 [Playwright](https://playwright.dev/) 构建的 Python 库，专为 LLM 驱动的浏览器自动化设计。它提供了高级 API，用于构建能够与网页浏览器交互的 AI 智能体，并内置隐身模式以绕过机器人检测。
 
