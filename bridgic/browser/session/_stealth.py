@@ -13,12 +13,11 @@ import io
 import json
 import os
 import sys
-import tempfile
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 
 # ========== JS Init Script — navigator/window property patches ==========
@@ -256,29 +255,6 @@ CHROME_LINUX_ONLY_ARGS: List[str] = [
     "--suppress-message-center-popups",  # ChromeOS message center only
 ]
 
-# ========== Universal Chrome Args (agent-browser compatible) ==========
-# Minimal set of flags that every Chrome/Chromium build recognises on every
-# platform (macOS, Linux, Windows). Used when launching the system-installed
-# Chrome via executable_path so that no "不支持的命令行标记" warnings appear.
-# Based on agent-browser/cli/src/native/cdp/chrome.rs::build_chrome_args().
-CHROME_UNIVERSAL_ARGS: List[str] = [
-    "--disable-background-networking",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-component-update",
-    "--disable-default-apps",
-    "--disable-hang-monitor",
-    "--disable-popup-blocking",
-    "--disable-prompt-on-repost",
-    "--disable-sync",
-    "--disable-features=Translate",
-    "--enable-features=NetworkService,NetworkServiceInProcess",
-    "--metrics-recording-only",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--password-store=basic",
-    "--use-mock-keychain",
-]
-
 # ========== Chrome Docker Args (browser-use/profile.py:84-94) ==========
 CHROME_DOCKER_ARGS: List[str] = [
     "--no-sandbox",
@@ -370,7 +346,6 @@ class StealthConfig:
     enabled: bool = True
     enable_extensions: bool = True
     disable_security: bool = False
-    minimal_args: bool = False
     in_docker: bool = field(default_factory=lambda: sys.platform != "darwin" and os.path.exists("/.dockerenv"))
     cookie_whitelist_domains: List[str] = field(
         default_factory=lambda: ["nature.com", "qatarairways.com"]
@@ -416,15 +391,10 @@ class StealthArgsBuilder:
         if not self.config.enabled:
             return []
 
-        if self.config.minimal_args:
-            # Minimal universal args (agent-browser style) — safe for system Chrome on any platform.
-            # Anti-detection relies entirely on the JS init script injected by get_init_script().
-            args = list(CHROME_UNIVERSAL_ARGS)
-        else:
-            args = list(CHROME_STEALTH_ARGS)
-            # Linux-only args (skip on macOS/Windows to avoid "unsupported flag" warnings)
-            if sys.platform == "linux":
-                args.extend(CHROME_LINUX_ONLY_ARGS)
+        args = list(CHROME_STEALTH_ARGS)
+        # Linux-only args (skip on macOS/Windows to avoid "unsupported flag" warnings)
+        if sys.platform == "linux":
+            args.extend(CHROME_LINUX_ONLY_ARGS)
 
         # Add disabled components
         args.append(f"--disable-features={','.join(CHROME_DISABLED_COMPONENTS)}")
@@ -749,7 +719,6 @@ __all__ = [
     "create_stealth_config",
     "CHROME_STEALTH_ARGS",
     "CHROME_LINUX_ONLY_ARGS",
-    "CHROME_UNIVERSAL_ARGS",
     "CHROME_DISABLED_COMPONENTS",
     "CHROME_DOCKER_ARGS",
     "CHROME_DISABLE_SECURITY_ARGS",

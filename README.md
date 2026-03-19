@@ -125,11 +125,12 @@ Browser options are read at daemon startup from the following sources, in priori
 | `./bridgic-browser.json` | Project-local config (in cwd at daemon start) |
 | Environment variables | See `skills/bridgic-browser/references/env-vars.md` |
 
-**Headed browser note (macOS/Linux/Windows):**
-When `headless=false` and you did not explicitly set `channel` or `executable_path`, the daemon will **prefer launching the system-installed stable Chrome** when it can detect one.
-This avoids Playwright’s bundled “Chrome for Testing”.
-To force a specific browser, set either:
-- `channel` (recommended): e.g. `"chrome"`, `"msedge"`, `"chromium"`
+**Headed browser note:**
+When `headless=false`, the daemon uses Playwright’s bundled browser by default.
+This ensures stealth extensions (uBlock Origin Lite, cookie consent, Force Background Tab)
+load correctly — system Chrome v137+ no longer supports `--load-extension`.
+To use system Chrome instead, set:
+- `channel`: e.g. `”chrome”`, `”msedge”`
 - `executable_path`: absolute path to a browser binary
 
 The JSON sources accept any `Browser` constructor parameter:
@@ -137,7 +138,6 @@ The JSON sources accept any `Browser` constructor parameter:
 ```json
 {
   "headless": false,
-  "channel": "chrome",
   "proxy": {"server": "http://proxy:8080", "username": "u", "password": "p"},
   "viewport": {"width": 1280, "height": 720},
   "locale": "zh-CN",
@@ -147,7 +147,7 @@ The JSON sources accept any `Browser` constructor parameter:
 
 ```bash
 # One-shot env override
-BRIDGIC_BROWSER_JSON='{"channel":"chrome","headless":false}' bridgic-browser open URL
+BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open URL
 ```
 
 #### Commands
@@ -578,11 +578,11 @@ bridgic-browser close                       # 停止 daemon
 | `./bridgic-browser.json` | 项目本地配置（daemon 启动时的工作目录） |
 | 环境变量 | 统一说明见 `skills/bridgic-browser/references/env-vars.md` |
 
-**Headed 模式说明（macOS/Linux/Windows）：**
-当 `headless=false` 且你没有显式设置 `channel` 或 `executable_path` 时，daemon 会在检测到可用的情况下 **优先启动系统安装的稳定版 Chrome**。
-这样可以避免 Playwright 自带的 “Chrome for Testing”。
-如需强制指定浏览器，请显式设置：
-- `channel`（推荐）：例如 `"chrome"`、`"msedge"`、`"chromium"`
+**Headed 模式说明：**
+当 `headless=false` 时，daemon 默认使用 Playwright 自带浏览器。
+这样可以确保隐身扩展（uBlock Origin Lite、cookie 弹窗自动关闭、Force Background Tab）正常加载——系统 Chrome v137+ 已移除 `--load-extension` 支持。
+如需使用系统 Chrome，请设置：
+- `channel`：例如 `”chrome”`、`”msedge”`
 - `executable_path`：浏览器可执行文件的绝对路径
 
 JSON 来源支持所有 `Browser` 构造参数：
@@ -590,7 +590,6 @@ JSON 来源支持所有 `Browser` 构造参数：
 ```json
 {
   "headless": false,
-  "channel": "chrome",
   "proxy": {"server": "http://proxy:8080", "username": "u", "password": "p"},
   "viewport": {"width": 1280, "height": 720},
   "locale": "zh-CN",
@@ -600,7 +599,7 @@ JSON 来源支持所有 `Browser` 构造参数：
 
 ```bash
 # 单次环境变量覆盖
-BRIDGIC_BROWSER_JSON='{"channel":"chrome","headless":false}' bridgic-browser open URL
+BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open URL
 ```
 
 #### 命令列表

@@ -120,20 +120,6 @@ class TestStealthArgsBuilder:
         # Should include window-size arg
         assert "--window-size=1280,720" in args
 
-    def test_build_args_minimal_uses_universal(self):
-        """minimal_args=True uses CHROME_UNIVERSAL_ARGS instead of CHROME_STEALTH_ARGS."""
-        from bridgic.browser.session._stealth import CHROME_UNIVERSAL_ARGS
-        config = StealthConfig(minimal_args=True)
-        builder = StealthArgsBuilder(config)
-
-        args = builder.build_args()
-
-        # Universal args should be present
-        for ua in CHROME_UNIVERSAL_ARGS:
-            assert ua in args, f"Missing universal arg: {ua}"
-        # Full stealth args should NOT be present (e.g. --disable-blink-features is stealth-only)
-        assert "--disable-blink-features=AutomationControlled" not in args
-
     def test_build_args_disabled(self):
         """Test building args when stealth is disabled."""
         config = StealthConfig(enabled=False)

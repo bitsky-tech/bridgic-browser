@@ -118,6 +118,9 @@ Key options:
 - `docker_mode=True` for container environments
 - `cookie_whitelist_domains` for selective cookie retention
 
+**System Chrome vs extensions trade-off**:
+System Chrome (v137+) removed `--load-extension` CLI support, so extensions only work with Playwright's bundled "Chrome for Testing" (the default). The CLI daemon does NOT auto-switch to system Chrome — it uses Playwright's default browser to keep extensions working. Users who explicitly set `channel="chrome"` or `executable_path` in config get the system Chrome Dock icon but lose extension loading.
+
 **JS init script** (`_STEALTH_INIT_SCRIPT_TEMPLATE` in `_stealth.py`) patches these navigator/window properties before any page script runs:
 - `navigator.webdriver` → `undefined`
 - `navigator.plugins` / `navigator.mimeTypes` → realistic PDF Viewer entries (5 plugins, 2 MIME types); each plugin holds its own per-plugin mime copies so `enabledPlugin` refs are correct

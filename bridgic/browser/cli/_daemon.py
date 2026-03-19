@@ -791,76 +791,20 @@ def _build_browser_kwargs() -> Dict[str, Any]:
     if "BRIDGIC_HEADLESS" in os.environ:
         kwargs["headless"] = os.environ["BRIDGIC_HEADLESS"] != "0"
 
-    # 5. Auto-detect system Chrome for headed mode (agent-browser style).
-    #    When the user runs headed without an explicit channel/executable_path,
-    #    find the system Chrome and launch it directly via executable_path.
-    #    This shows "Google Chrome" in the macOS Dock (not "Chromium") and avoids
-    #    "不支持的命令行标记" warnings by switching to the minimal universal arg set.
-    if (
-        kwargs.get("headless") is False
-        and not kwargs.get("channel")
-        and not kwargs.get("executable_path")
-    ):
-        chrome_path = _find_system_chrome()
-        if chrome_path:
-            kwargs["executable_path"] = chrome_path
-            # Use minimal args so system Chrome doesn't warn about unsupported flags.
-            # Stealth is still applied via the JS init script injected into every page.
-            from ..session._stealth import StealthConfig
-            existing_stealth = kwargs.get("stealth")
-            if existing_stealth is True or existing_stealth is None:
-                # Default or explicit True — replace with StealthConfig(minimal_args=True)
-                kwargs["stealth"] = StealthConfig(minimal_args=True)
-            elif isinstance(existing_stealth, StealthConfig):
-                # Preserve user's StealthConfig but enable minimal_args
-                existing_stealth.minimal_args = True
-            # Playwright adds --no-sandbox unless chromium_sandbox is explicitly True.
-            # System Chrome on macOS/Windows doesn't need --no-sandbox and shows a
-            # "不支持的命令行标记 --no-sandbox" warning if it receives it.
-            kwargs.setdefault("chromium_sandbox", True)
+    # 5. Headed-mode defaults.
+    #    Playwright's bundled "Chrome for Testing" supports --load-extension so
+    #    extensions (uBlock, cookie consent, …) load correctly.  System Chrome
+    #    v137+ removed that flag, so we do NOT auto-switch to executable_path.
+    #    Users who explicitly set channel="chrome" or executable_path in config
+    #    accept the trade-off (no extensions, but "Google Chrome" Dock icon).
+    #
+    #    chromium_sandbox=True prevents Playwright from adding --no-sandbox
+    #    (which causes a warning banner on macOS system Chrome).
+    if kwargs.get("headless") is False:
+        kwargs.setdefault("chromium_sandbox", True)
 
     return kwargs
 
-
-def _find_system_chrome() -> Optional[str]:
-    """Find the system-installed Chrome/Chromium executable (agent-browser style).
-
-    Priority (same order as agent-browser find_chrome()):
-      macOS  : Google Chrome → Chrome Canary → Chromium → Brave
-      Linux  : google-chrome-stable → google-chrome (PATH lookup)
-      Windows: Program Files → Program Files (x86) → %LOCALAPPDATA%
-    """
-    import shutil
-
-    if sys.platform == "darwin":
-        candidates = [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-        ]
-        for c in candidates:
-            if Path(c).exists():
-                return c
-
-    elif sys.platform.startswith("linux"):
-        for name in ("google-chrome-stable", "google-chrome", "chromium-browser", "chromium"):
-            path = shutil.which(name)
-            if path:
-                return path
-
-    elif sys.platform == "win32":
-        local = os.environ.get("LOCALAPPDATA", "")
-        candidates = [
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            os.path.join(local, r"Google\Chrome\Application\chrome.exe") if local else "",
-        ]
-        for c in candidates:
-            if c and Path(c).exists():
-                return c
-
-    return None
 
 
 async def run_daemon() -> None:

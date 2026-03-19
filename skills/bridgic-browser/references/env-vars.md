@@ -17,7 +17,7 @@ Use this reference when the task needs environment variable behavior or login st
 
 Notes:
 - Config file precedence for CLI (lowest -> highest): defaults, `~/.bridgic/bridgic-browser.json`, `./bridgic-browser.json`, `BRIDGIC_BROWSER_JSON`, `BRIDGIC_HEADLESS`.
-- When `headless=false` and neither `channel` nor `executable_path` is specified, the CLI daemon will *prefer* the system-installed stable Chrome when it can detect one (helps avoid Playwright’s bundled “Chrome for Testing”).
+- When `headless=false` and neither `channel` nor `executable_path` is specified, the CLI daemon uses Playwright’s bundled “Chrome for Testing” browser to keep extension loading working. `chromium_sandbox=True` is auto-set to prevent `--no-sandbox` warnings. To use system Chrome instead (shows “Google Chrome” in Dock, no TEST badge), set `channel=”chrome”` or `executable_path` in config — but note that system Chrome v137+ no longer supports `--load-extension`, so extensions won’t load.
 
 ### Config Files and `BRIDGIC_BROWSER_JSON` Values
 
@@ -53,7 +53,7 @@ Notes:
 | Key | Type / values | Notes |
 |---|---|---|
 | `enabled` | `true | false` | Default `true`. |
-| `enable_extensions` | `true | false` | Requires `headless=false` and persistent context. |
+| `enable_extensions` | `true | false` | Requires `headless=false` and persistent context. Only works with Playwright's bundled browser (system Chrome v137+ dropped `--load-extension`). |
 | `disable_security` | `true | false` | Disables security features (testing only). |
 | `in_docker` | `true | false` | Auto-detected by default. |
 | `cookie_whitelist_domains` | `string[]` | Domains to whitelist in cookie consent extension. |
@@ -108,7 +108,6 @@ Config file (`~/.bridgic/bridgic-browser.json` or `./bridgic-browser.json`):
 ```json
 {
   "headless": false,
-  "channel": "chrome",
   "proxy": {"server": "http://proxy:8080", "username": "u", "password": "p"},
   "viewport": {"width": 1280, "height": 720},
   "locale": "zh-CN",
@@ -119,7 +118,7 @@ Config file (`~/.bridgic/bridgic-browser.json` or `./bridgic-browser.json`):
 
 Environment variable:
 ```bash
-BRIDGIC_BROWSER_JSON='{"headless":false,"channel":"chrome","viewport":{"width":1280,"height":720}}'
+BRIDGIC_BROWSER_JSON='{"headless":false,"viewport":{"width":1280,"height":720}}'
 ```
 
 ## Login State Persistence (Storage)
