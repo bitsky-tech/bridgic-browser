@@ -2294,3 +2294,85 @@ class TestStableRefs:
         gen._process_page_snapshot_for_ai(raw, refs, SnapshotOptions())
         assert len(refs) == 2
         assert len(set(refs.keys())) == 2
+
+
+# ---------------------------------------------------------------------------
+# 8. YAML single-quote stripping
+# ---------------------------------------------------------------------------
+
+class TestStripYamlQuotes:
+    """Tests for _strip_yaml_quotes static method."""
+
+    def test_no_quotes_passthrough(self) -> None:
+        line = '- button "Submit" [ref=e1]'
+        assert SnapshotGenerator._strip_yaml_quotes(line) == line
+
+    def test_simple_single_quote_wrap(self) -> None:
+        line = "- 'row \"very long name\" [ref=e175]':"
+        expected = '- row "very long name" [ref=e175]:'
+        assert SnapshotGenerator._strip_yaml_quotes(line) == expected
+
+    def test_single_quote_without_trailing_colon(self) -> None:
+        line = "  - 'cell \"description text\" [ref=e183]'"
+        expected = '  - cell "description text" [ref=e183]'
+        assert SnapshotGenerator._strip_yaml_quotes(line) == expected
+
+    def test_escaped_single_quotes_inside(self) -> None:
+        """YAML escapes internal single quotes as ''."""
+        line = "- 'link \"it''s here\" [ref=e5]'"
+        expected = "- link \"it's here\" [ref=e5]"
+        assert SnapshotGenerator._strip_yaml_quotes(line) == expected
+
+    def test_indented_line(self) -> None:
+        line = "    - 'button \"OK\" [ref=e9]':"
+        expected = '    - button "OK" [ref=e9]:'
+        assert SnapshotGenerator._strip_yaml_quotes(line) == expected
+
+    def test_empty_line_passthrough(self) -> None:
+        assert SnapshotGenerator._strip_yaml_quotes("") == ""
+
+    def test_plain_text_line_passthrough(self) -> None:
+        line = "  some random text"
+        assert SnapshotGenerator._strip_yaml_quotes(line) == line
+
+    def test_normalize_raw_snapshot(self) -> None:
+        raw = (
+            "- navigation:\n"
+            "  - 'link \"very long link text here\" [ref=e3]'\n"
+            "  - button \"Short\" [ref=e4]\n"
+            "- 'row \"data row\" [ref=e5]':"
+        )
+        result = SnapshotGenerator._normalize_raw_snapshot(raw)
+        lines = result.split('\n')
+        assert lines[0] == "- navigation:"
+        assert lines[1] == '  - link "very long link text here" [ref=e3]'
+        assert lines[2] == '  - button "Short" [ref=e4]'
+        assert lines[3] == '- row "data row" [ref=e5]:'
+
+
+class TestYamlQuoteEndToEnd:
+    """End-to-end: YAML-quoted lines produce valid 8-hex-char bridgic refs."""
+
+    def test_single_quoted_lines_get_bridgic_refs(self, gen: SnapshotGenerator) -> None:
+        """Lines wrapped in YAML single quotes should get 8-char hex refs."""
+        raw = (
+            "- 'row \"very long name with quotes\" [ref=e175]':\n"
+            "  - 'cell \"long description text\" [ref=e183]'\n"
+            "  - button \"Short\" [ref=e4]"
+        )
+        # Normalize first (as _generate_snapshot does)
+        normalized = SnapshotGenerator._normalize_raw_snapshot(raw)
+        refs: Dict[str, RefData] = {}
+        gen._reset_refs()
+        result = gen._process_page_snapshot_for_ai(
+            normalized, refs, SnapshotOptions()
+        )
+        # All refs in output should be 8-char hex (bridgic stable refs)
+        found_refs = re.findall(r'\[ref=([a-fA-F0-9]+)\]', result)
+        assert len(found_refs) >= 2  # at least cell + button (row may be structural)
+        for ref_id in found_refs:
+            assert len(ref_id) == 8, f"Expected 8-char ref, got '{ref_id}'"
+        # No original short Playwright refs should remain
+        assert '[ref=e175]' not in result
+        assert '[ref=e183]' not in result
+        assert '[ref=e4]' not in result

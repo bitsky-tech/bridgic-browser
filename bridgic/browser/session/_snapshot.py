@@ -339,6 +339,12 @@ class SnapshotGenerator:
         'presentation': '[role="presentation"]',
     }
 
+    # Pattern to strip YAML-style single-quote wrapping from snapshot lines.
+    # Playwright wraps long/escaped-quote lines as: - 'role "name" [ref=eN]':
+    _YAML_QUOTE_PATTERN = re.compile(
+        r"^(\s*-\s*)'(.+)'(:{0,1})\s*$"
+    )
+
     # Pre-compiled regex patterns (avoid recompilation per call)
     # Pattern for _process_page_snapshot_for_ai: matches any snapshot line
     _LINE_PATTERN = re.compile(
@@ -375,6 +381,25 @@ class SnapshotGenerator:
 
     def __init__(self):
         """Initialize the snapshot generator."""
+
+    @staticmethod
+    def _strip_yaml_quotes(line: str) -> str:
+        """Strip YAML-style single-quote wrapping from a snapshot line."""
+        m = SnapshotGenerator._YAML_QUOTE_PATTERN.match(line)
+        if m:
+            prefix, content, colon = m.groups()
+            # YAML escapes internal single quotes as ''
+            content = content.replace("''", "'")
+            return f"{prefix}{content}{colon}"
+        return line
+
+    @staticmethod
+    def _normalize_raw_snapshot(raw: str) -> str:
+        """Normalize raw Playwright snapshot, stripping YAML quote wrapping."""
+        lines = raw.split('\n')
+        return '\n'.join(
+            SnapshotGenerator._strip_yaml_quotes(line) for line in lines
+        )
 
     def _reset_refs(self) -> None:
         """No-op: ref generation is stateless (pure hash, no instance state)."""
@@ -1698,6 +1723,9 @@ class SnapshotGenerator:
         raw_snapshot = await self.page_snapshot_for_ai(page)
         if not raw_snapshot:
             return EnhancedSnapshot(tree='(empty)', refs={})
+
+        # Normalize: strip YAML single-quote wrapping from long/escaped lines
+        raw_snapshot = self._normalize_raw_snapshot(raw_snapshot)
 
         logger.debug("Raw snapshot length: %d chars", len(raw_snapshot))
 
