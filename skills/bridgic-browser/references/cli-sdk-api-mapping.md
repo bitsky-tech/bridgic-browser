@@ -1,9 +1,9 @@
 # CLI and SDK API Mapping Guide
 
 Use this guide when the task needs CLI/SDK relationship reasoning:
-- migrate from CLI to Python SDK;
+- migrate code from CLI to Python SDK;
 - explain command-to-method correspondence;
-- generate SDK code from CLI action steps;
+- generate Python code from CLI action steps;
 - compare parity and behavior differences.
 
 Canonical source in this repo: `bridgic/browser/_cli_catalog.py` (`CLI_COMMAND_TO_TOOL_METHOD`).
@@ -158,7 +158,7 @@ bridgic-browser wait "Dashboard"
 bridgic-browser screenshot logged-in.png
 ```
 
-SDK output:
+SDK alternative:
 
 ```python
 import asyncio
@@ -193,4 +193,4 @@ These CLI behaviors have no direct SDK equivalent or work differently:
 
 ## Practical Rule for Mixed Tasks
 
-If execution is done via CLI but final deliverable must be SDK code, use this guide first, then verify final code shape with `sdk-guide.md`.
+If execution is done via CLI but final deliverable must be Python code, use this guide first, then verify final code shape with `sdk-guide.md`.

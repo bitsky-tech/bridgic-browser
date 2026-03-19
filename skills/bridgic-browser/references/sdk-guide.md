@@ -47,37 +47,43 @@ Notes:
 - `async with Browser(...)` handles start/stop automatically.
 - `get_snapshot(...)` returns `EnhancedSnapshot` (never `None`); raises `StateError` if no active page, `OperationError` if generation fails.
 
-## Core SDK Decision: Raw Methods vs Tool Methods
+## API Division: Raw Methods vs Tool Methods
 
-Two surfaces serve different purposes — pick the right one:
+Two parts of API serve different purposes — pick the right one:
 
-| Surface | When to use | Examples |
+| API | When to use | Examples |
 |---|---|---|
 | **Raw methods** | Direct Playwright-level control in scripts | `get_current_page()`, `take_screenshot(filename=...)`, `get_snapshot()` |
-| **Tool methods** | Align with CLI behavior or expose to an LLM agent | `click_element_by_ref()`, `wait_for()`, `verify_*()`, `get_snapshot_text()` |
+| **Tool methods** | Align with CLI behavior or expose to an LLM agent | `get_element_by_ref`, `click_element_by_ref()`, `wait_for()`, `verify_*()`, `get_snapshot_text()` |
 
 Rule of thumb: if you're building an agent or want your script to behave like the CLI, prefer tool methods. If you need low-level page/script control, use raw methods.
+
+## Tool Methods
+
+| Category | SDK method(s) |
+|---|---|
+| Navigation | `navigate_to`, `go_back`, `go_forward`, `reload_page`, `get_current_page_info`, `search` |
+| Snapshot | `get_snapshot_text` |
+| Element interaction (by ref) | `click_element_by_ref`, `double_click_element_by_ref`, `hover_element_by_ref`, `focus_element_by_ref`, `input_text_by_ref`, `select_dropdown_option_by_ref`, `check_checkbox_or_radio_by_ref`, `uncheck_checkbox_by_ref`, `scroll_element_into_view_by_ref`, `drag_element_by_ref`, `get_dropdown_options_by_ref`, `upload_file_by_ref`, `fill_form` |
+| Keyboard | `press_key`, `type_text`, `key_down`, `key_up` |
+| Mouse | `mouse_wheel`, `mouse_move`, `mouse_click`, `mouse_drag`, `mouse_down`, `mouse_up` |
+| Wait | `wait_for` |
+| Tabs | `get_tabs`, `new_tab`, `switch_tab`, `close_tab` |
+| Capture | `take_screenshot`, `save_pdf` |
+| Network | `start_network_capture`, `stop_network_capture`, `get_network_requests`, `wait_for_network_idle` |
+| Dialog | `setup_dialog_handler`, `handle_dialog`, `remove_dialog_handler` |
+| Storage | `save_storage_state`, `restore_storage_state`, `clear_cookies`, `get_cookies`, `set_cookie` |
+| Verify | `verify_element_visible`, `verify_text_visible`, `verify_value`, `verify_element_state`, `verify_url`, `verify_title` |
+| Evaluate | `evaluate_javascript`, `evaluate_javascript_on_ref` |
+| Developer | `start_console_capture`, `stop_console_capture`, `get_console_messages`, `start_tracing`, `stop_tracing`, `add_trace_chunk`, `start_video`, `stop_video` |
+| Lifecycle | `stop`, `browser_resize` |
 
 ## Snapshot and Ref Rules
 
 - Refs are emitted in snapshot tree entries like `[ref=8d4b03a9]`.
 - Resolve refs with ref-based methods (for example `click_element_by_ref("8d4b03a9")`).
-- `navigate_to(...)` clears cached snapshot refs. Take a new snapshot after page changes.
+- `navigate_to(...)`, `search(...)`, `new_tab(...)` or `switch_tab(...)` may clear cached snapshot refs. Take a new snapshot after page changes.
 - `get_element_by_ref(...)` depends on the last snapshot cache.
-
-## Frequent SDK Methods
-
-| Objective | Preferred SDK method(s) |
-|---|---|
-| Navigate URL with URL normalization/safety checks | `navigate_to(url)` |
-| Navigate with explicit Playwright wait strategy | `navigate_to(url, wait_until=..., timeout=...)` |
-| Capture ref snapshot as string for LLM/tooling | `get_snapshot_text(interactive=..., full_page=..., start_from_char=...)` |
-| Capture structured snapshot object | `get_snapshot(interactive=..., full_page=...)` |
-| Interact with element by ref | `click_element_by_ref`, `input_text_by_ref(ref, text, clear=True, is_secret=False, slowly=False, submit=False)`, `select_dropdown_option_by_ref`, `check_checkbox_or_radio_by_ref`, ... |
-| Coordinate mouse operations | `mouse_click`, `mouse_move`, `mouse_drag`, `mouse_wheel` |
-| Waits | `wait_for(time_seconds=... | text=... | text_gone=... | selector=..., timeout=30.0)` |
-| Verification | `verify_text_visible`, `verify_element_visible`, `verify_url`, `verify_title`, `verify_element_state`, `verify_value` |
-| Capture artifacts | `take_screenshot`, `save_pdf`, `start_tracing`, `stop_tracing` |
 
 ## Tool Set Builder (for Agent Integration)
 

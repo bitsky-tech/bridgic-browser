@@ -31,10 +31,10 @@ bridgic-browser close
 ## Standard CLI Session Pattern
 
 1. Navigate (`open` or `search`).
-2. Capture refs (`snapshot`).
+2. Wait if needed, then get accessibility tree with refs (`snapshot`).
 3. Interact by ref (`click`, `fill`, `select`, ...).
-4. Verify/capture (`verify-*`, `screenshot`, `pdf`, `network`, `console`).
-5. Close daemon when done (`close`) if session should not remain alive.
+4. Verify / wait / capture (`verify-*`, `screenshot`, `pdf`, `wait`, `wait-network`).
+5. Close when done (`close`) if session should not remain alive.
 
 ## Command Groups
 
@@ -56,7 +56,7 @@ bridgic-browser close
 | Developer | `console-start`, `console`, `console-stop`, `trace-start`, `trace-chunk`, `trace-stop`, `video-start`, `video-stop` |
 | Lifecycle | `close`, `resize` |
 
-Use `-h` on any command for exact flags:
+Use `-h` or `--help` on any command for exact usage information:
 
 ```bash
 bridgic-browser -h
@@ -66,6 +66,9 @@ bridgic-browser snapshot -h
 ## High-Frequency Examples
 
 ```bash
+# Open a browser if needed and Navigate to URL
+bridgic-browser open https://example.com
+
 # Fill and press Enter in one step
 bridgic-browser fill @d6a530b4 "hello@example.com" --submit
 
@@ -98,6 +101,9 @@ bridgic-browser network-stop
 bridgic-browser dialog-setup --action accept
 bridgic-browser open https://example.com    # any alert triggered will be auto-accepted
 bridgic-browser dialog-remove
+
+# Close the browser when everything is done
+bridgic-browser close
 ```
 
 ## Runtime and Configuration
@@ -108,22 +114,22 @@ Config precedence (low -> high):
 |---|---|
 | Defaults | `headless=True` |
 | `~/.bridgic/bridgic-browser.json` | User-level persistent config |
-| `./bridgic-browser.json` | Project-local config (daemon startup cwd) |
-| `BRIDGIC_BROWSER_JSON` | Full JSON override for any Browser parameter |
+| `./bridgic-browser.json` | Project-specific config (daemon startup cwd) |
+| `BRIDGIC_BROWSER_JSON` | Full JSON override for any Browser parameters |
 | `BRIDGIC_HEADLESS` | `0` means headed mode |
-| `BRIDGIC_MAX_CHARS` | Max chars per `snapshot` page before pagination notice |
+| `BRIDGIC_MAX_CHARS` | Max chars per `snapshot` page before pagination |
 
 Environment variables and login state persistence are documented in `env-vars.md`.
 
 ## Non-Obvious CLI Behavior
 
-- Refs come from the latest snapshot. If page changed, re-run `snapshot` before ref operations.
-- `snapshot` pagination is explicit: use `-s <offset>` from truncation notice.
+- Refs come from the latest snapshot. If page changed, re-run `snapshot` before interaction.
+- `snapshot` pagination is explicit: use `-s <offset>` whose value can be from truncation notice.
 - `snapshot -i` returns only clickable/editable elements — use for action selection, not full-page inspection.
 - CLI uses a persistent daemon/browser. State survives across commands until `close`.
 - After local Python code changes, restart daemon to pick up new code:
   - `bridgic-browser close`
-  - run next command (`open`, `search`, etc.) to auto-start again.
+  - run `open` or `search` command to auto-start again.
 - `scroll` uses `--dy`/`--dx` options (not positional arguments) so negative values work correctly.
 - `screenshot`, `pdf`, `upload`, `storage-save`, `storage-load`, `trace-stop` convert their path argument to an absolute path on the **client side** before sending to daemon (daemon's working directory may differ).
 - For `network-start`, start capture before navigation if page-load requests are needed.
@@ -131,5 +137,5 @@ Environment variables and login state persistence are documented in `env-vars.md
 ## When to Load Other References
 
 - Need Python code instead of CLI commands: read `sdk-guide.md`.
-- Need CLI and SDK translation (for example, CLI steps -> SDK automation code): read `cli-sdk-api-mapping.md`.
+- Need CLI and SDK mapping / migration (for example, CLI steps -> Python code generation): read `cli-sdk-api-mapping.md`.
 - Need environment variables or login state persistence details: read `env-vars.md`.
