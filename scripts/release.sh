@@ -158,6 +158,17 @@ if [[ "$REPO" == "testpypi" ]]; then
 elif [[ "$REPO" == "pypi" ]]; then
     echo ""
     warn "Next steps:"
+    CURRENT_BRANCH="$(git branch --show-current)"
+    if [[ "$CURRENT_BRANCH" =~ ^release/ ]]; then
+        echo "  git push origin ${CURRENT_BRANCH}"
+        echo "  # Open PR: ${CURRENT_BRANCH} -> main, then merge"
+    else
+        echo "  git checkout -b release/${VERSION}"
+        echo "  git push origin release/${VERSION}"
+        echo "  # Open PR: release/${VERSION} -> main, then merge"
+    fi
+    echo "  git checkout main && git pull --ff-only"
     echo "  git tag -a v${VERSION} -m \"Release v${VERSION}\""
     echo "  git push origin v${VERSION}"
+    echo "  # Tag push is allowed; branch naming checks only apply to refs/heads/*"
 fi
