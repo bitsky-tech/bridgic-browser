@@ -119,6 +119,9 @@ class DownloadManager:
         self._downloaded_files: List[DownloadedFile] = []
         self._pending_downloads: Dict[str, "Download"] = {}
         self._attached_contexts: List["BrowserContext"] = []
+        # Track handlers for cleanup
+        self._page_handlers: Dict[str, Callable] = {}
+        self._context_handlers: Dict[str, Callable] = {}
 
     @property
     def downloads_path(self) -> Path:
@@ -150,10 +153,35 @@ class DownloadManager:
             self._attach_to_page(page)
 
         # Handle downloads on new pages
-        context.on("page", self._attach_to_page)
+        handler = lambda page: self._attach_to_page(page)
+        context.on("page", handler)
+        self._context_handlers[str(id(context))] = handler
 
         self._attached_contexts.append(context)
         logger.info(f"Download manager attached, saving to: {self._config.downloads_path}")
+
+    def detach_from_context(self, context: "BrowserContext") -> None:
+        """Detach download handler from a browser context and its pages."""
+        if context not in self._attached_contexts:
+            return
+
+        # Remove context-level page listener
+        context_key = str(id(context))
+        handler = self._context_handlers.pop(context_key, None)
+        if handler:
+            try:
+                context.remove_listener("page", handler)
+            except Exception:
+                pass
+
+        # Detach from all pages in this context
+        for page in context.pages:
+            self._detach_from_page(page)
+
+        try:
+            self._attached_contexts.remove(context)
+        except ValueError:
+            pass
 
     def attach_to_page(self, page: "Page") -> None:
         """Attach download handler to a specific page.
@@ -167,8 +195,27 @@ class DownloadManager:
 
     def _attach_to_page(self, page: "Page") -> None:
         """Internal method to attach download handler to a page."""
-        page.on("download", lambda download: asyncio.create_task(self._handle_download(download)))
+        page_key = str(id(page))
+
+        # Remove old handler if exists
+        self._detach_from_page(page)
+
+        def handle_download(download):
+            asyncio.create_task(self._handle_download(download))
+
+        page.on("download", handle_download)
+        self._page_handlers[page_key] = handle_download
         logger.debug(f"Download handler attached to page: {page.url}")
+
+    def _detach_from_page(self, page: "Page") -> None:
+        """Internal method to detach download handler from a page."""
+        page_key = str(id(page))
+        handler = self._page_handlers.pop(page_key, None)
+        if handler:
+            try:
+                page.remove_listener("download", handler)
+            except Exception:
+                pass
 
     async def _handle_download(self, download: "Download") -> None:
         """Handle a download event.
@@ -347,7 +394,9 @@ class DownloadManager:
             downloaded = file
             download_event.set()
             if original_callback:
-                original_callback(file)
+                result = original_callback(file)
+                if asyncio.iscoroutine(result):
+                    asyncio.create_task(result)
 
         self._config.on_download_complete = on_complete
 
@@ -355,10 +404,9 @@ class DownloadManager:
             # Start waiting for download
             async with page.expect_download(timeout=timeout) as download_info:
                 # Perform the action that triggers download
-                if asyncio.iscoroutinefunction(action):
-                    await action()
-                else:
-                    action()
+                action_result = action()
+                if asyncio.iscoroutine(action_result):
+                    await action_result
 
             # Wait for our handler to process it
             await asyncio.wait_for(

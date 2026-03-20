@@ -33,9 +33,8 @@ MAJOR.MINOR.PATCH[.devN | aN | bN | rcN]
 ### Prerequisites
 
 1. All tests pass
-2. CHANGELOG.md is updated
-3. Version in `pyproject.toml` is correct
-4. You have publishing credentials configured
+2. Version in `pyproject.toml` is correct
+3. You have publishing credentials configured
 
 ### Step 1: Update Version
 
@@ -46,24 +45,7 @@ Edit `pyproject.toml`:
 version = "X.Y.Z"  # Update this
 ```
 
-### Step 2: Update CHANGELOG
-
-Add release notes to `CHANGELOG.md`:
-
-```markdown
-## [X.Y.Z] - YYYY-MM-DD
-
-### Added
-- New feature description
-
-### Changed
-- Changed behavior description
-
-### Fixed
-- Bug fix description
-```
-
-### Step 3: Run Tests
+### Step 2: Run Tests
 
 ```bash
 # Run all tests
@@ -73,7 +55,7 @@ make test
 make test-quick
 ```
 
-### Step 4: Build Package
+### Step 3: Build Package
 
 ```bash
 make build
@@ -83,7 +65,7 @@ Verify the build artifacts in `dist/`:
 - `bridgic_browser-X.Y.Z.tar.gz` (source distribution)
 - `bridgic_browser-X.Y.Z-py3-none-any.whl` (wheel)
 
-### Step 5: Publish
+### Step 4: Publish
 
 #### To Test PyPI (recommended for pre-releases)
 
@@ -102,20 +84,20 @@ pip install -i https://test.pypi.org/simple/ bridgic-browser==X.Y.Z
 make publish repo=pypi
 ```
 
-### Step 6: Create Git Tag
+### Step 5: Create Git Tag
 
 ```bash
 git tag -a vX.Y.Z -m "Release vX.Y.Z"
 git push origin vX.Y.Z
 ```
 
-### Step 7: Create GitHub Release
+### Step 6: Create GitHub Release
 
 1. Go to GitHub Releases page
 2. Click "Create a new release"
 3. Select the tag `vX.Y.Z`
 4. Title: `vX.Y.Z`
-5. Copy release notes from CHANGELOG.md
+5. Write release notes summarizing changes (use `git log` for reference)
 6. Publish release
 
 ## Release Checklist
@@ -125,7 +107,6 @@ Before releasing, verify:
 - [ ] All tests pass (`make test`)
 - [ ] No TODO/FIXME in production code
 - [ ] Version updated in `pyproject.toml`
-- [ ] CHANGELOG.md updated with release notes
 - [ ] README.md is up to date
 - [ ] No debug/logging code that writes files
 - [ ] Dependencies are up to date and pinned appropriately
@@ -186,11 +167,11 @@ PyPI indexing can take a few minutes. Wait and try again.
 
 ## Automated Releases (CI/CD)
 
-For automated releases via GitHub Actions, see `.github/workflows/publish.yml`.
+This repository currently uses manual publishing (`make publish ...`) and does
+not include a dedicated GitHub Actions publish workflow.
 
-The workflow is triggered by:
-- Pushing a version tag (e.g., `v0.1.0`)
-- Manual workflow dispatch
+Current CI workflow:
+- `.github/workflows/multi-version-test.yml` (test matrix only)
 
 ## Rollback
 

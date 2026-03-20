@@ -1,22 +1,20 @@
-# Bridgic Browser
-
-[English](#english) | [中文](#中文)
+[English](#bridgic-browser) | [中文](README_zh.md)
 
 ---
 
-<a name="english"></a>
+## Bridgic Browser
 
-## English
-
-**Bridgic Browser** is a Python library for LLM-driven browser automation built on [Playwright](https://playwright.dev/). It provides a high-level API for building AI agents that can interact with web browsers, featuring built-in stealth mode for bypassing bot detection.
+**Bridgic Browser** is a Python library for LLM-driven browser automation built on [Playwright](https://playwright.dev/). It includes CLI tools, Python tools and skills for AI agents.
 
 ### Features
 
-- **LLM-Ready Browser Automation** - Designed for AI agents with structured page snapshots and element references
+- **Comprehensive CLI Tools** - 67 tools organized into 15 categories; Designed to integrate with any AI agent
+- **Python-based Tools** - Used for agent / workflow code generation; Easier integration with [Bridgic](https://github.com/bitsky-tech/bridgic) 
+- **Snapshot with Semantic Invariance** - A representation of page snapshot based on accessibility tree and a specially designed ref-generation algorithm that ensures element refs remain unchanged across page reloads
+- **Skills** - Used for guided exploration and code generation; Compatible with most of coding agents
 - **Stealth Mode (Enabled by Default)** - 50+ Chrome args and optimizations to bypass bot detection
 - **Dual Launch Mode** - Automatically switches between isolated sessions and persistent contexts
-- **Download Management** - Automatic download handling with proper filename preservation
-- **Comprehensive Tool Set** - Navigation, element interaction, tab management, and more
+- **Nested iframe Support** - Supports DOM element operations within multi-level nested iframes
 
 ### Installation
 
@@ -32,54 +30,419 @@ playwright install chromium
 
 ### Quick Start
 
-#### Basic Usage
+#### CLI Tolls Usage
+
+```shell
+bridgic-browser open --headed https://example.com
+bridgic-browser snapshot
+# 'f0201d1c' is the ref value of the 'Learn more' link
+bridgic-browser click f0201d1c
+bridgic-browser screenshot page.png
+bridgic-browser close
+```
+
+#### Python Tolls Integration
+
+First, build tools:
 
 ```python
-import asyncio
 from bridgic.browser.session import Browser
+from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
+
+# create a browser instance
+browser = Browser(headless=False)
+
+async def create_tools(browser):
+    # Build a focused tool set for your agent
+    builder = BrowserToolSetBuilder.for_categories(
+        browser,
+        ToolCategory.NAVIGATION,
+        ToolCategory.SNAPSHOT,
+        ToolCategory.ELEMENT_INTERACTION,
+        ToolCategory.CAPTURE,
+        ToolCategory.WAIT,
+    )
+    tools = builder.build()["tool_specs"]
+    return tools
+```
+
+Second (optional), build a [Bridgic](https://github.com/bitsky-tech/bridgic) agent that uses this tool set:
+
+```python
+import os
+from bridgic.llms.openai import OpenAILlm, OpenAIConfiguration
+async def create_llm():
+    _api_key = os.environ.get("OPENAI_API_KEY")
+    _model_name = os.environ.get("OPENAI_MODEL_NAME")
+
+    llm = OpenAILlm(
+        api_key=_api_key,
+        configuration=OpenAIConfiguration(model=_model_name),
+        timeout=60,
+    )
+    return llm
+
+from bridgic.core.agentic.recent import ReCentAutoma, StopCondition
+from bridgic.core.automa import RunningOptions
+async def create_agent(llm, tools):
+    browser_agent = ReCentAutoma(
+        llm=llm,
+        tools=tools,
+        stop_condition=StopCondition(max_iteration=10, max_consecutive_no_tool_selected=1),
+        running_options=RunningOptions(debug=True),
+    )
+    return browser_agent
 
 async def main():
-    # Create browser with stealth mode (enabled by default)
-    browser = Browser(headless=False)
-
-    # Start browser
+    tools = await create_tools(browser)
+    llm = await create_llm()
+    agent = await create_agent(llm, tools)
     await browser.start()
 
-    try:
-        # Navigate to a URL
-        await browser.navigate_to("https://example.com")
+    result = await agent.arun(
+        goal=(
+            "Summarize the 'Learn more' page of example.com for me"
+        ),
+        guidance=(
+            "Do the following steps one by one:\n"
+            "1. Navigate to https://example.com\n"
+            "2. Click the 'Learn more' link\n"
+            "3. Take a screenshot of the 'Learn more' page\n"
+            "4. Summarize the page content in one sentence and tell me how to access the screenshot.\n"
+        ),
+    )
+    print("\n\n*** Final Result: ***\n\n")
+    print(result)
 
-        # Get page snapshot for LLM
-        snapshot = await browser.get_snapshot()
-        print(snapshot.tree)  # Accessible element tree with refs
+    await browser.stop()
 
-        # Interact with elements by ref
-        element = await browser.get_element_by_ref("e1")
-        if element:
-            await element.click()
-    finally:
-        await browser.close()
-
-asyncio.run(main())
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
 ```
 
-#### Using with AI Agents
+#### How to Install Skills?
+
+The skills of this repo can work with most of coding agents / AI assistant, such as Claude Code, Cursor, OpenClaw...
+Install using the `npx skills` CLI:
+
+```bash
+# From this repository checkout
+npx skills add . --skill bridgic-browser
+
+# Or from GitHub
+npx skills add bitsky-tech/bridgic-browser --skill bridgic-browser
+```
+
+After installation, the Skill will appear in your project’s agent directories (for example, Claude Code typically under `.claude/skills/bridgic-browser/`, and Cursor under `.agents/skills/bridgic-browser/`).
+
+#### Browser API Usage
+
+You can also directly call the underlying `Browser` API to control the browser.
 
 ```python
 from bridgic.browser.session import Browser
-from bridgic.browser.tools import BrowserToolSetBuilder
 
-async def create_agent():
-    browser = Browser(headless=False)
+browser = Browser(headless=False)
+
+async def main():
     await browser.start()
+    await browser.navigate_to("https://example.com")
+    snapshot = await browser.get_snapshot()
+    print(snapshot.tree)  # Tree format: - role "name" [ref=f0201d1c]
+    for ref, data in snapshot.refs.items():
+        if data.name == "Learn more":
+            learn_more_ref = ref
+            break
+    print(f"Found ref for 'Learn more': {learn_more_ref}")
+    await browser.click_element_by_ref(learn_more_ref)
+    await browser.take_screenshot(filename="page.png")
+    await browser.stop()
 
-    # Build tool set for your agent
-    tools = BrowserToolSetBuilder.basic_tools(browser)
-
-    # Use tools with your LLM agent
-    # tools include: navigate, click, input_text, scroll, etc.
-    return browser, tools
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
 ```
+
+### CLI Tools
+
+`bridgic-browser` ships with a command-line interface for controlling a browser from the terminal (67 tools organized into 15 categories). A persistent daemon process holds a browser instance; each CLI invocation connects over a Unix domain socket and exits immediately.
+
+#### Configuration
+
+Browser options are read at daemon startup from the following sources, in priority order (highest last wins):
+
+| Source | Example |
+|--------|---------|
+| Defaults | `headless=True` |
+| `~/.bridgic/bridgic-browser.json` | User-level persistent config |
+| `./bridgic-browser.json` | Project-local config (in cwd at daemon start) |
+| Environment variables | See `skills/bridgic-browser/references/env-vars.md` |
+
+**Headed browser note:**
+When `headless=false`, the daemon uses Playwright’s bundled browser by default.
+This ensures stealth extensions (uBlock Origin Lite, cookie consent, Force Background Tab)
+load correctly — system Chrome v137+ no longer supports `--load-extension`.
+To use system Chrome instead, set:
+- `channel`: e.g. `”chrome”`, `”msedge”`
+- `executable_path`: absolute path to a browser binary
+
+The JSON sources accept any `Browser` constructor parameter:
+
+```json
+{
+  "headless": false,
+  "proxy": {"server": "http://proxy:8080", "username": "u", "password": "p"},
+  "viewport": {"width": 1280, "height": 720},
+  "locale": "zh-CN",
+  "timezone_id": "Asia/Shanghai"
+}
+```
+
+```bash
+# One-shot env override
+BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open URL
+```
+
+#### Command List
+
+| Category | Commands |
+|----------|----------|
+| Navigation | `open`, `back`, `forward`, `reload`, `search`, `info` |
+| Snapshot | `snapshot [-i] [-f\|-F] [-s N]` |
+| Element Interaction | `click`, `double-click`, `hover`, `focus`, `fill`, `select`, `options`, `check`, `uncheck`, `scroll-to`, `drag`, `upload`, `fill-form` |
+| Keyboard | `press`, `type`, `key-down`, `key-up` |
+| Mouse | `scroll`, `mouse-move`, `mouse-click`, `mouse-drag`, `mouse-down`, `mouse-up` |
+| Wait | `wait [SECONDS] [TEXT] [--gone]` |
+| Tabs | `tabs`, `new-tab`, `switch-tab`, `close-tab` |
+| Evaluate | `eval`, `eval-on` |
+| Capture | `screenshot`, `pdf` |
+| Network | `network-start`, `network-stop`, `network`, `wait-network` |
+| Dialog | `dialog-setup`, `dialog`, `dialog-remove` |
+| Storage | `storage-save`, `storage-load`, `cookies-clear`, `cookies`, `cookie-set` |
+| Verify | `verify-visible`, `verify-text`, `verify-value`, `verify-state`, `verify-url`, `verify-title` |
+| Developer | `console-start`, `console-stop`, `console`, `trace-start`, `trace-stop`, `trace-chunk`, `video-start`, `video-stop` |
+| Lifecycle | `close`, `resize` |
+
+Use `-h` or `--help` on any command for details:
+
+```bash
+bridgic-browser -h
+bridgic-browser scroll -h
+```
+
+### Python Tools
+
+Bridgic Browser provides 67 tools organized into 15 categories. Use `BrowserToolSetBuilder` with category/name selection for scenario-focused tool sets.
+
+#### Category-based Selection
+
+```python
+from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
+
+# Focused set for your specific agent flows
+builder = BrowserToolSetBuilder.for_categories(
+    browser,
+    ToolCategory.NAVIGATION,
+    ToolCategory.ELEMENT_INTERACTION,
+    ToolCategory.CAPTURE,
+)
+tools = builder.build()["tool_specs"]
+
+# Include all available tools
+builder = BrowserToolSetBuilder.for_categories(browser, ToolCategory.ALL)
+tools = builder.build()["tool_specs"]
+```
+
+#### Name-based Selection (by function name)
+
+```python
+# Select by tool function names
+builder = BrowserToolSetBuilder.for_tool_names(
+    browser,
+    "search",
+    "navigate_to",
+    "click_element_by_ref",
+)
+tools = builder.build()["tool_specs"]
+
+# Enable strict mode to catch typos and missing browser methods early
+builder = BrowserToolSetBuilder.for_tool_names(
+    browser,
+    "search",
+    "navigate_to",
+    strict=True,
+)
+tools = builder.build()["tool_specs"]
+```
+
+#### Mixed Selection
+
+```python
+builder1 = BrowserToolSetBuilder.for_categories(
+    browser,
+    ToolCategory.NAVIGATION,
+    ToolCategory.ELEMENT_INTERACTION,
+    ToolCategory.CAPTURE,
+)
+builder2 = BrowserToolSetBuilder.for_tool_names(
+    browser, "verify_url", "verify_title"
+)
+tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
+```
+
+#### Tool List
+
+**Navigation (6 tools):**
+- `navigate_to(url)` - Navigate to URL
+- `search(query, engine)` - Search using search engine
+- `get_current_page_info()` - Get current page info (URL, title, etc.)
+- `reload_page()` - Reload current page
+- `go_back()` / `go_forward()` - Browser history navigation
+
+**Snapshot (1 tool):**
+- `get_snapshot_text(start_from_char=0, interactive=False, full_page=True)` - Get page state string for LLM (accessibility tree with refs). **start_from_char** must be `>= 0` and is used for pagination when the page is long: if the return value is truncated, a `[notice]` at the end gives **next_start_char** to call again. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default). Output is truncated at the configured limit; see `skills/bridgic-browser/references/env-vars.md` for `BRIDGIC_MAX_CHARS`.
+
+**Element Interaction (13 tools) - by ref:**
+- `click_element_by_ref(ref)` - Click element
+- `input_text_by_ref(ref, text)` - Input text
+- `fill_form(fields)` - Fill multiple form fields
+- `scroll_element_into_view_by_ref(ref)` - Scroll element into view
+- `select_dropdown_option_by_ref(ref, value)` - Select dropdown option
+- `get_dropdown_options_by_ref(ref)` - Get dropdown options
+- `check_checkbox_or_radio_by_ref(ref)` / `uncheck_checkbox_by_ref(ref)` - Checkbox control
+- `focus_element_by_ref(ref)` - Focus element
+- `hover_element_by_ref(ref)` - Hover over element
+- `double_click_element_by_ref(ref)` - Double click
+- `upload_file_by_ref(ref, path)` - Upload file
+- `drag_element_by_ref(start_ref, end_ref)` - Drag and drop
+
+**Tabs (4 tools):**
+- `get_tabs()` / `new_tab(url)` / `switch_tab(page_id)` / `close_tab(page_id)` - Tab management
+
+**Evaluate (2 tools):**
+- `evaluate_javascript(code)` - Execute JavaScript
+- `evaluate_javascript_on_ref(ref, code)` - Execute JavaScript on element
+
+**Keyboard (4 tools):**
+- `type_text(text)` - Type text character by character (key events, no ref — acts on focused element)
+- `press_key(key)` - Press keyboard shortcut (e.g. `"Enter"`, `"Control+A"`)
+- `key_down(key)` / `key_up(key)` - Key control
+
+**Mouse (6 tools) - Coordinate-based:**
+- `mouse_wheel(delta_x, delta_y)` - Scroll wheel
+- `mouse_click(x, y)` - Click at position
+- `mouse_move(x, y)` - Move mouse
+- `mouse_drag(start_x, start_y, end_x, end_y)` - Drag operation
+- `mouse_down()` / `mouse_up()` - Mouse button control
+
+**Wait (1 tool):**
+- `wait_for(time_seconds, text, text_gone, selector, state, timeout)` - Wait for conditions
+
+**Capture (2 tools):**
+- `take_screenshot(filename=None, ref=None, full_page=False, type="png")` - Capture screenshot
+- `save_pdf(filename)` - Save page as PDF
+
+**Network (4 tools):**
+- `start_network_capture()` / `stop_network_capture()` / `get_network_requests()` - Network monitoring
+- `wait_for_network_idle()` - Wait for network idle
+
+**Dialog (3 tools):**
+- `setup_dialog_handler(default_action)` - Set up auto dialog handler
+- `handle_dialog(accept, prompt_text)` - Handle dialog
+- `remove_dialog_handler()` - Remove dialog handler
+
+**Storage (5 tools):**
+- `get_cookies()` / `set_cookie()` / `clear_cookies()` - Cookie management (`expires=0` is valid and preserved)
+- `save_storage_state(filename)` / `restore_storage_state(filename)` - Session persistence
+
+**Verify (6 tools):**
+- `verify_text_visible(text)` - Check text visibility
+- `verify_element_visible(role, accessible_name)` - Check element visibility by role and accessible name
+- `verify_url(pattern)` / `verify_title(pattern)` - URL/title verification
+- `verify_element_state(ref, state)` - Check element state
+- `verify_value(ref, value)` - Check element value
+
+**Developer (8 tools):**
+- `start_console_capture()` / `stop_console_capture()` / `get_console_messages()` - Console monitoring
+- `start_tracing()` / `stop_tracing()` / `add_trace_chunk()` - Performance tracing
+- `start_video()` / `stop_video()` - Video recording
+
+**Lifecycle (2 tools):**
+- `stop()` - Stop browser
+- `browser_resize(width, height)` - Resize viewport
+
+### CLI Tools -> Python Tools Mapping
+
+| CLI command | SDK tool method |
+|---|---|
+| `open` | `navigate_to` |
+| `search` | `search` |
+| `info` | `get_current_page_info` |
+| `reload` | `reload_page` |
+| `back` | `go_back` |
+| `forward` | `go_forward` |
+| `snapshot` | `get_snapshot_text` |
+| `click` | `click_element_by_ref` |
+| `fill` | `input_text_by_ref` |
+| `fill-form` | `fill_form` |
+| `scroll-to` | `scroll_element_into_view_by_ref` |
+| `select` | `select_dropdown_option_by_ref` |
+| `options` | `get_dropdown_options_by_ref` |
+| `check` | `check_checkbox_or_radio_by_ref` |
+| `uncheck` | `uncheck_checkbox_by_ref` |
+| `focus` | `focus_element_by_ref` |
+| `hover` | `hover_element_by_ref` |
+| `double-click` | `double_click_element_by_ref` |
+| `upload` | `upload_file_by_ref` |
+| `drag` | `drag_element_by_ref` |
+| `tabs` | `get_tabs` |
+| `new-tab` | `new_tab` |
+| `switch-tab` | `switch_tab` |
+| `close-tab` | `close_tab` |
+| `eval` | `evaluate_javascript` |
+| `eval-on` | `evaluate_javascript_on_ref` |
+| `press` | `press_key` |
+| `type` | `type_text` |
+| `key-down` | `key_down` |
+| `key-up` | `key_up` |
+| `scroll` | `mouse_wheel` |
+| `mouse-click` | `mouse_click` |
+| `mouse-move` | `mouse_move` |
+| `mouse-drag` | `mouse_drag` |
+| `mouse-down` | `mouse_down` |
+| `mouse-up` | `mouse_up` |
+| `wait` | `wait_for` |
+| `screenshot` | `take_screenshot` |
+| `pdf` | `save_pdf` |
+| `network-start` | `start_network_capture` |
+| `network` | `get_network_requests` |
+| `network-stop` | `stop_network_capture` |
+| `wait-network` | `wait_for_network_idle` |
+| `dialog-setup` | `setup_dialog_handler` |
+| `dialog` | `handle_dialog` |
+| `dialog-remove` | `remove_dialog_handler` |
+| `cookies` | `get_cookies` |
+| `cookie-set` | `set_cookie` |
+| `cookies-clear` | `clear_cookies` |
+| `storage-save` | `save_storage_state` |
+| `storage-load` | `restore_storage_state` |
+| `verify-text` | `verify_text_visible` |
+| `verify-visible` | `verify_element_visible` |
+| `verify-url` | `verify_url` |
+| `verify-title` | `verify_title` |
+| `verify-state` | `verify_element_state` |
+| `verify-value` | `verify_value` |
+| `console-start` | `start_console_capture` |
+| `console` | `get_console_messages` |
+| `console-stop` | `stop_console_capture` |
+| `trace-start` | `start_tracing` |
+| `trace-chunk` | `add_trace_chunk` |
+| `trace-stop` | `stop_tracing` |
+| `video-start` | `start_video` |
+| `video-stop` | `stop_video` |
+| `close` | `stop` |
+| `resize` | `browser_resize` |
 
 ### Core Components
 
@@ -93,7 +456,7 @@ from bridgic.browser.session import Browser
 # Isolated session (no persistence)
 browser = Browser(
     headless=True,
-    viewport={"width": 1920, "height": 1080},
+    viewport={"width": 1600, "height": 900},
 )
 
 # Persistent session (with user data)
@@ -109,12 +472,14 @@ browser = Browser(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `headless` | bool | True | Run in headless mode |
-| `viewport` | dict | 1920x1080 | Browser viewport size |
+| `viewport` | dict | 1600x900 | Browser viewport size |
 | `user_data_dir` | str/Path | None | Path for persistent context |
 | `stealth` | bool/StealthConfig | True | Stealth mode configuration |
 | `channel` | str | None | Browser channel (chrome, msedge, etc.) |
 | `proxy` | dict | None | Proxy settings |
 | `downloads_path` | str/Path | None | Download directory |
+
+**Snapshot:** Use `get_snapshot(interactive=False, full_page=True)` to get an `EnhancedSnapshot` with `.tree` (accessibility tree string) and `.refs` (ref → locator data). By default `full_page=True` includes all elements regardless of viewport position. Pass `interactive=True` for clickable/editable elements only (flattened output), or `full_page=False` to limit to viewport-only elements. Use `get_element_by_ref(ref)` to get a Playwright Locator from a ref (e.g. "1f79fe5e") for click, fill, etc.
 
 #### StealthConfig
 
@@ -139,156 +504,14 @@ browser = Browser(stealth=config, headless=False)
 Handle file downloads with proper filename preservation:
 
 ```python
-from bridgic.browser.session import DownloadManager, DownloadManagerConfig
+# Pass downloads_path to Browser — it creates and manages the DownloadManager internally
+browser = Browser(downloads_path="./downloads", headless=True)
+await browser.start()
 
-config = DownloadManagerConfig(
-    downloads_path="./downloads",
-    auto_save=True,
-    overwrite_existing=False,
-)
-
-manager = DownloadManager(config=config)
-
-# Attach to browser context
-manager.attach_to_context(browser.context)
-
-# Access downloaded files
-for file in manager.downloaded_files:
+# Access downloaded files via the built-in manager
+for file in browser.download_manager.downloaded_files:
     print(f"Downloaded: {file.file_name} ({file.file_size} bytes)")
 ```
-
-### Browser Tools
-
-Bridgic Browser provides 68+ tools organized into categories. Use `BrowserToolSetBuilder` with `ToolPreset` for scenario-based tool selection.
-
-#### Quick Start with Presets
-
-```python
-from bridgic.browser.tools import BrowserToolSetBuilder, ToolPreset
-
-# Choose a preset for your use case
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.MINIMAL)       # 10 tools
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)  # 20 tools
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.TESTING)       # 28 tools
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.COMPLETE)      # 68 tools
-```
-
-#### Available Presets
-
-| Preset | Tools | Description |
-|--------|-------|-------------|
-| `MINIMAL` | 10 | Navigate, click, input, snapshot |
-| `NAVIGATION` | 4 | Search, navigate, back/forward |
-| `SCRAPING` | 13 | Navigation + snapshot + scroll |
-| `FORM_FILLING` | 20 | Navigation + input + dropdown + checkbox |
-| `TESTING` | 28 | Form filling + verification + screenshot |
-| `INTERACTIVE` | 40 | All action tools + mouse + keyboard |
-| `DEVELOPER` | 18 | Network + console + tracing |
-| `COMPLETE` | 68 | All available tools |
-
-#### Category-based Selection
-
-```python
-# Select by category
-tools = BrowserToolSetBuilder.for_categories(
-    browser, "navigation", "action", "screenshot"
-)
-```
-
-#### Fluent Builder for Custom Selection
-
-```python
-from bridgic.browser.tools import take_screenshot, verify_url
-
-tools = (BrowserToolSetBuilder(browser)
-    .with_preset(ToolPreset.MINIMAL)
-    .with_category("screenshot")
-    .with_tools(verify_url)
-    .without_tools("go_forward")
-    .build_specs())
-```
-
-#### Tool Categories
-
-**Navigation (4 tools):**
-- `search(query, engine)` - Search using search engine
-- `navigate_to_url(url)` - Navigate to URL
-- `go_back()` / `go_forward()` - Browser history navigation
-
-**Page (9 tools):**
-- `reload_page()` - Reload current page
-- `scroll_to_text(text)` - Scroll to text
-- `press_key(key)` - Press keyboard key
-- `evaluate_javascript(code)` - Execute JavaScript
-- `get_current_page_info()` - Get current page info
-- `new_tab(url)` / `get_tabs()` / `switch_tab(tab_id)` / `close_tab(tab_id)` - Tab management
-
-**Action (13 tools) - Element interaction by ref:**
-- `click_element_by_ref(ref)` - Click element
-- `input_text_by_ref(ref, text)` - Input text
-- `hover_element_by_ref(ref)` - Hover over element
-- `focus_element_by_ref(ref)` - Focus element
-- `double_click_element_by_ref(ref)` - Double click
-- `scroll_element_into_view_by_ref(ref)` - Scroll element into view
-- `drag_element_by_ref(start_ref, end_ref)` - Drag and drop
-
-**Form (7 tools):**
-- `get_dropdown_options_by_ref(ref)` - Get dropdown options
-- `select_dropdown_option_by_ref(ref, value)` - Select dropdown option
-- `check_element_by_ref(ref)` / `uncheck_element_by_ref(ref)` - Checkbox control
-- `upload_file_by_ref(ref, path)` - Upload file
-- `fill_form(fields)` - Fill multiple form fields
-
-**Mouse (6 tools) - Coordinate-based:**
-- `mouse_move(x, y)` - Move mouse
-- `mouse_click(x, y)` - Click at position
-- `mouse_drag(start_x, start_y, end_x, end_y)` - Drag operation
-- `mouse_down()` / `mouse_up()` - Mouse button control
-- `mouse_wheel(delta_x, delta_y)` - Scroll wheel
-
-**Keyboard (5 tools):**
-- `press_sequentially(text)` - Type text character by character
-- `key_down(key)` / `key_up(key)` - Key control
-- `insert_text(text)` - Insert text at cursor
-- `fill_form(fields)` - Fill form fields
-
-**Screenshot (2 tools):**
-- `take_screenshot(type, filename)` - Capture screenshot
-- `save_pdf(filename)` - Save page as PDF
-
-**Network (5 tools):**
-- `start_console_capture()` / `get_console_messages()` - Console monitoring
-- `start_network_capture()` / `get_network_requests()` - Network monitoring
-- `wait_for_network_idle()` - Wait for network idle
-
-**Dialog (3 tools):**
-- `setup_dialog_handler(default_action)` - Set up auto dialog handler
-- `handle_dialog(accept, prompt_text)` - Handle dialog
-- `remove_dialog_handler()` - Remove dialog handler
-
-**Storage (5 tools):**
-- `save_storage_state(filename)` / `restore_storage_state(filename)` - Session persistence
-- `clear_cookies()` / `get_cookies()` / `set_cookie()` - Cookie management
-
-**Verify (6 tools):**
-- `verify_element_visible(ref)` - Check element visibility
-- `verify_text_visible(text)` - Check text visibility
-- `verify_value(ref, value)` - Check element value
-- `verify_element_state(ref, state)` - Check element state
-- `verify_url(pattern)` / `verify_title(pattern)` - URL/title verification
-
-**DevTools (5 tools):**
-- `start_tracing()` / `stop_tracing()` - Performance tracing
-- `start_video()` / `stop_video()` - Video recording
-- `add_trace_chunk()` - Add trace data
-
-**Control (3 tools):**
-- `browser_close()` - Close browser
-- `browser_resize(width, height)` - Resize viewport
-- `wait_for(time, text, text_gone)` - Wait for conditions
-
-**State (1 tool):**
-- `get_llm_repr()` - Get page snapshot for LLM
 
 ### Stealth Mode
 
@@ -297,7 +520,7 @@ Stealth mode is **enabled by default** and includes:
 - 50+ Chrome arguments to disable automation detection
 - Disabled automation-revealing features (`navigator.webdriver`, etc.)
 - Human-like browser fingerprint
-- Optional extensions (uBlock Origin, Cookie Consent) for non-headless mode
+- Optional extensions (uBlock Origin Lite, I still don't care about cookies, Force Background Tab) for non-headless mode
 
 ```python
 # Stealth is ON by default
@@ -316,9 +539,34 @@ config = create_stealth_config(
 browser = Browser(stealth=config)
 ```
 
+### Error Model
+
+SDK and CLI share one structured error protocol.
+
+- Base type: `BridgicBrowserError`
+- Stable fields: `code`, `message`, `details`, `retryable`
+- Behavior subclasses:
+  - `InvalidInputError` (invalid arguments/user input)
+  - `StateError` (invalid runtime state, e.g. no active page/session)
+  - `OperationError` (operation execution failures)
+  - `VerificationError` (assertion/verification failures)
+
+Why keep a small number of behavior subclasses:
+
+- Lets callers catch by behavior when needed (e.g. retry only `StateError`)
+- Encodes default retry semantics close to the failure source
+- Avoids a large, hard-to-maintain class hierarchy while keeping error handling predictable
+
+Daemon protocol is also structured:
+
+- Success: `{"success": true, "result": "..."}`
+- Failure: `{"success": false, "error_code": "...", "result": "...", "data": {...}, "meta": {"retryable": false}}`
+
+CLI client converts daemon failures into `BridgicBrowserCommandError`, and CLI output keeps machine code visible as `Error[CODE]: ...`.
+
 ### Requirements
 
-- Python 3.11+
+- Python 3.10+
 - Playwright 1.57+
 - Pydantic 2.11+
 
@@ -326,338 +574,8 @@ browser = Browser(stealth=config)
 
 MIT License
 
----
-
-<a name="中文"></a>
-
-## 中文
-
-**Bridgic Browser** 是一个基于 [Playwright](https://playwright.dev/) 构建的 Python 库，专为 LLM 驱动的浏览器自动化设计。它提供了高级 API，用于构建能够与网页浏览器交互的 AI 智能体，并内置隐身模式以绕过机器人检测。
-
-### 特性
-
-- **LLM 就绪的浏览器自动化** - 专为 AI 智能体设计，提供结构化页面快照和元素引用
-- **隐身模式（默认启用）** - 50+ Chrome 参数和优化，用于绕过机器人检测
-- **双启动模式** - 自动在隔离会话和持久化上下文之间切换
-- **下载管理** - 自动处理下载，正确保留文件名
-- **完整工具集** - 导航、元素交互、标签页管理等
-
-### 安装
-
-```bash
-pip install bridgic-browser
-```
-
-安装后，安装 Playwright 浏览器：
-
-```bash
-playwright install chromium
-```
-
-### 快速开始
-
-#### 基本用法
-
-```python
-import asyncio
-from bridgic.browser.session import Browser
-
-async def main():
-    # 创建浏览器，隐身模式默认启用
-    browser = Browser(headless=False)
-
-    # 启动浏览器
-    await browser.start()
-
-    try:
-        # 导航到 URL
-        await browser.navigate_to("https://example.com")
-
-        # 获取页面快照供 LLM 使用
-        snapshot = await browser.get_snapshot()
-        print(snapshot.tree)  # 带引用的可访问元素树
-
-        # 通过引用与元素交互
-        element = await browser.get_element_by_ref("e1")
-        if element:
-            await element.click()
-    finally:
-        await browser.close()
-
-asyncio.run(main())
-```
-
-#### 与 AI 智能体配合使用
-
-```python
-from bridgic.browser.session import Browser
-from bridgic.browser.tools import BrowserToolSetBuilder
-
-async def create_agent():
-    browser = Browser(headless=False)
-    await browser.start()
-
-    # 为智能体构建工具集
-    tools = BrowserToolSetBuilder.basic_tools(browser)
-
-    # 将工具与 LLM 智能体配合使用
-    # 工具包括：导航、点击、输入文本、滚动等
-    return browser, tools
-```
-
-### 核心组件
-
-#### Browser
-
-浏览器自动化的主类，支持自动启动模式选择：
-
-```python
-from bridgic.browser.session import Browser
-
-# 隔离会话（无持久化）
-browser = Browser(
-    headless=True,
-    viewport={"width": 1920, "height": 1080},
-)
-
-# 持久化会话（带用户数据）
-browser = Browser(
-    headless=False,
-    user_data_dir="./user_data",
-    stealth=True,  # 默认启用
-)
-```
-
-**主要参数：**
-
-| 参数 | 类型 | 默认值 | 描述 |
-|------|------|--------|------|
-| `headless` | bool | True | 无头模式运行 |
-| `viewport` | dict | 1920x1080 | 浏览器视口大小 |
-| `user_data_dir` | str/Path | None | 持久化上下文路径 |
-| `stealth` | bool/StealthConfig | True | 隐身模式配置 |
-| `channel` | str | None | 浏览器通道（chrome、msedge 等） |
-| `proxy` | dict | None | 代理设置 |
-| `downloads_path` | str/Path | None | 下载目录 |
-
-#### StealthConfig
-
-配置隐身模式以绕过机器人检测：
-
-```python
-from bridgic.browser.session import StealthConfig, Browser
-
-# 自定义隐身配置
-config = StealthConfig(
-    enabled=True,
-    enable_extensions=True,  # 需要 headless=False
-    disable_security=False,
-    cookie_whitelist_domains=["example.com"],
-)
-
-browser = Browser(stealth=config, headless=False)
-```
-
-#### DownloadManager
-
-处理文件下载，正确保留文件名：
-
-```python
-from bridgic.browser.session import DownloadManager, DownloadManagerConfig
-
-config = DownloadManagerConfig(
-    downloads_path="./downloads",
-    auto_save=True,
-    overwrite_existing=False,
-)
-
-manager = DownloadManager(config=config)
-
-# 附加到浏览器上下文
-manager.attach_to_context(browser.context)
-
-# 访问已下载的文件
-for file in manager.downloaded_files:
-    print(f"已下载：{file.file_name}（{file.file_size} 字节）")
-```
-
-### 浏览器工具
-
-Bridgic Browser 提供 68+ 个工具，按类别组织。使用 `BrowserToolSetBuilder` 配合 `ToolPreset` 进行场景化工具选择。
-
-#### 使用预设快速开始
-
-```python
-from bridgic.browser.tools import BrowserToolSetBuilder, ToolPreset
-
-# 根据使用场景选择预设
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.MINIMAL)       # 10 个工具
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.FORM_FILLING)  # 20 个工具
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.TESTING)       # 28 个工具
-tools = BrowserToolSetBuilder.for_preset(browser, ToolPreset.COMPLETE)      # 68 个工具
-```
-
-#### 可用预设
-
-| 预设 | 工具数 | 描述 |
-|------|--------|------|
-| `MINIMAL` | 10 | 导航、点击、输入、快照 |
-| `NAVIGATION` | 4 | 搜索、导航、前进/后退 |
-| `SCRAPING` | 13 | 导航 + 快照 + 滚动 |
-| `FORM_FILLING` | 20 | 导航 + 输入 + 下拉框 + 复选框 |
-| `TESTING` | 28 | 表单填写 + 验证 + 截图 |
-| `INTERACTIVE` | 40 | 所有交互工具 + 鼠标 + 键盘 |
-| `DEVELOPER` | 18 | 网络 + 控制台 + 追踪 |
-| `COMPLETE` | 68 | 所有可用工具 |
-
-#### 按类别选择
-
-```python
-# 按类别选择工具
-tools = BrowserToolSetBuilder.for_categories(
-    browser, "navigation", "action", "screenshot"
-)
-```
-
-#### 流式构建器自定义选择
-
-```python
-from bridgic.browser.tools import take_screenshot, verify_url
-
-tools = (BrowserToolSetBuilder(browser)
-    .with_preset(ToolPreset.MINIMAL)
-    .with_category("screenshot")
-    .with_tools(verify_url)
-    .without_tools("go_forward")
-    .build_specs())
-```
-
-#### 工具类别
-
-**导航（4 个工具）：**
-- `search(query, engine)` - 使用搜索引擎搜索
-- `navigate_to_url(url)` - 导航到 URL
-- `go_back()` / `go_forward()` - 浏览器历史导航
-
-**页面（9 个工具）：**
-- `reload_page()` - 重新加载当前页面
-- `scroll_to_text(text)` - 滚动到指定文本
-- `press_key(key)` - 按下键盘键
-- `evaluate_javascript(code)` - 执行 JavaScript
-- `get_current_page_info()` - 获取当前页面信息
-- `new_tab(url)` / `get_tabs()` / `switch_tab(tab_id)` / `close_tab(tab_id)` - 标签页管理
-
-**动作（13 个工具）- 通过引用操作元素：**
-- `click_element_by_ref(ref)` - 点击元素
-- `input_text_by_ref(ref, text)` - 输入文本
-- `hover_element_by_ref(ref)` - 悬停在元素上
-- `focus_element_by_ref(ref)` - 聚焦元素
-- `double_click_element_by_ref(ref)` - 双击
-- `scroll_element_into_view_by_ref(ref)` - 滚动元素到可视区域
-- `drag_element_by_ref(start_ref, end_ref)` - 拖放
-
-**表单（7 个工具）：**
-- `get_dropdown_options_by_ref(ref)` - 获取下拉选项
-- `select_dropdown_option_by_ref(ref, value)` - 选择下拉选项
-- `check_element_by_ref(ref)` / `uncheck_element_by_ref(ref)` - 复选框控制
-- `upload_file_by_ref(ref, path)` - 上传文件
-- `fill_form(fields)` - 填写多个表单字段
-
-**鼠标（6 个工具）- 基于坐标：**
-- `mouse_move(x, y)` - 移动鼠标
-- `mouse_click(x, y)` - 在指定位置点击
-- `mouse_drag(start_x, start_y, end_x, end_y)` - 拖动操作
-- `mouse_down()` / `mouse_up()` - 鼠标按钮控制
-- `mouse_wheel(delta_x, delta_y)` - 滚轮
-
-**键盘（5 个工具）：**
-- `press_sequentially(text)` - 逐字符输入文本
-- `key_down(key)` / `key_up(key)` - 按键控制
-- `insert_text(text)` - 在光标处插入文本
-- `fill_form(fields)` - 填写表单字段
-
-**截图（2 个工具）：**
-- `take_screenshot(type, filename)` - 截取屏幕截图
-- `save_pdf(filename)` - 保存页面为 PDF
-
-**网络（5 个工具）：**
-- `start_console_capture()` / `get_console_messages()` - 控制台监控
-- `start_network_capture()` / `get_network_requests()` - 网络监控
-- `wait_for_network_idle()` - 等待网络空闲
-
-**对话框（3 个工具）：**
-- `setup_dialog_handler(default_action)` - 设置自动对话框处理
-- `handle_dialog(accept, prompt_text)` - 处理对话框
-- `remove_dialog_handler()` - 移除对话框处理器
-
-**存储（5 个工具）：**
-- `save_storage_state(filename)` / `restore_storage_state(filename)` - 会话持久化
-- `clear_cookies()` / `get_cookies()` / `set_cookie()` - Cookie 管理
-
-**验证（6 个工具）：**
-- `verify_element_visible(ref)` - 检查元素可见性
-- `verify_text_visible(text)` - 检查文本可见性
-- `verify_value(ref, value)` - 检查元素值
-- `verify_element_state(ref, state)` - 检查元素状态
-- `verify_url(pattern)` / `verify_title(pattern)` - URL/标题验证
-
-**开发者工具（5 个工具）：**
-- `start_tracing()` / `stop_tracing()` - 性能追踪
-- `start_video()` / `stop_video()` - 视频录制
-- `add_trace_chunk()` - 添加追踪数据
-
-**控制（3 个工具）：**
-- `browser_close()` - 关闭浏览器
-- `browser_resize(width, height)` - 调整视口大小
-- `wait_for(time, text, text_gone)` - 等待条件
-
-**状态（1 个工具）：**
-- `get_llm_repr()` - 获取供 LLM 使用的页面快照
-
-### 隐身模式
-
-隐身模式**默认启用**，包括：
-
-- 50+ Chrome 参数禁用自动化检测
-- 禁用暴露自动化的特性（`navigator.webdriver` 等）
-- 类人的浏览器指纹
-- 可选扩展（uBlock Origin、Cookie Consent）用于非无头模式
-
-```python
-# 隐身模式默认开启
-browser = Browser()  # stealth=True
-
-# 如需禁用隐身模式
-browser = Browser(stealth=False)
-
-# 自定义隐身设置
-from bridgic.browser.session import create_stealth_config
-
-config = create_stealth_config(
-    enable_extensions=False,
-    disable_security=True,
-)
-browser = Browser(stealth=config)
-```
-
-### 环境要求
-
-- Python 3.11+
-- Playwright 1.57+
-- Pydantic 2.11+
-
-### 许可证
-
-MIT 许可证
-
----
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Links
-
-- [GitHub Repository](https://github.com/bitsky-tech/bridgic-browser)
-- [Documentation](https://bridgic.dev)
-- [Issue Tracker](https://github.com/bitsky-tech/bridgic-browser/issues)
+## More documentation
+
+- [Browser Tools Guide](docs/BROWSER_TOOLS_GUIDE.md) – Tool selection, ref vs coordinate, wait strategies, patterns.
+- [Snapshot and Page State](docs/SNAPSHOT_AND_STATE.md) – SnapshotOptions, EnhancedSnapshot, get_snapshot_text, get_element_by_ref.
+- [API Summary](docs/API.md) – Session and DownloadManager API reference.
