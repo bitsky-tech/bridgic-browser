@@ -26,7 +26,7 @@ MAJOR.MINOR.PATCH[.devN | aN | bN | rcN]
 |--------------|------------|---------|
 | Development (`*.dev*`) | btsk (private) | `0.1.0.dev1` |
 | Alpha/Beta/RC | testpypi or pypi | `0.1.0a1`, `0.1.0b1` |
-| Stable (`X.Y.Z`) | pypi | `0.1.0`, `1.0.0` |
+| Stable (`X.Y.Z`) | testpypi or pypi | `0.1.0`, `1.0.0` |
 
 ## Release Process
 
@@ -35,6 +35,25 @@ MAJOR.MINOR.PATCH[.devN | aN | bN | rcN]
 1. All tests pass
 2. Version in `pyproject.toml` is correct
 3. You have publishing credentials configured
+
+### Branch Strategy (Required)
+
+This repository enforces branch naming rules in git hooks.
+
+- Allowed branch prefixes: `feature/`, `bugfix/`, `refactor/`, `release/`, `docs/`
+- Direct push to `main` and `dev` is blocked
+- Use PR merge to update `main`/`dev`
+- Branch naming checks apply to branch refs (`refs/heads/*`), not tags (`refs/tags/*`)
+
+### Step 0: Create Release Branch
+
+Use a `release/*` branch before publishing:
+
+```bash
+git checkout main
+git pull --ff-only
+git checkout -b release/X.Y.Z
+```
 
 ### Step 1: Update Version
 
@@ -84,14 +103,24 @@ pip install -i https://test.pypi.org/simple/ bridgic-browser==X.Y.Z
 make publish repo=pypi
 ```
 
-### Step 5: Create Git Tag
+### Step 5: Push Release Branch and Merge PR
 
 ```bash
+git push origin release/X.Y.Z
+```
+
+Then open PR `release/X.Y.Z -> main` and merge.
+
+### Step 6: Create Git Tag (After PR Merge)
+
+```bash
+git checkout main
+git pull --ff-only
 git tag -a vX.Y.Z -m "Release vX.Y.Z"
 git push origin vX.Y.Z
 ```
 
-### Step 6: Create GitHub Release
+### Step 7: Create GitHub Release
 
 1. Go to GitHub Releases page
 2. Click "Create a new release"
@@ -164,6 +193,27 @@ Solution: Check your API token and credentials.
 ### Package Not Found After Publishing
 
 PyPI indexing can take a few minutes. Wait and try again.
+
+### Branch Hook Error While Pushing Tag
+
+If you hit this error when pushing tag:
+
+```
+Branch name 'refs/tags/vX.Y.Z' doesn't follow naming convention
+```
+
+Your local hook is outdated and incorrectly treats tags as branches.
+
+Solution:
+1. Pull latest repository changes
+2. Re-install hooks:
+   ```bash
+   make init-dev
+   ```
+3. Retry:
+   ```bash
+   git push origin vX.Y.Z
+   ```
 
 ## Automated Releases (CI/CD)
 

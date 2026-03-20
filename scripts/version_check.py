@@ -8,7 +8,7 @@ repository before publishing.
 Version rules:
 - Development versions (*.dev*): btsk only
 - Pre-release versions (alpha, beta, rc): pypi or testpypi
-- Release versions (x.y.z): pypi only
+- Release versions (x.y.z): pypi or testpypi
 """
 
 import re

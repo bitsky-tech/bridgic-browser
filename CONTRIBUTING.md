@@ -78,15 +78,18 @@ make test-integration
    - `feature/` - New features
    - `bugfix/` - Bug fixes
    - `refactor/` - Code refactoring
+   - `release/` - Release preparation (version/release docs/changelog)
    - `docs/` - Documentation updates
+   
+   Protected branches:
+   - `main` and `dev` do not allow direct push from local branches
+   - Use Pull Requests to merge into `main`/`dev`
 
 2. **Make your changes and test:**
    ```shell
    # Run tests
    make test-quick
    
-   # Check for linting issues (optional)
-   uvx ruff check .
    ```
 
 3. **Commit your changes:**
