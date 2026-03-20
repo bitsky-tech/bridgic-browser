@@ -97,13 +97,6 @@ make test-integration
    git add .
    git commit -m "feat: description of your changes"
    ```
-   
-   Commit message prefixes:
-   - `feat:` - New feature
-   - `fix:` - Bug fix
-   - `docs:` - Documentation
-   - `refactor:` - Code refactoring
-   - `test:` - Test updates
 
 4. **Push and create a Pull Request:**
    ```shell
