@@ -855,8 +855,62 @@ async def run_daemon() -> None:
     remove_run_info()
 
 
+DAEMON_LOG_PATH = BRIDGIC_HOME / "logs" / "daemon.log"
+
+
+def _setup_daemon_logging() -> None:
+    """Configure daemon logging with both file and stderr output.
+
+    Writes bridgic.browser logs (DEBUG+) to ~/.bridgic/logs/daemon.log so
+    that diagnostics are preserved even after the parent process closes the
+    stdout pipe. Stderr still gets WARNING+ for immediate visibility.
+    """
+    from logging.handlers import RotatingFileHandler
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.WARNING)
+    stderr_handler.setFormatter(logging.Formatter(
+        "[%(levelname)s] %(message)s",
+    ))
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(logging.WARNING)
+    root.addHandler(stderr_handler)
+
+    bridgic_logger = logging.getLogger("bridgic.browser")
+    bridgic_logger.setLevel(logging.DEBUG)
+    bridgic_logger.propagate = True
+    bridgic_logger.handlers.clear()
+
+    try:
+        log_dir = DAEMON_LOG_PATH.parent
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        file_handler = RotatingFileHandler(
+            str(DAEMON_LOG_PATH),
+            maxBytes=5 * 1024 * 1024,  # 5 MB
+            backupCount=1,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter(
+            "[%(asctime)s.%(msecs)03d] [%(levelname)-5s] [%(name)s:%(lineno)d] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+    except Exception as exc:
+        logger.warning(
+            "[daemon] failed to initialize file logging at %s: %s",
+            DAEMON_LOG_PATH,
+            exc,
+        )
+        return
+
+    bridgic_logger.addHandler(file_handler)
+
+
 def main() -> None:
-    logging.basicConfig(level=logging.WARNING)
+    _setup_daemon_logging()
     asyncio.run(run_daemon())
 
 

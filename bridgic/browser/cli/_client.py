@@ -16,7 +16,7 @@ import threading
 from typing import Any, Dict, Optional
 
 from ..errors import BridgicBrowserCommandError
-from ._daemon import READY_SIGNAL, STREAM_LIMIT
+from ._daemon import DAEMON_LOG_PATH, READY_SIGNAL, STREAM_LIMIT
 from ._transport import (
     RUN_INFO_PATH,
     _safe_remove_socket,
@@ -244,7 +244,8 @@ def _spawn_daemon(headed: bool = False) -> None:
 
     raise RuntimeError(
         "Daemon did not send ready signal within 30 seconds. "
-        "Check that Playwright browsers are installed (`make playwright-install`)."
+        "Check that Playwright browsers are installed (`python -m playwright install`).\n"
+        f"Daemon log: {DAEMON_LOG_PATH}"
         + diagnostics_tail
     )
 

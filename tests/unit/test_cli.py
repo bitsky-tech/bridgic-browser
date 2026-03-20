@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import stat
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -235,6 +237,36 @@ def make_browser() -> MagicMock:
         "video_dir": None,
     })
     return b
+
+
+def _snapshot_logging_state() -> dict[str, Any]:
+    root = logging.getLogger()
+    bridgic_logger = logging.getLogger("bridgic.browser")
+    return {
+        "root_handlers": list(root.handlers),
+        "root_level": root.level,
+        "bridgic_handlers": list(bridgic_logger.handlers),
+        "bridgic_level": bridgic_logger.level,
+        "bridgic_propagate": bridgic_logger.propagate,
+    }
+
+
+def _restore_logging_state(state: dict[str, Any]) -> None:
+    root = logging.getLogger()
+    bridgic_logger = logging.getLogger("bridgic.browser")
+
+    for handler in list(bridgic_logger.handlers):
+        if getattr(handler, "baseFilename", None):
+            handler.close()
+
+    root.handlers.clear()
+    root.handlers.extend(state["root_handlers"])
+    root.setLevel(state["root_level"])
+
+    bridgic_logger.handlers.clear()
+    bridgic_logger.handlers.extend(state["bridgic_handlers"])
+    bridgic_logger.setLevel(state["bridgic_level"])
+    bridgic_logger.propagate = state["bridgic_propagate"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1888,8 +1920,11 @@ class TestClientSendCommand:
         fake_proc.stdout = io.BytesIO(b"startup failed\n")
 
         with patch("bridgic.browser.cli._client.subprocess.Popen", return_value=fake_proc):
-            with pytest.raises(RuntimeError, match="Daemon output \\(tail\\):"):
+            with pytest.raises(RuntimeError) as exc_info:
                 _client._spawn_daemon()
+        assert "Daemon output (tail):" in str(exc_info.value)
+        assert "python -m playwright install" in str(exc_info.value)
+        assert "Daemon log:" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_send_command_async_uses_success_field_when_present(self):
@@ -1945,6 +1980,52 @@ class TestClientSendCommand:
             with pytest.raises(BridgicBrowserCommandError) as exc_info:
                 await _send_command_async("snapshot", {})
         assert exc_info.value.code == "DAEMON_RESPONSE_TIMEOUT"
+
+
+class TestDaemonLogging:
+    def test_setup_daemon_logging_scopes_debug_to_bridgic_logger(self, tmp_path):
+        from bridgic.browser.cli import _daemon
+
+        state = _snapshot_logging_state()
+        try:
+            log_path = tmp_path / "logs" / "daemon.log"
+            with patch("bridgic.browser.cli._daemon.DAEMON_LOG_PATH", log_path):
+                _daemon._setup_daemon_logging()
+
+            root = logging.getLogger()
+            bridgic_logger = logging.getLogger("bridgic.browser")
+
+            assert root.level == logging.WARNING
+            assert bridgic_logger.level == logging.DEBUG
+            assert bridgic_logger.propagate is True
+            assert any(getattr(h, "baseFilename", None) == str(log_path) for h in bridgic_logger.handlers)
+            assert not any(getattr(h, "baseFilename", None) == str(log_path) for h in root.handlers)
+        finally:
+            _restore_logging_state(state)
+
+    def test_setup_daemon_logging_falls_back_when_file_logging_fails(self, tmp_path):
+        from bridgic.browser.cli import _daemon
+
+        state = _snapshot_logging_state()
+        try:
+            log_path = tmp_path / "logs" / "daemon.log"
+            with (
+                patch("bridgic.browser.cli._daemon.DAEMON_LOG_PATH", log_path),
+                patch("logging.handlers.RotatingFileHandler", side_effect=OSError("no space left")),
+                patch("bridgic.browser.cli._daemon.logger.warning") as mock_warning,
+            ):
+                _daemon._setup_daemon_logging()
+
+            root = logging.getLogger()
+            bridgic_logger = logging.getLogger("bridgic.browser")
+
+            assert root.level == logging.WARNING
+            assert any(isinstance(h, logging.StreamHandler) for h in root.handlers)
+            assert bridgic_logger.handlers == []
+            mock_warning.assert_called_once()
+            assert "failed to initialize file logging" in mock_warning.call_args[0][0]
+        finally:
+            _restore_logging_state(state)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
