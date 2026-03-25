@@ -374,6 +374,62 @@ class TestGetLocatorFromRefAsync:
         # .nth() must NOT be called — the stored nth is in a different key space
         filtered_locator.nth.assert_not_called()
 
+    def test_unnamed_generic_named_noise_child_resolves_via_parent_locator(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Unnamed generic with a named STRUCTURAL_NOISE child resolves via child → .locator('..').
+
+        Scenario mirrors a Semantic UI dropdown where the button div is unnamed
+        but contains a named <span class="text">自动检测</span>:
+
+            generic [ref=8944f251]:
+              generic "自动检测" [ref=5fcfa23c]
+
+        The unnamed parent cannot be targeted by get_by_role('generic') (returns 0).
+        Instead: resolve the named child (which uses CSS + has_text), then climb to
+        the DOM parent via .locator('..').
+        """
+        page = Mock()
+        # Child resolution mocks (named generic "自动检测" branch):
+        css_locator = Mock()
+        filtered_child = Mock()
+        parent_locator = Mock()
+        page.locator.return_value = css_locator
+        css_locator.filter.return_value = filtered_child
+        filtered_child.locator.return_value = parent_locator
+
+        refs = {
+            "8944f251": RefData(
+                selector="get_by_role('generic')",
+                role="generic",
+                name=None,
+                nth=None,
+                text_content=None,
+                parent_ref=None,
+            ),
+            "5fcfa23c": RefData(
+                selector='get_by_text("自动检测", exact=True)',
+                role="generic",
+                name="自动检测",
+                nth=None,  # unique element — no nth disambiguation
+                text_content=None,
+                parent_ref="8944f251",
+            ),
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "8944f251", refs)
+
+        # Child is located inline with STRUCTURAL_NOISE_CSS_NAMED (span-inclusive)
+        page.locator.assert_called_once_with(
+            'div:not([role]), span:not([role]), legend, [role="generic"]'
+        )
+        css_locator.filter.assert_called_once()
+        # .locator('..') must be called on the resolved child to get the DOM parent
+        filtered_child.locator.assert_called_once_with('..')
+        assert locator is parent_locator
+        # nth is NOT applied — parent is anchored via child, not nth-counting
+        parent_locator.nth.assert_not_called()
+
     def test_unnamed_generic_no_text_child_falls_back_to_role(self, gen: SnapshotGenerator) -> None:
         """Unnamed generic with no text children still falls back to get_by_role."""
         page = Mock()
@@ -1464,15 +1520,14 @@ class TestExtractAndProcessPipeline:
 
         container_ref = None
         child_named_ref = None
-        child_unnamed_ref = None
         for ref, data in refs.items():
             if data.name == "Container":
                 container_ref = ref
             elif data.name == "自动检测":
                 child_named_ref = ref
-            elif data.role == "generic" and data.name is None:
-                child_unnamed_ref = ref
 
+        # Unnamed generic elements (e3) are filtered before entering refs —
+        # should_have_ref = bool(name) — so only the named children appear.
         assert container_ref is not None
         assert child_named_ref is not None
         assert refs[container_ref].parent_ref is None
@@ -2376,3 +2431,65 @@ class TestYamlQuoteEndToEnd:
         assert '[ref=e175]' not in result
         assert '[ref=e183]' not in result
         assert '[ref=e4]' not in result
+
+
+# ---------------------------------------------------------------------------
+# playwright_ref storage in RefData (aria-ref fast-path)
+# ---------------------------------------------------------------------------
+
+class TestPlaywrightRefStorage:
+    """Verify that _process_page_snapshot_for_ai stores Playwright's ephemeral
+    aria-ref IDs (e.g. "e369") in RefData.playwright_ref for fast-path lookup."""
+
+    def test_playwright_ref_stored_for_named_element(self, gen: SnapshotGenerator) -> None:
+        """playwright_ref is stored for a regular named interactive element."""
+        raw = "- button \"Submit\" [ref=e1]"
+        refs: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw, refs, SnapshotOptions())
+        assert len(refs) == 1
+        ref_data = next(iter(refs.values()))
+        assert ref_data.playwright_ref == "e1"
+
+    def test_playwright_ref_stored_for_generic_with_name(self, gen: SnapshotGenerator) -> None:
+        """playwright_ref is stored even for structural-noise roles."""
+        raw = "- generic \"自动检测\" [ref=e42]"
+        refs: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw, refs, SnapshotOptions())
+        assert len(refs) == 1
+        ref_data = next(iter(refs.values()))
+        assert ref_data.playwright_ref == "e42"
+
+    def test_playwright_ref_is_none_when_no_ref_in_suffix(self, gen: SnapshotGenerator) -> None:
+        """Synthetic input without [ref=...] produces playwright_ref=None."""
+        raw = "- button \"Submit\""
+        refs: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw, refs, SnapshotOptions())
+        assert len(refs) == 1
+        ref_data = next(iter(refs.values()))
+        assert ref_data.playwright_ref is None
+
+    def test_playwright_ref_stored_in_interactive_mode(self, gen: SnapshotGenerator) -> None:
+        """playwright_ref is correctly stored when options.interactive=True."""
+        raw = "- button \"Login\" [ref=e7]"
+        refs: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw, refs, SnapshotOptions(interactive=True))
+        assert len(refs) == 1
+        ref_data = next(iter(refs.values()))
+        assert ref_data.playwright_ref == "e7"
+
+    def test_playwright_ref_stored_for_iframe_child(self, gen: SnapshotGenerator) -> None:
+        """playwright_ref is stored for elements inside iframes."""
+        raw = (
+            "- iframe \"frame\" [ref=e1]\n"
+            "  - button \"Go\" [ref=e2]"
+        )
+        refs: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw, refs, SnapshotOptions())
+        btn_data = next(d for d in refs.values() if d.role == "button")
+        assert btn_data.playwright_ref == "e2"
+        assert btn_data.frame_path == [0]

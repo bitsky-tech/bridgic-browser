@@ -242,15 +242,17 @@ async def _click_checkable_target(page, locator, bbox) -> None:
         cx = bbox["x"] + bbox["width"] / 2
         cy = bbox["y"] + bbox["height"] / 2
         if not await locator.is_visible():
+            logger.debug("_click_checkable_target: bbox present but is_visible()=False; using dispatch_event click")
             await locator.dispatch_event("click")
             return
 
         covered = await locator.evaluate(
-            f"(el) => {{ if (window.frameElement !== null) return false; "
+            f"(el) => {{ if (window.parent !== window) return false; "
             f"const t = document.elementFromPoint({cx}, {cy}); "
             f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
         )
         if covered:
+            logger.debug("_click_checkable_target: covered at (%.1f, %.1f), clicking intercepting element", cx, cy)
             if page:
                 await page.evaluate(f"document.elementFromPoint({cx}, {cy})?.click()")
             else:
@@ -262,6 +264,7 @@ async def _click_checkable_target(page, locator, bbox) -> None:
     if await locator.is_visible():
         await locator.click()
     else:
+        logger.debug("_click_checkable_target: no bbox and is_visible()=False; using dispatch_event click")
         await locator.dispatch_event("click")
 
 
@@ -1792,7 +1795,60 @@ class Browser:
         try:
             if self._snapshot_generator is None:
                 self._snapshot_generator = SnapshotGenerator()
-            
+
+            ref_data = self._last_snapshot.refs.get(ref)
+
+            # ── aria-ref fast-path ─────────────────────────────────────────────────
+            # Playwright's aria-ref engine maps ephemeral IDs (e.g. "e369", "f1e5")
+            # directly to live DOM element pointers populated during snapshotForAI.
+            # O(1) lookup — no CSS reconstruction needed.
+            #
+            # Each frame stores its own _lastAriaSnapshotForQuery keyed by the FULL
+            # prefixed ref (e.g. L1 frame stores "f1e5" → element).  For iframe
+            # elements we therefore scope the locator to the correct frame first via
+            # frame_locator chain — this ensures locator.evaluate() and all other
+            # locator operations run in the element's own frame context, not the
+            # main frame.  Main-frame elements (frame_path=None) use page directly.
+            #
+            # Falls through silently if stale (count=0) or engine unavailable.
+            if ref_data and getattr(ref_data, 'playwright_ref', None):
+                try:
+                    ar_scope = self._page
+                    if ref_data.frame_path:
+                        for local_nth in ref_data.frame_path:
+                            ar_scope = ar_scope.frame_locator("iframe").nth(local_nth)
+                    ar_locator = ar_scope.locator(f"aria-ref={ref_data.playwright_ref}")
+                    ar_count = await ar_locator.count()
+                    if ar_count == 1:
+                        logger.debug(
+                            "[get_element_by_ref] aria-ref fast-path hit: ref=%s playwright_ref=%s frame_path=%s",
+                            ref, ref_data.playwright_ref, ref_data.frame_path,
+                        )
+                        return ar_locator
+                    # ar_count == 0 → snapshot is stale (DOM changed) — fall through
+                    # ar_count > 1  → should never happen for a direct pointer — fall through
+                    logger.debug(
+                        "[get_element_by_ref] aria-ref stale (count=%d), falling through to CSS: ref=%s playwright_ref=%s",
+                        ar_count, ref, ref_data.playwright_ref,
+                    )
+                except Exception as _ar_exc:
+                    logger.debug(
+                        "[get_element_by_ref] aria-ref exception (%s), falling through to CSS: ref=%s",
+                        _ar_exc, ref,
+                    )
+            # ── aria-ref fast-path end ─────────────────────────────────────────────
+
+            if ref_data is None:
+                logger.debug("[get_element_by_ref] ref not found in snapshot: %s", ref)
+            else:
+                logger.debug(
+                    "[get_element_by_ref] CSS path: ref=%s role=%s name=%r nth=%s frame_path=%s",
+                    ref,
+                    getattr(ref_data, 'role', None),
+                    getattr(ref_data, 'name', None),
+                    getattr(ref_data, 'nth', None),
+                    getattr(ref_data, 'frame_path', None),
+                )
             locator = self._snapshot_generator.get_locator_from_ref_async(
                 self._page, ref, self._last_snapshot.refs
             )
@@ -1802,7 +1858,6 @@ class Browser:
                 if count == 1:
                     return locator
                 elif count > 1:
-                    ref_data = self._last_snapshot.refs.get(ref)
                     can_recover_by_role_name = (
                         bool(ref_data and ref_data.name)
                         and ref_data.role not in SnapshotGenerator.ROLE_TEXT_MATCH_ROLES
@@ -3074,7 +3129,7 @@ Before you return the element ref, reason about the state and elements for a sen
                     await locator.dispatch_event("click")
                 else:
                     covered = await locator.evaluate(
-                        f"(el) => {{ if (window.frameElement !== null) return false; "
+                        f"(el) => {{ if (window.parent !== window) return false; "
                         f"const t = document.elementFromPoint({cx}, {cy}); "
                         f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
                     )
@@ -3299,7 +3354,7 @@ Before you return the element ref, reason about the state and elements for a sen
                         await locator.hover(force=True)
                 else:
                     covered = await locator.evaluate(
-                        f"(el) => {{ if (window.frameElement !== null) return false; "
+                        f"(el) => {{ if (window.parent !== window) return false; "
                         f"const t = document.elementFromPoint({cx}, {cy}); "
                         f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
                     )
@@ -3579,7 +3634,7 @@ Before you return the element ref, reason about the state and elements for a sen
                         await locator.dispatch_event("click")
                     else:
                         covered = await locator.evaluate(
-                            f"(el) => {{ if (window.frameElement !== null) return false; "
+                            f"(el) => {{ if (window.parent !== window) return false; "
                             f"const t = document.elementFromPoint({cx}, {cy}); "
                             f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
                         )
@@ -3674,7 +3729,7 @@ Before you return the element ref, reason about the state and elements for a sen
                         await locator.dispatch_event("click")
                     else:
                         covered = await locator.evaluate(
-                            f"(el) => {{ if (window.frameElement !== null) return false; "
+                            f"(el) => {{ if (window.parent !== window) return false; "
                             f"const t = document.elementFromPoint({cx}, {cy}); "
                             f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
                         )
@@ -3762,7 +3817,7 @@ Before you return the element ref, reason about the state and elements for a sen
                     await locator.dispatch_event("dblclick")
                 else:
                     covered = await locator.evaluate(
-                        f"(el) => {{ if (window.frameElement !== null) return false; "
+                        f"(el) => {{ if (window.parent !== window) return false; "
                         f"const t = document.elementFromPoint({cx}, {cy}); "
                         f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
                     )

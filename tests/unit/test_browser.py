@@ -960,3 +960,118 @@ class TestBrowserChildFallback:
         result = await browser.get_element_by_ref("e6")
 
         assert result is None
+
+
+class TestGetElementByRefAriaRef:
+    """Tests for the aria-ref O(1) fast-path in get_element_by_ref."""
+
+    def _make_browser_with_ref(self, playwright_ref, frame_path=None):
+        from bridgic.browser.session._snapshot import RefData
+        browser = Browser(stealth=False)
+        browser._page = MagicMock()
+        browser._snapshot_generator = MagicMock()
+        ref_data = RefData(
+            selector="get_by_role('button')",
+            role="button",
+            name="Submit",
+            nth=None,
+            playwright_ref=playwright_ref,
+            frame_path=frame_path,
+        )
+        browser._last_snapshot = MagicMock(refs={"myref": ref_data})
+        return browser
+
+    @pytest.mark.asyncio
+    async def test_aria_ref_fast_path_hit(self):
+        """When aria-ref count=1, return immediately without calling CSS locator."""
+        browser = self._make_browser_with_ref("e369")
+
+        ar_locator = MagicMock()
+        ar_locator.count = AsyncMock(return_value=1)
+        browser._page.locator.return_value = ar_locator
+
+        result = await browser.get_element_by_ref("myref")
+
+        assert result is ar_locator
+        browser._page.locator.assert_called_once_with("aria-ref=e369")
+        browser._snapshot_generator.get_locator_from_ref_async.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_aria_ref_falls_through_on_stale(self):
+        """When aria-ref count=0 (stale), fall through to CSS locator."""
+        browser = self._make_browser_with_ref("e369")
+
+        ar_locator = MagicMock()
+        ar_locator.count = AsyncMock(return_value=0)
+        browser._page.locator.return_value = ar_locator
+
+        css_locator = MagicMock()
+        css_locator.count = AsyncMock(return_value=1)
+        browser._snapshot_generator.get_locator_from_ref_async.return_value = css_locator
+
+        result = await browser.get_element_by_ref("myref")
+
+        assert result is css_locator
+        browser._snapshot_generator.get_locator_from_ref_async.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_aria_ref_falls_through_on_exception(self):
+        """When aria-ref raises, fall through silently — no exception propagates."""
+        browser = self._make_browser_with_ref("e369")
+
+        browser._page.locator.side_effect = Exception("engine not available")
+
+        css_locator = MagicMock()
+        css_locator.count = AsyncMock(return_value=1)
+        browser._snapshot_generator.get_locator_from_ref_async.return_value = css_locator
+
+        result = await browser.get_element_by_ref("myref")
+
+        assert result is css_locator
+
+    @pytest.mark.asyncio
+    async def test_aria_ref_skipped_when_playwright_ref_none(self):
+        """When playwright_ref=None, skip fast-path entirely."""
+        browser = self._make_browser_with_ref(playwright_ref=None)
+
+        css_locator = MagicMock()
+        css_locator.count = AsyncMock(return_value=1)
+        browser._snapshot_generator.get_locator_from_ref_async.return_value = css_locator
+
+        result = await browser.get_element_by_ref("myref")
+
+        assert result is css_locator
+        # page.locator should NOT have been called with aria-ref=...
+        for call in browser._page.locator.call_args_list:
+            assert "aria-ref=" not in str(call)
+
+    @pytest.mark.asyncio
+    async def test_aria_ref_iframe_uses_frame_locator_chain(self):
+        """For iframe elements, aria-ref is scoped via frame_locator chain.
+
+        Each frame stores its own _lastAriaSnapshotForQuery keyed by the full prefixed ref
+        (e.g. L1 stores "f1e99" → element).  Scoping the locator to the correct frame
+        ensures locator.evaluate() runs in the element's own frame context, not main frame.
+        This is critical for the covered-element check: without scoping, evaluate() would
+        run in the main frame where window.parent === window and the check mis-fires.
+        """
+        # Iframe element: playwright_ref has "f1" prefix, frame_path=[0]
+        browser = self._make_browser_with_ref("f1e99", frame_path=[0])
+
+        # Set up the frame_locator chain mock
+        frame_locator_mock = MagicMock()
+        nth_mock = MagicMock()
+        ar_locator = MagicMock()
+        ar_locator.count = AsyncMock(return_value=1)
+
+        browser._page.frame_locator.return_value = frame_locator_mock
+        frame_locator_mock.nth.return_value = nth_mock
+        nth_mock.locator.return_value = ar_locator
+
+        result = await browser.get_element_by_ref("myref")
+
+        assert result is ar_locator
+        # page.frame_locator("iframe") called once for the single frame_path level
+        browser._page.frame_locator.assert_called_once_with("iframe")
+        frame_locator_mock.nth.assert_called_once_with(0)
+        nth_mock.locator.assert_called_once_with("aria-ref=f1e99")

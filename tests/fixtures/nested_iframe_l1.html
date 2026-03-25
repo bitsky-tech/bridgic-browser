@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Level 1 Frame</title>
+  <style>
+    body { font-family: sans-serif; padding: 12px; background: #f0f4ff; }
+    iframe { border: 1px solid #aaa; display: block; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h2>Level 1 Frame</h2>
+
+  <button id="l1-btn" data-click-count="0"
+    onclick="this.dataset.clickCount = parseInt(this.dataset.clickCount||0)+1; this.dataset.clicked='true'">
+    Level 1 Button
+  </button>
+  <input type="text" id="l1-input" aria-label="Level 1 Input" placeholder="Level 1 Input">
+
+  <!-- Same name as in main frame and l2 — nth disambiguation test -->
+  <button id="l1-shared-btn" data-click-count="0"
+    onclick="this.dataset.clickCount = parseInt(this.dataset.clickCount||0)+1; this.dataset.clicked='true'">
+    Shared Button
+  </button>
+
+  <!-- Checkbox for state-change verification -->
+  <input type="checkbox" id="l1-checkbox" aria-label="Level 1 Checkbox">
+  <label for="l1-checkbox">Level 1 Checkbox</label>
+
+  <!-- A select dropdown -->
+  <select id="l1-select" aria-label="Level 1 Select">
+    <option value="a">Option A</option>
+    <option value="b">Option B</option>
+    <option value="c">Option C</option>
+  </select>
+
+  <iframe
+    id="level2-frame"
+    src="nested_iframe_l2.html"
+    title="Level 2 Frame"
+    style="width:420px;height:120px;"
+  ></iframe>
+</body>
+</html>
