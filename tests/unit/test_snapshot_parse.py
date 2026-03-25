@@ -1189,6 +1189,131 @@ class TestProcessPageSnapshotForAI:
 
         assert 'button "File Upload"' in result
 
+    # ------------------------------------------------------------------
+    # TEXT_LEAF_ROLES propagation in interactive mode
+    # ------------------------------------------------------------------
+
+    def test_text_node_under_interactive_parent_shown_in_interactive_mode(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """text pseudo-nodes with no playwright_ref inherit interactivity from
+        the nearest interactive ancestor (cursor=pointer parent).
+
+        Real-world case: dropdown items rendered as
+          <div class="item" @click>QQ</div>
+        produce "- generic [ref=eX] [cursor=pointer]\\n  - text: QQ" in the
+        Playwright snapshot.  Without the fix the text node (no [ref=...]) is
+        always filtered in -i mode; with the fix it is shown.
+        """
+        raw = (
+            '- generic [ref=e1] [cursor=pointer]\n'
+            '  - text: QQ'
+        )
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+        interactive_map = {"e1": True}
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
+
+        assert 'text "QQ"' in result
+
+    def test_text_node_under_non_interactive_parent_hidden_in_interactive_mode(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """text nodes whose direct and indirect ancestors are all non-interactive
+        must NOT appear in -i mode."""
+        raw = (
+            '- heading "Page Title" [ref=e1]\n'
+            '  - text: subtitle'
+        )
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+        # heading is not in INTERACTIVE_ROLES, no cursor=pointer → not kept
+        interactive_map = {"e1": False}
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
+
+        assert 'text "subtitle"' not in result
+        assert 'subtitle' not in result
+
+    def test_text_node_under_span_wrapper_inside_interactive_grandparent(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """A span wrapper between the clickable container and the text node must
+        not break propagation.
+
+        DOM: <div class="item" @click><span>QQ</span></div>
+        Snapshot:
+          - generic [ref=e1] [cursor=pointer]   ← interactive grandparent
+            - generic                            ← unnamed span wrapper, no cursor
+              - text: QQ
+        """
+        raw = (
+            '- generic [ref=e1] [cursor=pointer]\n'
+            '  - generic\n'
+            '    - text: QQ'
+        )
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+        interactive_map = {"e1": True}
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
+
+        assert 'text "QQ"' in result
+
+    def test_multiple_text_children_under_one_interactive_parent(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """All text children of an interactive parent appear in -i mode."""
+        raw = (
+            '- generic [ref=e1] [cursor=pointer]\n'
+            '  - text: 微信\n'
+            '- generic [ref=e2] [cursor=pointer]\n'
+            '  - text: 订单ID'
+        )
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+        interactive_map = {"e1": True, "e2": True}
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
+
+        assert '微信' in result
+        assert '订单ID' in result
+
+    def test_text_node_ref_is_assigned_and_stored(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """A text node kept via parent propagation gets a stable ref stored in refs."""
+        raw = (
+            '- generic [ref=e1] [cursor=pointer]\n'
+            '  - text: QQ'
+        )
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+        interactive_map = {"e1": True}
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
+
+        # At least one ref should be for a text-role node named "QQ"
+        text_ref = next(
+            (ref for ref, rd in refs.items() if rd.role == 'text' and rd.name == 'QQ'),
+            None,
+        )
+        assert text_ref is not None, "Expected a ref for text node 'QQ'"
+        assert f'[ref={text_ref}]' in result
+
+    def test_text_node_not_shown_without_interactive_ancestor(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Top-level text node with no parent at all is not shown in -i mode."""
+        raw = '- text: standalone'
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options)
+
+        assert 'standalone' not in result
+
 
 # ---------------------------------------------------------------------------
 # 4. Name dedup in clean_suffix

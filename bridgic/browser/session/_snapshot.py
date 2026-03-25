@@ -1109,10 +1109,10 @@ class SnapshotGenerator:
 
         # 9. Small icon check (Section 5.7)
         # Size within 10-50px range + has strong semantic attributes.
-        # NOTE: classAndId is intentionally excluded here — almost every element has a CSS
-        # class, so using it as a signal would produce false positives for decorative
-        # elements (badges, avatars, dividers, etc.).  Only data-action and aria-label
-        # are strong enough signals; cursor=pointer is handled separately by rule 10.
+        # NOTE: classAndId is intentionally excluded — almost every element has a CSS
+        # class, so it would cause false positives for decorative elements (badges,
+        # avatars, dividers, etc.) that happen to be small.  Only data-action and
+        # aria-label are strong enough signals; cursor=pointer is rule 10.
         width = info.get('width') or 0
         height = info.get('height') or 0
         if 10 <= width <= 50 and 10 <= height <= 50:
@@ -1411,6 +1411,16 @@ class SnapshotGenerator:
                 if interactive_map and original_ref:
                     # Use the pre-computed interactive_map for precise filtering
                     is_effectively_interactive = interactive_map.get(original_ref, False)
+                elif role_lower in self.TEXT_LEAF_ROLES and playwright_ref_for_element is None:
+                    # Playwright does not assign [ref=...] to inline text nodes
+                    # (e.g. "- text: QQ"). In interactive mode, depth_stack entries
+                    # with kept=True are ancestors that passed the interactive filter
+                    # (cursor=pointer / INTERACTIVE_ROLES / ARIA state) — ordinary
+                    # structural containers (div, section, heading) are NOT kept.
+                    # So any() here means "this text lives inside an interactive
+                    # region", which is exactly when it should be visible regardless
+                    # of how many wrapper spans/divs sit in between.
+                    is_effectively_interactive = any(kept for _, kept, _, _ in depth_stack)
                 else:
                     # Fallback to basic role/attribute checks
                     is_effectively_interactive = (

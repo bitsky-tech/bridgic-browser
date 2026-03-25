@@ -25,6 +25,7 @@ from .._constants import BRIDGIC_HOME
 from ..errors import BridgicBrowserError, InvalidInputError
 from ._transport import (
     get_transport,
+    read_run_info,
     write_run_info,
     remove_run_info,
 )
@@ -851,8 +852,21 @@ async def run_daemon() -> None:
 
     _write_close_report(browser, timed_out=_stop_timed_out, stop_exc=_stop_exc)
 
-    transport.cleanup()
-    remove_run_info()
+    # Only clean up the socket and run-info if this daemon is still the owner.
+    # Race condition: `close` responds immediately and a new daemon can start
+    # (write_run_info + bind socket) before browser.stop() finishes here.
+    # If we blindly call cleanup/remove_run_info we would delete the new
+    # daemon's socket file and run-info, causing the next command to spawn
+    # yet another daemon (with no page) and return NO_BROWSER_SESSION.
+    current_info = read_run_info()
+    if current_info is None or current_info.get("pid") == os.getpid():
+        transport.cleanup()
+        remove_run_info()
+    else:
+        logger.info(
+            "[daemon] skipping cleanup — run info belongs to pid=%s (ours=%d)",
+            current_info.get("pid"), os.getpid(),
+        )
 
 
 DAEMON_LOG_PATH = BRIDGIC_HOME / "logs" / "daemon.log"
