@@ -15,8 +15,8 @@ Use this guide when the task should be executed directly from terminal commands 
 ## Quick Start
 
 ```bash
-pip install bridgic-browser
-playwright install chromium
+uv add bridgic-browser
+uv run playwright install chromium
 ```
 
 ```bash
