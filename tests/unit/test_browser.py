@@ -749,7 +749,7 @@ class TestBrowserRefResolution:
         browser._page = MagicMock()
         browser._snapshot_generator = MagicMock()
         browser._last_snapshot = MagicMock(
-            refs={"e7": SimpleNamespace(role="button", name="自动检测", nth=None)}
+            refs={"e7": SimpleNamespace(role="button", name="Automatic detection", nth=None)}
         )
 
         ambiguous_locator = MagicMock()
@@ -765,7 +765,7 @@ class TestBrowserRefResolution:
         assert result is role_name_locator
         browser._page.get_by_role.assert_called_once_with(
             "button",
-            name="自动检测",
+            name="Automatic detection",
             exact=True,
         )
 
@@ -776,7 +776,7 @@ class TestBrowserRefResolution:
         browser._page = MagicMock()
         browser._snapshot_generator = MagicMock()
         browser._last_snapshot = MagicMock(
-            refs={"e7": SimpleNamespace(role="generic", name="自动检测", nth=None)}
+            refs={"e7": SimpleNamespace(role="generic", name="Automatic detection", nth=None)}
         )
 
         ambiguous_locator = MagicMock()
@@ -836,9 +836,9 @@ class TestBrowserChildFallback:
                 parent_ref=None,
             ),
             "e7": RefData(
-                selector='get_by_text("自动检测", exact=True)',
+                selector='get_by_text("Automatic detection", exact=True)',
                 role="generic",
-                name="自动检测",
+                name="Automatic detection",
                 nth=None,
                 text_content=None,
                 parent_ref="e6",

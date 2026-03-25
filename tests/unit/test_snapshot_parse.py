@@ -380,17 +380,17 @@ class TestGetLocatorFromRefAsync:
         """Unnamed generic with a named STRUCTURAL_NOISE child resolves via child → .locator('..').
 
         Scenario mirrors a Semantic UI dropdown where the button div is unnamed
-        but contains a named <span class="text">自动检测</span>:
+        but contains a named <span class="text">Automatic detection</span>:
 
             generic [ref=8944f251]:
-              generic "自动检测" [ref=5fcfa23c]
+              generic "Automatic detection" [ref=5fcfa23c]
 
         The unnamed parent cannot be targeted by get_by_role('generic') (returns 0).
         Instead: resolve the named child (which uses CSS + has_text), then climb to
         the DOM parent via .locator('..').
         """
         page = Mock()
-        # Child resolution mocks (named generic "自动检测" branch):
+        # Child resolution mocks (named generic "Automatic detection" branch):
         css_locator = Mock()
         filtered_child = Mock()
         parent_locator = Mock()
@@ -408,9 +408,9 @@ class TestGetLocatorFromRefAsync:
                 parent_ref=None,
             ),
             "5fcfa23c": RefData(
-                selector='get_by_text("自动检测", exact=True)',
+                selector='get_by_text("Automatic detection", exact=True)',
                 role="generic",
-                name="自动检测",
+                name="Automatic detection",
                 nth=None,  # unique element — no nth disambiguation
                 text_content=None,
                 parent_ref="8944f251",
@@ -560,18 +560,18 @@ class TestGetLocatorFromRefAsync:
         page.get_by_text.return_value = text_locator
         refs = {
             "a1b2c3d4": RefData(
-                selector='get_by_text("自动检测", exact=True)',
+                selector='get_by_text("Automatic detection", exact=True)',
                 role="button",
                 name=None,
                 nth=None,
-                text_content="自动检测",
+                text_content="Automatic detection",
             )
         }
 
         locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is text_locator
-        page.get_by_text.assert_called_once_with("自动检测", exact=True)
+        page.get_by_text.assert_called_once_with("Automatic detection", exact=True)
         text_locator.nth.assert_not_called()
 
     def test_bare_text_content_with_explicit_nth_skips_nth(self, gen: SnapshotGenerator) -> None:
@@ -1512,7 +1512,7 @@ class TestExtractAndProcessPipeline:
         """Parent refs are correctly recorded for nested elements."""
         raw = (
             '- generic "Container" [ref=e1] [cursor=pointer]:\n'
-            '  - generic "自动检测" [ref=e2]\n'
+            '  - generic "Automatic detection" [ref=e2]\n'
             '  - generic [ref=e3]'
         )
 
@@ -1523,7 +1523,7 @@ class TestExtractAndProcessPipeline:
         for ref, data in refs.items():
             if data.name == "Container":
                 container_ref = ref
-            elif data.name == "自动检测":
+            elif data.name == "Automatic detection":
                 child_named_ref = ref
 
         # Unnamed generic elements (e3) are filtered before entering refs —
@@ -2453,7 +2453,7 @@ class TestPlaywrightRefStorage:
 
     def test_playwright_ref_stored_for_generic_with_name(self, gen: SnapshotGenerator) -> None:
         """playwright_ref is stored even for structural-noise roles."""
-        raw = "- generic \"自动检测\" [ref=e42]"
+        raw = "- generic \"Automatic detection\" [ref=e42]"
         refs: Dict[str, RefData] = {}
         gen._reset_refs()
         gen._process_page_snapshot_for_ai(raw, refs, SnapshotOptions())

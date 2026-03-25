@@ -1984,7 +1984,7 @@ class SnapshotGenerator:
                 # No text-leaf child found; try a named STRUCTURAL_NOISE_ROLES child
                 # as an anchor — build its locator inline, then navigate up via '..'.
                 # e.g. generic [ref=8944f251]:
-                #        generic "自动检测" [ref=5fcfa23c, parent_ref=8944f251]
+                #        generic "Automatic detection" [ref=5fcfa23c, parent_ref=8944f251]
                 # Strategy: locate the child with span-inclusive CSS (STRUCTURAL_NOISE_CSS_NAMED),
                 # then call .locator('..') to get its DOM parent.  More precise than the
                 # earlier has= filter approach, which could match sibling menu items with
