@@ -98,6 +98,7 @@ def mock_context(mock_page: MagicMock) -> MagicMock:
     context.close = AsyncMock()
     context.browser = MagicMock()
     context.new_cdp_session = AsyncMock()
+    context.add_init_script = AsyncMock()
     return context
 
 
@@ -154,7 +155,7 @@ async def browser_instance():
         await browser.start()
         yield browser
     finally:
-        await browser.kill()
+        await browser.stop()
 
 
 @pytest_asyncio.fixture
@@ -175,4 +176,4 @@ async def browser_with_stealth():
         await browser.start()
         yield browser
     finally:
-        await browser.kill()
+        await browser.stop()

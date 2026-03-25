@@ -4,21 +4,29 @@ This package provides a simple logging configuration system with configurable lo
 
 ## Quick Start
 
-The logging is automatically configured when you import the package:
+Logging is **not** auto-configured on import. Configure it explicitly once at startup:
 
 ```python
-import bridgic.browser  # Logging is configured automatically
+from bridgic.browser import configure_logging
+
+configure_logging()  # Uses BRIDGIC_LOG_LEVEL or INFO by default
 ```
 
 ## Configuration
 
 ### Via Environment Variable
 
-Set the `BRIDGIC_LOG_LEVEL` environment variable:
+Set the `BRIDGIC_LOG_LEVEL` environment variable and call `configure_logging()`:
 
 ```bash
 export BRIDGIC_LOG_LEVEL=DEBUG
 python your_script.py
+```
+
+```python
+from bridgic.browser import configure_logging
+
+configure_logging()  # Reads BRIDGIC_LOG_LEVEL
 ```
 
 Supported levels: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`
@@ -26,7 +34,7 @@ Supported levels: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`
 ### Via Code
 
 ```python
-from bridgic.browser.utils import configure_logging
+from bridgic.browser import configure_logging
 
 # Set log level
 configure_logging(level="DEBUG")
@@ -42,12 +50,12 @@ configure_logging(
 
 The default log format is:
 ```
-%(asctime)s [%(levelname)-8s] %(name)s: %(message)s
+[%(asctime)s.%(msecs)03d] [%(levelname)-5s] [%(filename)s:%(lineno)d] %(message)s
 ```
 
 Example output:
 ```
-2026-01-28 10:30:45 [INFO    ] bridgic.browser.session._browser: Starting playwright
+[2026-01-28 10:30:45.123] [INFO ] [_browser.py:321] Starting playwright
 ```
 
 ## Usage in Code

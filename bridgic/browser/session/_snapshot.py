@@ -7,15 +7,15 @@ AI agents to reliably interact with elements without fragile CSS/XPath selectors
 
 Key Features:
 - Generates AI-friendly accessibility tree with element refs
-- Filters invisible elements and viewport-only content
+- Filters viewport-only content
 - Supports interactive-only mode for action-focused tasks
 - Provides locator reconstruction from refs for element interaction
 
 Example Output:
-    - heading "Example Domain" [ref=e1] [level=1]
+    - heading "Example Domain" [ref=a1b2c3d4] [level=1]
     - paragraph: Some text content
-    - button "Submit" [ref=e2]
-    - textbox "Email" [ref=e3]
+    - button "Submit" [ref=e5f6a7b8]
+    - textbox "Email" [ref=c9d0e1f2]
 
 Usage:
     from playwright.async_api import async_playwright
@@ -29,7 +29,7 @@ Usage:
 
             generator = SnapshotGenerator()
 
-            # Default: viewport-only, filter invisible elements
+            # Default: viewport-only
             snapshot = await generator.get_enhanced_snapshot_async(page)
             print(snapshot.tree)
 
@@ -44,7 +44,7 @@ Usage:
             )
 
             # Get locator from ref for interaction
-            locator = generator.get_locator_from_ref_async(page, "@e2", snapshot.refs)
+            locator = generator.get_locator_from_ref_async(page, "@8d4b03a9", snapshot.refs)
             if locator:
                 await locator.click()
 
@@ -54,10 +54,11 @@ Usage:
 import re
 import math
 import logging
-import asyncio
-from typing import Dict, Optional, Set, List, Tuple
+import time
+import hashlib
+from typing import Dict, Optional, Set, List, Tuple, Any
 from dataclasses import dataclass
-from playwright.async_api import Page as AsyncPage, Locator as AsyncLocator
+from playwright.async_api import FrameLocator as AsyncFrameLocator, Page as AsyncPage, Locator as AsyncLocator
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,9 @@ class RefData:
     role: str
     name: Optional[str] = None
     nth: Optional[int] = None
+    text_content: Optional[str] = None
+    parent_ref: Optional[str] = None
+    frame_path: Optional[List[int]] = None  # per-level local iframe indices, outermost→innermost; None = main frame
 
 
 @dataclass
@@ -88,16 +92,11 @@ class SnapshotOptions:
         with flattened output (no indentation). Useful for getting a quick
         list of actionable elements on the page.
     full_page : bool
-        If False (default), only include elements within the viewport.
-        If True, include all elements regardless of viewport position.
-    filter_invisible : bool
-        If True (default), filter out CSS-hidden elements (display:none,
-        visibility:hidden, opacity:0, aria-hidden="true", etc.).
-        If False, keep all elements regardless of visibility.
+        If True (default), include all elements regardless of viewport position.
+        If False, only include elements within the viewport.
     """
     interactive: bool = False
-    full_page: bool = False
-    filter_invisible: bool = True
+    full_page: bool = True
 
 
 class RoleNameTracker:
@@ -154,7 +153,7 @@ class RoleNameTracker:
         name : Optional[str]
             Accessible name.
         ref : str
-            Generated ref (e.g., ``e1``).
+            Generated ref (e.g., "8d4b03a9").
         """
         key = self.get_key(role, name)
         if key not in self.refs_by_key:
@@ -182,10 +181,10 @@ class SnapshotGenerator:
     IMPORTANT USAGE NOTES:
 
     1. Thread/Coroutine Safety:
-       This class uses instance-level state (_ref_counter) that is reset at the
-       start of each snapshot generation. Do NOT share a single SnapshotGenerator
-       instance across concurrent coroutines. Create a new instance per concurrent
-       operation, or ensure sequential access.
+       This class is stateless with respect to ref generation — refs are derived
+       purely from element semantics via a deterministic hash. Multiple coroutines
+       may share an instance safely as long as they don't call get_enhanced_snapshot_async
+       concurrently (Playwright page objects are not thread-safe).
 
     2. Regex Handling:
        The line parsing regex uses `(?:[^"\\]|\\.)*` to correctly handle escaped quotes
@@ -197,23 +196,66 @@ class SnapshotGenerator:
        the DOM has been modified or contains filtered elements.
     """
 
-    # Roles that are interactive and should get refs
-    # Reference: W3C WAI-ARIA 1.2 Widget Roles (https://www.w3.org/TR/wai-aria/#widget_roles)
-    # and browser-use's clickable_elements.py
-    INTERACTIVE_ROLES: Set[str] = {
-        # Widget roles (WAI-ARIA 1.2 Section 5.3.2)
-        'button', 'link', 'textbox', 'checkbox', 'radio',
-        'menuitem', 'menuitemcheckbox', 'menuitemradio',
-        'option', 'searchbox', 'slider', 'spinbutton', 'switch',
-        'tab', 'treeitem',
-        'gridcell',      # Editable/selectable grid cell
-        'progressbar',   # Progress indicator (user monitors)
-        'scrollbar',     # Scrollbar control (user operates)
-        # Composite widget roles (container widgets that manage focus)
-        'combobox', 'listbox',
-        # Landmark role that's also interactive
-        'search',
+    # =========================================================================
+    # Interactive Tags (W3C HTML5 Specification)
+    # Reference: Section 5.1 of INTERACTIVE_ELEMENTS.md
+    # These HTML tags are inherently interactive by specification
+    # =========================================================================
+    INTERACTIVE_TAGS: Set[str] = {
+        'button', 'input', 'select', 'textarea', 'a',
+        'details', 'summary', 'option', 'optgroup'
     }
+
+    # =========================================================================
+    # Search-related Keywords
+    # Reference: Section 5.3 of INTERACTIVE_ELEMENTS.md
+    # Used to detect search-related elements by class/id/data-* attributes
+    # =========================================================================
+    SEARCH_KEYWORDS: Set[str] = {
+        'search', 'magnify', 'glass', 'lookup', 'find', 'query',
+        'search-icon', 'search-btn', 'search-button', 'searchbox'
+    }
+
+    # =========================================================================
+    # Interactive Roles (WAI-ARIA 1.2 Specification)
+    # Reference: https://www.w3.org/TR/wai-aria-1.2/#widget_roles
+    # =========================================================================
+
+    # Basic Widget Roles - Independent interactive components
+    WIDGET_ROLES: Set[str] = {
+        'button', 'checkbox', 'gridcell', 'link',
+        'menuitem', 'menuitemcheckbox', 'menuitemradio',
+        'option', 'progressbar', 'radio', 'scrollbar', 'searchbox',
+        'slider', 'spinbutton', 'switch',
+        'tab', 'tabpanel', 'textbox', 'treeitem',
+        # Note: 'separator' is only interactive when focusable (tabindex >= 0)
+        # This is handled specially in _is_element_interactive()
+    }
+
+    # Composite Widget Roles - Containers that manage child components
+    COMPOSITE_WIDGET_ROLES: Set[str] = {
+        'combobox', 'grid', 'listbox', 'menu', 'menubar',
+        'radiogroup', 'tablist', 'tree', 'treegrid',
+    }
+
+    # Window Roles - Windows requiring user interaction
+    WINDOW_ROLES: Set[str] = {
+        'alertdialog', 'dialog',
+    }
+
+    # Other Interactive Roles
+    OTHER_INTERACTIVE_ROLES: Set[str] = {
+        'application',  # Contains focusable elements
+        'search',       # Search landmark (usually contains interactive elements)
+    }
+
+    # Combined Interactive Roles set
+    INTERACTIVE_ROLES: Set[str] = (
+        WIDGET_ROLES |
+        COMPOSITE_WIDGET_ROLES |
+        WINDOW_ROLES |
+        OTHER_INTERACTIVE_ROLES
+    )
 
     # Roles that provide structure/context (get refs only when named)
     # NOTE: Some roles like 'cell' also appear in ALWAYS_REF_ROLES for DOM lookup purposes.
@@ -238,26 +280,39 @@ class SnapshotGenerator:
         'option',        # Select options (also in INTERACTIVE, but explicit here)
     }
 
+    # Roles where snapshot "name" can come from visible text while Playwright
+    # role-name matching relies on accessible name semantics.
+    # For these roles, prefer role-constrained exact text matching.
+    ROLE_TEXT_MATCH_ROLES: Set[str] = {
+        'listitem',
+        'row',
+        'cell',
+        'gridcell',
+        'columnheader',
+        'rowheader',
+    }
+
     # Landmark roles that provide semantic structure (always keep)
+    # Note: 'search' is also in OTHER_INTERACTIVE_ROLES
     LANDMARK_ROLES: Set[str] = {
         'banner', 'contentinfo', 'complementary', 'form', 'search',
         'main', 'navigation', 'region'
     }
 
     # Semantic roles that convey meaning (always keep)
-    # Reference: W3C WAI-ARIA 1.2 Document Structure & Live Region & Window Roles
+    # Reference: W3C WAI-ARIA 1.2 Document Structure & Live Region Roles
+    # Note: Window roles (dialog, alertdialog) moved to WINDOW_ROLES
+    # Note: 'application' moved to OTHER_INTERACTIVE_ROLES
     SEMANTIC_ROLES: Set[str] = {
         # Document structure roles
         'img', 'figure', 'paragraph', 'blockquote', 'code', 'emphasis',
         'strong', 'deletion', 'insertion', 'subscript', 'superscript',
         'term', 'definition', 'note', 'math', 'time', 'tooltip',
-        'document', 'application', 'feed', 'text',
+        'document', 'feed', 'text',
         'caption',       # Table/figure caption (WAI-ARIA 1.2)
         'meter',         # Scalar measurement within known range (WAI-ARIA 1.2)
         # Live region roles (WAI-ARIA 1.2 Section 5.3.5)
         'status', 'alert', 'log', 'marquee', 'timer',
-        # Window roles (WAI-ARIA 1.2 Section 5.3.6)
-        'dialog', 'alertdialog',
     }
 
     # Roles that are purely structural noise (filter when unnamed)
@@ -265,33 +320,114 @@ class SnapshotGenerator:
         'generic', 'group', 'none', 'presentation'
     }
 
+    # Pseudo-roles used by Playwright snapshotForAI that are NOT valid ARIA roles.
+    # These must use get_by_text() instead of get_by_role().
+    TEXT_LEAF_ROLES: Set[str] = {'text'}
+
+    # CSS selectors that approximate each STRUCTURAL_NOISE role.
+    # Used by get_locator_from_ref_async to build locators scoped to the correct
+    # element type, so that nth indices remain valid within the scoped set.
+    #
+    # IMPORTANT: <span> is intentionally excluded from 'generic'.  Playwright's
+    # accessibility tree often maps <span> to 'text' (not 'generic'), so including
+    # span:not([role]) would overcount and shift nth indices — e.g. clicking
+    # generic "Pending" [nth=2] would hit a <span> instead of the correct <div>.
+    STRUCTURAL_NOISE_CSS: Dict[str, str] = {
+        'generic': 'div:not([role]), legend, [role="generic"]',
+        'group': 'fieldset, details, optgroup, [role="group"]',
+        'none': '[role="none"]',
+        'presentation': '[role="presentation"]',
+    }
+
+    # Pattern to strip YAML-style single-quote wrapping from snapshot lines.
+    # Playwright wraps long/escaped-quote lines as: - 'role "name" [ref=eN]':
+    _YAML_QUOTE_PATTERN = re.compile(
+        r"^(\s*-\s*)'(.+)'(:{0,1})\s*$"
+    )
+
+    # Pre-compiled regex patterns (avoid recompilation per call)
+    # Pattern for _process_page_snapshot_for_ai: matches any snapshot line
+    _LINE_PATTERN = re.compile(
+        r'^(\s*-\s*)'              # prefix with indentation
+        r'(\w+)'                   # role
+        r'(?:\s+"((?:[^"\\]|\\.)*)")?'  # optional name in quotes (handles escaped quotes)
+        r'(.*)$'                   # suffix (attributes, colon, etc.)
+    )
+    # Pattern for cleaning existing refs from suffix (matches both our eN refs and
+    # Playwright's internal frame refs like f2e7, f1e5, etc.)
+    _REF_CLEAN_PATTERN = re.compile(r'\s*\[ref=[a-zA-Z0-9]+\]')
+    # Pattern to extract ref ID from a line or suffix
+    _REF_EXTRACT_PATTERN = re.compile(r'\[ref=([a-zA-Z0-9]+)\]')
+    # Pattern for _extract_original_refs_from_raw: matches lines with refs
+    _REF_LINE_PATTERN = re.compile(
+        r'^\s*-\s*(\w+)'           # role
+        r'(?:\s+"((?:[^"\\]|\\.)*)")?'  # optional name (handles escaped quotes)
+        r'(.*\[ref=([a-zA-Z0-9]+)\].*)$'   # suffix containing ref
+    )
+
     # Container structural roles (keep for tree structure)
-    # Includes composite widget containers (WAI-ARIA 1.2 Section 5.3.3)
-    # These manage focus for their child widgets
+    # Note: Composite widget containers moved to COMPOSITE_WIDGET_ROLES
     STRUCTURAL_ROLES: Set[str] = {
         # Document structure containers
         'list', 'table', 'row', 'rowgroup',
-        # Composite widget containers (focus management)
-        'grid', 'treegrid', 'menu', 'menubar', 'toolbar',
-        'tablist', 'tree', 'radiogroup', 'tabpanel',
+        'toolbar',       # Toolbar is a container, not an interaction target
         # Deprecated but still in use
         'directory',
     }
 
+    # Namespace salt baked into every fingerprint.
+    # Changing this value invalidates all existing refs (intentional for major versions).
+    _REF_NAMESPACE = "bridgic-browser-v1"
+
     def __init__(self):
         """Initialize the snapshot generator."""
-        self._ref_counter = 0
-    
+
+    @staticmethod
+    def _strip_yaml_quotes(line: str) -> str:
+        """Strip YAML-style single-quote wrapping from a snapshot line."""
+        m = SnapshotGenerator._YAML_QUOTE_PATTERN.match(line)
+        if m:
+            prefix, content, colon = m.groups()
+            # YAML escapes internal single quotes as ''
+            content = content.replace("''", "'")
+            return f"{prefix}{content}{colon}"
+        return line
+
+    @staticmethod
+    def _normalize_raw_snapshot(raw: str) -> str:
+        """Normalize raw Playwright snapshot, stripping YAML quote wrapping."""
+        lines = raw.split('\n')
+        return '\n'.join(
+            SnapshotGenerator._strip_yaml_quotes(line) for line in lines
+        )
+
     def _reset_refs(self) -> None:
-        """Reset ref counter (call at start of each snapshot)."""
-        self._ref_counter = 0
+        """No-op: ref generation is stateless (pure hash, no instance state)."""
+
+    @staticmethod
+    def _compute_stable_ref(role: str, name: Optional[str],
+                             frame_path: Optional[List[int]],
+                             nth: int) -> str:
+        """Derive a stable 8-hex-char ref from element semantics.
+
+        Uses a fixed namespace salt + CRC32 over all disambiguating fields.
+        With 32-bit output and a typical page of ~1 000 elements, the birthday
+        collision probability is ~N²/2³² ≈ 0.012 %, low enough to ignore.
+        \x1f (ASCII Unit Separator) is safe as a field delimiter: it cannot
+        appear in HTML accessible names.
+        """
+        frame_str = ",".join(str(x) for x in frame_path) if frame_path else ""
+        raw = (
+            f"{SnapshotGenerator._REF_NAMESPACE}"
+            f"\x1f{role}\x1f{name or ''}\x1f{frame_str}\x1f{nth}"
+        )
+        # SHA-256 has uniform distribution and no structural bias for similar inputs.
+        # First 4 bytes (32 bits) → 8 hex chars; collision prob ≈ N²/2³² for N elements
+        # (~0.012% for a typical page of 1 000 elements — safely negligible).
+        digest = hashlib.sha256(raw.encode("utf-8")).digest()
+        return digest[:4].hex()
     
-    def _next_ref(self) -> str:
-        """Generate next ref ID."""
-        self._ref_counter += 1
-        return f"e{self._ref_counter}"
-    
-    def _build_selector(self, role: str, name: Optional[str] = None) -> str:
+    def _build_selector(self, role: str, name: Optional[str] = None, text_content: Optional[str] = None) -> str:
         """Build a selector string for storing in the ref map.
 
         Parameters
@@ -300,6 +436,8 @@ class SnapshotGenerator:
             ARIA role (lowercase).
         name : Optional[str], optional
             Accessible name.
+        text_content : Optional[str], optional
+            Inline text content for elements without an accessible name.
 
         Returns
         -------
@@ -309,7 +447,12 @@ class SnapshotGenerator:
         if name:
             # Escape all double quotes (matching TS version: name.replace(/"/g, '\\"'))
             escaped_name = name.replace('"', '\\"')
+            if role in self.TEXT_LEAF_ROLES:
+                return f"get_by_text(\"{escaped_name}\", exact=True)"
             return f"get_by_role('{role}', name=\"{escaped_name}\", exact=True)"
+        if text_content:
+            escaped_text = text_content.replace('"', '\\"')
+            return f"get_by_text(\"{escaped_text}\", exact=True)"
         return f"get_by_role('{role}')"
     
     def _get_indent_level(self, line: str) -> int:
@@ -343,12 +486,635 @@ class SnapshotGenerator:
             Tracker that can report duplicate keys.
         """
         duplicate_keys = tracker.get_duplicate_keys()
-        
+
         for ref, data in refs.items():
             key = tracker.get_key(data.role, data.name)
             if key not in duplicate_keys:
                 # Not a duplicate, remove nth to keep locator simple
                 refs[ref].nth = None
+
+    async def _get_element_interactive_info(
+        self,
+        locator: AsyncLocator
+    ) -> Dict[str, Any]:
+        """Get element's interactive judgment info via a single evaluate call.
+
+        Based on Section 2 of INTERACTIVE_ELEMENTS.md, this method retrieves
+        all input data needed for interactive element judgment.
+
+        Parameters
+        ----------
+        locator : AsyncLocator
+            Playwright locator for the target element.
+
+        Returns
+        -------
+        Dict[str, Any]
+            Dictionary containing:
+            - tagName: str - Tag name (lowercase)
+            - cursor: str - Computed style cursor
+            - width: int - Element width
+            - height: int - Element height
+            - hasEventHandler: bool - Has event handlers (onclick, etc.)
+            - tabindex: str | None - tabindex attribute
+            - classAndId: str - Combined class and id (for search keyword check)
+            - dataAction: str | None - data-action attribute (for icon detection)
+            - ariaRequired: bool - Has aria-required
+            - ariaAutocomplete: str | None - aria-autocomplete value
+            - ariaKeyshortcuts: str | None - aria-keyshortcuts value
+            - ariaHidden: bool - Has aria-hidden="true"
+            - ariaDisabled: bool - Has aria-disabled="true"
+            - isContentEditable: bool - Is content editable
+            - role: str | None - Explicit role attribute
+            - isEditable: bool - Playwright's is_editable result
+            - isDisabled: bool - Playwright's is_disabled result
+        """
+        try:
+            start_time = time.time()
+            info = await locator.evaluate("""el => {
+                const computed = window.getComputedStyle(el);
+                const tag = el.tagName.toLowerCase();
+
+                // Check event handlers (Section 5.2)
+                const hasEventHandler = !!(
+                    el.onclick || el.onmousedown || el.onmouseup ||
+                    el.onkeydown || el.onkeyup || el.onkeypress ||
+                    el.onmouseenter || el.onmouseleave ||
+                    el.ondblclick || el.onfocus || el.onblur
+                );
+
+                // Get class, id, and data-* attributes for search keyword check (Section 5.3)
+                let classAndId = '';
+                if (el.className && typeof el.className === 'string') {
+                    classAndId += el.className + ' ';
+                }
+                if (el.id) {
+                    classAndId += el.id + ' ';
+                }
+
+                // Collect all data-* attribute values
+                let dataAction = null;
+                for (let attr of el.attributes) {
+                    if (attr.name.startsWith('data-')) {
+                        classAndId += attr.value + ' ';
+                        if (attr.name === 'data-action') {
+                            dataAction = attr.value;
+                        }
+                    }
+                }
+
+                // Check aria-hidden (Section 4 - Disabled/Hidden exclusion)
+                const ariaHidden = el.getAttribute('aria-hidden') === 'true';
+
+                return {
+                    tagName: tag,
+                    cursor: computed.cursor,
+                    display: computed.display,
+                    visibility: computed.visibility,
+                    opacity: parseFloat(computed.opacity),
+                    width: el.offsetWidth,
+                    height: el.offsetHeight,
+                    hasEventHandler: hasEventHandler,
+                    tabindex: el.getAttribute('tabindex'),
+                    classAndId: classAndId.toLowerCase().trim(),
+                    dataAction: dataAction,
+                    ariaRequired: el.hasAttribute('aria-required'),
+                    ariaAutocomplete: el.getAttribute('aria-autocomplete'),
+                    ariaKeyshortcuts: el.getAttribute('aria-keyshortcuts'),
+                    ariaHidden: ariaHidden,
+                    ariaDisabled: el.getAttribute('aria-disabled') === 'true',
+                    isContentEditable: el.isContentEditable,
+                    role: el.getAttribute('role'),
+                    isEditable: el.isContentEditable ||
+                        (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName.toUpperCase()) && !el.disabled && !el.readOnly),
+                    isDisabled: el.disabled || el.getAttribute('aria-disabled') === 'true',
+                };
+            }""")
+            end_time = time.time()
+            logger.info(f"_get_element_interactive_info Time taken: {end_time - start_time} seconds")
+
+            return info
+        except Exception as e:
+            logger.debug(f"Failed to get element interactive info: {e}")
+            return {}
+
+    async def _batch_get_elements_info(
+        self,
+        page: AsyncPage,
+        refs_info: Dict[str, Tuple[str, Optional[str], int]],
+        ref_suffixes: Dict[str, str],
+        check_viewport: bool,
+        viewport_width: Optional[int],
+        viewport_height: Optional[int],
+    ) -> Tuple[Set[str], Dict[str, bool]]:
+        """Batch check visibility + interactivity for all refs in one JS call.
+
+        Reduces browser IPC from 4N calls to 1 by evaluating all element
+        lookups, bounding boxes, and interactive info in a single
+        ``page.evaluate()`` call.
+
+        Parameters
+        ----------
+        page : AsyncPage
+            Playwright page object.
+        refs_info : Dict[str, Tuple[str, Optional[str], int]]
+            Mapping of ``ref -> (role, name, nth_index)``.
+        ref_suffixes : Dict[str, str]
+            Mapping of ``ref -> suffix``.
+        check_viewport : bool
+            Whether to filter elements outside the viewport.
+        viewport_width : Optional[int]
+            Viewport width.
+        viewport_height : Optional[int]
+            Viewport height.
+
+        Returns
+        -------
+        Tuple[Set[str], Dict[str, bool]]
+            ``(visible_refs, interactive_map)``
+        """
+        # Separate structural noise without name (handle from suffix only)
+        suffix_only_refs: Dict[str, str] = {}
+        batch_elements: list[Dict[str, Any]] = []
+
+        for ref, (role, name, nth) in refs_info.items():
+            if role in self.STRUCTURAL_NOISE_ROLES and not name:
+                # Unnamed structural noise roles (generic, group, etc.) bypass batch JS
+                # because they have implicit roles that can't be matched via CSS selectors.
+                # Named generics go through batch for viewport filtering.
+                suffix_only_refs[ref] = ref_suffixes.get(ref, '')
+            else:
+                batch_elements.append({
+                    'ref': ref,
+                    'role': role,
+                    'name': name,
+                    'nth': nth,
+                })
+
+        # Process suffix-only refs (no IPC needed)
+        visible_refs: Set[str] = set()
+        interactive_map: Dict[str, bool] = {}
+
+        for ref, suffix in suffix_only_refs.items():
+            visible_refs.add(ref)
+            is_interactive = False
+            if '[cursor=pointer]' in suffix:
+                is_interactive = True
+            elif any(state in suffix for state in ['[pressed', '[expanded', '[checked', '[selected']):
+                is_interactive = True
+            interactive_map[ref] = is_interactive
+
+        if not batch_elements:
+            return visible_refs, interactive_map
+
+        # Single page.evaluate for all remaining elements
+        try:
+            start_time = time.time()
+            batch_results = await page.evaluate("""(args) => {
+                const { elements, viewportWidth, viewportHeight, checkViewport } = args;
+
+                const IMPLICIT_ROLE_SELECTORS = {
+                    'button': 'button, input[type="button"], input[type="submit"], input[type="reset"], input[type="file"], [role="button"]',
+                    'link': 'a[href], area[href], [role="link"]',
+                    'textbox': 'input:not([type]), input[type="text"], input[type="email"], input[type="password"], input[type="search"], input[type="url"], input[type="tel"], textarea, [role="textbox"], [contenteditable="true"], [contenteditable=""]',
+                    'checkbox': 'input[type="checkbox"], [role="checkbox"]',
+                    'radio': 'input[type="radio"], [role="radio"]',
+                    'combobox': 'select, [role="combobox"]',
+                    'option': 'option, [role="option"]',
+                    'heading': 'h1, h2, h3, h4, h5, h6, [role="heading"]',
+                    'listitem': 'li, [role="listitem"]',
+                    'list': 'ul, ol, [role="list"]',
+                    'img': 'img[alt], [role="img"]',
+                    'row': 'tr, [role="row"]',
+                    'cell': 'td, [role="cell"]',
+                    'columnheader': 'th, [role="columnheader"]',
+                    'navigation': 'nav, [role="navigation"]',
+                    'main': 'main, [role="main"]',
+                    'banner': 'header, [role="banner"]',
+                    'contentinfo': 'footer, [role="contentinfo"]',
+                    'table': 'table, [role="table"]',
+                    'menuitem': '[role="menuitem"]',
+                    'menuitemcheckbox': '[role="menuitemcheckbox"]',
+                    'menuitemradio': '[role="menuitemradio"]',
+                    'tab': '[role="tab"]',
+                    'tabpanel': '[role="tabpanel"]',
+                    'treeitem': '[role="treeitem"]',
+                    'switch': '[role="switch"]',
+                    'slider': 'input[type="range"], [role="slider"]',
+                    'spinbutton': 'input[type="number"], [role="spinbutton"]',
+                    'searchbox': 'input[type="search"], [role="searchbox"]',
+                    'progressbar': 'progress, [role="progressbar"]',
+                    'scrollbar': '[role="scrollbar"]',
+                    'separator': 'hr, [role="separator"]',
+                    'gridcell': '[role="gridcell"]',
+                    'grid': '[role="grid"]',
+                    'listbox': '[role="listbox"]',
+                    'menu': '[role="menu"]',
+                    'menubar': '[role="menubar"]',
+                    'radiogroup': '[role="radiogroup"]',
+                    'tablist': '[role="tablist"]',
+                    'tree': '[role="tree"]',
+                    'treegrid': '[role="treegrid"]',
+                    'alertdialog': '[role="alertdialog"]',
+                    'dialog': 'dialog, [role="dialog"]',
+                    'application': '[role="application"]',
+                    'search': '[role="search"]',
+                    'article': 'article, [role="article"]',
+                    'region': 'section[aria-label], section[aria-labelledby], [role="region"]',
+                    'rowheader': 'th[scope="row"], [role="rowheader"]',
+                    'rowgroup': 'thead, tbody, tfoot, [role="rowgroup"]',
+                    'toolbar': '[role="toolbar"]',
+                    'status': '[role="status"]',
+                    'alert': '[role="alert"]',
+                    'log': '[role="log"]',
+                    'marquee': '[role="marquee"]',
+                    'timer': '[role="timer"]',
+                    'tooltip': '[role="tooltip"]',
+                    'figure': 'figure, [role="figure"]',
+                    'paragraph': 'p, [role="paragraph"]',
+                    'blockquote': 'blockquote, [role="blockquote"]',
+                    'code': 'code, [role="code"]',
+                    'emphasis': 'em, [role="emphasis"]',
+                    'strong': 'strong, [role="strong"]',
+                    'deletion': 'del, [role="deletion"]',
+                    'insertion': 'ins, [role="insertion"]',
+                    'subscript': 'sub, [role="subscript"]',
+                    'superscript': 'sup, [role="superscript"]',
+                    'term': 'dfn, [role="term"]',
+                    'definition': 'dd, [role="definition"]',
+                    'note': '[role="note"]',
+                    'math': 'math, [role="math"]',
+                    'time': 'time, [role="time"]',
+                    'complementary': 'aside, [role="complementary"]',
+                    'form': 'form[aria-label], form[aria-labelledby], [role="form"]',
+                    'iframe': 'iframe',
+                    'feed': '[role="feed"]',
+                    'document': '[role="document"]',
+                    'caption': 'caption, figcaption, [role="caption"]',
+                    'meter': 'meter, [role="meter"]',
+                    'summary': 'summary',
+                    'details': 'details',
+                    'generic': 'div:not([role]), legend, [role="generic"]',
+                    'group': 'fieldset, details, optgroup, [role="group"]',
+                    'none': '[role="none"]',
+                    'presentation': '[role="presentation"]',
+                };
+
+                function getAssociatedLabelText(el) {
+                    if (!el) return '';
+
+                    // Prefer the browser's label association when available.
+                    if (el.labels && el.labels.length > 0) {
+                        const texts = Array.from(el.labels)
+                            .map(label => (label.textContent || '').trim())
+                            .filter(Boolean);
+                        if (texts.length) return texts.join(' ');
+                    }
+
+                    if (el.id) {
+                        const explicitLabels = Array.from(
+                            document.querySelectorAll('label[for="' + el.id + '"]')
+                        )
+                            .map(label => (label.textContent || '').trim())
+                            .filter(Boolean);
+                        if (explicitLabels.length) return explicitLabels.join(' ');
+                    }
+
+                    return '';
+                }
+
+                function getAccessibleName(el) {
+                    const ariaLabel = el.getAttribute('aria-label');
+                    if (ariaLabel) return ariaLabel.trim();
+
+                    const labelledBy = el.getAttribute('aria-labelledby');
+                    if (labelledBy) {
+                        const parts = labelledBy.split(/\\s+/).map(id => {
+                            const ref = document.getElementById(id);
+                            return ref ? ref.textContent.trim() : '';
+                        }).filter(Boolean);
+                        if (parts.length) return parts.join(' ');
+                    }
+
+                    const associatedLabel = getAssociatedLabelText(el);
+                    if (associatedLabel) return associatedLabel;
+
+                    const tagName = el.tagName.toUpperCase();
+                    if (tagName === 'IMG') {
+                        const alt = el.getAttribute('alt');
+                        if (alt) return alt.trim();
+                    }
+
+                    if (tagName === 'INPUT') {
+                        const inputType = (el.getAttribute('type') || '').toLowerCase();
+                        if (['button', 'submit', 'reset'].includes(inputType)) {
+                            const valueAttr = el.getAttribute('value');
+                            if (valueAttr) return valueAttr.trim();
+                        }
+                        if (inputType === 'image') {
+                            const alt = el.getAttribute('alt');
+                            if (alt) return alt.trim();
+                        }
+                    }
+
+                    const title = el.getAttribute('title');
+                    if (title) return title.trim();
+
+                    // For inputs: placeholder is a valid accessible name source (W3C accname-1.2).
+                    // Do NOT use el.value — it holds user-typed content, not the accessible name,
+                    // and would cause findElement to fail after the user fills the field.
+                    if (['INPUT', 'TEXTAREA'].includes(tagName)) {
+                        if (el.placeholder) return el.placeholder;
+                        const ariaPlaceholder = el.getAttribute('aria-placeholder');
+                        if (ariaPlaceholder) return ariaPlaceholder.trim();
+                    }
+
+                    return el.textContent ? el.textContent.trim() : '';
+                }
+
+                function normalizeText(value) {
+                    if (!value) return '';
+                    return String(value).replace(/\\s+/g, ' ').trim();
+                }
+
+                function findElement(role, name, nth) {
+                    const selector = IMPLICIT_ROLE_SELECTORS[role] || '[role="' + role + '"]';
+                    const all = Array.from(document.querySelectorAll(selector));
+                    if (!name) return all[nth] || null;
+
+                    const normalizedName = normalizeText(name);
+                    if (!normalizedName) return all[nth] || null;
+
+                    const roleTextMatchRoles = new Set([
+                        'listitem', 'row', 'cell', 'gridcell', 'columnheader', 'rowheader'
+                    ]);
+
+                    let matching = [];
+                    if (roleTextMatchRoles.has(role)) {
+                        if (role === 'row') {
+                            matching = all.filter(el => {
+                                const rowText = normalizeText(el.innerText || el.textContent || '');
+                                if (rowText === normalizedName) return true;
+
+                                // Row names can map to a single cell/header text. Check descendants.
+                                const descendants = [el, ...Array.from(el.querySelectorAll('*'))];
+                                return descendants.some(node =>
+                                    normalizeText(node.innerText || node.textContent || '') === normalizedName
+                                );
+                            });
+                        } else {
+                            matching = all.filter(el =>
+                                normalizeText(el.innerText || el.textContent || '') === normalizedName
+                            );
+                        }
+                    } else {
+                        matching = all.filter(
+                            el => normalizeText(getAccessibleName(el)) === normalizedName
+                        );
+                    }
+
+                    return matching[nth] || null;
+                }
+
+                function getElementInfo(el) {
+                    if (!el) return null;
+                    const computed = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    const tag = el.tagName.toLowerCase();
+
+                    const hasEventHandler = !!(
+                        el.onclick || el.onmousedown || el.onmouseup ||
+                        el.onkeydown || el.onkeyup || el.onkeypress ||
+                        el.onmouseenter || el.onmouseleave ||
+                        el.ondblclick || el.onfocus || el.onblur
+                    );
+
+                    let classAndId = '';
+                    if (el.className && typeof el.className === 'string') classAndId += el.className + ' ';
+                    if (el.id) classAndId += el.id + ' ';
+                    let dataAction = null;
+                    for (let attr of el.attributes) {
+                        if (attr.name.startsWith('data-')) {
+                            classAndId += attr.value + ' ';
+                            if (attr.name === 'data-action') dataAction = attr.value;
+                        }
+                    }
+
+                    return {
+                        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+                                right: rect.right, bottom: rect.bottom },
+                        tagName: tag,
+                        cursor: computed.cursor,
+                        width: el.offsetWidth,
+                        height: el.offsetHeight,
+                        hasEventHandler: hasEventHandler,
+                        tabindex: el.getAttribute('tabindex'),
+                        classAndId: classAndId.toLowerCase().trim(),
+                        dataAction: dataAction,
+                        ariaRequired: el.hasAttribute('aria-required'),
+                        ariaAutocomplete: el.getAttribute('aria-autocomplete'),
+                        ariaKeyshortcuts: el.getAttribute('aria-keyshortcuts'),
+                        ariaHidden: el.getAttribute('aria-hidden') === 'true',
+                        ariaDisabled: el.getAttribute('aria-disabled') === 'true',
+                        isContentEditable: el.isContentEditable,
+                        role: el.getAttribute('role'),
+                        isEditable: el.isContentEditable ||
+                            (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName.toUpperCase()) && !el.disabled && !el.readOnly),
+                        isDisabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true',
+                    };
+                }
+
+                const results = {};
+                for (const item of elements) {
+                    const el = findElement(item.role, item.name, item.nth);
+                    results[item.ref] = getElementInfo(el);
+                }
+                return results;
+            }""", {
+                'elements': batch_elements,
+                'viewportWidth': viewport_width,
+                'viewportHeight': viewport_height,
+                'checkViewport': check_viewport,
+            })
+            end_time = time.time()
+            logger.info(f"_batch_get_elements_info Time taken: {end_time - start_time:.3f}s for {len(batch_elements)} elements")
+        except Exception as e:
+            logger.debug(f"Batch element info failed: {e}")
+            # Fallback: include all elements
+            for item in batch_elements:
+                visible_refs.add(item['ref'])
+                interactive_map[item['ref']] = False
+            return visible_refs, interactive_map
+
+        # Process batch results
+        for item in batch_elements:
+            ref = item['ref']
+            info = batch_results.get(ref)
+
+            if info is None:
+                role = refs_info[ref][0]
+                if check_viewport and role.lower() == 'iframe' and not ref.startswith('f'):
+                    # In viewport mode, unresolved MAIN-FRAME iframes (e-prefixed ref) are
+                    # treated as off-screen to avoid leaking their entire subtrees.
+                    # Nested iframes inside other frames have f-prefixed refs and cannot be
+                    # located via main-frame page.evaluate() at all — they fall through to
+                    # the fallback below so their children remain accessible in the snapshot.
+                    interactive_map[ref] = False
+                    continue
+
+                # Can't reliably re-find this element in page.evaluate().
+                # This happens for iframe-contained nodes and some accname edge cases.
+                # Keep it with suffix-based interactivity instead of silently dropping.
+                visible_refs.add(ref)
+                suffix = ref_suffixes.get(ref, '')
+                is_interactive = role.lower() in self.INTERACTIVE_ROLES
+                if not is_interactive and '[cursor=pointer]' in suffix:
+                    is_interactive = True
+                elif not is_interactive and any(
+                    state in suffix for state in ['[pressed', '[expanded', '[checked', '[selected']
+                ):
+                    is_interactive = True
+                interactive_map[ref] = is_interactive
+                continue
+
+            # Viewport check
+            if check_viewport:
+                rect = info['rect']
+                in_viewport = not (
+                    rect['right'] < 0 or rect['x'] > viewport_width or
+                    rect['bottom'] < 0 or rect['y'] > viewport_height
+                )
+                if not in_viewport:
+                    interactive_map[ref] = False
+                    continue
+
+            visible_refs.add(ref)
+
+            # Interactive check
+            role = refs_info[ref][0]
+            suffix = ref_suffixes.get(ref, '')
+            is_interactive = self._is_element_interactive(role, info, suffix)
+
+            # Disabled interactive roles still included
+            if not is_interactive and role.lower() in self.INTERACTIVE_ROLES:
+                if info.get('isDisabled') or info.get('ariaDisabled'):
+                    is_interactive = True
+
+            interactive_map[ref] = is_interactive
+
+        return visible_refs, interactive_map
+
+    def _is_element_interactive(
+        self,
+        role: str,
+        info: Dict[str, Any],
+        snapshot_suffix: str = ""
+    ) -> bool:
+        """Determine if an element is interactive.
+
+        Based on Section 5 of INTERACTIVE_ELEMENTS.md:
+        Any single rule being True means the element is interactive.
+
+        Also references WAI-ARIA 1.2 specification (docs/INTERACTIVE_ELEMENTS.md).
+
+        Parameters
+        ----------
+        role : str
+            ARIA role of the element.
+        info : Dict[str, Any]
+            Element info from _get_element_interactive_info().
+        snapshot_suffix : str, optional
+            Suffix from snapshot line (for ARIA state detection).
+
+        Returns
+        -------
+        bool
+            True if element is interactive, False otherwise.
+        """
+        role_lower = role.lower() if role else ''
+
+        # 0. Disabled/Hidden check - Directly exclude (Section 4)
+        if info.get('isDisabled'):
+            # Note: Disabled elements are still shown in output but not "interactive"
+            return False
+
+        # Check aria-hidden
+        if info.get('ariaHidden'):
+            return False
+
+        # 1. Tag check (Section 5.1)
+        if info.get('tagName') in self.INTERACTIVE_TAGS:
+            return True
+
+        # 2. Event attribute check (Section 5.2)
+        if info.get('hasEventHandler'):
+            return True
+
+        # 3. tabindex check - Focusable (Section 5.2)
+        tabindex = info.get('tabindex')
+        is_focusable = False
+        if tabindex is not None:
+            try:
+                if int(tabindex) >= 0:
+                    is_focusable = True
+            except ValueError:
+                pass
+
+        # Directly interactive via tabindex
+        if is_focusable:
+            return True
+
+        # 4. Search-related check (Section 5.3)
+        class_and_id = info.get('classAndId') or ''
+        if any(keyword in class_and_id for keyword in self.SEARCH_KEYWORDS):
+            return True
+
+        # 5. ARIA role check (Section 5.4 + WAI-ARIA 1.2)
+        # Special handling for separator: only interactive when focusable
+        if role_lower == 'separator':
+            return is_focusable
+
+        if role_lower in self.INTERACTIVE_ROLES:
+            return True
+
+        # 6. ARIA state check (Section 5.5)
+        # These state attributes indicate interactive widget controls
+        if snapshot_suffix:
+            aria_states = ['[pressed', '[expanded', '[checked', '[selected']
+            if any(state in snapshot_suffix for state in aria_states):
+                return True
+
+        # 7. focusable/editable/settable check (Section 5.5)
+        if info.get('isEditable') or info.get('isContentEditable'):
+            return True
+
+        # 8. Control attribute check (Section 5.5)
+        if info.get('ariaRequired') or info.get('ariaAutocomplete') or info.get('ariaKeyshortcuts'):
+            return True
+
+        # 9. Small icon check (Section 5.7)
+        # Size within 10-50px range + has semantic attributes
+        width = info.get('width') or 0
+        height = info.get('height') or 0
+        if 10 <= width <= 50 and 10 <= height <= 50:
+            # Check for semantic attributes: class, role, data-action, aria-label
+            # Note: hasEventHandler already checked in rule 2, dataAction implies interactivity
+            has_semantic = (
+                info.get('classAndId') or  # Contains class and id
+                info.get('dataAction') or  # data-action
+                '[aria-label' in (snapshot_suffix or '')  # aria-label
+            )
+            if has_semantic:
+                return True
+
+        # 10. cursor=pointer fallback (Section 5.8)
+        if info.get('cursor') == 'pointer':
+            return True
+        # Also check cursor=pointer in snapshot
+        if '[cursor=pointer]' in (snapshot_suffix or ''):
+            return True
+
+        return False
 
     async def page_snapshot_for_ai(self, page: AsyncPage) -> str:
         """Get Playwright internal snapshot for AI.
@@ -388,7 +1154,8 @@ class SnapshotGenerator:
         self,
         raw_snapshot: str,
         refs: Dict[str, RefData],
-        options: SnapshotOptions
+        options: SnapshotOptions,
+        interactive_map: Optional[Dict[str, bool]] = None
     ) -> str:
         """Process `page_snapshot_for_ai` output into a streamlined tree.
 
@@ -418,6 +1185,9 @@ class SnapshotGenerator:
             Mapping to populate with ``ref -> RefData``.
         options : SnapshotOptions
             Snapshot options (interactive only, for flattened output).
+        interactive_map : Optional[Dict[str, bool]]
+            Mapping of ref -> is_interactive from _pre_filter_raw_snapshot().
+            Used for precise filtering in interactive mode.
 
         Returns
         -------
@@ -428,33 +1198,38 @@ class SnapshotGenerator:
         result: List[str] = []
         tracker = RoleNameTracker()
 
-        # Track the stack of (original_depth, kept, effective_depth)
+        # Track the stack of (original_depth, kept, effective_depth, ref_or_none)
         # - original_depth: the depth in the original tree
         # - kept: whether this element was kept in output
         # - effective_depth: the depth in the output tree
-        depth_stack: List[Tuple[int, bool, int]] = []
+        # - ref_or_none: the ref assigned to this element (if any)
+        depth_stack: List[Tuple[int, bool, int, Optional[str]]] = []
 
-        # Regex to match snapshot lines
-        # Note: (?:[^"\\]|\\.)* handles escaped quotes like \"
-        line_pattern = re.compile(
-            r'^(\s*-\s*)'              # prefix with indentation
-            r'(\w+)'                   # role
-            r'(?:\s+"((?:[^"\\]|\\.)*)")?'  # optional name in quotes (handles escaped quotes)
-            r'(.*)$'                   # suffix (attributes, colon, etc.)
-        )
+        # Track iframe nesting: list of (iframe_depth, path_to_iframe)
+        # path_to_iframe = list of per-level local indices, e.g. [0, 1] means
+        # "the 2nd iframe inside the 1st top-level iframe".
+        iframe_stack: List[Tuple[int, List[int]]] = []
+        # Per-parent counter: key = tuple(parent_path), value = iframes seen so far at that level.
+        _iframe_local_counters: Dict[tuple, int] = {}
 
-        # Regex patterns for cleaning
-        ref_pattern = re.compile(r'\s*\[ref=e\d+\]')
-        # Note: We keep [cursor=pointer] as it indicates interactive elements
+        line_pattern = self._LINE_PATTERN
+        ref_pattern = self._REF_CLEAN_PATTERN
+        ref_extract_pattern = self._REF_EXTRACT_PATTERN
 
         def get_effective_depth(original_depth: int) -> int:
             """Calculate effective depth based on kept parents."""
-            # Find the nearest kept parent
             effective = 0
-            for orig_d, kept, eff_d in depth_stack:
+            for orig_d, kept, eff_d, _ in depth_stack:
                 if orig_d < original_depth and kept:
                     effective = eff_d + 1
             return effective
+
+        def get_nearest_parent_ref(original_depth: int) -> Optional[str]:
+            """Find the ref of the nearest ancestor that has one."""
+            for orig_d, kept, _, ref_id in reversed(depth_stack):
+                if orig_d < original_depth and kept and ref_id is not None:
+                    return ref_id
+            return None
 
         for line in lines:
             # Skip empty lines
@@ -477,17 +1252,35 @@ class SnapshotGenerator:
             while depth_stack and depth_stack[-1][0] >= original_depth:
                 depth_stack.pop()
 
+            # Pop iframe contexts that are no longer enclosing the current element
+            while iframe_stack and iframe_stack[-1][0] >= original_depth:
+                iframe_stack.pop()
+
             match = line_pattern.match(line)
 
             if not match:
                 # Non-standard line (text content, metadata like /url:)
-                # Find if there's a kept parent
-                has_kept_parent = any(kept for _, kept, _ in depth_stack)
+                stripped = line.lstrip()
+
+                # In interactive-only mode, skip text nodes but keep metadata
+                if options.interactive:
+                    # Only keep metadata lines (like /url:, /placeholder:) for kept parents
+                    if stripped.startswith('- /'):
+                        has_kept_parent = any(kept for _, kept, _, _ in depth_stack)
+                        if has_kept_parent:
+                            eff_depth = get_effective_depth(original_depth)
+                            content = stripped[2:]
+                            new_line = '  ' * eff_depth + '- ' + content
+                            result.append(new_line)
+                    # Skip all other non-standard lines (text nodes) in interactive mode
+                    continue
+
+                # Non-interactive mode: keep text and metadata if there's a kept parent
+                has_kept_parent = any(kept for _, kept, _, _ in depth_stack)
                 if has_kept_parent or not depth_stack:
                     # Calculate effective depth and re-indent
                     eff_depth = get_effective_depth(original_depth)
                     # Extract content after the "- " prefix
-                    stripped = line.lstrip()
                     if stripped.startswith('- '):
                         content = stripped[2:]
                         new_line = '  ' * eff_depth + '- ' + content
@@ -498,11 +1291,18 @@ class SnapshotGenerator:
                 continue
 
             _, role, name, suffix = match.groups()
+            # Use inline label (after colon) as name when no quoted name — consistent with _extract_original_refs_from_raw
+            if not name and suffix and ':' in suffix:
+                inline_label_match = re.search(
+                    r':\s*(?:"((?:[^"\\]|\\.)*)"|([^\n]+))\s*$', suffix
+                )
+                if inline_label_match:
+                    name = (inline_label_match.group(1) or inline_label_match.group(2) or '').strip() or None
             role_lower = role.lower()
 
             # Handle metadata lines (like /url:, /placeholder:)
             if role.startswith('/'):
-                has_kept_parent = any(kept for _, kept, _ in depth_stack)
+                has_kept_parent = any(kept for _, kept, _, _ in depth_stack)
                 if has_kept_parent or not depth_stack:
                     eff_depth = get_effective_depth(original_depth)
                     new_line = '  ' * eff_depth + f'- {role}{suffix}'
@@ -582,32 +1382,52 @@ class SnapshotGenerator:
                 should_have_ref = bool(name)
 
             # In interactive-only mode, only keep interactive elements
-            # cursor=pointer and ARIA state elements are also considered interactive
+            # Use interactive_map for precise filtering when available
             if options.interactive:
-                is_effectively_interactive = (
-                    is_interactive or has_cursor_pointer or has_aria_state
-                )
+                # Try to get ref from suffix for interactive_map lookup
+                ref_match_in_suffix = ref_extract_pattern.search(suffix) if suffix else None
+                original_ref = ref_match_in_suffix.group(1) if ref_match_in_suffix else None
+
+                if interactive_map and original_ref:
+                    # Use the pre-computed interactive_map for precise filtering
+                    is_effectively_interactive = interactive_map.get(original_ref, False)
+                else:
+                    # Fallback to basic role/attribute checks
+                    is_effectively_interactive = (
+                        is_interactive or has_cursor_pointer or has_aria_state
+                    )
                 if not is_effectively_interactive:
                     should_keep = False
 
             # Calculate effective depth for this element
             effective_depth = get_effective_depth(original_depth)
 
-            # Track this element in the stack
-            depth_stack.append((original_depth, should_keep, effective_depth))
+            # Determine current element's ref (filled below if should_have_ref).
+            current_ref: Optional[str] = None
 
             if not should_keep:
-                # Check if this filtered element has inline text content
-                # e.g., "- generic [ref=e369]: Recommended" has text after the colon
-                if suffix and ':' in suffix:
-                    # Extract text after the last colon (non-whitespace content only)
-                    text_match = re.search(r':\s*(\S.*)$', suffix)
-                    if text_match:
-                        inline_text = text_match.group(1).strip()
-                        # Only emit if text has printable content
-                        if inline_text and any(c.isprintable() and not c.isspace() for c in inline_text):
-                            indent = '  ' * effective_depth
-                            result.append(f"{indent}- text: {inline_text}")
+                depth_stack.append((original_depth, False, effective_depth, None))
+                # Even when filtered, iframes must be pushed onto the iframe_stack so
+                # that their interactive children still get the correct frame_path.
+                if role_lower == 'iframe':
+                    parent_path = tuple(iframe_stack[-1][1]) if iframe_stack else ()
+                    local_idx = _iframe_local_counters.get(parent_path, 0)
+                    _iframe_local_counters[parent_path] = local_idx + 1
+                    iframe_stack.append((original_depth, list(parent_path) + [local_idx]))
+                # In interactive mode, skip filtered elements entirely (no inline text)
+                # In non-interactive mode, preserve inline text from filtered elements
+                if not options.interactive:
+                    # Check if this filtered element has inline text content
+                    # e.g., "- generic [ref=e369]: Recommended" has text after the colon
+                    if suffix and ':' in suffix:
+                        # Extract text after the last colon (non-whitespace content only)
+                        text_match = re.search(r':\s*(\S.*)$', suffix)
+                        if text_match:
+                            inline_text = text_match.group(1).strip()
+                            # Only emit if text has printable content
+                            if inline_text and any(c.isprintable() and not c.isspace() for c in inline_text):
+                                indent = '  ' * effective_depth
+                                result.append(f"{indent}- text: {inline_text}")
                 continue
 
             # Clean the suffix - remove existing ref (we keep style attributes like cursor)
@@ -625,15 +1445,29 @@ class SnapshotGenerator:
                 enhanced += f' "{name}"'
 
             if should_have_ref:
-                ref = self._next_ref()
+                current_frame_path = iframe_stack[-1][1] if iframe_stack else None
                 nth = tracker.get_next_index(role_lower, name)
+                ref = self._compute_stable_ref(role_lower, name, current_frame_path, nth)
+                current_ref = ref
                 tracker.track_ref(role_lower, name, ref)
 
+                # Extract inline text content for unnamed elements
+                text_content = None
+                if not name and clean_suffix and ':' in clean_suffix:
+                    text_match = re.search(r':\s*"?([^"]+)"?\s*$', clean_suffix)
+                    if text_match:
+                        text_content = text_match.group(1).strip()
+
+                parent_ref = get_nearest_parent_ref(original_depth)
+
                 refs[ref] = RefData(
-                    selector=self._build_selector(role_lower, name),
+                    selector=self._build_selector(role_lower, name, text_content),
                     role=role_lower,
                     name=name,
-                    nth=nth
+                    nth=nth,
+                    text_content=text_content,
+                    parent_ref=parent_ref,
+                    frame_path=current_frame_path,
                 )
 
                 enhanced += f" [ref={ref}]"
@@ -642,8 +1476,32 @@ class SnapshotGenerator:
                 if nth > 0 and name:
                     enhanced += f" [nth={nth}]"
 
+            # Track this element in the stack (after ref assignment).
+            depth_stack.append((original_depth, should_keep, effective_depth, current_ref))
+
+            # If this element is an iframe, future children will be scoped to it.
+            if role_lower == 'iframe':
+                parent_path = tuple(iframe_stack[-1][1]) if iframe_stack else ()
+                local_idx = _iframe_local_counters.get(parent_path, 0)
+                _iframe_local_counters[parent_path] = local_idx + 1
+                iframe_stack.append((original_depth, list(parent_path) + [local_idx]))
+
             # Re-add clean suffix (like [level=1] for headings, or trailing colon)
             if clean_suffix:
+                # If name matches inline text, suppress duplication to save tokens
+                # e.g. generic "Username" [ref=e14]: Username → generic "Username" [ref=e14]
+                # e.g. generic "Item 1" [ref=eNN] [cursor=pointer]: Item 1 → [cursor=pointer]
+                if name and ':' in clean_suffix:
+                    colon_match = re.search(r':\s*(.+?)\s*$', clean_suffix)
+                    if colon_match:
+                        raw_text = colon_match.group(1).strip()
+                        # Strip outer quotes to get inline text
+                        if raw_text.startswith('"') and raw_text.endswith('"'):
+                            raw_text = raw_text[1:-1]
+                        # Compare with name (both may contain escaped quotes like \")
+                        if raw_text == name:
+                            clean_suffix = clean_suffix[:colon_match.start()].rstrip()
+
                 if clean_suffix == ':':
                     enhanced += ':'
                 elif clean_suffix.startswith(':'):
@@ -651,7 +1509,7 @@ class SnapshotGenerator:
                     enhanced += clean_suffix
                 elif clean_suffix.endswith(':'):
                     enhanced += f" {clean_suffix[:-1]}:"
-                else:
+                elif clean_suffix:
                     enhanced += f" {clean_suffix}"
 
             result.append(enhanced)
@@ -661,7 +1519,9 @@ class SnapshotGenerator:
 
         return '\n'.join(result)
 
-    def _extract_original_refs_from_raw(self, raw_snapshot: str) -> Dict[str, Tuple[str, Optional[str], int]]:
+    def _extract_original_refs_from_raw(
+        self, raw_snapshot: str
+    ) -> Tuple[Dict[str, Tuple[str, Optional[str], int]], Dict[str, str]]:
         """Extract original refs from a raw snapshot.
 
         IMPORTANT: The nth_index computed here is based on the ORDER OF APPEARANCE
@@ -680,24 +1540,33 @@ class SnapshotGenerator:
 
         Returns
         -------
-        Dict[str, Tuple[str, Optional[str], int]]
-            Mapping of ``ref -> (role, name, nth_index)``.
+        Tuple[Dict[str, Tuple[str, Optional[str], int]], Dict[str, str]]
+            - refs_info: Mapping of ``ref -> (role, name, nth_index)``
+            - ref_suffixes: Mapping of ``ref -> suffix`` (from [ref=...] to end of line)
         """
         refs_info: Dict[str, Tuple[str, Optional[str], int]] = {}
+        ref_suffixes: Dict[str, str] = {}
         role_name_counts: Dict[str, int] = {}
 
-        # Pattern to match lines with refs
-        # Note: (?:[^"\\]|\\.)* correctly handles escaped quotes like \"
-        line_pattern = re.compile(
-            r'^\s*-\s*(\w+)'           # role
-            r'(?:\s+"((?:[^"\\]|\\.)*)")?'  # optional name (handles escaped quotes)
-            r'.*\[ref=(e\d+)\]'        # ref
-        )
+        line_pattern = self._REF_LINE_PATTERN
 
         for line in raw_snapshot.split('\n'):
             match = line_pattern.match(line)
             if match:
-                role, name, ref = match.groups()
+                groups = match.groups()
+                role = groups[0]
+                name = groups[1]  # quoted name before ref (e.g. "Go to Form Section")
+                suffix = groups[2]  # everything from [ref=...] to end of line
+                ref = groups[3]
+
+                # Extract inline label from suffix if no quoted name before ref
+                if not name and suffix and ':' in suffix:
+                    inline_label_match = re.search(
+                        r':\s*(?:"((?:[^"\\]|\\.)*)"|([^\n]+))\s*$', suffix
+                    )
+                    if inline_label_match:
+                        name = (inline_label_match.group(1) or inline_label_match.group(2) or '').strip() or None
+
                 role_lower = role.lower()
 
                 # Track nth index for role+name combination
@@ -705,162 +1574,62 @@ class SnapshotGenerator:
                 nth = role_name_counts.get(key, 0)
                 role_name_counts[key] = nth + 1
 
-                refs_info[ref] = (role_lower, name, nth)
+                refs_info[ref] = (role_lower, name if name else None, nth)
+                ref_suffixes[ref] = suffix or ''
 
-        return refs_info
-
-    async def _check_element_should_include(
-        self,
-        page: AsyncPage,
-        role: str,
-        name: Optional[str],
-        nth: int,
-        filter_invisible: bool,
-        check_viewport: bool,
-        viewport_width: Optional[int] = None,
-        viewport_height: Optional[int] = None
-    ) -> bool:
-        """Check whether an element should be included based on visibility and viewport.
-
-        This method determines element inclusion using Playwright locators.
-
-        Locator Strategy:
-        1. Build locator using get_by_role(role, name=name, exact=True)
-        2. Apply nth index for disambiguation when multiple matches exist
-        3. Check CSS visibility using is_visible() if filter_invisible is enabled
-        4. Check viewport bounds if check_viewport is enabled
-
-        CRITICAL LIMITATION:
-        The nth index is based on snapshot text order, which may not match DOM order.
-        For unnamed elements (especially structural roles like 'generic'), this can
-        cause the locator to target the wrong element. This is why we skip visibility
-        checks for STRUCTURAL_NOISE_ROLES without names - they cannot be reliably located.
-
-        Parameters
-        ----------
-        page : playwright.async_api.Page
-            Playwright page object.
-        role : str
-            ARIA role of the element.
-        name : Optional[str]
-            Accessible name of the element.
-        nth : int
-            Index for elements with same role+name (based on snapshot order, NOT DOM order).
-        filter_invisible : bool
-            Whether to filter CSS-hidden elements.
-        check_viewport : bool
-            Whether to filter elements outside the viewport.
-        viewport_width : Optional[int], optional
-            Viewport width (pre-fetched for efficiency).
-        viewport_height : Optional[int], optional
-            Viewport height (pre-fetched for efficiency).
-
-        Returns
-        -------
-        bool
-            True if element should be included, otherwise False.
-        """
-        # Skip visibility check for structural noise roles (generic, group, etc.)
-        # These are layout containers that:
-        # 1. Cannot be reliably located via get_by_role without a name
-        # 2. May cause entire subtrees to be incorrectly filtered
-        # 3. Their visibility is determined by their children, not themselves
-        if role in self.STRUCTURAL_NOISE_ROLES and not name:
-            return True
-
-        try:
-            # Build locator
-            if name:
-                locator = page.get_by_role(role, name=name, exact=True)
-            else:
-                locator = page.get_by_role(role)
-
-            # Apply nth index
-            if nth > 0:
-                locator = locator.nth(nth)
-            else:
-                locator = locator.first
-
-            # Check CSS visibility using is_visible() if filter_invisible is enabled
-            if filter_invisible:
-                is_visible = await locator.is_visible()
-                if not is_visible:
-                    return False
-
-            # Check viewport bounds if needed
-            if check_viewport and viewport_width is not None and viewport_height is not None:
-                # Get element bounding box
-                bounding_box = await locator.bounding_box()
-                if bounding_box:
-                    # Check if element overlaps with viewport (partial overlap counts)
-                    elem_right = bounding_box['x'] + bounding_box['width']
-                    elem_bottom = bounding_box['y'] + bounding_box['height']
-
-                    is_in_viewport = not (
-                        elem_right < 0 or bounding_box['x'] > viewport_width or
-                        elem_bottom < 0 or bounding_box['y'] > viewport_height
-                    )
-                    if not is_in_viewport:
-                        return False
-                else:
-                    # No bounding box means element is not rendered, exclude it
-                    return False
-
-            return True
-
-        except Exception as e:
-            # If we can't check (element not found, etc.), assume it should be included
-            logger.debug(f"Failed to check element {role} '{name}': {e}")
-            return True
+        return refs_info, ref_suffixes
 
     async def _pre_filter_raw_snapshot(
         self,
         raw_snapshot: str,
         page: AsyncPage,
         options: SnapshotOptions
-    ) -> str:
-        """Pre-filter raw snapshot to remove invisible/out-of-viewport elements.
+    ) -> Tuple[str, Dict[str, bool]]:
+        """Pre-filter raw snapshot and check interactivity of elements.
 
         This method runs BEFORE the main processing to filter out elements that
         don't need to be processed at all, improving performance significantly.
 
         Filter Strategy:
         1. Extract all refs from raw snapshot with their role/name/nth info
-        2. Run parallel visibility checks on all ref'd elements
-        3. Build a set of visible refs
-        4. Filter snapshot lines, skipping invisible elements and their children
+        2. Run parallel visibility and interactivity checks on all ref'd elements
+        3. Build a set of visible refs and an interactive map
+        4. Filter snapshot lines, skipping out-of-viewport elements and their children
 
         IMPORTANT: When an element is marked invisible, ALL its children are also
         skipped, regardless of their individual visibility. This matches the
         expectation that content inside a hidden container is not accessible.
 
         Performance Note:
-        Visibility checks are run in parallel using asyncio.gather() for better
-        performance on pages with many elements.
+        Visibility and interactivity checks are run in parallel using asyncio.gather()
+        for better performance on pages with many elements.
 
         Parameters
         ----------
         raw_snapshot : str
             Raw output from `page_snapshot_for_ai()`.
         page : playwright.async_api.Page
-            Playwright page object for visibility checking.
+            Playwright page object for visibility and interactivity checking.
         options : SnapshotOptions
-            Snapshot options with `full_page` and `filter_invisible` settings.
+            Snapshot options with `full_page` and `interactive` settings.
 
         Returns
         -------
-        str
-            Filtered raw snapshot string.
+        Tuple[str, Dict[str, bool]]
+            - Filtered raw snapshot string
+            - ref -> is_interactive mapping (only populated when options.interactive is True)
         """
-        # If no filtering needed, return as-is
-        if options.full_page and not options.filter_invisible:
-            return raw_snapshot
+        interactive_map: Dict[str, bool] = {}
 
-        # Extract all original refs with their role/name/nth
-        refs_info = self._extract_original_refs_from_raw(raw_snapshot)
+        # If no filtering needed and not interactive mode, return as-is
+        if options.full_page and not options.interactive:
+            return raw_snapshot, interactive_map
+
+        # Extract all original refs with their role/name/nth and suffixes in one pass
+        refs_info, ref_suffixes = self._extract_original_refs_from_raw(raw_snapshot)
 
         if not refs_info:
-            return raw_snapshot
+            return raw_snapshot, interactive_map
 
         # Pre-fetch viewport size once for efficiency
         viewport = page.viewport_size
@@ -868,39 +1637,22 @@ class SnapshotGenerator:
         viewport_height = viewport['height'] if viewport else None
         check_viewport = not options.full_page and viewport_width is not None
 
-        # Define coroutine for checking each ref
-        async def check_ref(ref: str, role: str, name: Optional[str], nth: int) -> Tuple[str, bool]:
-            should_include = await self._check_element_should_include(
-                page, role, name, nth,
-                filter_invisible=options.filter_invisible,
-                check_viewport=check_viewport,
-                viewport_width=viewport_width,
-                viewport_height=viewport_height
-            )
-            return (ref, should_include)
-
-        # Run all visibility checks in parallel for better performance
-        tasks = [
-            check_ref(ref, role, name, nth)
-            for ref, (role, name, nth) in refs_info.items()
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Collect visible refs
-        visible_refs: Set[str] = set()
-        for result in results:
-            if isinstance(result, Exception):
-                logger.debug(f"Visibility check exception: {result}")
-                continue
-            ref, should_include = result
-            if should_include:
-                visible_refs.add(ref)
+        # Batch check all elements in a single page.evaluate() call
+        visible_refs, interactive_map = await self._batch_get_elements_info(
+            page, refs_info, ref_suffixes,
+            check_viewport=check_viewport,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
+        )
 
         logger.debug(f"Pre-filter: {len(visible_refs)}/{len(refs_info)} refs visible/in-viewport")
+        if options.interactive:
+            interactive_count = sum(1 for v in interactive_map.values() if v)
+            logger.debug(f"Interactive check: {interactive_count}/{len(interactive_map)} refs interactive")
 
-        # If all refs are visible, return as-is
+        # If all refs are in-viewport (or no viewport filtering is active), return as-is
         if len(visible_refs) == len(refs_info):
-            return raw_snapshot
+            return raw_snapshot, interactive_map
 
         # Filter the raw snapshot
         lines = raw_snapshot.split('\n')
@@ -909,8 +1661,7 @@ class SnapshotGenerator:
         # Track invisible parent depths to skip children
         invisible_depth: Optional[int] = None
 
-        # Pattern to extract ref from line
-        ref_pattern = re.compile(r'\[ref=(e\d+)\]')
+        ref_extract_pattern = self._REF_EXTRACT_PATTERN
 
         for line in lines:
             if not line.strip():
@@ -929,17 +1680,23 @@ class SnapshotGenerator:
                     invisible_depth = None
 
             # Check if this line has a ref
-            ref_match = ref_pattern.search(line)
+            ref_match = ref_extract_pattern.search(line)
             if ref_match:
                 ref = ref_match.group(1)
                 if ref not in visible_refs:
-                    # This element is invisible/out-of-viewport, mark depth to skip children
+                    # Preserve iframe lines even when filtered out, so frame_path local
+                    # indices remain aligned with real DOM iframe order.
+                    if re.match(r'^\s*-\s*iframe\b', line, flags=re.IGNORECASE):
+                        result.append(line)
+                        invisible_depth = depth
+                        continue
+                    # This element is invisible/out-of-viewport, mark depth to skip children.
                     invisible_depth = depth
                     continue
 
             result.append(line)
 
-        return '\n'.join(result)
+        return '\n'.join(result), interactive_map
 
     async def _generate_snapshot(
         self,
@@ -964,13 +1721,26 @@ class SnapshotGenerator:
             Generated snapshot with tree and refs.
         """
         raw_snapshot = await self.page_snapshot_for_ai(page)
-
         if not raw_snapshot:
             return EnhancedSnapshot(tree='(empty)', refs={})
 
-        # Pre-filter invisible/out-of-viewport elements before processing
-        filtered_snapshot = await self._pre_filter_raw_snapshot(raw_snapshot, page, options)
-        enhanced_tree = self._process_page_snapshot_for_ai(filtered_snapshot, refs, options)
+        # Normalize: strip YAML single-quote wrapping from long/escaped lines
+        raw_snapshot = self._normalize_raw_snapshot(raw_snapshot)
+
+        logger.debug("Raw snapshot length: %d chars", len(raw_snapshot))
+
+        # Pre-filter out-of-viewport elements and get interactive map
+        filtered_snapshot, interactive_map = await self._pre_filter_raw_snapshot(
+            raw_snapshot, page, options
+        )
+
+        logger.debug("Filtered snapshot length: %d chars", len(filtered_snapshot))
+
+        enhanced_tree = self._process_page_snapshot_for_ai(
+            filtered_snapshot, refs, options, interactive_map
+        )
+
+        logger.debug("Enhanced tree length: %d chars", len(enhanced_tree))
 
         return EnhancedSnapshot(tree=enhanced_tree, refs=refs)
 
@@ -985,22 +1755,13 @@ class SnapshotGenerator:
 
         Processing Flow:
         1. Call page_snapshot_for_ai() to get raw Playwright snapshot
-        2. Pre-filter invisible/out-of-viewport elements
+        2. Pre-filter out-of-viewport elements (when full_page=False)
         3. Process and enhance the tree with element refs
         4. Return EnhancedSnapshot with tree text and refs dictionary
 
         Options:
         - interactive: Only include interactive elements (flattened output)
-        - filter_invisible: Filter CSS-hidden elements (default: True)
-        - full_page: Include all elements regardless of viewport (default: False)
-
-        Filtering Behavior:
-        | filter_invisible | full_page | Behavior                              |
-        |------------------|-----------|---------------------------------------|
-        | True             | False     | Visible + in viewport only (default)  |
-        | True             | True      | Visible elements (entire page)        |
-        | False            | False     | In viewport only (include hidden)     |
-        | False            | True      | No filtering (all elements)           |
+        - full_page: Include all elements regardless of viewport (default: True)
 
         Parameters
         ----------
@@ -1024,12 +1785,12 @@ class SnapshotGenerator:
 
     @staticmethod
     def parse_ref(arg: str) -> Optional[str]:
-        """Parse a ref string (e.g., ``@e1`` -> ``e1``).
+        """Parse a ref string (e.g., ``@3ad7b2c1`` -> ``3ad7b2c1``).
 
         Parameters
         ----------
         arg : str
-            Reference string in various formats (``@e1``, ``ref=e1``, ``e1``).
+            Reference string in various formats (``@3ad7b2c1``, ``ref=3ad7b2c1``, ``3ad7b2c1``).
 
         Returns
         -------
@@ -1041,9 +1802,7 @@ class SnapshotGenerator:
             return arg[1:]
         if arg.startswith('ref='):
             return arg[4:]
-        if arg.isdigit():
-            return f"e{arg}"
-        if re.match(r'^e\d+$', arg):
+        if re.match(r'^[0-9a-f]{8}$', arg):
             return arg
         return None
     
@@ -1059,7 +1818,7 @@ class SnapshotGenerator:
         The locator can then be used for interactions (click, fill, etc.).
 
         Locator Construction:
-        1. Parse ref string to extract ref ID (e.g., "@e1" -> "e1")
+        1. Parse ref string to extract ref ID (e.g., "@8d4b03a9" -> "8d4b03a9")
         2. Look up RefData from the refs dictionary
         3. Build locator using get_by_role(role, name=name, exact=True)
         4. Apply nth() if disambiguation is needed for duplicate role+name
@@ -1073,7 +1832,7 @@ class SnapshotGenerator:
         page : playwright.async_api.Page
             Playwright page object (async_api).
         ref_arg : str
-            Reference string (``e1``, ``@e1``, ``ref=e1``).
+            Reference string (``a1b2c3d4``, ``@a1b2c3d4``, ``ref=a1b2c3d4``).
         refs : Dict[str, RefData]
             Ref map dictionary from snapshot.
 
@@ -1089,17 +1848,134 @@ class SnapshotGenerator:
         ref_data = refs.get(ref)
         if not ref_data:
             return None
-        
-        # Build locator with exact=True to avoid substring matches
-        if ref_data.name:
-            locator = page.get_by_role(ref_data.role, name=ref_data.name, exact=True)
+
+        # Normalize once so all branches share consistent empty-text handling.
+        normalized_name = ref_data.name.strip() if ref_data.name and ref_data.name.strip() else None
+        normalized_text = (
+            ref_data.text_content.strip()
+            if ref_data.text_content and ref_data.text_content.strip()
+            else None
+        )
+        match_text = normalized_name or normalized_text
+
+        def text_pattern(value: str, exact: bool) -> re.Pattern:
+            """Build a whitespace-tolerant regex for snapshot text matching."""
+            parts = [re.escape(p) for p in re.split(r"\s+", value.strip()) if p]
+            joined = r"\s+".join(parts) if parts else ""
+            if exact:
+                return re.compile(rf"^\s*{joined}\s*$")
+            return re.compile(joined)
+
+        # Determine the search scope: chain frame_locator calls for each level of iframe nesting.
+        # frame_path = [i0, i1, ...] means the element is in the i1-th iframe inside the i0-th iframe.
+        scope: "AsyncPage | AsyncFrameLocator" = page
+        if ref_data.frame_path:
+            for local_nth in ref_data.frame_path:
+                scope = scope.frame_locator("iframe").nth(local_nth)
+
+        # Build locator by signal strength:
+        # 1) Semantic role+name
+        # 2) Role-constrained text match for structural roles
+        # 3) Text fallback for pseudo/noise roles
+        # 4) Bare role fallback
+        #
+        # skip_nth is set to True in branches where the locator key space differs
+        # from the role:name key space used to compute ref_data.nth.
+        skip_nth = False
+
+        if (
+            normalized_name
+            and ref_data.role not in self.ROLE_TEXT_MATCH_ROLES
+            and ref_data.role not in self.STRUCTURAL_NOISE_ROLES
+            and ref_data.role not in self.TEXT_LEAF_ROLES
+        ):
+            locator = scope.get_by_role(ref_data.role, name=normalized_name, exact=True)
+        elif ref_data.role in self.ROLE_TEXT_MATCH_ROLES and match_text:
+            if ref_data.role == 'row':
+                # Row text usually includes descendant cell text; use role-constrained
+                # contains matching and avoid locator.or_ expansion.
+                row_text_pattern = text_pattern(match_text, exact=False)
+                locator = scope.get_by_role('row').filter(has_text=row_text_pattern)
+            else:
+                exact_text_pattern = text_pattern(match_text, exact=True)
+                locator = scope.get_by_role(ref_data.role).filter(has_text=exact_text_pattern)
+        elif ref_data.role in self.TEXT_LEAF_ROLES and match_text:
+            # 'text' is a snapshot pseudo-role (not a valid ARIA role).
+            locator = scope.get_by_text(match_text, exact=True)
+            # nth was computed counting only text-leaf nodes with this text,
+            # but get_by_text counts ALL elements with that text across any role
+            # (buttons, headings, cells, etc.) — a different key space.
+            skip_nth = True
+        elif ref_data.role in self.STRUCTURAL_NOISE_ROLES and match_text:
+            # generic/group/none/presentation have weak role semantics in Playwright;
+            # get_by_role() returns 0 results for implicit generic/group roles.
+            # Use a CSS-scoped locator to restrict to the correct element type,
+            # keeping the nth index valid within the scoped set.
+            css = self.STRUCTURAL_NOISE_CSS.get(ref_data.role)
+            if css:
+                exact_text_pattern = text_pattern(match_text, exact=True)
+                locator = scope.locator(css).filter(has_text=exact_text_pattern)
+                # CSS-scoped locator approximates the role:name key space
+                # (e.g. only div/span elements containing "Pending"), so nth
+                # is safe to apply — no skip_nth needed.
+            else:
+                locator = scope.get_by_text(match_text, exact=True)
+                skip_nth = True
+        elif ref_data.role in self.STRUCTURAL_NOISE_ROLES:
+            # Unnamed and no stored text — scan text-leaf children as inner text anchor.
+            # e.g. generic "" [ref=e28]:
+            #        text "ID" [ref=e29, parent_ref=e28]
+            # get_by_role('generic') returns 0 results in Playwright, so this is the only
+            # reliable fallback.
+            #
+            # NOTE: only child refs (parent_ref == this ref) are considered.  Sibling-text
+            # strategies (same parent_ref, next ref by number) were evaluated but rejected:
+            # they search the entire page scope and can match unrelated elements that
+            # happen to share the same adjacent text, causing silent false positives.
+            # When an unnamed generic has only a sibling text (not a child), the sibling
+            # text ref itself (e.g. e29) is always independently locatable and should be
+            # used directly instead.
+            child_text = next(
+                (
+                    d.name.strip()
+                    for d in refs.values()
+                    if d.parent_ref == ref
+                    and d.role in self.TEXT_LEAF_ROLES
+                    and d.name and d.name.strip()
+                ),
+                None,
+            )
+            if child_text:
+                css = self.STRUCTURAL_NOISE_CSS.get(ref_data.role)
+                if css:
+                    exact_text_pattern = text_pattern(child_text, exact=True)
+                    locator = scope.locator(css).filter(has_text=exact_text_pattern)
+                else:
+                    locator = scope.get_by_text(child_text, exact=True)
+                # nth was computed in 'generic:' key space (all unnamed generics),
+                # but this locator counts CSS-matched elements containing this specific
+                # child text — a different key space. Still skip nth.
+                skip_nth = True
+            else:
+                locator = scope.get_by_role(ref_data.role)
+        elif normalized_text:
+            locator = scope.get_by_text(normalized_text, exact=True)
+            # nth was computed counting only unnamed elements of this role,
+            # but get_by_text counts ALL elements with that text across any role.
+            skip_nth = True
         else:
-            locator = page.get_by_role(ref_data.role)
-        
-        # If an nth index is stored (for disambiguation), use it
-        if ref_data.nth is not None:
+            # No name and no text — use an empty-name regex to restrict to
+            # unnamed elements only.  Without this, get_by_role("combobox")
+            # would match ALL comboboxes (named + unnamed), but nth was
+            # computed among unnamed elements only → key-space mismatch.
+            locator = scope.get_by_role(ref_data.role, name=re.compile(r"^$"))
+
+        # Only apply nth when the snapshot explicitly captured disambiguation,
+        # and when the locator key space matches the role:name key space used
+        # to compute the nth index.
+        if not skip_nth and ref_data.nth is not None:
             locator = locator.nth(ref_data.nth)
-        
+
         return locator
     
     def get_snapshot_stats(

@@ -8,7 +8,7 @@ repository before publishing.
 Version rules:
 - Development versions (*.dev*): btsk only
 - Pre-release versions (alpha, beta, rc): pypi or testpypi
-- Release versions (x.y.z): pypi only
+- Release versions (x.y.z): pypi or testpypi
 """
 
 import re
@@ -67,9 +67,9 @@ def check_version_repo_compatibility(version: str, repo: str) -> bool:
     if version_type in ['alpha', 'beta', 'rc', 'post']:
         return repo in ['pypi', 'testpypi']
     
-    # Release versions can only be published to pypi
+    # Release versions can be published to pypi or testpypi
     if version_type == 'release':
-        return repo == 'pypi'
+        return repo in ['pypi', 'testpypi']
     
     # Unknown version types are not allowed to be published
     return False
@@ -104,7 +104,7 @@ def main():
             repo_name_str = colored("pypi or testpypi", "yellow")
             print(f"  Pre-release versions can only be published to [{repo_name_str}].")
         elif version_type == 'release':
-            repo_name_str = colored("pypi", "yellow")
+            repo_name_str = colored("pypi or testpypi", "yellow")
             print(f"  Release versions can only be published to [{repo_name_str}].")
         else:
             print("  Unknown version type.")

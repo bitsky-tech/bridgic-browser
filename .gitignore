@@ -28,6 +28,7 @@ htmlcov/
 .vscode/
 .idea/
 .claude/
+.agents/
 *.swp
 *.swo
 
@@ -63,6 +64,7 @@ playwright-report/
 
 # Debug output files
 snapshot_*.yaml
-snapshot*.txt
-browser_use.txt
-system_prompt.txt
+
+# Skills lock file
+skills-lock.json
+

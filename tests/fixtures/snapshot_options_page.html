@@ -27,7 +27,6 @@
             background: #ffebee;
             margin-top: 20px;
         }
-        /* Hidden container to test filter_invisible */
         .hidden-container {
             display: none;
         }
@@ -55,16 +54,16 @@
         <button id="bottom-offscreen-button">Bottom Offscreen Button</button>
     </section>
 
-    <!-- HIDDEN elements to test filter_invisible -->
+    <!-- HIDDEN elements (not expected in AI snapshot) -->
     <section id="hidden-section" aria-label="Hidden Elements Section">
         <h2>Hidden Elements Section</h2>
-        <p>This section contains a hidden button to test filter_invisible.</p>
+        <p>This section contains a fully hidden button (display:none + aria-hidden).</p>
         <div class="hidden-container" aria-hidden="true">
             <button id="hidden-button">Hidden Button</button>
         </div>
         <p id="hidden-explanation">
             The "Hidden Button" is inside a <code>display:none</code> container with <code>aria-hidden="true"</code>.
-            It should only appear in snapshots when <code>filter_invisible=False</code>.
+            It should not appear in the snapshot.
         </p>
     </section>
 </body>
