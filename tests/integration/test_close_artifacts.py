@@ -2,13 +2,13 @@
 Integration tests for browser close with active trace/video sessions.
 
 Two scenarios:
-  A) stop() called directly while trace + video are still active
-     → artifacts auto-finalized, paths returned in stop() result
-  B) stop_tracing() + stop_video() called first, then stop()
-     → artifacts already saved before stop(), stop() should be clean
+  A) close() called directly while trace + video are still active
+     → artifacts auto-finalized, paths returned in close() result
+  B) stop_tracing() + stop_video() called first, then close()
+     → artifacts already saved before close(), close() should be clean
 
 Note: close-report.json is written by the daemon (CLI path) only.
-      These tests cover the Python SDK path (direct browser.stop()).
+      These tests cover the Python SDK path (direct browser.close()).
 
 Run with:
     uv run pytest tests/integration/test_close_artifacts.py -v -s
@@ -50,7 +50,6 @@ async def test_close_direct_with_active_trace_and_video():
     - Video file exists on disk
     """
     browser = Browser(headless=True, stealth=False)
-    await browser.start()
 
     await browser.navigate_to(TEST_URL)
     await browser.start_tracing()
@@ -68,7 +67,7 @@ async def test_close_direct_with_active_trace_and_video():
     assert pre_trace.exists(), "Pre-allocated trace.zip should be created on disk"
 
     t0 = time.monotonic()
-    result = await browser.stop()
+    result = await browser.close()
     elapsed = time.monotonic() - t0
     print(f"\n  stop() elapsed: {elapsed:.3f}s")
     print(f"  stop() result:\n{result}")
@@ -103,7 +102,6 @@ async def test_close_after_explicit_stop_trace_and_video():
     - stop() completes cleanly, no duplicate artifact paths
     """
     browser = Browser(headless=True, stealth=False)
-    await browser.start()
 
     await browser.navigate_to(TEST_URL)
     await browser.start_tracing()
@@ -133,7 +131,7 @@ async def test_close_after_explicit_stop_trace_and_video():
     )
 
     t0 = time.monotonic()
-    result = await browser.stop()
+    result = await browser.close()
     elapsed = time.monotonic() - t0
     print(f"\n  stop() elapsed: {elapsed:.3f}s")
     print(f"  stop() result:\n{result}")

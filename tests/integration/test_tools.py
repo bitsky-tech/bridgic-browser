@@ -107,12 +107,11 @@ async def browser():
         stealth=False,
         viewport={"width": 1280, "height": 720},
     )
-    await browser_instance.start()
     test_url = f"file://{TEST_PAGE_PATH.absolute()}"
     await browser_instance.navigate_to(test_url)
     await asyncio.sleep(0.3)
     yield browser_instance
-    await browser_instance.stop()
+    await browser_instance.close()
 
 @pytest_asyncio.fixture
 async def browser_with_complete_snapshot(browser):
@@ -245,11 +244,10 @@ class TestControlTools:
         assert "wait" in result.lower() or "found" in result.lower() or result
 
     @pytest.mark.asyncio
-    async def test_stop(self):
-        """stop() kills the browser instance (separate browser to avoid fixture conflict)."""
+    async def test_close(self):
+        """close() kills the browser instance (separate browser to avoid fixture conflict)."""
         b = Browser(headless=True, stealth=False, viewport={"width": 800, "height": 600})
-        await b.start()
-        result = await b.stop()
+        result = await b.close()
         assert "close" in result.lower() or "browser" in result.lower() or result
 
 # ==================== 4. Action Tools (13 tools) ====================

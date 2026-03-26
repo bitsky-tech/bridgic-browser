@@ -66,7 +66,7 @@ bridgic/browser/
 
 ### Core data flow
 
-1. **`Browser`** (`session/_browser.py`) — instantiate and `await start()`. Auto-selects:
+1. **`Browser`** (`session/_browser.py`) — instantiate; browser starts lazily on first `navigate_to` / `search`, or explicitly via `async with Browser(...) as b:` (calls `_start()`). Auto-selects:
    - Isolated mode: `launch()` + `new_context()` (default, no `user_data_dir`)
    - Persistent mode: `launch_persistent_context(user_data_dir)` (preserves cookies/session)
 
@@ -108,7 +108,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 `get_snapshot(interactive=False, full_page=True)`:
 - `interactive=True` — flattened list of clickable/editable elements only (best for LLM action selection)
 - `full_page=False` — limit to viewport content only
-- `await browser.get_snapshot_text(...)` — returns a truncated string ready for LLM context, with pagination via `start_from_char`
+- `await browser.get_snapshot_text(...)` — returns a truncated string ready for LLM context, with pagination via `offset` and `limit` (default 10000)
 
 ### Stealth
 
@@ -130,7 +130,7 @@ System Chrome (v137+) removed `--load-extension` CLI support, so extensions only
 - `navigator.permissions.query` → returns `"default"` for notifications (not `"denied"`)
 - `window.outerWidth/Height` → matches `innerWidth/Height` (fixes headless zero-value)
 
-`get_init_script(locale=None)` accepts the locale and performs the `__BRIDGIC_LANGS__` substitution before returning the script. Called from `_browser.py:start()` with `self._locale`.
+`get_init_script(locale=None)` accepts the locale and performs the `__BRIDGIC_LANGS__` substitution before returning the script. Called from `_browser.py:_start()` with `self._locale`.
 
 **Extensions** (headed mode only, all MV3):
 - uBlock Origin Lite — content/ad blocking
@@ -156,14 +156,15 @@ bridgic-browser click @8d4b03a9
 Key implementation details:
 - **`_client.py`**: `send_command()` auto-starts the daemon if no socket exists. `_spawn_daemon()` uses `select.select()` + `os.read()` for the 30-second ready timeout (avoids blocking `proc.stdout.read()`). `start_if_needed=False` prevents auto-start for the `close` command.
 - **`_daemon.py`**: `run_daemon()` calls `_build_browser_kwargs()` then launches `Browser(**kwargs)`, writes `BRIDGIC_DAEMON_READY` to stdout, and serves one JSON command per connection. `asyncio.wait_for(reader.readline(), timeout=60)` prevents hanging on idle connections. Signal handling uses `loop.add_signal_handler()` (asyncio-safe).
-- **`_commands.py`**: 67 Click commands in 15 sections via `SectionedGroup`. `scroll` uses `--dy`/`--dx` options (not positional) to support negative values. `screenshot`/`pdf`/`upload`/`storage-save`/`storage-load`/`trace-stop` call `os.path.abspath()` on the client side before sending (daemon cwd may differ). `snapshot` supports `-i`/`--interactive`, `-f/-F`/`--full-page/--no-full-page`, and `-s`/`--start-from-char`; it delegates to `browser.get_snapshot_text()` (which adds truncation/pagination).
-- **`_build_browser_kwargs()`** priority chain (lowest → highest): defaults → `~/.bridgic/bridgic-browser.json` → `./bridgic-browser.json` → `BRIDGIC_BROWSER_JSON` env var → `BRIDGIC_HEADLESS` env var.
-- **`close` command fast-path**: the daemon calls `browser.inspect_pending_close_artifacts()` to pre-allocate a session dir and trace path, responds to the client immediately with those paths, then sets `stop_event`. Actual `browser.stop()` runs after the client disconnects. After stop, `_write_close_report()` writes `~/.bridgic/tmp/close-<timestamp>-<rand>/close-report.json` with status, artifact paths, and any errors.
+- **`_commands.py`**: 67 Click commands in 15 sections via `SectionedGroup`. `scroll` uses `--dy`/`--dx` options (not positional) to support negative values. `screenshot`/`pdf`/`upload`/`storage-save`/`storage-load`/`trace-stop` call `os.path.abspath()` on the client side before sending (daemon cwd may differ). `snapshot` supports `-i`/`--interactive`, `-f/-F`/`--full-page/--no-full-page`, `-o`/`--offset` (default 0), and `-l`/`--limit` (default 10000); it delegates to `browser.get_snapshot_text()` (which adds truncation/pagination).
+- **`_build_browser_kwargs()`** priority chain (lowest → highest): defaults → `~/.bridgic/bridgic-browser.json` → `./bridgic-browser.json` → `BRIDGIC_BROWSER_JSON` env var. The `--headed` CLI flag merges `{"headless": false}` into `BRIDGIC_BROWSER_JSON` before spawning the daemon.
+- **`close` command fast-path**: the daemon calls `browser.inspect_pending_close_artifacts()` to pre-allocate a session dir and trace path, responds to the client immediately with those paths, then sets `stop_event`. Actual `browser.close()` runs after the client disconnects. After close, `_write_close_report()` writes `~/.bridgic/tmp/close-<timestamp>-<rand>/close-report.json` with status, artifact paths, and any errors.
+- **Daemon cleanup ownership guard**: after `browser.close()` finishes, `run_daemon()` reads the run-info file and compares its `pid` field to `os.getpid()` before calling `transport.cleanup()` / `remove_run_info()`. This prevents the outgoing daemon from deleting the new daemon's socket when a `close` is followed immediately by a new command (which starts a new daemon before the old one's shutdown completes). If the run-info is gone (`None`) the old daemon is still the owner and cleans up normally.
 
 Socket path: `BRIDGIC_SOCKET` env var (default `~/.bridgic/run/bridgic-browser.sock`).
 The directory is created with `0o700` permissions on first use. Users upgrading from an older version that used `/tmp/bridgic-browser.sock` should stop any running daemon first (`bridgic-browser close`) before upgrading.
 
-Snapshot truncation limit: `BRIDGIC_MAX_CHARS` env var (default `30000`).
+Snapshot pagination: `get_snapshot_text(offset=0, limit=10000, ...)` — `offset` and `limit` are the two pagination parameters. Both must be ≥ 0 / ≥ 1 respectively.
 
 ## Key Implementation Details & Playwright Internals
 
@@ -410,10 +411,23 @@ Phase 2: CSS rebuild path (get_locator_from_ref_async)
     1) get_by_role(role, name=name, exact=True)          ← most elements
     2) get_by_role(role).filter(has_text=...)            ← ROLE_TEXT_MATCH_ROLES
     3) get_by_text(text, exact=True)                     ← TEXT_LEAF_ROLES (text pseudo-role)
-    4) STRUCTURAL_NOISE_ROLES child-anchor path          ← div/span structural noise
-    5) get_by_role(role)                                 ← bare role fallback when no name
+    4) STRUCTURAL_NOISE_ROLES with match_text            ← CSS-scoped + filter(has_text) + nth
+    5) STRUCTURAL_NOISE_ROLES child-anchor path          ← unnamed noise with no text
+    6) get_by_role(role)                                 ← bare role fallback when no name
   scope: chain frame_locator("iframe").nth(n) per frame_path level first
   nth: applied only when locator key space matches role:name key space (excluding STRUCTURAL_NOISE/TEXT_LEAF)
+
+STRUCTURAL_NOISE child-anchor path (strategy 5) detail:
+  Applies to: unnamed generic/group/none/presentation with no stored text
+  Sub-strategies (tried in order):
+    a) Find text-leaf child (role='text', parent_ref==ref) → CSS-scoped container locator (STRUCTURAL_NOISE_CSS)
+    b) Find named STRUCTURAL_NOISE child (parent_ref==ref, role in STRUCTURAL_NOISE_ROLES, name non-empty)
+       → scope.locator(STRUCTURAL_NOISE_CSS_NAMED).filter(has_text=name).locator('..')
+         Note: locator('..') is auto-detected as XPath parent by Playwright (selectorParser.js:159)
+         Note: STRUCTURAL_NOISE_CSS_NAMED adds span:not([role]) vs STRUCTURAL_NOISE_CSS because
+               the child may be a <span> that Playwright maps to 'generic' role.
+               nth is NOT applied; the parent is located structurally via the child.
+    c) fallback: get_by_role(role) (returns 0 results for implicit generic — last resort)
 ```
 
 ---
@@ -451,6 +465,19 @@ for local_nth in frame_path:
 ```
 
 `_iframe_local_counters: Dict[tuple, int]` (`_snapshot.py:1229`) tracks the iframe count under each parent path, ensuring per-level nth values are independent across multiple nesting levels.
+
+---
+
+### Interactive Element Detection — Small Icon Rule
+
+`_is_element_interactive()` (`_snapshot.py`) rule 9: small icon (10–50 px) is treated as interactive only when it carries **strong semantic signals**:
+
+- `data-action` attribute → explicit author intent
+- `aria-label` → screen-reader accessible name
+
+**`classAndId` is intentionally excluded**: almost every element carries a CSS class, so including it causes false positives for purely decorative elements (badges, avatars, dividers) that happen to be small. `cursor=pointer` is covered by rule 10 (separate check) and is a stronger signal.
+
+Impact on `get_snapshot(interactive=True)`: a small icon with only a CSS class (no `data-action`, no `aria-label`, no `cursor:pointer`) will **not** appear in the interactive snapshot. If an icon is missing, add `data-action` or `aria-label` to the element.
 
 ---
 

@@ -81,28 +81,27 @@ When using `Browser`, you typically use `browser.get_snapshot()` and `browser.ge
 
 Browser method used to supply the page state to an LLM. It calls `browser.get_snapshot(interactive=..., full_page=...)` and returns the tree string, with optional truncation and pagination.
 
-- **Signature**: `await browser.get_snapshot_text(start_from_char=0, interactive=False, full_page=True) -> str`
-- **Returns**: The accessibility tree string. May be truncated at ~30,000 characters; if so, a `[notice]` at the end explains how to continue (see below).
+- **Signature**: `await browser.get_snapshot_text(offset=0, limit=10000, interactive=False, full_page=True) -> str`
+- **Returns**: The accessibility tree string. May be truncated when the full tree exceeds `limit`; if so, a `[notice]` at the end explains how to continue (see below).
 
 ### Parameters
 
-| Parameter         | Type | Default | Description |
-|-------------------|------|---------|-------------|
-| `start_from_char` | int  | 0       | Character offset for pagination. Must be `>= 0`. Use the `next_start_char` from the truncation notice to get the next segment. |
-| `interactive`     | bool | False   | Same as `SnapshotOptions.interactive`: only interactive elements, flattened. |
-| `full_page`       | bool | True    | Same as `SnapshotOptions.full_page`: include all elements regardless of viewport position. |
+| Parameter     | Type | Default | Description |
+|---------------|------|---------|-------------|
+| `offset`      | int  | 0       | Character offset for pagination. Must be `>= 0`. Use the `next_offset` value from the truncation notice to get the next segment. |
+| `limit`       | int  | 10000   | Maximum characters to return. Must be `>= 1`. |
+| `interactive` | bool | False   | Same as `SnapshotOptions.interactive`: only interactive elements, flattened. |
+| `full_page`   | bool | True    | Same as `SnapshotOptions.full_page`: include all elements regardless of viewport position. |
 
 ### Truncation and pagination
 
-When the full tree is longer than the limit (default 30,000 characters), the returned string is cut at a natural break (e.g. paragraph or sentence) and a notice is appended, for example:
+When the full tree is longer than `limit`, the returned string is cut and a notice is appended, for example:
 
 ```
-[notice] Current page text is too long, returned portion starting from character 0 (this segment length 30000 / total length 45000 characters). To continue getting subsequent content: call get_snapshot_text(start_from_char=30000, interactive=False, full_page=True)
+[notice] Current page text is too long, returned portion starting from character 0 (this segment length 10000 / total length 45000 characters). To continue getting subsequent content: call get_snapshot_text(offset=10000, limit=10000, interactive=False, full_page=True)
 ```
 
-Use the given `start_from_char` (e.g. `30000`) in the next call to get the rest.
-
-The character limit is configured via `BRIDGIC_MAX_CHARS`; see `skills/bridgic-browser/references/env-vars.md`.
+Use the given `offset` (e.g. `10000`) in the next call to get the rest.
 
 ### Relation to get_snapshot
 
@@ -132,21 +131,23 @@ The `snapshot` command is the CLI equivalent of `browser.get_snapshot_text()`. I
 bridgic-browser snapshot [OPTIONS]
 
 Options:
-  -i, --interactive          Only show clickable/editable elements.
-  -f, --full-page            Include elements outside the viewport (default).
-  -F, --no-full-page         Limit to viewport-only elements.
-  -s, --start-from-char INT  Pagination offset (use next_start_char from the
-                             truncation notice). Default: 0.
+  -i, --interactive   Only show clickable/editable elements.
+  -f, --full-page     Include elements outside the viewport (default).
+  -F, --no-full-page  Limit to viewport-only elements.
+  -o, --offset INT    Pagination offset (use next_offset from the truncation
+                      notice). Default: 0.
+  -l, --limit INT     Max characters to return. Default: 10000.
 ```
 
 Examples:
 
 ```bash
-bridgic-browser snapshot                  # full tree
-bridgic-browser snapshot -i               # interactive elements only
-bridgic-browser snapshot -F               # viewport-only
-bridgic-browser snapshot -s 30000         # page 2 of a long snapshot
-bridgic-browser snapshot -i -F -s 10000  # combined
+bridgic-browser snapshot                     # full tree
+bridgic-browser snapshot -i                  # interactive elements only
+bridgic-browser snapshot -F                  # viewport-only
+bridgic-browser snapshot -o 10000            # page 2 of a long snapshot
+bridgic-browser snapshot -o 10000 -l 5000    # custom limit
+bridgic-browser snapshot -i -F -o 10000      # combined
 ```
 
 ### Environment variables

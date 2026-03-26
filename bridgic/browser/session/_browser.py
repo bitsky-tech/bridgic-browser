@@ -43,7 +43,7 @@ from ..errors import (
 
 logger = logging.getLogger(__name__)
 
-_MAX_CHAR_LIMIT = int(os.environ.get("BRIDGIC_MAX_CHARS", "30000"))
+_DEFAULT_SNAPSHOT_LIMIT = 10000
 
 _LAUNCH_DEBUG_LOG = os.path.expanduser("~/.bridgic/tmp/launch-debug.json")
 
@@ -821,7 +821,7 @@ class Browser:
 
     # ==================== Lifecycle ====================
 
-    async def start(self) -> None:
+    async def _start(self) -> None:
         """Start the browser.
 
         Automatically chooses between two launch modes:
@@ -896,10 +896,15 @@ class Browser:
         except Exception:
             logger.exception("Failed to start browser; rolling back partial startup state")
             try:
-                await self.stop()
+                await self.close()
             except Exception:
                 logger.exception("Failed to roll back browser startup state")
             raise
+
+    async def _ensure_started(self) -> None:
+        """Auto-start the browser if not yet started."""
+        if self._playwright is None:
+            await self._start()
 
     # Timeout (seconds) applied to individual page.close() calls during
     # shutdown so that a hung beforeunload handler cannot block forever.
@@ -948,7 +953,7 @@ class Browser:
         """Create a unique close-session directory and pre-allocate artifact paths.
 
         Called by the daemon before background teardown so paths can be reported
-        immediately to the client. Stores state for browser.stop() and the
+        immediately to the client. Stores state for browser.close() and the
         post-close report writer to consume.
 
         Returns
@@ -1000,7 +1005,7 @@ class Browser:
 
         return artifacts
 
-    async def stop(self) -> str:
+    async def close(self) -> str:
         """Close the browser.
 
         Stops the browser and cleans up all resources. Automatically removes
@@ -1009,9 +1014,8 @@ class Browser:
         beforehand. Active tracing/video sessions are auto-finalized and their
         paths included in the result.
 
-        Safe to call even when :meth:`start` was never called (all internal
-        handles are ``None`` and every teardown step is guarded by a null-check,
-        so the method returns immediately without raising).
+        Safe to call even when the browser was never started — returns
+        ``"Browser closed."`` immediately without raising.
 
         Returns
         -------
@@ -1019,6 +1023,9 @@ class Browser:
             Operation result message. Includes auto-saved trace/video paths
             when active sessions were finalized during close.
         """
+        if self._playwright is None:
+            return "Browser closed."
+
         errors: List[str] = []
         shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
         context_key: Optional[str] = None
@@ -1252,26 +1259,26 @@ class Browser:
         result = "\n".join(lines)
 
         if errors:
-            logger.warning(f"Browser stopped with errors: {errors}")
+            logger.warning(f"Browser closed with errors: {errors}")
         else:
-            logger.info("Browser stopped")
+            logger.info("Browser closed")
 
         return result
 
     async def __aenter__(self) -> "Browser":
         """Async context manager entry - starts the browser.
-        
+
         Usage:
             async with Browser(headless=True) as browser:
                 await browser.navigate_to("https://example.com")
                 # Browser is automatically closed when exiting the context
         """
-        await self.start()
+        await self._start()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Async context manager exit - stops the browser."""
-        await self.stop()
+        """Async context manager exit - closes the browser."""
+        await self.close()
 
     # ==================== Page Management ====================
 
@@ -1309,11 +1316,12 @@ class Browser:
         InvalidInputError
             If url is empty.
         StateError
-            If no browser context is open (call start() first).
+            If context is unavailable after auto-start (should not normally occur).
         OperationError
             If navigation fails (network error, timeout, etc.).
         """
         try:
+            await self._ensure_started()
             logger.info(f"[navigate_to] start url={url}")
 
             url = url.strip()
@@ -1329,11 +1337,7 @@ class Browser:
                 # fail at navigation time with a clear Playwright error (intentional).
 
             if not self._page:
-                if not self._context:
-                    _raise_state_error(
-                        "No browser context is open. Call start() first.",
-                        code="NO_BROWSER_CONTEXT",
-                    )
+                # All tabs were closed (e.g. via close_tab); _context is still alive.
                 logger.info("No page is open, creating a new page in existing context")
                 self._page = await self._context.new_page()
 
@@ -1357,20 +1361,16 @@ class Browser:
             logger.error(f"[navigate_to] {error_msg}")
             _raise_operation_error(error_msg)
 
-    async def new_page(
+    async def _new_page(
         self,
         url: Optional[str] = None,
         wait_until: Literal["domcontentloaded", "load", "networkidle", "commit"] = "domcontentloaded",
         timeout: Optional[float] = None,
-    ) -> Optional[Page]:
-        if not self._context:
-            _raise_state_error(
-                "No browser context is open. Call start() first.",
-                code="NO_BROWSER_CONTEXT",
-            )
+    ) -> Page:
         self._page = await self._context.new_page()
         if url:
             await self.navigate_to(url, wait_until=wait_until, timeout=timeout)
+        await self._page.bring_to_front()
         return self._page
 
     async def get_page_desc(self, page: Optional[Page] = None) -> Optional[PageDesc]:
@@ -1431,7 +1431,7 @@ class Browser:
         title = await page.title()
         return True, f"Switched to tab {page_id}: {page.url} (title: {title})"
 
-    async def close_page(self, page: Page | str) -> tuple[bool, str]:
+    async def _close_page(self, page: Page | str) -> tuple[bool, str]:
         """Close a page by Page object or page_id.
 
         Parameters
@@ -1811,7 +1811,7 @@ class Browser:
             # main frame.  Main-frame elements (frame_path=None) use page directly.
             #
             # Falls through silently if stale (count=0) or engine unavailable.
-            if ref_data and getattr(ref_data, 'playwright_ref', None):
+            if ref_data and ref_data.playwright_ref:
                 try:
                     ar_scope = self._page
                     if ref_data.frame_path:
@@ -1844,10 +1844,10 @@ class Browser:
                 logger.debug(
                     "[get_element_by_ref] CSS path: ref=%s role=%s name=%r nth=%s frame_path=%s",
                     ref,
-                    getattr(ref_data, 'role', None),
-                    getattr(ref_data, 'name', None),
-                    getattr(ref_data, 'nth', None),
-                    getattr(ref_data, 'frame_path', None),
+                    ref_data.role,
+                    ref_data.name,
+                    ref_data.nth,
+                    ref_data.frame_path,
                 )
             locator = self._snapshot_generator.get_locator_from_ref_async(
                 self._page, ref, self._last_snapshot.refs
@@ -1865,10 +1865,9 @@ class Browser:
                         and ref_data.role not in SnapshotGenerator.TEXT_LEAF_ROLES
                     )
                     if can_recover_by_role_name and ref_data:
-                        frame_path = getattr(ref_data, 'frame_path', None)
                         scope = self._page
-                        if frame_path:
-                            for local_nth in frame_path:
+                        if ref_data.frame_path:
+                            for local_nth in ref_data.frame_path:
                                 scope = scope.frame_locator("iframe").nth(local_nth)
                         role_name_locator = scope.get_by_role(
                             ref_data.role,
@@ -2124,7 +2123,8 @@ Before you return the element ref, reason about the state and elements for a sen
 
     async def get_snapshot_text(
         self,
-        start_from_char: int = 0,
+        offset: int = 0,
+        limit: int = _DEFAULT_SNAPSHOT_LIMIT,
         interactive: bool = False,
         full_page: bool = True,
         from_cli: bool = False,
@@ -2145,10 +2145,13 @@ Before you return the element ref, reason about the state and elements for a sen
 
         Parameters
         ----------
-        start_from_char : int, optional
+        offset : int, optional
             Pagination offset (character index into the full tree text).
-            Must be >= 0.  Use the ``next_start_char`` value from the
-            truncation notice to get the next page of content.  Default is 0.
+            Must be >= 0.  Use the ``next_offset`` value from the truncation
+            notice to get the next page of content.  Default is 0.
+        limit : int, optional
+            Maximum number of characters to return.  Must be >= 1.
+            Default is 10 000.
         interactive : bool, optional
             If True, only include clickable/editable elements (buttons, links,
             inputs, checkboxes, elements with cursor:pointer, etc.).
@@ -2167,23 +2170,30 @@ Before you return the element ref, reason about the state and elements for a sen
             Page header followed by the accessibility tree.  Lines with
             ``[ref=...]`` are interactive elements.
 
-            Output is truncated to ``BRIDGIC_MAX_CHARS`` (default 30 000)
-            characters.  When truncated, a ``[notice]`` at the end shows the
-            ``next_start_char`` value and the continuation call.
+            Output is truncated to ``limit`` characters.  When truncated, a
+            ``[notice]`` at the end shows the ``next_offset`` value and the
+            continuation call.
 
         Raises
         ------
         InvalidInputError
-            If ``start_from_char`` is negative or beyond the total tree length.
+            If ``offset`` is negative, beyond the total tree length, or
+            ``limit`` is less than 1.
         OperationError
             If snapshot generation fails.
         """
         try:
-            if start_from_char < 0:
+            if offset < 0:
                 _raise_invalid_input(
-                    "start_from_char must be >= 0",
-                    code="INVALID_START_FROM_CHAR",
-                    details={"start_from_char": start_from_char},
+                    "offset must be >= 0",
+                    code="INVALID_OFFSET",
+                    details={"offset": offset},
+                )
+            if limit < 1:
+                _raise_invalid_input(
+                    "limit must be >= 1",
+                    code="INVALID_LIMIT",
+                    details={"limit": limit},
                 )
 
             snapshot = await self.get_snapshot(
@@ -2198,39 +2208,39 @@ Before you return the element ref, reason about the state and elements for a sen
 
             total_length = len(full_text)
 
-            if start_from_char > 0:
-                if start_from_char >= total_length:
+            if offset > 0:
+                if offset >= total_length:
                     _raise_invalid_input(
                         (
-                            f"start_from_char ({start_from_char}) exceeds total page state length "
+                            f"offset ({offset}) exceeds total page state length "
                             f"of {total_length} characters."
                         ),
-                        code="START_FROM_CHAR_OUT_OF_RANGE",
-                        details={"start_from_char": start_from_char, "total_length": total_length},
+                        code="OFFSET_OUT_OF_RANGE",
+                        details={"offset": offset, "total_length": total_length},
                     )
-                text = full_text[start_from_char:]
+                text = full_text[offset:]
             else:
                 text = full_text
 
             truncated = False
-            next_start_char: Optional[int] = None
+            next_offset: Optional[int] = None
 
-            if len(text) > _MAX_CHAR_LIMIT:
-                truncate_at = _MAX_CHAR_LIMIT
+            if len(text) > limit:
+                truncate_at = limit
 
-                paragraph_break = text.rfind("\n\n", _MAX_CHAR_LIMIT - 500, _MAX_CHAR_LIMIT)
+                paragraph_break = text.rfind("\n\n", limit - 500, limit)
                 if paragraph_break > 0:
                     truncate_at = paragraph_break
                 else:
-                    line_break = text.rfind("\n", 0, _MAX_CHAR_LIMIT)
+                    line_break = text.rfind("\n", 0, limit)
                     if line_break > 0:
                         truncate_at = line_break + 1
 
                 text = text[:truncate_at]
                 truncated = True
-                next_start_char = start_from_char + truncate_at
+                next_offset = offset + truncate_at
 
-            if truncated and next_start_char is not None:
+            if truncated and next_offset is not None:
                 continuation: str
                 if from_cli:
                     cli_flags = []
@@ -2238,25 +2248,30 @@ Before you return the element ref, reason about the state and elements for a sen
                         cli_flags.append("-i")
                     if not full_page:
                         cli_flags.append("-F")
-                    cli_flags.append(f"-s {next_start_char}")
+                    cli_flags.append(f"-o {next_offset}")
+                    cli_flags.append(f"-l {limit}")
                     cli_cmd = "bridgic-browser snapshot " + " ".join(cli_flags)
                     continuation = f"run: {cli_cmd}"
                 else:
                     continuation = (
-                        f"call get_snapshot_text(start_from_char={next_start_char}, "
+                        f"call get_snapshot_text(offset={next_offset}, "
+                        f"limit={limit}, "
                         f"interactive={interactive}, full_page={full_page})"
                     )
 
                 notice = (
-                    "\n\n[notice] Current page text is too long, returned portion starting "
-                    f"from character {start_from_char} (this segment length {len(text)} / total "
+                    "[notice] Current page text is too long, returned portion starting "
+                    f"from character {offset} (this segment length {len(text)} / total "
                     f"length {total_length} characters). To continue getting subsequent content: "
-                    f"{continuation}"
+                    f"{continuation}\n\n"
                 )
-                text = f"{text}{notice}"
+                logger.info("[get_snapshot_text] Successfully retrieved interface information")
+                return header + notice + text
 
             logger.info("[get_snapshot_text] Successfully retrieved interface information")
             return header + text
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to get interface information: {e}"
             logger.error(f"[get_snapshot_text] {error_msg}")
@@ -2665,10 +2680,17 @@ Before you return the element ref, reason about the state and elements for a sen
         Raises
         ------
         StateError
-            If no browser context is open (call start() first).
+            If the browser has not been started yet. Call ``navigate_to()``
+            first to open a page, then use this method to create additional tabs.
         OperationError
             If tab creation or navigation fails.
         """
+        if self._playwright is None:
+            _raise_state_error(
+                "Browser is not started. Use navigate_to() to open a page first, then you can create additional tabs.",
+                code="BROWSER_NOT_STARTED",
+            )
+
         try:
             logger.info(f"[new_tab] start url={url}")
 
@@ -2686,10 +2708,10 @@ Before you return the element ref, reason about the state and elements for a sen
                     # else: URLs starting with '/' are absolute paths; passed as-is and will
                     # fail at navigation time with a clear Playwright error (intentional).
 
-            page = await self.new_page(url, wait_until=wait_until, timeout=timeout)
-            page_id = generate_page_id(page) if page else "unknown"
+            page = await self._new_page(url, wait_until=wait_until, timeout=timeout)
+            page_id = generate_page_id(page)
             if url:
-                result = f"Opened new tab {page_id} at {page.url if page else url}"
+                result = f"Opened new tab {page_id} at {page.url}"
             else:
                 result = f"Created new blank tab {page_id}"
             logger.info(f"[new_tab] done {result}")
@@ -2792,7 +2814,7 @@ Before you return the element ref, reason about the state and elements for a sen
                 page = await self.get_current_page()
                 if page is None:
                     _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
-                success, closed_result = await self.close_page(page)
+                success, closed_result = await self._close_page(page)
                 if not success:
                     logger.error(f"[close_tab] {closed_result}")
                     _raise_state_error(
@@ -2802,7 +2824,7 @@ Before you return the element ref, reason about the state and elements for a sen
                     )
                 result = closed_result
             else:
-                success, closed_result = await self.close_page(page_id)
+                success, closed_result = await self._close_page(page_id)
                 if not success:
                     logger.error(f"[close_tab] {closed_result}")
                     _raise_state_error(

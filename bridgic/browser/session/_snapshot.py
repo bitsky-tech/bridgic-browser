@@ -70,7 +70,7 @@ class RefData:
     name: Optional[str] = None
     nth: Optional[int] = None
     text_content: Optional[str] = None
-    parent_ref: Optional[str] = None
+    parent_ref: Optional[str] = None  # nearest KEPT ancestor that was assigned a ref (not necessarily direct DOM parent — may skip unnamed/untracked intermediates)
     frame_path: Optional[List[int]] = None  # per-level local iframe indices, outermost→innermost; None = main frame
     playwright_ref: Optional[str] = None  # Playwright's ephemeral aria-ref ID (e.g. "e369"); valid for the lifetime of the last snapshotForAI call
 
@@ -340,17 +340,14 @@ class SnapshotGenerator:
         'presentation': '[role="presentation"]',
     }
 
-    # Span-inclusive CSS for unnamed STRUCTURAL_NOISE parents resolved via a named
-    # child anchor.  Used ONLY in the child-anchor path (see get_locator_from_ref_async)
-    # where the child locator is not indexed by nth — we just need to find the child span
-    # in order to navigate to its DOM parent via '..'  Spans that Playwright maps to
-    # 'text' role (not 'generic') are safe to include here because nth is never applied
-    # to the result; the parent is found structurally, not by position.
+    # Span-inclusive CSS for the child-anchor path in get_locator_from_ref_async.
+    # Identical to STRUCTURAL_NOISE_CSS except 'generic' adds span:not([role]).
+    # nth is NEVER applied to locators built with this dict (we only use the child
+    # to navigate up via locator('..') to its DOM parent), so including <span>
+    # elements is safe even though Playwright maps many spans to 'text' role.
     STRUCTURAL_NOISE_CSS_NAMED: Dict[str, str] = {
+        **STRUCTURAL_NOISE_CSS,
         'generic': 'div:not([role]), span:not([role]), legend, [role="generic"]',
-        'group': 'fieldset, details, optgroup, [role="group"]',
-        'none': '[role="none"]',
-        'presentation': '[role="presentation"]',
     }
 
     # Pattern to strip YAML-style single-quote wrapping from snapshot lines.
@@ -1999,6 +1996,23 @@ class SnapshotGenerator:
                 # then call .locator('..') to get its DOM parent.  More precise than the
                 # earlier has= filter approach, which could match sibling menu items with
                 # the same text and return multiple ancestor divs as "the parent".
+                #
+                # Known limitation: .locator('..') navigates to the DIRECT DOM parent of
+                # the child element, which may be an unnamed intermediate container that
+                # does not appear in the snapshot (e.g. an unstyled <div class="content">
+                # between the interactive outer div and the <span>).  In such cases the
+                # returned locator targets the intermediate element rather than ref's DOM
+                # node.  This is rare in practice because:
+                #  (a) Playwright's a11y tree flattens most empty containers, and
+                #  (b) real-world libraries (e.g. Semantic UI) use flat single-level nesting.
+                # Invariant that makes this SAFE for direct children: parent_ref is the
+                # nearest KEPT ancestor WITH a ref.  An unnamed non-interactive noise
+                # element has should_keep=False, so it is never in depth_stack with
+                # kept=True.  Therefore if only unnamed non-interactive intermediates
+                # exist they won't "capture" parent_ref away from ref — the child still
+                # points here.  The bug manifests only when an unnamed element exists in
+                # the DOM but was excluded from the snapshot; fixing it would require
+                # XPath ancestor traversal which is disproportionate to the practical risk.
                 child_noise_ref_id = next(
                     (
                         k

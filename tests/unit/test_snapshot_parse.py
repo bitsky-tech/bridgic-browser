@@ -2618,3 +2618,20 @@ class TestPlaywrightRefStorage:
         btn_data = next(d for d in refs.values() if d.role == "button")
         assert btn_data.playwright_ref == "e2"
         assert btn_data.frame_path == [0]
+
+    def test_playwright_ref_stored_for_yaml_quoted_line(self, gen: SnapshotGenerator) -> None:
+        """playwright_ref is correctly extracted from YAML-quoted lines after normalization.
+
+        Playwright emits YAML single-quoted lines when the element name contains
+        special characters (e.g. double quotes).  _normalize_raw_snapshot() strips
+        the outer single quotes before _process_page_snapshot_for_ai() runs, so the
+        [ref=...] suffix must still be captured correctly.
+        """
+        raw = "- 'row \"very long name\" [ref=e175]':"
+        normalized = SnapshotGenerator._normalize_raw_snapshot(raw)
+        refs: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(normalized, refs, SnapshotOptions())
+        row_data = next((d for d in refs.values() if d.role == "row"), None)
+        assert row_data is not None, "row element should be tracked in refs"
+        assert row_data.playwright_ref == "e175"

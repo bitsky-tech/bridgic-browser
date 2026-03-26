@@ -97,8 +97,6 @@ async def main():
     tools = await create_tools(browser)
     llm = await create_llm()
     agent = await create_agent(llm, tools)
-    await browser.start()
-
     result = await agent.arun(
         goal=(
             "Summarize the 'Learn more' page of example.com for me"
@@ -114,7 +112,7 @@ async def main():
     print("\n\n*** Final Result: ***\n\n")
     print(result)
 
-    await browser.stop()
+    await browser.close()
 
 if __name__ == "__main__":
     import asyncio
@@ -146,7 +144,6 @@ from bridgic.browser.session import Browser
 browser = Browser(headless=False)
 
 async def main():
-    await browser.start()
     await browser.navigate_to("https://example.com")
     snapshot = await browser.get_snapshot()
     print(snapshot.tree)  # Tree format: - role "name" [ref=f0201d1c]
@@ -157,7 +154,7 @@ async def main():
     print(f"Found ref for 'Learn more': {learn_more_ref}")
     await browser.click_element_by_ref(learn_more_ref)
     await browser.take_screenshot(filename="page.png")
-    await browser.stop()
+    await browser.close()
 
 if __name__ == "__main__":
     import asyncio
@@ -209,7 +206,7 @@ BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open 
 | Category | Commands |
 |----------|----------|
 | Navigation | `open`, `back`, `forward`, `reload`, `search`, `info` |
-| Snapshot | `snapshot [-i] [-f\|-F] [-s N]` |
+| Snapshot | `snapshot [-i] [-f\|-F] [-o N] [-l N]` |
 | Element Interaction | `click`, `double-click`, `hover`, `focus`, `fill`, `select`, `options`, `check`, `uncheck`, `scroll-to`, `drag`, `upload`, `fill-form` |
 | Keyboard | `press`, `type`, `key-down`, `key-up` |
 | Mouse | `scroll`, `mouse-move`, `mouse-click`, `mouse-drag`, `mouse-down`, `mouse-up` |
@@ -301,7 +298,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `go_back()` / `go_forward()` - Browser history navigation
 
 **Snapshot (1 tool):**
-- `get_snapshot_text(start_from_char=0, interactive=False, full_page=True)` - Get page state string for LLM (accessibility tree with refs). **start_from_char** must be `>= 0` and is used for pagination when the page is long: if the return value is truncated, a `[notice]` at the end gives **next_start_char** to call again. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default). Output is truncated at the configured limit; see `skills/bridgic-browser/references/env-vars.md` for `BRIDGIC_MAX_CHARS`.
+- `get_snapshot_text(offset=0, limit=10000, interactive=False, full_page=True)` - Get page state string for LLM (accessibility tree with refs). **offset** must be `>= 0` and is used for pagination when the page is long: if the return value is truncated, a `[notice]` at the end gives **next_offset** to call again. **limit** (default 10000) controls the maximum characters returned. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default).
 
 **Element Interaction (13 tools) - by ref:**
 - `click_element_by_ref(ref)` - Click element
@@ -369,7 +366,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `start_video()` / `stop_video()` - Video recording
 
 **Lifecycle (2 tools):**
-- `stop()` - Stop browser
+- `close()` - Close browser
 - `browser_resize(width, height)` - Resize viewport
 
 ### CLI Tools -> Python Tools Mapping
@@ -441,7 +438,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 | `trace-stop` | `stop_tracing` |
 | `video-start` | `start_video` |
 | `video-stop` | `stop_video` |
-| `close` | `stop` |
+| `close` | `close` |
 | `resize` | `browser_resize` |
 
 ### Core Components
@@ -506,7 +503,7 @@ Handle file downloads with proper filename preservation:
 ```python
 # Pass downloads_path to Browser — it creates and manages the DownloadManager internally
 browser = Browser(downloads_path="./downloads", headless=True)
-await browser.start()
+await browser.navigate_to("https://example.com")  # lazy start triggers here
 
 # Access downloaded files via the built-in manager
 for file in browser.download_manager.downloaded_files:

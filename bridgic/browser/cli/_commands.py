@@ -189,15 +189,18 @@ def cmd_info() -> None:
               help="Only show clickable/editable elements.")
 @click.option("-f/-F", "--full-page/--no-full-page", default=True,
               help="Include elements outside the viewport (default: full-page). -F = viewport only.")
-@click.option("-s", "--start-from-char", default=0, type=click.IntRange(min=0),
-              help="Pagination offset. Get the offset value from the truncation notice when the page is too long.")
-def cmd_snapshot(interactive: bool, full_page: bool, start_from_char: int) -> None:
+@click.option("-o", "--offset", default=0, type=click.IntRange(min=0),
+              help="Pagination offset. Get the value from the truncation notice when the page is too long.")
+@click.option("-l", "--limit", default=10000, type=click.IntRange(min=1),
+              help="Maximum number of characters to return (default: 10000).")
+def cmd_snapshot(interactive: bool, full_page: bool, offset: int, limit: int) -> None:
     """Get an accessibility tree representation of the current page with refs (like 37edb785, 07eabf1e)."""
     try:
         _ok(send_command("snapshot", {
             "interactive": interactive,
             "full_page": full_page,
-            "start_from_char": start_from_char,
+            "offset": offset,
+            "limit": limit,
         }, start_if_needed=False))
     except Exception as exc:
         _err(exc)

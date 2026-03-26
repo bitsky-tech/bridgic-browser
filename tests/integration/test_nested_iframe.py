@@ -76,11 +76,10 @@ async def _get_click_count(browser: "Browser", ref: str) -> str:
 @pytest_asyncio.fixture
 async def browser():
     b = Browser(headless=True, stealth=False, viewport={"width": 1280, "height": 900})
-    await b.start()
     await b.navigate_to(f"file://{MAIN_PAGE}")
     await asyncio.sleep(0.6)  # wait for nested iframes to load
     yield b
-    await b.stop()
+    await b.close()
 
 
 async def _snap(browser: Browser):

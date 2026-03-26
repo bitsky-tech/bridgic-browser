@@ -193,12 +193,16 @@ def _spawn_daemon(headed: bool = False) -> None:
     Parameters
     ----------
     headed:
-        If True, set ``BRIDGIC_HEADLESS=0`` in the daemon environment so the
-        browser launches in headed (visible) mode.
+        If True, merge ``{"headless": false}`` into ``BRIDGIC_BROWSER_JSON``
+        in the daemon environment so the browser launches in headed (visible)
+        mode.
     """
     env = os.environ.copy()
     if headed:
-        env["BRIDGIC_HEADLESS"] = "0"
+        import json as _json
+        existing = _json.loads(env.get("BRIDGIC_BROWSER_JSON", "{}"))
+        existing["headless"] = False
+        env["BRIDGIC_BROWSER_JSON"] = _json.dumps(existing)
 
     proc = subprocess.Popen(
         [sys.executable, "-m", "bridgic.browser", "daemon"],

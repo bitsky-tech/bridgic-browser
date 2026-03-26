@@ -6,17 +6,16 @@ Use this reference when the task needs environment variable behavior or login st
 
 | Variable | Applies to | Default | Purpose |
 |---|---|---|---|
-| `BRIDGIC_MAX_CHARS` | SDK + CLI | `30000` | Max chars returned by `snapshot` / `get_snapshot_text` before pagination notice. |
 | `BRIDGIC_LOG_LEVEL` | SDK + CLI | `INFO` | Log level for the `bridgic.browser` logger. |
 | `BRIDGIC_BROWSER_JSON` | CLI daemon | unset | JSON string to override Browser constructor kwargs at daemon startup. |
-| `BRIDGIC_HEADLESS` | CLI daemon | unset | `0` forces headed mode; any other value = headless. Set by CLI `--headed`. |
 | `BRIDGIC_SOCKET` | CLI (Unix only) | platform default | Override Unix socket path for the daemon client/transport. |
 | `BRIDGIC_DAEMON_RESPONSE_TIMEOUT` | CLI client | `90` | Seconds to wait for a daemon response. |
 | `BRIDGIC_DAEMON_STOP_TIMEOUT` | CLI daemon | `45` | Seconds to wait for daemon shutdown. |
 | `SKIP_BROWSER_TESTS` | Tests | unset | If `1/true/yes`, skip browser tests. |
 
 Notes:
-- Config file precedence for CLI (lowest -> highest): defaults, `~/.bridgic/bridgic-browser.json`, `./bridgic-browser.json`, `BRIDGIC_BROWSER_JSON`, `BRIDGIC_HEADLESS`.
+- Config file precedence for CLI (lowest -> highest): defaults, `~/.bridgic/bridgic-browser.json`, `./bridgic-browser.json`, `BRIDGIC_BROWSER_JSON`.
+- To start the daemon in headed mode, pass `--headed` to `bridgic-browser open` / `bridgic-browser search`, or set `{"headless": false}` in `BRIDGIC_BROWSER_JSON`.
 - When `headless=false` and neither `channel` nor `executable_path` is specified, the CLI daemon uses Playwright’s bundled “Chrome for Testing” browser to keep extension loading working. `chromium_sandbox=True` is auto-set to prevent `--no-sandbox` warnings. To use system Chrome instead (shows “Google Chrome” in Dock, no TEST badge), set `channel=”chrome”` or `executable_path` in config — but note that system Chrome v137+ no longer supports `--load-extension`, so extensions won’t load.
 
 ### Config Files and `BRIDGIC_BROWSER_JSON` Values

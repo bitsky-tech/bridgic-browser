@@ -100,7 +100,7 @@ This model is the foundation of all correspondence in this guide.
 | `trace-stop` | `stop_tracing` |
 | `video-start` | `start_video` |
 | `video-stop` | `stop_video` |
-| `close` | `stop` |
+| `close` | `close` |
 | `resize` | `browser_resize` |
 
 ## Parameter Translation Rules (Important for Code Generation)
@@ -111,7 +111,8 @@ This model is the foundation of all correspondence in this guide.
 - `snapshot`:
   - `-i` -> `interactive=True`
   - `-F` -> `full_page=False`
-  - `-s N` -> `start_from_char=N`
+  - `-o N` -> `offset=N`
+  - `-l N` -> `limit=N`
 - `wait`:
   - `wait 2.5` -> `wait_for(time_seconds=2.5)`
   - `wait "Done"` -> `wait_for(text="Done")`
@@ -189,7 +190,7 @@ These CLI behaviors have no direct SDK equivalent or work differently:
 | `scroll` argument style | `--dy`/`--dx` flag options (not positional) to allow negative values | `mouse_wheel(delta_x=X, delta_y=Y)` keyword args |
 | `fill-form` input format | JSON string on command line | Python list of dicts |
 | `take_screenshot` return value | CLI always writes to a file path | SDK: `filename=None` returns base64 data URL; `filename="path.png"` writes file |
-| Video file write timing | `video-stop` registers path; file is written when daemon/browser closes | Same for SDK: `.webm` is written when page closes via `stop()` or `close_tab()` |
+| Video file write timing | `video-stop` registers path; file is written when daemon/browser closes | Same for SDK: `.webm` is written when page closes via `close()` or `close_tab()` |
 
 ## Practical Rule for Mixed Tasks
 

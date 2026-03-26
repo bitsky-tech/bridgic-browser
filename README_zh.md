@@ -97,8 +97,6 @@ async def main():
     tools = await create_tools(browser)
     llm = await create_llm()
     agent = await create_agent(llm, tools)
-    await browser.start()
-
     result = await agent.arun(
         goal=(
             "Summarize the 'Learn more' page of example.com for me"
@@ -114,7 +112,7 @@ async def main():
     print("\n\n*** Final Result: ***\n\n")
     print(result)
 
-    await browser.stop()
+    await browser.close()
 
 if __name__ == "__main__":
     import asyncio
@@ -146,7 +144,6 @@ from bridgic.browser.session import Browser
 browser = Browser(headless=False)
 
 async def main():
-    await browser.start()
     await browser.navigate_to("https://example.com")
     snapshot = await browser.get_snapshot()
     print(snapshot.tree)  # 树格式：- role "name" [ref=f0201d1c]
@@ -157,7 +154,7 @@ async def main():
     print(f"Found ref for 'Learn more': {learn_more_ref}")
     await browser.click_element_by_ref(learn_more_ref)
     await browser.take_screenshot(filename="page.png")
-    await browser.stop()
+    await browser.close()
 
 if __name__ == "__main__":
     import asyncio
@@ -208,7 +205,7 @@ BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open 
 | 类别 | 命令 |
 |----------|----------|
 | 导航 | `open`, `back`, `forward`, `reload`, `search`, `info` |
-| 快照 | `snapshot [-i] [-f\|-F] [-s N]` |
+| 快照 | `snapshot [-i] [-f\|-F] [-o N] [-l N]` |
 | 元素交互 | `click`, `double-click`, `hover`, `focus`, `fill`, `select`, `options`, `check`, `uncheck`, `scroll-to`, `drag`, `upload`, `fill-form` |
 | 键盘 | `press`, `type`, `key-down`, `key-up` |
 | 鼠标 | `scroll`, `mouse-move`, `mouse-click`, `mouse-drag`, `mouse-down`, `mouse-up` |
@@ -300,7 +297,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `go_back()` / `go_forward()` - 浏览器历史导航
 
 **快照（1 个工具）：**
-- `get_snapshot_text(start_from_char=0, interactive=False, full_page=True)` - 获取供 LLM 使用的页面状态字符串（带 ref 的无障碍树）。**start_from_char** 必须 `>= 0`，长页面分页时使用：若返回值被截断，末尾 `[notice]` 会给出 **next_start_char** 供再次调用。**interactive** 与 **full_page** 与 `get_snapshot` 一致（仅交互元素或默认全页）。输出在配置的上限处截断；`BRIDGIC_MAX_CHARS` 见 `skills/bridgic-browser/references/env-vars.md`。
+- `get_snapshot_text(offset=0, limit=10000, interactive=False, full_page=True)` - 获取供 LLM 使用的页面状态字符串（带 ref 的无障碍树）。**offset** 必须 `>= 0`，长页面分页时使用：若返回值被截断，末尾 `[notice]` 会给出 **next_offset** 供再次调用。**limit**（默认 10000）控制最多返回的字符数。**interactive** 与 **full_page** 与 `get_snapshot` 一致（仅交互元素或默认全页）。
 
 **元素交互（13 个工具）- 通过 ref：**
 - `click_element_by_ref(ref)` - 点击元素
@@ -368,7 +365,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `start_video()` / `stop_video()` - 视频录制
 
 **生命周期（2 个工具）：**
-- `stop()` - 停止浏览器
+- `close()` - 关闭浏览器
 - `browser_resize(width, height)` - 调整视口大小
 
 ### CLI 工具与 Python 工具对应关系
@@ -440,7 +437,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 | `trace-stop` | `stop_tracing` |
 | `video-start` | `start_video` |
 | `video-stop` | `stop_video` |
-| `close` | `stop` |
+| `close` | `close` |
 | `resize` | `browser_resize` |
 
 ### 核心组件
@@ -505,7 +502,7 @@ browser = Browser(stealth=config, headless=False)
 ```python
 # 将 downloads_path 传给 Browser — 它会内部创建并管理 DownloadManager
 browser = Browser(downloads_path="./downloads", headless=True)
-await browser.start()
+await browser.navigate_to("https://example.com")  # 懒加载，首次导航时自动启动
 
 # 通过内置管理器访问已下载的文件
 for file in browser.download_manager.downloaded_files:
