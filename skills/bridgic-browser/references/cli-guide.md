@@ -15,6 +15,7 @@ Use this guide when the task should be executed directly from terminal commands 
 ## Quick Start
 
 ```bash
+uv init --bare
 uv add bridgic-browser
 uv run playwright install chromium
 ```
