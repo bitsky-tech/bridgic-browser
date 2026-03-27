@@ -2243,7 +2243,7 @@ class TestBuildBrowserKwargs:
             kwargs = _build_browser_kwargs()
 
         assert kwargs.get("chromium_sandbox") is True
-        # No executable_path auto-set — use Playwright's bundled browser for extension support
+        # No executable_path auto-set
         assert "executable_path" not in kwargs
 
     def test_headed_mode_preserves_explicit_chromium_sandbox_false(self, tmp_path):

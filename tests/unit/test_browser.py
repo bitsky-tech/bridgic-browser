@@ -66,11 +66,10 @@ class TestBrowserInitialization:
 
     def test_stealth_custom_config(self):
         """Test custom stealth configuration."""
-        config = StealthConfig(enable_extensions=False, disable_security=True)
+        config = StealthConfig(disable_security=True)
         browser = Browser(stealth=config)
 
         assert browser.stealth_enabled is True
-        assert browser.stealth_config.enable_extensions is False
         assert browser.stealth_config.disable_security is True
 
     def test_strip_playwright_call_log(self):
@@ -94,18 +93,16 @@ class TestBrowserInitialization:
             Browser(viewport={"width": 800, "height": 600}, no_viewport=True)
         assert exc_info.value.code == "VIEWPORT_CONFLICT"
 
-    def test_headless_false_with_stealth_extensions(self):
-        """Test that stealth with extensions forces persistent context."""
+    def test_headless_false_uses_persistent_context(self):
+        """Test that headed mode uses persistent context."""
         browser = Browser(headless=False, stealth=True)
 
-        # Stealth with extensions needs persistent context
         assert browser.use_persistent_context is True
 
-    def test_headless_true_no_extensions(self):
-        """Test that headless mode disables stealth extensions."""
+    def test_headless_true_no_persistent_context(self):
+        """Test that headless mode does not use persistent context."""
         browser = Browser(headless=True, stealth=True)
 
-        # Extensions can't run in headless, so no persistent context needed
         assert browser.use_persistent_context is False
 
     def test_downloads_path_creates_manager(self):
@@ -419,7 +416,7 @@ class TestBrowserStartStop:
             browser = Browser(headless=False, stealth=True)
             await browser._start()
 
-            # Stealth with extensions creates temp dir
+            # Headed mode creates temp dir
             temp_dir = browser._temp_user_data_dir
 
             await browser.close()

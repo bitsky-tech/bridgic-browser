@@ -2,8 +2,6 @@
 Unit tests for the Stealth module.
 """
 
-from pathlib import Path
-
 from bridgic.browser.session import StealthConfig, StealthArgsBuilder, create_stealth_config
 from bridgic.browser.session._stealth import (
     CHROME_STEALTH_ARGS,
@@ -13,7 +11,6 @@ from bridgic.browser.session._stealth import (
     CHROME_DOCKER_ARGS,
     CHROME_DISABLE_SECURITY_ARGS,
     CHROME_IGNORE_DEFAULT_ARGS,
-    STEALTH_EXTENSIONS,
 )
 
 
@@ -25,7 +22,6 @@ class TestStealthConfig:
         config = StealthConfig()
 
         assert config.enabled is True
-        assert config.enable_extensions is True
         assert config.disable_security is False
         assert "clipboard-read" in config.permissions
         assert "clipboard-write" in config.permissions
@@ -34,12 +30,10 @@ class TestStealthConfig:
         """Test custom stealth configuration."""
         config = StealthConfig(
             enabled=True,
-            enable_extensions=False,
             disable_security=True,
         )
 
         assert config.enabled is True
-        assert config.enable_extensions is False
         assert config.disable_security is True
 
     def test_disabled_config(self):
@@ -47,42 +41,6 @@ class TestStealthConfig:
         config = StealthConfig(enabled=False)
 
         assert config.enabled is False
-
-    def test_cookie_whitelist_domains(self):
-        """Test default cookie whitelist domains."""
-        config = StealthConfig()
-
-        assert "nature.com" in config.cookie_whitelist_domains
-        assert "qatarairways.com" in config.cookie_whitelist_domains
-
-    def test_custom_cookie_whitelist(self):
-        """Test custom cookie whitelist domains."""
-        config = StealthConfig(
-            cookie_whitelist_domains=["example.com", "test.com"]
-        )
-
-        assert config.cookie_whitelist_domains == ["example.com", "test.com"]
-
-    def test_extension_cache_dir_default(self):
-        """Test default extension cache directory."""
-        config = StealthConfig()
-
-        expected_dir = Path.home() / ".cache" / "bridgic-browser" / "extensions"
-        assert config.extension_cache_dir == expected_dir
-
-    def test_can_use_extensions_headless(self):
-        """Test that extensions can't be used in headless mode (chromium-headless-shell limitation)."""
-        config = StealthConfig(enable_extensions=True)
-
-        assert config.can_use_extensions(headless=True) is False
-        assert config.can_use_extensions(headless=False) is True
-
-    def test_can_use_extensions_disabled(self):
-        """Test that extensions can't be used when disabled."""
-        config = StealthConfig(enable_extensions=False)
-
-        assert config.can_use_extensions(headless=True) is False
-        assert config.can_use_extensions(headless=False) is False
 
     def test_docker_detection_reflects_cgroup(self):
         """Test that in_docker=True activates Docker-specific Chrome args."""
@@ -165,15 +123,6 @@ class TestStealthArgsBuilder:
         assert "--disable-web-security" in args
         assert "--ignore-certificate-errors" in args
 
-    def test_build_extension_args_headless(self):
-        """Test that extension args are empty in headless mode."""
-        config = StealthConfig(enable_extensions=True)
-        builder = StealthArgsBuilder(config)
-
-        args = builder.build_extension_args(headless=True)
-
-        assert args == []
-
     def test_get_ignore_default_args(self):
         """Test getting ignore default args."""
         config = StealthConfig()
@@ -182,7 +131,6 @@ class TestStealthArgsBuilder:
         ignore_args = builder.get_ignore_default_args()
 
         assert "--enable-automation" in ignore_args
-        assert "--disable-extensions" in ignore_args
 
     def test_get_ignore_default_args_disabled(self):
         """Test ignore args are empty when stealth disabled."""
@@ -333,19 +281,7 @@ class TestStealthConstants:
         assert len(CHROME_IGNORE_DEFAULT_ARGS) > 0
         assert "--enable-automation" in CHROME_IGNORE_DEFAULT_ARGS
 
-    def test_extensions_defined(self):
-        """Test that extensions are defined."""
-        assert len(STEALTH_EXTENSIONS) >= 3
-        assert "ublock_origin" in STEALTH_EXTENSIONS
-        assert "cookie_consent" in STEALTH_EXTENSIONS
 
-    def test_extension_structure(self):
-        """Test extension info structure."""
-        for ext_info in STEALTH_EXTENSIONS.values():
-            assert "name" in ext_info
-            assert "id" in ext_info
-            assert "url" in ext_info
-            assert ext_info["url"].startswith("https://")
 
 
 class TestNewHeadlessMode:
@@ -539,17 +475,14 @@ class TestHeadedModeArgs:
         args = builder.build_args(headless_intent=False)
         assert "--headless=new" not in args
 
-    def test_headed_disable_features_minimal(self):
-        """Headed mode --disable-features= must not contain heavy user-facing features."""
+    def test_headed_disable_features_includes_stealth(self):
+        """Headed mode --disable-features= must include bridgic's stealth features."""
         builder = StealthArgsBuilder(StealthConfig())
         args = builder.build_args(headless_intent=False)
         df_args = [a for a in args if a.startswith("--disable-features=")]
         assert len(df_args) == 1
         assert "AutomationControlled" in df_args[0]
-        # These are real user features; disabling them is detectable
-        assert "HttpsUpgrades" not in df_args[0]
-        assert "MediaRouter" not in df_args[0]
-        assert "Translate" not in df_args[0]
+        assert "InfiniteSessionRestore" in df_args[0]
 
     def test_headed_lang_from_locale(self):
         """--lang arg must reflect the passed locale in headed mode."""
@@ -606,26 +539,23 @@ class TestCreateStealthConfig:
         config = create_stealth_config()
 
         assert config.enabled is True
-        assert config.enable_extensions is True
 
     def test_create_custom(self):
         """Test creating custom config."""
         config = create_stealth_config(
             enabled=True,
-            enable_extensions=False,
             disable_security=True,
         )
 
         assert config.enabled is True
-        assert config.enable_extensions is False
         assert config.disable_security is True
 
     def test_create_with_kwargs(self):
         """Test creating config with additional kwargs."""
         config = create_stealth_config(
-            cookie_whitelist_domains=["custom.com"],
+            permissions=["clipboard-read"],
         )
 
-        assert "custom.com" in config.cookie_whitelist_domains
+        assert "clipboard-read" in config.permissions
 
 

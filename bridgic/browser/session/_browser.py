@@ -48,6 +48,32 @@ _DEFAULT_SNAPSHOT_LIMIT = 10000
 _LAUNCH_DEBUG_LOG = os.path.expanduser("~/.bridgic/tmp/launch-debug.json")
 
 
+def _detect_system_chrome() -> bool:
+    """Check if system Google Chrome is installed.
+
+    Used to auto-switch from Playwright's bundled "Chrome for Testing" (which
+    Google blocks for OAuth login) to the real system Chrome in headed mode.
+    """
+    if sys.platform == "darwin":
+        return os.path.isfile(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        )
+    elif sys.platform == "linux":
+        import shutil
+        return (
+            shutil.which("google-chrome") is not None
+            or shutil.which("google-chrome-stable") is not None
+        )
+    elif sys.platform == "win32":
+        for env_var in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+            base = os.environ.get(env_var, "")
+            if base:
+                path = os.path.join(base, "Google", "Chrome", "Application", "chrome.exe")
+                if os.path.isfile(path):
+                    return True
+    return False
+
+
 def _write_launch_debug_log(options: Dict[str, Any], mode: str) -> None:
     """Write Chrome launch args to ~/.bridgic/tmp/launch-debug.json for debugging."""
     import datetime, json as _json
@@ -302,10 +328,6 @@ class Browser:
         Stealth mode includes:
         - 50+ Chrome args to disable automation detection
         - Ignoring Playwright's automation-revealing default args
-        - Extensions (uBlock Origin, Cookie Consent, etc.) when headless=False
-
-        Note: Extensions require headless=False. If stealth with extensions is
-        enabled without user_data_dir, a temporary directory will be created.
     channel : str, optional
         Browser distribution channel. Use "chrome", "chrome-beta", "msedge", etc.
         for branded browsers, or "chromium" for new headless mode.
@@ -368,8 +390,8 @@ class Browser:
     # Default: headless with stealth (stealth is ON by default)
     >>> browser = Browser()  # stealth=True, headless=True
 
-    # Non-headless with full stealth (includes extensions)
-    >>> browser = Browser(headless=False)  # Auto temp user_data_dir for extensions
+    # Non-headless with stealth
+    >>> browser = Browser(headless=False)
 
     # Persistent session with stealth
     >>> browser = Browser(
@@ -398,7 +420,6 @@ class Browser:
     # Custom stealth config
     >>> browser = Browser(
     ...     stealth=StealthConfig(
-    ...         enable_extensions=False,  # No extensions
     ...         disable_security=True,    # For testing only
     ...     ),
     ... )
@@ -460,6 +481,14 @@ class Browser:
 
         if stealth is True:
             self._stealth_config = StealthConfig()
+        elif isinstance(stealth, dict):
+            # Config files pass stealth as a dict (e.g. {"disable_security": true}).
+            # Filter out unknown keys for backwards compatibility (e.g. removed
+            # "enable_extensions" from older config files).
+            import dataclasses as _dc
+            _known = {f.name for f in _dc.fields(StealthConfig)}
+            _filtered = {k: v for k, v in stealth.items() if k in _known}
+            self._stealth_config = StealthConfig(**_filtered)
         elif isinstance(stealth, StealthConfig):
             self._stealth_config = stealth
 
@@ -531,21 +560,17 @@ class Browser:
 
         Returns True if:
         - user_data_dir is provided, OR
-        - stealth mode with extensions is enabled (extensions need persistent context)
-          AND we're not using system Chrome (which dropped --load-extension in v137+)
+        - headed mode (persistent context looks like a real user profile)
         """
         # Explicit user_data_dir
         if self._user_data_dir is not None:
             return True
 
-        # Stealth with extensions needs persistent context (and headless=False).
-        # Skip for system Chrome (channel/executable_path) — extensions won't load.
-        if (
-            self._stealth_config
-            and self._stealth_config.can_use_extensions(self._headless)
-            and not self._channel
-            and not self._executable_path
-        ):
+        # headed mode always uses persistent context so the browser profile looks
+        # like a real user to bot-detection systems (Google OAuth, reCAPTCHA, etc.).
+        # launch + new_context produces an incognito-like context with no cookies or
+        # history, which is easily flagged as automation.
+        if not self._headless and not self._channel and not self._executable_path:
             return True
 
         return False
@@ -653,14 +678,34 @@ class Browser:
         args_list: List[str] = []
 
         # When using system Chrome (channel or executable_path), skip stealth
-        # Chrome args and extension loading — system Chrome v137+ doesn't
-        # support --load-extension and many stealth flags cause "unsupported
-        # flag" warnings.  Anti-detection still works via ignore_default_args
+        # Chrome args — many stealth flags cause "unsupported flag" warnings.
+        # Anti-detection still works via ignore_default_args
         # (removes --enable-automation) and the JS init script (patches
         # navigator.webdriver, plugins, chrome object, etc.).
         _is_system_chrome = bool(self._channel or self._executable_path)
 
-        # Add stealth args first (if enabled)
+        # In headed mode, auto-switch to system Chrome to avoid Google blocking
+        # "Chrome for Testing" (the Playwright-bundled binary) for OAuth login.
+        # System Chrome shows as a normal browser in the Dock (no "test" label)
+        # and passes Google's browser safety checks.
+        _auto_system_chrome = (
+            not self._headless
+            and self.stealth_enabled
+            and not _is_system_chrome
+            and _detect_system_chrome()
+        )
+        if _auto_system_chrome:
+            options["channel"] = "chrome"
+            logger.info(
+                "Headed mode: auto-switching to system Chrome for anti-detection "
+                "(Chrome for Testing is blocked by Google OAuth)"
+            )
+
+        # Add stealth args first (if enabled).
+        # When user explicitly set channel/executable_path (_is_system_chrome),
+        # skip stealth args entirely (existing behaviour).
+        # When auto-switched to system Chrome, still apply the minimal headed
+        # stealth args (they're compatible with system Chrome).
         if self._stealth_builder and not _is_system_chrome:
             fallback_viewport = {"width": 1600, "height": 900}
             viewport = self._viewport or fallback_viewport
@@ -672,11 +717,13 @@ class Browser:
                 headless_intent=self._headless,
                 locale=self._locale,
             )
+            if _auto_system_chrome:
+                # System Chrome shows a "unsupported command-line flag" warning
+                # banner for --disable-blink-features.  --test-type= (empty value)
+                # tells Chrome to suppress all bad-flag warnings without adding
+                # any web-detectable side effects.
+                stealth_args.append("--test-type=")
             args_list.extend(stealth_args)
-
-            # Add extension args if applicable
-            extension_args = self._stealth_builder.build_extension_args(self._headless)
-            args_list.extend(extension_args)
 
         # Add user-provided args (can override/extend stealth args)
         if self._args:
@@ -722,6 +769,7 @@ class Browser:
             _use_full_binary = (
                 self._headless is True
                 and not _is_system_chrome       # system Chrome picks its own binary
+                and not _auto_system_chrome      # auto-switched system Chrome too
                 and self._stealth_config is not None
                 and self._stealth_config.enabled
                 and self._stealth_config.use_new_headless
@@ -839,20 +887,14 @@ class Browser:
         # Determine user_data_dir
         if self._user_data_dir:
             options["user_data_dir"] = str(self._user_data_dir)
-        elif self._stealth_config and self._stealth_config.can_use_extensions(self._headless):
-            # Stealth with extensions needs persistent context, create temp dir
+        else:
+            # Playwright requires a non-None user_data_dir for
+            # launch_persistent_context; create a bridgic-managed temp dir so
+            # close() can clean it up correctly via shutil.rmtree.
             if not self._temp_user_data_dir:
                 self._temp_user_data_dir = tempfile.mkdtemp(prefix="bridgic-browser-")
-                logger.info(f"Created temporary user data dir for stealth extensions: {self._temp_user_data_dir}")
+                logger.info(f"Created temporary user data dir for headed mode: {self._temp_user_data_dir}")
             options["user_data_dir"] = self._temp_user_data_dir
-        else:
-            # Safety net: use_persistent_context returned True but neither
-            # user_data_dir nor stealth extensions are active.  Playwright
-            # requires a non-None user_data_dir for launch_persistent_context,
-            # so pass "" which makes Playwright use a temporary directory.
-            # In practice this branch is unreachable today because
-            # use_persistent_context only returns True in the two cases above.
-            options["user_data_dir"] = ""
 
         return options
 
@@ -866,8 +908,7 @@ class Browser:
         - If `user_data_dir` is not provided: Uses `launch` + `new_context`
 
         When stealth mode is enabled, anti-detection args are automatically
-        applied. If stealth with extensions is enabled without user_data_dir,
-        a temporary directory is created automatically.
+        applied.
         """
         if self._playwright is not None:
             logger.warning("Playwright has already been started")
@@ -875,17 +916,13 @@ class Browser:
 
         logger.info("Starting playwright")
         if self.stealth_enabled:
-            extensions_enabled = (
-                self._stealth_config
-                and self._stealth_config.can_use_extensions(self._headless)
-            )
-            logger.info(f"Stealth mode enabled (extensions={extensions_enabled})")
+            logger.info("Stealth mode enabled")
 
         try:
             self._playwright = await async_playwright().start()
 
             if self.use_persistent_context:
-                # Mode 1: Persistent context (with user_data_dir or stealth extensions)
+                # Mode 1: Persistent context (with user_data_dir or headed mode)
                 logger.info("Using persistent context mode")
                 persistent_options = self._get_persistent_context_options()
                 logger.debug(f"Persistent context options: {persistent_options}")
@@ -2445,10 +2482,14 @@ Before you return the element ref, reason about the state and elements for a sen
                 result = f"Searched on {engine.title()}: '{query}'"
                 logger.info(f"[search] done {result}")
                 return result
+            except BridgicBrowserError:
+                raise
             except Exception as e:
                 logger.error(f"[search] failed engine={engine} error={type(e).__name__}: {e}")
                 error_msg = f'Search on {engine} failed for "{query}": {str(e)}'
                 _raise_operation_error(error_msg)
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Search failed: {str(e)}"
             logger.error(f"[search] failed error={type(e).__name__}: {error_msg}")
@@ -2481,6 +2522,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Navigated back to: {page.url}"
             logger.info(f"[go_back] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to navigate back: {str(e)}"
             logger.error(f"[go_back] {error_msg}")
@@ -2515,6 +2558,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Navigated forward to: {page.url}"
             logger.info(f"[go_forward] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to navigate forward: {str(e)}"
             logger.error(f"[go_forward] {error_msg}")
@@ -2559,6 +2604,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Page reloaded: {page.url} (title: {title})"
             logger.info(f"[reload_page] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to reload page: {str(e)}"
             logger.error(f"[reload_page] {error_msg}")
@@ -2601,6 +2648,8 @@ Before you return the element ref, reason about the state and elements for a sen
             )
             logger.info(f"[get_current_page_info] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to get current page info: {str(e)}"
             logger.error(f"[get_current_page_info] {error_msg}")
@@ -2634,6 +2683,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Pressed key: {key}"
             logger.info(f"[press_key] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to press key: {str(e)}"
             logger.error(f"[press_key] {error_msg}")
@@ -2696,6 +2747,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 result = f"Text '{text}' not found or not visible"
                 logger.info(f"[scroll_to_text] done {result}")
                 return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to scroll to text: {str(e)}"
             logger.error(f"[scroll_to_text] {error_msg}")
@@ -2742,6 +2795,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 result_str = str(result)
                 logger.info(f"[evaluate_javascript] done result_preview={result_str[:200]!r} result_len={len(result_str)}")
                 return result_str
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to execute JavaScript: {str(e)}"
             logger.error(f"[evaluate_javascript] {error_msg}")
@@ -2819,6 +2874,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 result = f"Created new blank tab {page_id}"
             logger.info(f"[new_tab] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to create new tab: {str(e)}"
             logger.error(f"[new_tab] {error_msg}")
@@ -2849,6 +2906,8 @@ Before you return the element ref, reason about the state and elements for a sen
             if not lines:
                 return "No open tabs"
             return "\n".join(lines)
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to get tabs info: {str(e)}"
             logger.error(f"[get_tabs] {error_msg}")
@@ -2885,6 +2944,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 )
             logger.info(f"[switch_tab] done page_id={page_id}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to switch tab: {str(e)}"
             logger.error(f"[switch_tab] {error_msg}")
@@ -2939,6 +3000,8 @@ Before you return the element ref, reason about the state and elements for a sen
 
             logger.info(f"[close_tab] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to close tab: {str(e)}"
             logger.error(f"[close_tab] {error_msg}")
@@ -2973,6 +3036,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Browser viewport resized to {width}x{height}"
             logger.info(f"[browser_resize] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to resize browser: {str(e)}"
             logger.error(f"[browser_resize] {error_msg}")
@@ -3063,6 +3128,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 return result
 
             _raise_invalid_input("No wait condition specified", code="INVALID_WAIT_CONDITION")
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Wait condition not met: {str(e)}"
             logger.error(f"[wait_for] {error_msg}")
@@ -3195,6 +3262,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[input_text_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[input_text_by_ref] Failed to input text: {type(e).__name__}: {e}')
             error_msg = f'Failed to input text to element {ref}: {e}'
@@ -3278,6 +3347,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[click_element_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[click_element_by_ref] Failed to click element: {type(e).__name__}: {e}')
             error_msg = f'Failed to click element {ref}: {str(e)}'
@@ -3331,6 +3402,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[get_dropdown_options_by_ref] Retrieved dropdown options')
             return result
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[get_dropdown_options_by_ref] Failed to get dropdown options: {type(e).__name__}: {e}')
             error_msg = f'Failed to get dropdown options for element {ref}: {str(e)}'
@@ -3437,6 +3510,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[select_dropdown_option_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[select_dropdown_option_by_ref] Failed to select dropdown option: {type(e).__name__}: {e}')
             error_msg = f'Failed to select dropdown option "{text}" for element {ref}: {str(e)}'
@@ -3511,6 +3586,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[hover_element_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[hover_element_by_ref] Failed to hover element: {type(e).__name__}: {e}')
             error_msg = f'Failed to hover element {ref}: {str(e)}'
@@ -3549,6 +3626,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[focus_element_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[focus_element_by_ref] Failed to focus element: {type(e).__name__}: {e}')
             error_msg = f'Failed to focus element {ref}: {str(e)}'
@@ -3590,6 +3669,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[evaluate_javascript_on_ref] Execution successful, result length: {len(result_str)}')
             return result_str
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[evaluate_javascript_on_ref] Failed to execute JavaScript: {type(e).__name__}: {e}')
             error_msg = f'Failed to execute JavaScript on element {ref}: {str(e)}'
@@ -3648,6 +3729,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[upload_file_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[upload_file_by_ref] Failed to upload file: {type(e).__name__}: {e}')
             error_msg = f'Failed to upload file to element {ref}: {str(e)}'
@@ -3689,6 +3772,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[drag_element_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[drag_element_by_ref] Failed to drag element: {type(e).__name__}: {e}')
             error_msg = f'Failed to drag element from {start_ref} to {end_ref}: {str(e)}'
@@ -3795,6 +3880,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[check_checkbox_or_radio_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[check_checkbox_or_radio_by_ref] Failed to check element: {type(e).__name__}: {e}')
             error_msg = f'Failed to check element {ref}: {str(e)}'
@@ -3891,6 +3978,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[uncheck_checkbox_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[uncheck_checkbox_by_ref] Failed to uncheck element: {type(e).__name__}: {e}')
             error_msg = f'Failed to uncheck element {ref}: {str(e)}'
@@ -3971,6 +4060,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[double_click_element_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[double_click_element_by_ref] Failed to double-click element: {type(e).__name__}: {e}')
             error_msg = f'Failed to double-click element {ref}: {str(e)}'
@@ -4017,6 +4108,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[scroll_element_into_view_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[scroll_element_into_view_by_ref] Failed to scroll element into view: {type(e).__name__}: {e}')
             error_msg = f'Failed to scroll element {ref} into view: {str(e)}'
@@ -4050,6 +4143,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Moved mouse to coordinates ({x}, {y})"
             logger.info(f"[mouse_move] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to move mouse: {str(e)}"
             logger.error(f"[mouse_move] {error_msg}")
@@ -4108,6 +4203,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Mouse {click_type} at ({x}, {y}) with {button} button"
             logger.info(f"[mouse_click] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to click mouse: {str(e)}"
             logger.error(f"[mouse_click] {error_msg}")
@@ -4153,6 +4250,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Dragged mouse from ({start_x}, {start_y}) to ({end_x}, {end_y})"
             logger.info(f"[mouse_drag] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to drag mouse: {str(e)}"
             logger.error(f"[mouse_drag] {error_msg}")
@@ -4182,6 +4281,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Mouse {button} button pressed down"
             logger.info(f"[mouse_down] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to press mouse button: {str(e)}"
             logger.error(f"[mouse_down] {error_msg}")
@@ -4211,6 +4312,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Mouse {button} button released"
             logger.info(f"[mouse_up] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to release mouse button: {str(e)}"
             logger.error(f"[mouse_up] {error_msg}")
@@ -4254,6 +4357,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Scrolled mouse wheel: delta_x={delta_x}, delta_y={delta_y}"
             logger.info(f"[mouse_wheel] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to scroll mouse wheel: {str(e)}"
             logger.error(f"[mouse_wheel] {error_msg}")
@@ -4318,6 +4423,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Typed {len(text)} characters sequentially{submit_msg}"
             logger.info(f"[type_text] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to type sequentially: {str(e)}"
             logger.error(f"[type_text] {error_msg}")
@@ -4351,6 +4458,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Key '{key}' pressed down"
             logger.info(f"[key_down] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to press key down: {str(e)}"
             logger.error(f"[key_down] {error_msg}")
@@ -4380,6 +4489,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Key '{key}' released"
             logger.info(f"[key_up] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to release key: {str(e)}"
             logger.error(f"[key_up] {error_msg}")
@@ -4453,6 +4564,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 try:
                     await locator.fill(value)
                     filled_refs.append(ref)
+                except BridgicBrowserError:
+                    raise
                 except Exception as e:
                     errors.append(f"{ref}: {str(e)}")
 
@@ -4473,6 +4586,8 @@ Before you return the element ref, reason about the state and elements for a sen
 
             logger.info(f"[fill_form] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to fill form: {str(e)}"
             logger.error(f"[fill_form] {error_msg}")
@@ -4522,6 +4637,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Inserted text ({len(text)} characters)"
             logger.info(f"[insert_text] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to insert text: {str(e)}"
             logger.error(f"[insert_text] {error_msg}")
@@ -4612,6 +4729,8 @@ Before you return the element ref, reason about the state and elements for a sen
 
             logger.info(f"[take_screenshot] done")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to take screenshot: {str(e)}"
             logger.error(f"[take_screenshot] {error_msg}")
@@ -4741,6 +4860,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"PDF saved to: {output_path}"
             logger.info(f"[save_pdf] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to save PDF: {str(e)}"
             logger.error(f"[save_pdf] {error_msg}")
@@ -4792,6 +4913,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = "Console message capture started"
             logger.info(f"[start_console_capture] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to start console capture: {str(e)}"
             logger.error(f"[start_console_capture] {error_msg}")
@@ -4828,6 +4951,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = "Console capture stopped"
             logger.info(f"[stop_console_capture] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to stop console capture: {str(e)}"
             logger.error(f"[stop_console_capture] {error_msg}")
@@ -4889,6 +5014,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = json.dumps(messages, indent=2)
             logger.info(f"[get_console_messages] done count={len(messages)}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to get console messages: {str(e)}"
             logger.error(f"[get_console_messages] {error_msg}")
@@ -4941,6 +5068,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = "Network request capture started"
             logger.info(f"[start_network_capture] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to start network capture: {str(e)}"
             logger.error(f"[start_network_capture] {error_msg}")
@@ -4977,6 +5106,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = "Network capture stopped"
             logger.info(f"[stop_network_capture] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to stop network capture: {str(e)}"
             logger.error(f"[stop_network_capture] {error_msg}")
@@ -5045,6 +5176,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = json.dumps(requests, indent=2)
             logger.info(f"[get_network_requests] done count={len(requests)}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to get network requests: {str(e)}"
             logger.error(f"[get_network_requests] {error_msg}")
@@ -5076,6 +5209,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = "Network is idle"
             logger.info(f"[wait_for_network_idle] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to wait for network idle: {str(e)}"
             logger.error(f"[wait_for_network_idle] {error_msg}")
@@ -5138,6 +5273,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Dialog handler set up with default action: {default_action}"
             logger.info(f"[setup_dialog_handler] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to setup dialog handler: {str(e)}"
             logger.error(f"[setup_dialog_handler] {error_msg}")
@@ -5220,6 +5357,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Dialog handler ready to {action} the next dialog"
             logger.info(f"[handle_dialog] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to set up dialog handler: {str(e)}"
             logger.error(f"[handle_dialog] {error_msg}")
@@ -5251,6 +5390,8 @@ Before you return the element ref, reason about the state and elements for a sen
 
             logger.info(f"[remove_dialog_handler] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to remove dialog handler: {str(e)}"
             logger.error(f"[remove_dialog_handler] {error_msg}")
@@ -5297,6 +5438,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Storage state saved to: {output_path}"
             logger.info(f"[save_storage_state] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to save storage state: {str(e)}"
             logger.error(f"[save_storage_state] {error_msg}")
@@ -5351,6 +5494,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Storage state restored from: {filename} ({len(cookies)} cookies)"
             logger.info(f"[restore_storage_state] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to restore storage state: {str(e)}"
             logger.error(f"[restore_storage_state] {error_msg}")
@@ -5394,6 +5539,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 result = "All cookies cleared"
             logger.info(f"[clear_cookies] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to clear cookies: {str(e)}"
             logger.error(f"[clear_cookies] {error_msg}")
@@ -5459,6 +5606,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = json.dumps(cookies, indent=2)
             logger.info(f"[get_cookies] done count={len(cookies)}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to get cookies: {str(e)}"
             logger.error(f"[get_cookies] {error_msg}")
@@ -5548,6 +5697,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Cookie '{name}' set successfully"
             logger.info(f"[set_cookie] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to set cookie: {str(e)}"
             logger.error(f"[set_cookie] {error_msg}")
@@ -5605,6 +5756,8 @@ Before you return the element ref, reason about the state and elements for a sen
                     result,
                     details={"role": role, "name": accessible_name, "timeout": timeout},
                 )
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             if isinstance(e, (StateError, VerificationError)):
                 raise
@@ -5662,6 +5815,8 @@ Before you return the element ref, reason about the state and elements for a sen
                     result,
                     details={"text": text, "exact": exact, "timeout": timeout},
                 )
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             if isinstance(e, (StateError, VerificationError)):
                 raise
@@ -5733,6 +5888,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 )
 
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             if isinstance(e, (StateError, VerificationError)):
                 raise
@@ -5817,6 +5974,8 @@ Before you return the element ref, reason about the state and elements for a sen
                         details={"state": state},
                     )
 
+            except BridgicBrowserError:
+                raise
             except Exception as e:
                 if isinstance(e, InvalidInputError):
                     raise
@@ -5833,6 +5992,8 @@ Before you return the element ref, reason about the state and elements for a sen
                     details={"ref": ref, "state": state},
                 )
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             if isinstance(e, (StateError, InvalidInputError, VerificationError)):
                 raise
@@ -5892,6 +6053,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 )
 
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             if isinstance(e, (StateError, VerificationError)):
                 raise
@@ -5947,6 +6110,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 )
 
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             if isinstance(e, (StateError, VerificationError)):
                 raise
@@ -6006,6 +6171,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = "Tracing started"
             logger.info(f"[start_tracing] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to start tracing: {str(e)}"
             logger.error(f"[start_tracing] {error_msg}")
@@ -6055,6 +6222,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Trace saved to: {output_path}"
             logger.info(f"[stop_tracing] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to stop tracing: {str(e)}"
             logger.error(f"[stop_tracing] {error_msg}")
@@ -6115,6 +6284,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 return result
             else:
                 _raise_state_error("No video recording available for this page", code="NO_ACTIVE_RECORDING")
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to start video: {str(e)}"
             logger.error(f"[start_video] {error_msg}")
@@ -6158,7 +6329,7 @@ Before you return the element ref, reason about the state and elements for a sen
             # is invalid.  Actual file writing is deferred to browser close.
             resolved: Optional[str] = None
             if filename:
-                if filename.endswith(os.sep) or os.path.isdir(filename):
+                if filename.endswith(os.sep) or filename.endswith("/") or os.path.isdir(filename):
                     import time as _time
                     dest_dir = os.path.abspath(filename)
                     resolved = os.path.join(dest_dir, f"video_{_time.strftime('%Y%m%d_%H%M%S')}.webm")
@@ -6191,6 +6362,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 )
             logger.info(f"[stop_video] done (deferred) {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to stop video: {str(e)}"
             logger.error(f"[stop_video] {error_msg}")
@@ -6227,6 +6400,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"New trace chunk started" + (f": {title}" if title else "")
             logger.info(f"[add_trace_chunk] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to add trace chunk: {str(e)}"
             logger.error(f"[add_trace_chunk] {error_msg}")

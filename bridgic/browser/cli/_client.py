@@ -70,7 +70,7 @@ async def _send_command_async(command: str, args: Dict[str, Any]) -> str:
             )
 
         try:
-            resp = json.loads(raw.decode())
+            resp = json.loads(raw.decode(errors="replace"))
         except json.JSONDecodeError as exc:
             raise BridgicBrowserCommandError(
                 command=command,

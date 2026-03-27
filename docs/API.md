@@ -24,7 +24,7 @@ Short reference for the main session and download APIs. For tool lists and selec
 | `browser.user_data_dir` | `Path` or `None` — persistent context directory, or `None` for isolated mode. |
 | `browser.stealth_enabled` | `bool` — whether stealth mode is active. |
 | `browser.stealth_config` | `StealthConfig` or `None` — current stealth configuration. |
-| `browser.use_persistent_context` | `bool` — `True` when using `launch_persistent_context` (either `user_data_dir` set or stealth extensions enabled). |
+| `browser.use_persistent_context` | `bool` — `True` when using `launch_persistent_context` (either `user_data_dir` set or headed mode). |
 
 ## DownloadManager
 

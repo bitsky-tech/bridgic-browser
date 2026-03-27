@@ -52,12 +52,9 @@ Notes:
 | Key | Type / values | Notes |
 |---|---|---|
 | `enabled` | `true | false` | Default `true`. |
-| `enable_extensions` | `true | false` | Requires `headless=false` and persistent context. Only works with Playwright's bundled browser (system Chrome v137+ dropped `--load-extension`). |
 | `disable_security` | `true | false` | Disables security features (testing only). |
 | `in_docker` | `true | false` | Auto-detected by default. |
-| `cookie_whitelist_domains` | `string[]` | Domains to whitelist in cookie consent extension. |
 | `permissions` | `string[]` | Default permissions for stealth context; top-level `permissions` overrides. |
-| `extension_cache_dir` | string (path) | Cache directory for extensions. |
 
 #### Launch kwargs (via `**kwargs`)
 

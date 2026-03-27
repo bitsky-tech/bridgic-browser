@@ -9,12 +9,9 @@ appear more like regular user browsers, helping bypass bot detection.
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import sys
-import urllib.request
-import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -446,31 +443,13 @@ CHROME_DISABLED_COMPONENTS_HEADED: List[str] = [
 # ========== Chrome Ignore Default Args (browser-use/profile.py:390-396) ==========
 CHROME_IGNORE_DEFAULT_ARGS: List[str] = [
     "--enable-automation",
-    "--disable-extensions",
     "--hide-scrollbars",
-    "--disable-features=AcceptCHFrame,AutoExpandDetailsElement,AvoidUnnecessaryBeforeUnloadCheckSync,CertificateTransparencyComponentUpdater,DeferRendererTasksAfterInput,DestroyProfileOnBrowserClose,DialMediaRouteProvider,ExtensionManifestV2Disabled,GlobalMediaControls,HttpsUpgrades,ImprovedCookieControls,LazyFrameLoading,LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePartitioning,Translate",
+    # NOTE: do NOT include "--disable-features=..." here.
+    # Chrome's --disable-features is last-wins; we let Playwright add its own flag
+    # and then append our combined flag in build_args() so ours wins with the full
+    # merged feature set.  A hardcoded string would silently stop matching whenever
+    # Playwright updates its feature list.
 ]
-
-# ========== Extensions (browser-use/profile.py:944-981) ==========
-STEALTH_EXTENSIONS: Dict[str, Dict[str, str]] = {
-    # uBlock Origin Lite (MV3) — replaces uBlock Origin (MV2, deprecated in Chrome 127+)
-    "ublock_origin": {
-        "name": "uBlock Origin Lite",
-        "id": "ddkjiahejlhfcafbddmgiahcphecmpfh",
-        "url": "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=133&acceptformat=crx3&x=id%3Dddkjiahejlhfcafbddmgiahcphecmpfh%26uc",
-    },
-    "cookie_consent": {
-        "name": "I still don't care about cookies",
-        "id": "edibdbjcniadpccecjdfdjjppcpchdlm",
-        "url": "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=133&acceptformat=crx3&x=id%3Dedibdbjcniadpccecjdfdjjppcpchdlm%26uc",
-    },
-    "force_background_tab": {
-        "name": "Force Background Tab",
-        "id": "gidlfommnbibbmegmgajdbikelkdcmcl",
-        "url": "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=133&acceptformat=crx3&x=id%3Dgidlfommnbibbmegmgajdbikelkdcmcl%26uc",
-    },
-}
-
 
 @dataclass
 class StealthConfig:
@@ -482,9 +461,6 @@ class StealthConfig:
     ----------
     enabled : bool
         Whether stealth mode is enabled. Default True.
-    enable_extensions : bool
-        Whether to load anti-detection extensions. Default True.
-        Note: Extensions require headless=False and persistent context.
     disable_security : bool
         Whether to disable security features (CORS, etc.). Default False.
         Only enable for trusted sites.
@@ -496,50 +472,52 @@ class StealthConfig:
         restore the old ``chromium-headless-shell`` behaviour.
     in_docker : bool
         Whether running in Docker environment. Auto-detected by default.
-    cookie_whitelist_domains : list[str]
-        Domains to whitelist in cookie consent extension.
     permissions : list[str]
         Browser permissions to grant.
-    extension_cache_dir : Path
-        Directory to cache downloaded extensions.
 
     Examples
     --------
     # Default stealth config
     >>> config = StealthConfig()
 
-    # Stealth without extensions (works with headless)
-    >>> config = StealthConfig(enable_extensions=False)
-
     # Full stealth with security disabled (for testing)
     >>> config = StealthConfig(disable_security=True)
     """
 
     enabled: bool = True
-    enable_extensions: bool = True
     disable_security: bool = False
     use_new_headless: bool = True
     """Use full Chromium binary with --headless=new instead of chromium-headless-shell.
     Only active when stealth.enabled=True and headless=True (and not using system Chrome).
     Set to False to restore old chromium-headless-shell behaviour."""
     in_docker: bool = field(default_factory=lambda: sys.platform != "darwin" and os.path.exists("/.dockerenv"))
-    cookie_whitelist_domains: List[str] = field(
-        default_factory=lambda: ["nature.com", "qatarairways.com"]
-    )
     permissions: List[str] = field(
         default_factory=lambda: ["clipboard-read", "clipboard-write", "notifications"]
     )
-    extension_cache_dir: Path = field(
-        default_factory=lambda: Path.home() / ".cache" / "bridgic-browser" / "extensions"
-    )
 
-    def can_use_extensions(self, headless: bool) -> bool:
-        """Check if extensions can be used with current settings.
 
-        Extensions require headless=False. Chrome does not support loading
-        extensions in any headless mode (--headless or --headless=new).
-        """
-        return self.enable_extensions and not headless
+def _get_playwright_disabled_features() -> List[str]:
+    """Read Playwright's default disabled-features list from its bundled JS.
+
+    Playwright generates a single ``--disable-features=A,B,C`` flag whose contents
+    change between Playwright versions.  Rather than hardcoding it (which becomes
+    stale on every Playwright upgrade), we parse it at runtime so our combined flag
+    always stays in sync.
+
+    Returns an empty list if the file cannot be read (e.g. non-standard install).
+    """
+    import re as _re
+    try:
+        import playwright as _pw
+        switches_js = Path(_pw.__file__).parent / "driver/package/lib/server/chromium/chromiumSwitches.js"
+        text = switches_js.read_text(encoding="utf-8")
+        # Locate the disabledFeatures array body: everything between the outer [ and ].filter
+        m = _re.search(r'const disabledFeatures\s*=.*?\[(.+?)\]\.filter', text, _re.DOTALL)
+        if not m:
+            return []
+        return [f for f in _re.findall(r'"([^"]+)"', m.group(1)) if f]
+    except Exception:
+        return []
 
 
 class StealthArgsBuilder:
@@ -547,7 +525,6 @@ class StealthArgsBuilder:
 
     def __init__(self, config: StealthConfig):
         self.config = config
-        self._extension_paths: List[str] = []
 
     def build_args(
         self,
@@ -590,11 +567,27 @@ class StealthArgsBuilder:
         if headless_intent:
             # Full stealth args for headless mode (original behaviour).
             args = list(CHROME_STEALTH_ARGS)
+            # Override the hardcoded --lang=en-US with the actual locale so
+            # that Chrome's Accept-Language header stays consistent with the
+            # navigator.languages array patched by the JS init script.
+            # Without this, a locale="zh-CN" user would have --lang=en-US
+            # (Accept-Language: en-US) but navigator.languages=["zh-CN",…],
+            # which is a detectable inconsistency for bot-detection systems.
+            if locale:
+                lang = locale.replace("_", "-")
+                args = [a for a in args if not a.startswith("--lang=")]
+                args.append(f"--lang={lang}")
             # Linux-only args (skip on macOS/Windows to avoid "unsupported flag" warnings)
             if sys.platform == "linux":
                 args.extend(CHROME_LINUX_ONLY_ARGS)
-            # Disable features list (full set for headless)
-            args.append(f"--disable-features={','.join(CHROME_DISABLED_COMPONENTS)}")
+            # Combine Playwright's disabled features with bridgic's full set.
+            # Chrome's --disable-features is last-wins: since our flag is appended
+            # after Playwright's default, ours overrides.  Merging ensures we don't
+            # accidentally re-enable features that Playwright disables for stability
+            # (e.g. AutoDeElevate, RenderDocument added in newer Playwright versions).
+            pw_features = _get_playwright_disabled_features()
+            combined = list(dict.fromkeys(pw_features + list(CHROME_DISABLED_COMPONENTS)))
+            args.append(f"--disable-features={','.join(combined)}")
         else:
             # Minimal stealth args for headed mode.
             # Goal: look like a real Chrome user, not an automated browser.
@@ -605,8 +598,14 @@ class StealthArgsBuilder:
                 # Only --disable-dev-shm-usage is relevant on Linux headed;
                 # --ash-no-nudges / --suppress-message-center-popups are ChromeOS-only.
                 args.append("--disable-dev-shm-usage")
-            # Minimal features list for headed mode
-            args.append(f"--disable-features={','.join(CHROME_DISABLED_COMPONENTS_HEADED)}")
+            # Combine Playwright's stability features with bridgic's stealth features
+            # into a single --disable-features flag so it wins the last-wins race.
+            # This ensures ThirdPartyStoragePartitioning (and other stability features)
+            # stay disabled — without it, cross-origin OAuth iframes (Google login)
+            # cannot access cookies, causing bot-detection failures.
+            pw_features = _get_playwright_disabled_features()
+            combined = list(dict.fromkeys(pw_features + list(CHROME_DISABLED_COMPONENTS_HEADED)))
+            args.append(f"--disable-features={','.join(combined)}")
             # Set --lang from actual locale so it's consistent with navigator.language
             lang = locale.replace("_", "-") if locale else "en-US"
             args.append(f"--lang={lang}")
@@ -639,43 +638,6 @@ class StealthArgsBuilder:
             ])
 
         return args
-
-    def build_extension_args(self, headless: bool) -> List[str]:
-        """Build extension-related Chrome arguments.
-
-        Parameters
-        ----------
-        headless : bool
-            The *user's* headless intent (i.e. ``Browser._headless``), NOT the
-            ``headless`` value passed to Playwright.  When ``use_new_headless``
-            is active, Playwright receives ``headless=False`` so it picks the
-            full Chromium binary, but the user still wants a windowless browser.
-            Extensions are disabled whenever the user's intent is headless,
-            because Chrome does not support loading extensions in any headless
-            mode (``--headless`` or ``--headless=new``).
-
-        Returns
-        -------
-        List[str]
-            Extension-related Chrome arguments.
-        """
-        if not self.config.can_use_extensions(headless):
-            return []
-
-        # Ensure extensions are downloaded
-        extension_paths = self._ensure_extensions()
-        if not extension_paths:
-            return []
-
-        self._extension_paths = extension_paths
-
-        return [
-            f"--load-extension={','.join(extension_paths)}",
-            f"--disable-extensions-except={','.join(extension_paths)}",
-            "--enable-extensions",
-            "--disable-extensions-file-access-check",
-            "--enable-extension-activity-logging",
-        ]
 
     def get_ignore_default_args(self) -> List[str]:
         """Get list of Playwright default args to ignore.
@@ -742,180 +704,8 @@ class StealthArgsBuilder:
 
         return _STEALTH_INIT_SCRIPT_TEMPLATE.replace("__BRIDGIC_LANGS__", json.dumps(langs))
 
-    def _ensure_extensions(self) -> List[str]:
-        """Download and extract extensions if needed.
-
-        Checks (in priority order):
-          1. Cache dir already has the extracted extension — reuse it directly.
-          2. Bundled zip in bridgic/browser/extensions/<id>.zip — extract once.
-          3. Network download as fallback.
-
-        Returns
-        -------
-        List[str]
-            Paths to extracted extension directories.
-        """
-        cache_dir = self.config.extension_cache_dir
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        # bridgic/browser/extensions/ — zips shipped with the package, work offline
-        bundled_dir = Path(__file__).parent.parent / "extensions"
-        paths = []
-
-        bundled_zip = bundled_dir / "extensions.zip"
-        for key, ext_info in STEALTH_EXTENSIONS.items():
-            ext_dir = cache_dir / ext_info["id"]
-
-            if not (ext_dir / "manifest.json").exists():
-                if bundled_zip.exists():
-                    ext_dir.mkdir(parents=True, exist_ok=True)
-                    prefix = ext_info["id"] + "/"
-                    with zipfile.ZipFile(bundled_zip, "r") as zf:
-                        members = [m for m in zf.namelist() if m.startswith(prefix)]
-                        for member in members:
-                            rel = member[len(prefix):]
-                            if not rel:
-                                continue
-                            target = ext_dir / rel
-                            if member.endswith("/"):
-                                target.mkdir(parents=True, exist_ok=True)
-                            else:
-                                target.parent.mkdir(parents=True, exist_ok=True)
-                                target.write_bytes(zf.read(member))
-                else:
-                    self._download_and_extract_extension(ext_info, ext_dir)
-
-            if key == "cookie_consent":
-                self._apply_cookie_extension_patch(ext_dir)
-
-            paths.append(str(ext_dir))
-
-        return paths
-
-    def _download_and_extract_extension(
-        self, ext_info: Dict[str, str], ext_dir: Path
-    ) -> None:
-        """Download and extract a Chrome extension.
-
-        Parameters
-        ----------
-        ext_info : Dict[str, str]
-            Extension info dict with name, id, url.
-        ext_dir : Path
-            Directory to extract extension to.
-        """
-        import logging
-
-        logger = logging.getLogger(__name__)
-
-        cache_dir = self.config.extension_cache_dir
-        crx_path = cache_dir / f"{ext_info['id']}.crx"
-
-        logger.info(f"Downloading extension: {ext_info['name']}...")
-        urllib.request.urlretrieve(ext_info["url"], crx_path)
-
-        ext_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            with zipfile.ZipFile(crx_path, "r") as zf:
-                zf.extractall(ext_dir)
-        except zipfile.BadZipFile:
-            self._extract_crx3(crx_path, ext_dir)
-
-        crx_path.unlink()
-        logger.info(f"Extension installed: {ext_info['name']}")
-
-    def _extract_crx3(self, crx_path: Path, ext_dir: Path) -> None:
-        """Extract CRX3 format Chrome extension.
-
-        Parameters
-        ----------
-        crx_path : Path
-            Path to CRX file.
-        ext_dir : Path
-            Directory to extract to.
-        """
-        with open(crx_path, "rb") as f:
-            magic = f.read(4)
-            if magic != b"Cr24":
-                raise ValueError("Invalid CRX file")
-
-            version = int.from_bytes(f.read(4), "little")
-            if version == 2:
-                pubkey_len = int.from_bytes(f.read(4), "little")
-                sig_len = int.from_bytes(f.read(4), "little")
-                f.seek(16 + pubkey_len + sig_len)
-            elif version == 3:
-                header_len = int.from_bytes(f.read(4), "little")
-                f.seek(12 + header_len)
-
-            zip_data = f.read()
-
-        with zipfile.ZipFile(io.BytesIO(zip_data), "r") as zf:
-            zf.extractall(ext_dir)
-
-    def _apply_cookie_extension_patch(self, ext_dir: Path) -> None:
-        """Apply whitelist patch to cookie consent extension.
-
-        Based on browser-use/profile.py:1033-1095
-
-        Parameters
-        ----------
-        ext_dir : Path
-            Extension directory path.
-        """
-        bg_path = ext_dir / "data" / "background.js"
-        if not bg_path.exists():
-            return
-
-        try:
-            content = bg_path.read_text(encoding="utf-8")
-
-            whitelist_domains = self.config.cookie_whitelist_domains
-            whitelist_entries = [f'        "{domain}": true' for domain in whitelist_domains]
-            whitelist_js = "{\n" + ",\n".join(whitelist_entries) + "\n      }"
-
-            old_init = """async function initialize(checkInitialized, magic) {
-  if (checkInitialized && initialized) {
-    return;
-  }
-  loadCachedRules();
-  await updateSettings();
-  await recreateTabList(magic);
-  initialized = true;
-}"""
-
-            new_init = f"""// Pre-populate storage with configurable domain whitelist if empty
-async function ensureWhitelistStorage() {{
-  const result = await chrome.storage.local.get({{ settings: null }});
-  if (!result.settings) {{
-    const defaultSettings = {{
-      statusIndicators: true,
-      whitelistedDomains: {whitelist_js}
-    }};
-    await chrome.storage.local.set({{ settings: defaultSettings }});
-  }}
-}}
-
-async function initialize(checkInitialized, magic) {{
-  if (checkInitialized && initialized) {{
-    return;
-  }}
-  loadCachedRules();
-  await ensureWhitelistStorage();
-  await updateSettings();
-  await recreateTabList(magic);
-  initialized = true;
-}}"""
-
-            if old_init in content:
-                content = content.replace(old_init, new_init)
-                bg_path.write_text(content, encoding="utf-8")
-        except Exception:
-            pass
-
-
 def create_stealth_config(
     enabled: bool = True,
-    enable_extensions: bool = True,
     disable_security: bool = False,
     **kwargs: Any,
 ) -> StealthConfig:
@@ -927,8 +717,6 @@ def create_stealth_config(
     ----------
     enabled : bool
         Whether stealth mode is enabled.
-    enable_extensions : bool
-        Whether to load extensions.
     disable_security : bool
         Whether to disable security features.
     **kwargs
@@ -941,7 +729,6 @@ def create_stealth_config(
     """
     return StealthConfig(
         enabled=enabled,
-        enable_extensions=enable_extensions,
         disable_security=disable_security,
         **kwargs,
     )
@@ -959,5 +746,4 @@ __all__ = [
     "CHROME_DOCKER_ARGS",
     "CHROME_DISABLE_SECURITY_ARGS",
     "CHROME_IGNORE_DEFAULT_ARGS",
-    "STEALTH_EXTENSIONS",
 ]

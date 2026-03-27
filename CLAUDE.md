@@ -36,11 +36,6 @@ make publish version=0.1.0 repo=testpypi      # Full release: version check → 
 make playwright-install
 ```
 
-**Stealth extensions** (maintainers only, commit result):
-```bash
-make download-extensions   # downloads + packs all extensions into bridgic/browser/extensions/extensions.zip
-```
-
 ## Architecture
 
 ### Package structure
@@ -115,10 +110,8 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 `StealthConfig` (default enabled) applies Chrome arguments and a JS init script to evade bot detection. The strategy is **mode-aware**: headless mode uses a full 50+ flag set; headed mode uses a minimal ~11 flag set to match real Chrome user behavior.
 
 Key options:
-- `enable_extensions=True` requires user's `headless=False` — Chrome does not load extensions in any headless mode (`--headless` or `--headless=new`)
 - `use_new_headless=True` (default) — use full Chromium binary with `--headless=new` instead of headless-shell (see below)
 - `docker_mode=True` for container environments
-- `cookie_whitelist_domains` for selective cookie retention
 
 **New headless mode (`use_new_headless=True`, default)**:
 When `headless=True` (default) and stealth is enabled, bridgic redirects Playwright to the full Chromium binary to avoid headless-shell's detectable fingerprint differences:
@@ -140,8 +133,8 @@ This redirect is skipped when:
 - `StealthConfig.use_new_headless=False` (opt-out to restore old headless-shell)
 - System Chrome is used (`channel` or `executable_path` set) — system Chrome manages its own binary
 
-**System Chrome vs extensions trade-off**:
-System Chrome (v137+) removed `--load-extension` CLI support, so extensions only work with Playwright's bundled "Chrome for Testing" (the default). The CLI daemon does NOT auto-switch to system Chrome — it uses Playwright's default browser to keep extensions working. Users who explicitly set `channel="chrome"` or `executable_path` in config get the system Chrome Dock icon but lose extension loading. With system Chrome, the new-headless-mode redirect is also skipped; Playwright's `headless=True` is passed directly.
+**Headed mode auto-switches to system Chrome**:
+Playwright's bundled "Google Chrome for Testing" binary is blocked by Google OAuth (login rejected as "unsafe browser") and shows a "test" label in the macOS Dock. In headed mode, when stealth is enabled and system Chrome is detected (`_detect_system_chrome()`), bridgic automatically sets `channel="chrome"` to use the real system Chrome binary. This is transparent to the user. The headed stealth args (~11 flags) are still applied; `--test-type=` is added to suppress Chrome's "unsupported flag" warning banner for `--disable-blink-features=AutomationControlled`. If system Chrome is not installed, bridgic falls back to Chrome for Testing.
 
 **JS init script** (`_STEALTH_INIT_SCRIPT_TEMPLATE` in `_stealth.py`) — **headless mode only**. Skipped entirely in headed mode (`self._headless=False`) because `context.add_init_script()` runs in ALL frames including Cloudflare Turnstile's challenge iframe; patching `window.chrome` (`configurable:false`), `navigator.permissions.query`, and WebGL prototype inside the iframe causes detectable API inconsistencies that fail the challenge. Playwright CLI injects nothing and passes Turnstile; bridgic matches that behaviour in headed mode.
 
@@ -177,13 +170,6 @@ Function.prototype.toString = _mkNative(function toString() {
 - `Notification.permission` → guarded: only patched if `Notification` exists and its permission is `'denied'`; returns `'default'`
 
 `get_init_script(locale=None)` accepts the locale and performs the `__BRIDGIC_LANGS__` substitution before returning the script. Called from `_browser.py:_start()` with `self._locale` only when `self._headless=True`.
-
-**Extensions** (headed mode only, all MV3):
-- uBlock Origin Lite — content/ad blocking
-- I don't care about cookies — auto-dismiss cookie banners
-- Force Background Tab — prevent new-tab focus stealing
-
-Extensions are bundled as `bridgic/browser/extensions/extensions.zip` (shipped with the package). On first use they are extracted to `~/.cache/bridgic-browser/extensions/<id>/`. Subsequent launches reuse the cache. Network download only happens if the zip is absent.
 
 ### CLI architecture
 
