@@ -298,7 +298,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `go_back()` / `go_forward()` - Browser history navigation
 
 **Snapshot (1 tool):**
-- `get_snapshot_text(offset=0, limit=10000, interactive=False, full_page=True)` - Get page state string for LLM (accessibility tree with refs). **offset** must be `>= 0` and is used for pagination when the page is long: if the return value is truncated, a `[notice]` at the end gives **next_offset** to call again. **limit** (default 10000) controls the maximum characters returned. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default).
+- `get_snapshot_text(offset=0, limit=10000, interactive=False, full_page=True)` - Get page state string for LLM (accessibility tree with refs). **offset** must be `>= 0` and is used for pagination when the page is long: if the return value is truncated, a `[notice]` before the page content gives **next_offset** to call again. **limit** (default 10000) controls the maximum characters returned. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default).
 
 **Element Interaction (13 tools) - by ref:**
 - `click_element_by_ref(ref)` - Click element

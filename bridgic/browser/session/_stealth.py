@@ -148,13 +148,57 @@ _STEALTH_INIT_SCRIPT_TEMPLATE: str = """
   }
 
   // ── window.outerWidth / outerHeight ───────────────────────────────────────
-  // Headless sets these to 0; real Chrome includes the browser chrome (~85px).
+  // Headless may set these to 0. With --headless=new the screen context option
+  // provides correct values, but guard here for any remaining edge cases.
+  // No +85 offset: new headless has no browser chrome UI, so outerHeight == innerHeight.
   if (window.outerWidth === 0) {
     try { Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth }); } catch (_) {}
   }
   if (window.outerHeight === 0) {
-    try { Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight + 85 }); } catch (_) {}
+    try { Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight }); } catch (_) {}
   }
+
+  // ── navigator.deviceMemory ────────────────────────────────────────────────
+  // Real Chrome returns 4 or 8 GB; some headless environments return undefined.
+  if (navigator.deviceMemory === undefined) {
+    try { Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 }); } catch (_) {}
+  }
+
+  // ── navigator.hardwareConcurrency ─────────────────────────────────────────
+  // Real Chrome reports actual CPU core count; headless may return 0 or 1.
+  if (!navigator.hardwareConcurrency || navigator.hardwareConcurrency < 2) {
+    try { Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 }); } catch (_) {}
+  }
+
+  // ── navigator.connection (NetworkInformation API) ─────────────────────────
+  // Some headless environments lack this object entirely.
+  if (!navigator.connection) {
+    try {
+      Object.defineProperty(navigator, 'connection', {
+        get: () => ({ effectiveType: '4g', downlink: 10, rtt: 100, saveData: false })
+      });
+    } catch (_) {}
+  }
+
+  // ── WebGL vendor / renderer ───────────────────────────────────────────────
+  // Headless on servers without a real GPU reports "Google SwiftShader" for
+  // UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL — a well-known bot signal.
+  // Spoof with a common Intel GPU string seen on real Mac/PC hardware.
+  // Both WebGLRenderingContext and WebGL2RenderingContext must be patched
+  // because modern bot-detection probes both.
+  (function () {
+    const _patchWebGL = (Ctx) => {
+      if (!Ctx) return;
+      const _orig = Ctx.prototype.getParameter;
+      Ctx.prototype.getParameter = function (parameter) {
+        if (parameter === 37445) return 'Intel Inc.';                // UNMASKED_VENDOR_WEBGL
+        if (parameter === 37446) return 'Intel Iris OpenGL Engine';  // UNMASKED_RENDERER_WEBGL
+        return _orig.call(this, parameter);
+      };
+    };
+    _patchWebGL(window.WebGLRenderingContext);
+    _patchWebGL(window.WebGL2RenderingContext);
+  })();
 })();
 """
 
@@ -216,8 +260,6 @@ CHROME_STEALTH_ARGS: List[str] = [
     "--export-tagged-pdf",
     "--disable-search-engine-choice-screen",
     "--unsafely-disable-devtools-self-xss-warnings",
-    "--enable-features=NetworkService,NetworkServiceInProcess",
-    "--enable-network-information-downlink-max",
     "--disable-sync",
     "--allow-legacy-extension-manifests",
     "--allow-pre-commit-input",
@@ -229,7 +271,6 @@ CHROME_STEALTH_ARGS: List[str] = [
     "--generate-pdf-document-outline",
     "--no-pings",
     "--disable-infobars",
-    "--simulate-outdated-no-au=Tue, 31 Dec 2099 23:59:59 GMT",
     "--hide-crash-restore-bubble",
     "--disable-domain-reliability",
     "--disable-datasaver-prompt",
@@ -322,6 +363,12 @@ class StealthConfig:
     disable_security : bool
         Whether to disable security features (CORS, etc.). Default False.
         Only enable for trusted sites.
+    use_new_headless : bool
+        Use full Chromium binary with ``--headless=new`` instead of the
+        stripped ``chromium-headless-shell`` binary. Default True.
+        Only active when ``enabled=True``, ``headless=True``, and not using
+        system Chrome (``channel`` / ``executable_path``).  Set to False to
+        restore the old ``chromium-headless-shell`` behaviour.
     in_docker : bool
         Whether running in Docker environment. Auto-detected by default.
     cookie_whitelist_domains : list[str]
@@ -346,6 +393,10 @@ class StealthConfig:
     enabled: bool = True
     enable_extensions: bool = True
     disable_security: bool = False
+    use_new_headless: bool = True
+    """Use full Chromium binary with --headless=new instead of chromium-headless-shell.
+    Only active when stealth.enabled=True and headless=True (and not using system Chrome).
+    Set to False to restore old chromium-headless-shell behaviour."""
     in_docker: bool = field(default_factory=lambda: sys.platform != "darwin" and os.path.exists("/.dockerenv"))
     cookie_whitelist_domains: List[str] = field(
         default_factory=lambda: ["nature.com", "qatarairways.com"]
@@ -360,8 +411,8 @@ class StealthConfig:
     def can_use_extensions(self, headless: bool) -> bool:
         """Check if extensions can be used with current settings.
 
-        Extensions require headless=False. Playwright's headless mode uses
-        chromium-headless-shell which does not support loading extensions.
+        Extensions require headless=False. Chrome does not support loading
+        extensions in any headless mode (--headless or --headless=new).
         """
         return self.enable_extensions and not headless
 
@@ -373,7 +424,7 @@ class StealthArgsBuilder:
         self.config = config
         self._extension_paths: List[str] = []
 
-    def build_args(self, viewport_width: int = 1600, viewport_height: int = 900) -> List[str]:
+    def build_args(self, viewport_width: int = 1600, viewport_height: int = 900, hide_window: bool = True) -> List[str]:
         """Build Chrome launch arguments for stealth mode.
 
         Parameters
@@ -382,6 +433,13 @@ class StealthArgsBuilder:
             Viewport width for window-size arg.
         viewport_height : int
             Viewport height for window-size arg.
+        hide_window : bool
+            Whether the user wants the browser window hidden (i.e. headless
+            from the user's perspective). When True and
+            ``config.use_new_headless`` is True, appends ``--headless=new``
+            and related args so Chrome runs without a visible window.
+            Note: this is the *user's intent*, independent of the
+            ``headless`` value passed to Playwright.
 
         Returns
         -------
@@ -410,6 +468,20 @@ class StealthArgsBuilder:
         if self.config.disable_security:
             args.extend(CHROME_DISABLE_SECURITY_ARGS)
 
+        # New headless mode: user wants no window + stealth enabled.
+        # _browser.py tells Playwright headless=False so it picks the full chromium
+        # binary (not headless-shell), then we supply these args so Chrome itself
+        # still runs without a visible window via --headless=new.
+        # Playwright normally adds --hide-scrollbars / --mute-audio / --blink-settings
+        # only when it receives headless=True; we add them explicitly here instead.
+        if hide_window and self.config.use_new_headless:
+            args.extend([
+                "--headless=new",
+                "--hide-scrollbars",
+                "--mute-audio",
+                "--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4",
+            ])
+
         return args
 
     def build_extension_args(self, headless: bool) -> List[str]:
@@ -418,7 +490,13 @@ class StealthArgsBuilder:
         Parameters
         ----------
         headless : bool
-            Whether browser is in headless mode.
+            The *user's* headless intent (i.e. ``Browser._headless``), NOT the
+            ``headless`` value passed to Playwright.  When ``use_new_headless``
+            is active, Playwright receives ``headless=False`` so it picks the
+            full Chromium binary, but the user still wants a windowless browser.
+            Extensions are disabled whenever the user's intent is headless,
+            because Chrome does not support loading extensions in any headless
+            mode (``--headless`` or ``--headless=new``).
 
         Returns
         -------

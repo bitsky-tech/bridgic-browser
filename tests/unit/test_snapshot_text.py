@@ -124,8 +124,12 @@ async def test_get_snapshot_text_pagination_offset_exceeds_total_length(browser_
     await browser_instance.navigate_to(_data_url(html))
 
     full = await browser_instance.get_snapshot_text()
+    # offset is validated against len(snapshot.tree), which does NOT include the header
+    # line prepended by get_snapshot_text. Subtract the header to get the correct boundary.
+    header_len = full.index('\n') + 1
+    tree_len = len(full) - header_len
     with pytest.raises(InvalidInputError) as exc_info:
-        await browser_instance.get_snapshot_text(offset=len(full) + 1)
+        await browser_instance.get_snapshot_text(offset=tree_len)
     assert exc_info.value.code == "OFFSET_OUT_OF_RANGE"
 
 

@@ -82,7 +82,7 @@ When using `Browser`, you typically use `browser.get_snapshot()` and `browser.ge
 Browser method used to supply the page state to an LLM. It calls `browser.get_snapshot(interactive=..., full_page=...)` and returns the tree string, with optional truncation and pagination.
 
 - **Signature**: `await browser.get_snapshot_text(offset=0, limit=10000, interactive=False, full_page=True) -> str`
-- **Returns**: The accessibility tree string. May be truncated when the full tree exceeds `limit`; if so, a `[notice]` at the end explains how to continue (see below).
+- **Returns**: The accessibility tree string. May be truncated when the full tree exceeds `limit`; if so, a `[notice]` is shown before the page content (right after the page header) explaining how to continue (see below).
 
 ### Parameters
 
@@ -95,7 +95,7 @@ Browser method used to supply the page state to an LLM. It calls `browser.get_sn
 
 ### Truncation and pagination
 
-When the full tree is longer than `limit`, the returned string is cut and a notice is appended, for example:
+When the full tree is longer than `limit`, the returned string is cut and a notice is prepended before the page content (right after the page header), for example:
 
 ```
 [notice] Current page text is too long, returned portion starting from character 0 (this segment length 10000 / total length 45000 characters). To continue getting subsequent content: call get_snapshot_text(offset=10000, limit=10000, interactive=False, full_page=True)

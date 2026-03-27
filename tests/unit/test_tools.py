@@ -74,7 +74,7 @@ def mock_browser():
     browser.get_tabs = AsyncMock(return_value="Tab 1")
     browser.switch_tab = AsyncMock(return_value="Switched to tab")
     browser.close_tab = AsyncMock(return_value="Closed tab")
-    browser.stop = AsyncMock(return_value="Browser closed")
+    browser.close = AsyncMock(return_value="Browser closed")
     browser.browser_resize = AsyncMock(return_value="Resized browser to 800x600")
     browser.wait_for = AsyncMock(return_value="Waited")
     browser.get_snapshot_text = AsyncMock(return_value="- button 'Submit' [ref=e1]")

@@ -346,6 +346,90 @@ class TestStealthConstants:
             assert ext_info["url"].startswith("https://")
 
 
+class TestNewHeadlessMode:
+    """Tests for new headless mode (--headless=new with full Chromium binary)."""
+
+    def test_use_new_headless_default_is_true(self):
+        config = StealthConfig()
+        assert config.use_new_headless is True
+
+    def test_use_new_headless_can_be_disabled(self):
+        config = StealthConfig(use_new_headless=False)
+        assert config.use_new_headless is False
+
+    def test_build_args_headless_new_in_headless_mode(self):
+        """--headless=new and companion args appear when headless=True and use_new_headless=True."""
+        builder = StealthArgsBuilder(StealthConfig(use_new_headless=True))
+        args = builder.build_args(hide_window=True)
+        assert "--headless=new" in args
+        assert "--hide-scrollbars" in args
+        assert "--mute-audio" in args
+        assert any("blink-settings" in a for a in args)
+
+    def test_build_args_no_headless_new_when_headed(self):
+        """--headless=new must NOT appear when headless=False."""
+        builder = StealthArgsBuilder(StealthConfig(use_new_headless=True))
+        args = builder.build_args(hide_window=False)
+        assert "--headless=new" not in args
+
+    def test_build_args_no_headless_new_when_disabled(self):
+        """--headless=new must NOT appear when use_new_headless=False."""
+        builder = StealthArgsBuilder(StealthConfig(use_new_headless=False))
+        args = builder.build_args(hide_window=True)
+        assert "--headless=new" not in args
+
+    def test_build_args_default_headless_param_is_true(self):
+        """Default headless param is True so existing callers get --headless=new."""
+        builder = StealthArgsBuilder(StealthConfig(use_new_headless=True))
+        args_default = builder.build_args()
+        args_explicit = builder.build_args(hide_window=True)
+        assert args_default == args_explicit
+
+
+class TestRemovedFingerprintArgs:
+    """Confirm high-risk fingerprint args are absent from CHROME_STEALTH_ARGS."""
+
+    def test_simulate_outdated_not_in_stealth_args(self):
+        assert not any("simulate-outdated-no-au" in a for a in CHROME_STEALTH_ARGS)
+
+    def test_enable_network_information_downlink_max_removed(self):
+        assert "--enable-network-information-downlink-max" not in CHROME_STEALTH_ARGS
+
+    def test_enable_features_network_service_removed(self):
+        assert not any("NetworkService,NetworkServiceInProcess" in a for a in CHROME_STEALTH_ARGS)
+
+
+class TestInitScriptPatches:
+    """Verify new navigator patches in the JS init script."""
+
+    def test_init_script_device_memory_patch(self):
+        script = StealthArgsBuilder(StealthConfig()).get_init_script()
+        assert "navigator.deviceMemory" in script
+
+    def test_init_script_hardware_concurrency_patch(self):
+        script = StealthArgsBuilder(StealthConfig()).get_init_script()
+        assert "navigator.hardwareConcurrency" in script
+
+    def test_init_script_connection_patch(self):
+        script = StealthArgsBuilder(StealthConfig()).get_init_script()
+        assert "navigator.connection" in script
+        assert "effectiveType" in script
+
+    def test_init_script_outer_height_no_plus_85(self):
+        """The old +85 browser-chrome offset must not appear in new headless mode."""
+        script = StealthArgsBuilder(StealthConfig()).get_init_script()
+        assert "innerHeight + 85" not in script
+
+    def test_init_script_webgl_vendor_patch(self):
+        script = StealthArgsBuilder(StealthConfig()).get_init_script()
+        assert "WebGLRenderingContext" in script
+        assert "WebGL2RenderingContext" in script
+        assert "37445" in script  # UNMASKED_VENDOR_WEBGL
+        assert "37446" in script  # UNMASKED_RENDERER_WEBGL
+        assert "Intel Inc." in script
+        assert "Intel Iris OpenGL Engine" in script
+
+
 class TestCreateStealthConfig:
     """Tests for create_stealth_config helper function."""
 

@@ -115,12 +115,31 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 `StealthConfig` (default enabled) applies 50+ Chrome arguments to evade bot detection, plus a JS init script injected into every page via `context.add_init_script()`.
 
 Key options:
-- `enable_extensions=True` requires `headless=False` (Playwright's headless-shell does not support extensions)
+- `enable_extensions=True` requires user's `headless=False` — Chrome does not load extensions in any headless mode (`--headless` or `--headless=new`)
+- `use_new_headless=True` (default) — use full Chromium binary with `--headless=new` instead of headless-shell (see below)
 - `docker_mode=True` for container environments
 - `cookie_whitelist_domains` for selective cookie retention
 
+**New headless mode (`use_new_headless=True`, default)**:
+When `headless=True` (default) and stealth is enabled, bridgic redirects Playwright to the full Chromium binary to avoid headless-shell's detectable fingerprint differences:
+
+```
+self._headless=True (user intent)  →  Playwright receives headless=False  →  full Chromium binary
+                                       build_args() adds --headless=new    →  no visible window
+```
+
+Key distinction:
+- `Browser._headless` — **user's intent** (hide the window?)
+- `options["headless"]` passed to Playwright — **binary selection** (which binary to pick?)
+
+`StealthArgsBuilder.build_args(hide_window=True)` injects `--headless=new`, `--hide-scrollbars`, `--mute-audio`, and `--blink-settings=...` explicitly (these are normally injected by Playwright when `headless=True`, but since we pass `headless=False`, we add them manually).
+
+This redirect is skipped when:
+- `StealthConfig.use_new_headless=False` (opt-out to restore old headless-shell)
+- System Chrome is used (`channel` or `executable_path` set) — system Chrome manages its own binary
+
 **System Chrome vs extensions trade-off**:
-System Chrome (v137+) removed `--load-extension` CLI support, so extensions only work with Playwright's bundled "Chrome for Testing" (the default). The CLI daemon does NOT auto-switch to system Chrome — it uses Playwright's default browser to keep extensions working. Users who explicitly set `channel="chrome"` or `executable_path` in config get the system Chrome Dock icon but lose extension loading.
+System Chrome (v137+) removed `--load-extension` CLI support, so extensions only work with Playwright's bundled "Chrome for Testing" (the default). The CLI daemon does NOT auto-switch to system Chrome — it uses Playwright's default browser to keep extensions working. Users who explicitly set `channel="chrome"` or `executable_path` in config get the system Chrome Dock icon but lose extension loading. With system Chrome, the new-headless-mode redirect is also skipped; Playwright's `headless=True` is passed directly.
 
 **JS init script** (`_STEALTH_INIT_SCRIPT_TEMPLATE` in `_stealth.py`) patches these navigator/window properties before any page script runs:
 - `navigator.webdriver` → `undefined`
@@ -128,7 +147,11 @@ System Chrome (v137+) removed `--load-extension` CLI support, so extensions only
 - `navigator.languages` → derived from `Browser(locale=...)` to keep `navigator.language === navigator.languages[0]` (e.g. `["zh-CN", "zh", "en"]` for `locale="zh-CN"`); defaults to `["en-US", "en"]`
 - `window.chrome` → complete object with `runtime`, `csi()`, `loadTimes()`
 - `navigator.permissions.query` → returns `"default"` for notifications (not `"denied"`)
-- `window.outerWidth/Height` → matches `innerWidth/Height` (fixes headless zero-value)
+- `window.outerWidth/Height` → matches `innerWidth/Height` when zero (guard for edge cases; with `--headless=new` + `screen` context option these are already correctly set by Chrome)
+- `navigator.deviceMemory` → `8` (headless environments may return `undefined`)
+- `navigator.hardwareConcurrency` → `8` when value is 0 or 1 (headless may report fewer cores)
+- `navigator.connection` → `{ effectiveType: '4g', downlink: 10, rtt: 100, saveData: false }` when absent
+- `WebGLRenderingContext` / `WebGL2RenderingContext` → `getParameter(37445)` returns `'Intel Inc.'`, `getParameter(37446)` returns `'Intel Iris OpenGL Engine'` (masks SwiftShader which is a well-known bot signal)
 
 `get_init_script(locale=None)` accepts the locale and performs the `__BRIDGIC_LANGS__` substitution before returning the script. Called from `_browser.py:_start()` with `self._locale`.
 
@@ -155,7 +178,7 @@ bridgic-browser click @8d4b03a9
 
 Key implementation details:
 - **`_client.py`**: `send_command()` auto-starts the daemon if no socket exists. `_spawn_daemon()` uses `select.select()` + `os.read()` for the 30-second ready timeout (avoids blocking `proc.stdout.read()`). `start_if_needed=False` prevents auto-start for the `close` command.
-- **`_daemon.py`**: `run_daemon()` calls `_build_browser_kwargs()` then launches `Browser(**kwargs)`, writes `BRIDGIC_DAEMON_READY` to stdout, and serves one JSON command per connection. `asyncio.wait_for(reader.readline(), timeout=60)` prevents hanging on idle connections. Signal handling uses `loop.add_signal_handler()` (asyncio-safe).
+- **`_daemon.py`**: `run_daemon()` calls `_build_browser_kwargs()` then creates a `Browser(**kwargs)` instance (lazy start — Playwright does **not** launch immediately), writes `BRIDGIC_DAEMON_READY` to stdout, and serves one JSON command per connection. The browser's Playwright process starts on the first command that calls `_ensure_started()` (e.g. `navigate_to`). `asyncio.wait_for(reader.readline(), timeout=60)` prevents hanging on idle connections. Signal handling uses `loop.add_signal_handler()` (asyncio-safe).
 - **`_commands.py`**: 67 Click commands in 15 sections via `SectionedGroup`. `scroll` uses `--dy`/`--dx` options (not positional) to support negative values. `screenshot`/`pdf`/`upload`/`storage-save`/`storage-load`/`trace-stop` call `os.path.abspath()` on the client side before sending (daemon cwd may differ). `snapshot` supports `-i`/`--interactive`, `-f/-F`/`--full-page/--no-full-page`, `-o`/`--offset` (default 0), and `-l`/`--limit` (default 10000); it delegates to `browser.get_snapshot_text()` (which adds truncation/pagination).
 - **`_build_browser_kwargs()`** priority chain (lowest → highest): defaults → `~/.bridgic/bridgic-browser.json` → `./bridgic-browser.json` → `BRIDGIC_BROWSER_JSON` env var. The `--headed` CLI flag merges `{"headless": false}` into `BRIDGIC_BROWSER_JSON` before spawning the daemon.
 - **`close` command fast-path**: the daemon calls `browser.inspect_pending_close_artifacts()` to pre-allocate a session dir and trace path, responds to the client immediately with those paths, then sets `stop_event`. Actual `browser.close()` runs after the client disconnects. After close, `_write_close_report()` writes `~/.bridgic/tmp/close-<timestamp>-<rand>/close-report.json` with status, artifact paths, and any errors.
@@ -434,7 +457,7 @@ STRUCTURAL_NOISE child-anchor path (strategy 5) detail:
 
 ### Covered-element Check
 
-**6 locations**: `_click_checkable_target` (`_browser.py:239`), `click_element_by_ref` (`~3106`), `hover_element_by_ref` (`~3331`), `check_checkbox_or_radio_by_ref` (`~3611`), `uncheck_checkbox_by_ref` (`~3706`), `double_click_element_by_ref` (`~3794`)
+**6 locations**: `_click_checkable_target` (`_browser.py:239`), `click_element_by_ref` (`~3151`), `hover_element_by_ref` (`~3393`), `check_checkbox_or_radio_by_ref` (`~3645`), `uncheck_checkbox_by_ref` (`~3751`), `double_click_element_by_ref` (`~3847`)
 
 ```javascript
 (el) => {

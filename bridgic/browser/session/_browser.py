@@ -574,7 +574,14 @@ class Browser:
 
     @property
     def headless(self) -> bool:
-        """Whether browser runs in headless mode."""
+        """Whether the user requested a windowless (headless) browser.
+
+        Reflects the *user's intent*, not the internal Playwright ``headless``
+        flag.  When stealth's new-headless mode is active, Playwright receives
+        ``headless=False`` internally so it selects the full Chromium binary,
+        but this property still returns ``True`` because Chrome itself runs
+        with ``--headless=new`` and has no visible window.
+        """
         return self._headless
 
     @property
@@ -659,7 +666,7 @@ class Browser:
             viewport = self._viewport or fallback_viewport
             viewport_width = viewport.get("width", 1600)
             viewport_height = viewport.get("height", 900)
-            stealth_args = self._stealth_builder.build_args(viewport_width, viewport_height)
+            stealth_args = self._stealth_builder.build_args(viewport_width, viewport_height, hide_window=self._headless)
             args_list.extend(stealth_args)
 
             # Add extension args if applicable
@@ -698,7 +705,23 @@ class Browser:
         if self._timeout is not None:
             options["timeout"] = self._timeout * 1000.0
         if self._headless is not None:
-            options["headless"] = self._headless
+            # When the user wants no window + stealth is active, redirect Playwright
+            # to the full chromium binary by passing headless=False.  The actual
+            # "no window" behaviour comes from --headless=new added in build_args().
+            #
+            #   self._headless      → user intent   (hide the window?)
+            #   options["headless"] → Playwright arg (which binary to pick?)
+            #
+            # chromium-headless-shell is a stripped binary with detectable
+            # fingerprint differences; full chromium + --headless=new avoids that.
+            _use_full_binary = (
+                self._headless is True
+                and not _is_system_chrome       # system Chrome picks its own binary
+                and self._stealth_config is not None
+                and self._stealth_config.enabled
+                and self._stealth_config.use_new_headless
+            )
+            options["headless"] = False if _use_full_binary else self._headless
         if self._devtools is not None:
             options["devtools"] = self._devtools
         if self._proxy is not None:
@@ -737,9 +760,12 @@ class Browser:
             stealth_context_opts = self._stealth_builder.get_context_options()
             options.update(stealth_context_opts)
 
-            # Add screen size to match viewport (stealth recommendation)
+            # Add screen size to match viewport for correct window.screen values.
+            # Fall back to a standard desktop resolution when no_viewport=True.
             if self._viewport:
                 options["screen"] = self._viewport.copy()
+            else:
+                options["screen"] = {"width": 1600, "height": 900}
 
         # Add non-None context parameters (user values override stealth defaults)
         if self._viewport is not None and not self._no_viewport:
@@ -815,6 +841,12 @@ class Browser:
                 logger.info(f"Created temporary user data dir for stealth extensions: {self._temp_user_data_dir}")
             options["user_data_dir"] = self._temp_user_data_dir
         else:
+            # Safety net: use_persistent_context returned True but neither
+            # user_data_dir nor stealth extensions are active.  Playwright
+            # requires a non-None user_data_dir for launch_persistent_context,
+            # so pass "" which makes Playwright use a temporary directory.
+            # In practice this branch is unreachable today because
+            # use_persistent_context only returns True in the two cases above.
             options["user_data_dir"] = ""
 
         return options
@@ -902,8 +934,22 @@ class Browser:
             raise
 
     async def _ensure_started(self) -> None:
-        """Auto-start the browser if not yet started."""
+        """Auto-start the browser if not yet started.
+
+        Guarantees that both ``_playwright`` and ``_context`` are initialised
+        after this call returns.  If ``_playwright`` is set but ``_context`` is
+        None (inconsistent state caused by an external browser crash or a
+        partial ``close()``), the browser is fully reset before restarting.
+        """
         if self._playwright is None:
+            await self._start()
+        elif self._context is None:
+            # _playwright exists but context was lost — do a clean reset.
+            logger.warning(
+                "[_ensure_started] inconsistent state: _playwright set but _context is None; "
+                "performing clean restart"
+            )
+            await self.close()
             await self._start()
 
     # Timeout (seconds) applied to individual page.close() calls during
@@ -1367,6 +1413,11 @@ class Browser:
         wait_until: Literal["domcontentloaded", "load", "networkidle", "commit"] = "domcontentloaded",
         timeout: Optional[float] = None,
     ) -> Page:
+        if self._context is None:
+            _raise_state_error(
+                "No browser context is open. Use navigate_to() to start the browser first.",
+                code="NO_BROWSER_CONTEXT",
+            )
         self._page = await self._context.new_page()
         if url:
             await self.navigate_to(url, wait_until=wait_until, timeout=timeout)
@@ -2171,8 +2222,8 @@ Before you return the element ref, reason about the state and elements for a sen
             ``[ref=...]`` are interactive elements.
 
             Output is truncated to ``limit`` characters.  When truncated, a
-            ``[notice]`` at the end shows the ``next_offset`` value and the
-            continuation call.
+            ``[notice]`` is prepended before the page content (after the header)
+            with the ``next_offset`` value and the continuation call.
 
         Raises
         ------

@@ -192,6 +192,50 @@ class TestBrowserLaunchOptions:
             # (DownloadManager handles it instead)
             assert "downloads_path" not in options
 
+    def test_launch_options_new_headless_active(self):
+        """stealth+headless=True redirects to full Chromium binary via headless=False + --headless=new."""
+        browser = Browser(headless=True, stealth=True)
+        options = browser._get_launch_options()
+
+        # Playwright must receive headless=False to use the full chromium binary
+        assert options["headless"] is False
+        # The actual headless behaviour comes from --headless=new in args
+        assert "--headless=new" in options["args"]
+        assert "--hide-scrollbars" in options["args"]
+        assert "--mute-audio" in options["args"]
+
+    def test_launch_options_new_headless_disabled_by_config(self):
+        """use_new_headless=False restores chromium-headless-shell behaviour."""
+        from bridgic.browser.session import StealthConfig
+        browser = Browser(headless=True, stealth=StealthConfig(use_new_headless=False))
+        options = browser._get_launch_options()
+
+        assert options["headless"] is True
+        assert "--headless=new" not in options.get("args", [])
+
+    def test_launch_options_system_chrome_not_redirected(self):
+        """System Chrome (channel set) is NOT redirected to new headless mode."""
+        browser = Browser(headless=True, stealth=True, channel="chrome")
+        options = browser._get_launch_options()
+
+        assert options["headless"] is True
+        assert "--headless=new" not in options.get("args", [])
+
+    def test_launch_options_headless_false_unchanged(self):
+        """headless=False with stealth does NOT add --headless=new."""
+        browser = Browser(headless=False, stealth=True)
+        options = browser._get_launch_options()
+
+        assert options["headless"] is False
+        assert "--headless=new" not in options.get("args", [])
+
+    def test_launch_options_stealth_disabled_headless_unchanged(self):
+        """stealth=False leaves headless setting unchanged."""
+        browser = Browser(headless=True, stealth=False)
+        options = browser._get_launch_options()
+
+        assert options["headless"] is True
+
 
 class TestBrowserContextOptions:
     """Tests for Browser context options generation."""
@@ -211,6 +255,16 @@ class TestBrowserContextOptions:
         assert "viewport" not in options
         assert options["no_viewport"] is True
 
+    def test_context_options_stealth_no_viewport_has_screen_fallback(self):
+        """stealth=True + no_viewport=True: screen falls back to 1600×900 (window.screen spoof)."""
+        browser = Browser(stealth=True, no_viewport=True)
+        options = browser._get_context_options()
+
+        assert "viewport" not in options
+        assert options["no_viewport"] is True
+        # Even with no_viewport, stealth must set a screen size for window.screen spoofing
+        assert options["screen"] == {"width": 1600, "height": 900}
+
     def test_context_options_with_stealth(self):
         """Test context options include stealth settings."""
         browser = Browser(stealth=True)
@@ -219,6 +273,14 @@ class TestBrowserContextOptions:
         assert "permissions" in options
         assert "accept_downloads" in options
         assert "screen" in options  # Stealth adds screen to match viewport
+        assert options["screen"] == {"width": 1600, "height": 900}  # default viewport
+
+    def test_context_options_stealth_screen_matches_custom_viewport(self):
+        """stealth=True with custom viewport: screen must mirror viewport dimensions."""
+        browser = Browser(stealth=True, viewport={"width": 1280, "height": 720})
+        options = browser._get_context_options()
+
+        assert options["screen"] == {"width": 1280, "height": 720}
 
     def test_context_options_user_agent(self):
         """Test context options with custom user agent."""
@@ -542,6 +604,24 @@ class TestBrowserStartStop:
                 for warning in browser._last_shutdown_errors
             )
 
+    @pytest.mark.asyncio
+    async def test_ensure_started_recovers_from_inconsistent_state(self, mock_playwright, mock_context, mock_page):
+        """_ensure_started() resets cleanly when _playwright is set but _context is None."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            # Simulate inconsistent state: playwright alive, context lost
+            browser._context = None
+
+            # _ensure_started should detect the inconsistency, close, and restart
+            await browser._ensure_started()
+
+            assert browser._playwright is not None
+            assert browser._context is not None
+
 
 class TestBrowserNavigation:
     """Tests for Browser navigation methods."""
@@ -665,6 +745,19 @@ class TestBrowserPageManagement:
             title = await browser.get_current_page_title()
 
             assert title == "Example Page"
+
+    @pytest.mark.asyncio
+    async def test_new_tab_raises_when_browser_not_started(self):
+        """new_tab() raises StateError(BROWSER_NOT_STARTED) when called before navigate_to()."""
+        from bridgic.browser.errors import StateError
+
+        browser = Browser(stealth=False)
+        assert browser._playwright is None
+
+        with pytest.raises(StateError) as exc_info:
+            await browser.new_tab()
+
+        assert exc_info.value.code == "BROWSER_NOT_STARTED"
 
 
 class TestBrowserRefResolution:

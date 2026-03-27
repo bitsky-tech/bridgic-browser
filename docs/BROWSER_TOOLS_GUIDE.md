@@ -35,7 +35,7 @@ This guide helps you choose the right tools for different browser automation sce
 
 ### Truncation and pagination
 
-When the full tree exceeds `limit`, the tool returns a segment and appends a notice like:
+When the full tree exceeds `limit`, the tool returns a segment and prepends a notice (before the page content, right after the page header) like:
 
 ```
 [notice] Current page text is too long, returned portion starting from character 0 (this segment length 10000 / total length 45000 characters). To continue getting subsequent content: call get_snapshot_text(offset=10000, limit=10000, interactive=False, full_page=True)
@@ -48,7 +48,7 @@ Use the given `offset` in the next call to continue reading.
 ```python
 # First call – get initial page state
 state = await browser.get_snapshot_text()
-# If state ends with [notice] and next_offset=10000:
+# If state contains [notice] (shown before page content) with next_offset=10000:
 # state_more = await browser.get_snapshot_text(offset=10000)
 
 # Only interactive elements (good for "what can I click?")
