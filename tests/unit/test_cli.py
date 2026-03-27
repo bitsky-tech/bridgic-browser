@@ -315,13 +315,15 @@ class TestSectionedGroupHelp:
         result = invoke_raw(["-h"])
         assert result.exit_code == 0
         assert "Usage:" in result.output
-        assert "[OPTIONS]" not in result.output
+        assert "-V" in result.output
+        assert "--version" in result.output
 
     def test_help_longhand_on_group(self):
         result = invoke_raw(["--help"])
         assert result.exit_code == 0
         assert "Usage:" in result.output
-        assert "[OPTIONS]" not in result.output
+        assert "-V" in result.output
+        assert "--version" in result.output
 
     def test_h_shorthand_on_subcommand(self):
         result = invoke_raw(["open", "-h"])
