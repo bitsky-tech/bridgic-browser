@@ -12,7 +12,7 @@
 - **基于 Python 的工具** — 用于智能体 / 工作流代码生成；更易与 [Bridgic](https://github.com/bitsky-tech/bridgic) 集成
 - **语义不变的快照** — 基于无障碍树与专门设计的 ref 生成算法，保证元素 ref 在页面重载后仍可对应同一元素
 - **Skills** — 用于引导探索与代码生成；兼容多数编程类智能体
-- **隐身模式（默认开启）** — 50+ Chrome 参数与优化，降低被识别为机器人的概率
+- **隐身模式（默认开启）** — 模式感知反检测策略：headless 模式使用 50+ Chrome 参数 + JS 补丁；headed 模式仅使用 ~11 个最小 flag，与真实 Chrome 指纹一致
 - **双启动模式** — 自动在隔离会话与持久化上下文之间切换
 - **嵌套 iframe 支持** — 支持在多层嵌套 iframe 内对 DOM 元素进行操作
 
@@ -513,10 +513,9 @@ for file in browser.download_manager.downloaded_files:
 
 隐身模式**默认启用**，包括：
 
-- 50+ Chrome 参数，降低自动化检测
-- 关闭易暴露自动化的特性（`navigator.webdriver` 等）
-- 更接近真人的浏览器指纹
-- 非无头模式下可选用扩展（uBlock Origin Lite、I still don't care about cookies、Force Background Tab）
+- **Headless 模式**：50+ Chrome 参数 + JS init script，修补 `navigator.webdriver`、`window.chrome`、WebGL、`document.hasFocus()`、`visibilityState` 等。所有被修补的函数均通过 `Function.prototype.toString` 欺骗返回 `[native code]`。
+- **Headed 模式**：仅使用 ~11 个最小 flag（与真实 Chrome 一致），完全跳过 JS 补丁注入，确保 Cloudflare Turnstile 等第三方 challenge iframe 看到未经修改的原生 API。
+- Headed 模式下可选用扩展（uBlock Origin Lite、I don't care about cookies、Force Background Tab）
 
 ```python
 # 隐身默认开启

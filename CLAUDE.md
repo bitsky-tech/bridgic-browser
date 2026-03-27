@@ -146,16 +146,35 @@ System Chrome (v137+) removed `--load-extension` CLI support, so extensions only
 **JS init script** (`_STEALTH_INIT_SCRIPT_TEMPLATE` in `_stealth.py`) — **headless mode only**. Skipped entirely in headed mode (`self._headless=False`) because `context.add_init_script()` runs in ALL frames including Cloudflare Turnstile's challenge iframe; patching `window.chrome` (`configurable:false`), `navigator.permissions.query`, and WebGL prototype inside the iframe causes detectable API inconsistencies that fail the challenge. Playwright CLI injects nothing and passes Turnstile; bridgic matches that behaviour in headed mode.
 
 When active (headless mode), patches these navigator/window properties before any page script runs:
-- `navigator.webdriver` → `undefined`
+
+**Anti-toString-detection (`_mkNative` framework)**:
+All patched functions are registered in a `WeakSet` (`_nativeFns`) via `_mkNative(fn, name)`. `Function.prototype.toString` is itself intercepted to return `"function foo() { [native code] }"` for any registered function. This closes the entire class of "call `.toString()` on a function to detect monkey-patching" attacks used by DataDome, PerimeterX, and Cloudflare bot detectors.
+
+```javascript
+const _nativeFns = new WeakSet();
+const _nativeFnNames = new WeakMap();
+const _mkNative = (fn, name) => { _nativeFns.add(fn); _nativeFnNames.set(fn, name); return fn; };
+Function.prototype.toString = _mkNative(function toString() {
+  if (_nativeFns.has(this)) return `function ${_nativeFnNames.get(this) ?? this.name}() { [native code] }`;
+  return _origFnToString.call(this);
+}, 'toString');
+```
+
+**Patched properties**:
+- `navigator.webdriver` → **conditionally** `undefined`; checks `Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver')` first and patches the prototype descriptor. Falls back to instance property only if the prototype has no descriptor but the value is non-undefined. Avoids creating an own-property (which makes `'webdriver' in navigator` = true — detectable in real Chrome where the property is absent).
 - `navigator.plugins` / `navigator.mimeTypes` → realistic PDF Viewer entries (5 plugins, 2 MIME types); each plugin holds its own per-plugin mime copies so `enabledPlugin` refs are correct
 - `navigator.languages` → derived from `Browser(locale=...)` to keep `navigator.language === navigator.languages[0]` (e.g. `["zh-CN", "zh", "en"]` for `locale="zh-CN"`); defaults to `["en-US", "en"]`
-- `window.chrome` → complete object with `runtime`, `csi()`, `loadTimes()`
-- `navigator.permissions.query` → returns `"default"` for notifications (not `"denied"`)
+- `window.chrome` → complete object with `runtime`, `csi()`, `loadTimes()` (all wrapped with `_mkNative`)
+- `navigator.permissions.query` → returns `"default"` for notifications (not `"denied"`); wrapped with `_mkNative`
 - `window.outerWidth/Height` → matches `innerWidth/Height` when zero (guard for edge cases; with `--headless=new` + `screen` context option these are already correctly set by Chrome)
 - `navigator.deviceMemory` → `8` (headless environments may return `undefined`)
 - `navigator.hardwareConcurrency` → `8` when value is 0 or 1 (headless may report fewer cores)
 - `navigator.connection` → `{ effectiveType: '4g', downlink: 10, rtt: 100, saveData: false }` when absent
-- `WebGLRenderingContext` / `WebGL2RenderingContext` → `getParameter(37445/37446)` **conditionally** returns `'Intel Inc.'` / `'Intel Iris OpenGL Engine'` only when the real vendor contains `'Google'` or `'SwiftShader'` (masks SwiftShader which is a well-known bot signal). On headed Apple Silicon Mac the real `'Apple Inc.'` value is preserved so the WebGL fingerprint stays consistent with DPI, Canvas, and font rendering signals.
+- `WebGLRenderingContext` / `WebGL2RenderingContext` → `getParameter(37445/37446)` **conditionally** returns `'Intel Inc.'` / `'Intel Iris OpenGL Engine'` only when the real vendor contains `'Google'` or `'SwiftShader'` (masks SwiftShader which is a well-known bot signal). On headed Apple Silicon Mac the real `'Apple Inc.'` value is preserved so the WebGL fingerprint stays consistent with DPI, Canvas, and font rendering signals. `getParameter` is wrapped with `_mkNative`.
+- `document.hasFocus()` → always returns `true` (headless tabs return `false` by default; Cloudflare and DataDome probe this); wrapped with `_mkNative`
+- `document.hidden` → always `false` (via `Object.defineProperty`)
+- `document.visibilityState` → always `'visible'` (via `Object.defineProperty`); headless tabs default to `'hidden'` which is a strong bot signal
+- `Notification.permission` → guarded: only patched if `Notification` exists and its permission is `'denied'`; returns `'default'`
 
 `get_init_script(locale=None)` accepts the locale and performs the `__BRIDGIC_LANGS__` substitution before returning the script. Called from `_browser.py:_start()` with `self._locale` only when `self._headless=True`.
 
@@ -184,6 +203,10 @@ Key implementation details:
 - **`_client.py`**: `send_command()` auto-starts the daemon if no socket exists. `_spawn_daemon()` uses `select.select()` + `os.read()` for the 30-second ready timeout (avoids blocking `proc.stdout.read()`). `start_if_needed=False` prevents auto-start for the `close` command.
 - **`_daemon.py`**: `run_daemon()` calls `_build_browser_kwargs()` then creates a `Browser(**kwargs)` instance (lazy start — Playwright does **not** launch immediately), writes `BRIDGIC_DAEMON_READY` to stdout, and serves one JSON command per connection. The browser's Playwright process starts on the first command that calls `_ensure_started()` (e.g. `navigate_to`). `asyncio.wait_for(reader.readline(), timeout=60)` prevents hanging on idle connections. Signal handling uses `loop.add_signal_handler()` (asyncio-safe).
 - **`_commands.py`**: 67 Click commands in 15 sections via `SectionedGroup`. `scroll` uses `--dy`/`--dx` options (not positional) to support negative values. `screenshot`/`pdf`/`upload`/`storage-save`/`storage-load`/`trace-stop` call `os.path.abspath()` on the client side before sending (daemon cwd may differ). `snapshot` supports `-i`/`--interactive`, `-f/-F`/`--full-page/--no-full-page`, `-o`/`--offset` (default 0), and `-l`/`--limit` (default 10000); it delegates to `browser.get_snapshot_text()` (which adds truncation/pagination).
+  - **`wait`**: argument is named `SECONDS_OR_TEXT`. When the argument parses as a float it always takes the time-wait path (`wait_seconds`); when it is a string it takes the text-wait path (`text` or `text_gone` with `--gone`). The `--gone` flag is **only** meaningful with a string argument — a numeric argument with `--gone` is ignored (number always → time). Unit is **seconds**, not milliseconds. This is documented explicitly in the command docstring and in `_cli_catalog.py` to prevent LLM confusion.
+  - **`type`**: docstring explicitly states the text goes into the **currently focused element** and that the user must `click` or `focus` the target first.
+  - **`mouse-move` / `mouse-click` / `mouse-drag`**: coordinates are **viewport pixels from the top-left corner**; documented in both docstrings and `_cli_catalog.py`.
+  - **`eval-on`**: CODE must be an arrow function or named function that receives the element as its argument (e.g. `"(el) => el.textContent"`); this calling convention is documented in the docstring with examples.
 - **`_build_browser_kwargs()`** priority chain (lowest → highest): defaults → `~/.bridgic/bridgic-browser.json` → `./bridgic-browser.json` → `BRIDGIC_BROWSER_JSON` env var. The `--headed` CLI flag merges `{"headless": false}` into `BRIDGIC_BROWSER_JSON` before spawning the daemon.
 - **`close` command fast-path**: the daemon calls `browser.inspect_pending_close_artifacts()` to pre-allocate a session dir and trace path, responds to the client immediately with those paths, then sets `stop_event`. Actual `browser.close()` runs after the client disconnects. After close, `_write_close_report()` writes `~/.bridgic/tmp/close-<timestamp>-<rand>/close-report.json` with status, artifact paths, and any errors.
 - **Daemon cleanup ownership guard**: after `browser.close()` finishes, `run_daemon()` reads the run-info file and compares its `pid` field to `os.getpid()` before calling `transport.cleanup()` / `remove_run_info()`. This prevents the outgoing daemon from deleting the new daemon's socket when a `close` is followed immediately by a new command (which starts a new daemon before the old one's shutdown completes). If the run-info is gone (`None`) the old daemon is still the owner and cleans up normally.

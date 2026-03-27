@@ -113,19 +113,20 @@ This model is the foundation of all correspondence in this guide.
   - `-F` -> `full_page=False`
   - `-o N` -> `offset=N`
   - `-l N` -> `limit=N`
-- `wait`:
-  - `wait 2.5` -> `wait_for(time_seconds=2.5)`
+- `wait` (**unit is SECONDS, not milliseconds**):
+  - `wait 2.5` -> `wait_for(time_seconds=2.5)` — numeric argument always takes the time path; `--gone` is ignored
   - `wait "Done"` -> `wait_for(text="Done")`
-  - `wait --gone "Loading"` -> `wait_for(text_gone="Loading")`
+  - `wait --gone "Loading"` -> `wait_for(text_gone="Loading")` — `--gone` only works with a text argument
   - SDK-only (no CLI equivalent): `wait_for(selector=".spinner", state="hidden", timeout=10.0)`
 - `fill REF TEXT [--submit]` -> `input_text_by_ref(ref, text, submit=False)`
   - SDK-only params: `clear=True` (clear field before typing), `is_secret=False` (mask value in logs), `slowly=False` (type char-by-char with key events)
 - `scroll --dy Y --dx X` -> `mouse_wheel(delta_x=X, delta_y=Y)`
-- `mouse-click X Y --button right --count 2` -> `mouse_click(X, Y, button="right", click_count=2)`
+- `mouse-click X Y` / `mouse-move X Y` / `mouse-drag X1 Y1 X2 Y2` — **coordinates are viewport pixels from the top-left corner**
+  - `mouse-click X Y --button right --count 2` -> `mouse_click(X, Y, button="right", click_count=2)`
+  - `mouse-drag X1 Y1 X2 Y2` -> `mouse_drag(X1, Y1, X2, Y2)` (positional only; params named `start_x, start_y, end_x, end_y`)
 - `fill-form '<json>'`:
   - CLI passes JSON string.
   - SDK uses parsed list: `fill_form(fields=[{"ref":"1f79fe5e","value":"..."}], submit=False)`
-- `mouse-drag X1 Y1 X2 Y2` -> `mouse_drag(X1, Y1, X2, Y2)` (positional only; params named `start_x, start_y, end_x, end_y`)
 - `dialog --dismiss --text T` -> `handle_dialog(accept=False, prompt_text=T)`
 - `dialog-setup --action dismiss --text T` -> `setup_dialog_handler(default_action="dismiss", default_prompt_text=T)`
 - `verify-visible ROLE NAME --timeout 5.0` -> `verify_element_visible(role=ROLE, accessible_name=NAME, timeout=5.0)`
@@ -136,6 +137,10 @@ This model is the foundation of all correspondence in this guide.
 - `pdf path.pdf` -> `save_pdf(filename="path.pdf")`
   - SDK-only params: `display_header_footer`, `print_background`, `scale`, `paper_width`, `paper_height`, `margin_top`, `margin_bottom`, `margin_left`, `margin_right`, `landscape`
 - `video-stop path.webm` -> `stop_video(filename="path.webm")`
+- `type TEXT [--submit]` -> `type_text(text, submit=False)` — **requires a focused element**; call `focus_element_by_ref` or `click_element_by_ref` on the target before `type`
+- `eval-on REF CODE` -> `evaluate_javascript_on_ref(ref, code)` — **CODE must be an arrow or named function** that accepts the element:
+  - `"(el) => el.textContent"` ✓
+  - `"el.textContent"` ✗ (not a function, will throw)
 
 ## CLI-First -> SDK Code Generation Workflow
 

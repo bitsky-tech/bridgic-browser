@@ -87,10 +87,10 @@ await browser.click_element_by_ref("8d4b03a9")
 
 ### When to Use Coordinate-based Tools
 
-**Coordinate-based tools** use pixel positions:
+**Coordinate-based tools** use pixel positions measured from the **top-left corner of the browser viewport**:
 
 ```python
-# Click at specific coordinates
+# Click at specific coordinates (x=500px from left, y=300px from top)
 await browser.mouse_click(x=500, y=300)
 
 # Drag from one point to another
@@ -151,10 +151,13 @@ await browser.input_text_by_ref("d6a530b4", "search query", slowly=True)
 For typing at the current focus position:
 
 ```python
+# Must focus the target element first
+await browser.focus_element_by_ref("d6a530b4")
 await browser.type_text("hello world")
 ```
 
-- Types at cursor position (no ref needed)
+- **Requires a focused element** — call `focus_element_by_ref` or `click_element_by_ref` on the target first
+- Types at cursor position (no ref needed for `type_text` itself)
 - Triggers all keyboard events
 - Good for search boxes with autocomplete
 - Can add `submit=True` to press Enter after

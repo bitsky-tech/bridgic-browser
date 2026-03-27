@@ -368,7 +368,10 @@ def cmd_press(key: str) -> None:
 @click.option("--submit", is_flag=True, default=False,
               help="Press Enter after typing.")
 def cmd_type(text: str, submit: bool) -> None:
-    """Type text character-by-character (triggers keyboard events)."""
+    """Type TEXT into the currently focused element, character-by-character (triggers keyboard events).
+
+    Use 'click' or 'focus' first to focus the target element before typing.
+    """
     try:
         _ok(send_command("type_text", {"text": text, "submit": submit}, start_if_needed=False))
     except Exception as exc:
@@ -412,7 +415,7 @@ def cmd_scroll(dy: float, dx: float) -> None:
 @click.argument("x", type=float)
 @click.argument("y", type=float)
 def cmd_mouse_move(x: float, y: float) -> None:
-    """Move the mouse to coordinates (X, Y)."""
+    """Move the mouse to (X, Y) — viewport pixels from the top-left corner."""
     try:
         _ok(send_command("mouse_move", {"x": x, "y": y}, start_if_needed=False))
     except Exception as exc:
@@ -427,7 +430,7 @@ def cmd_mouse_move(x: float, y: float) -> None:
               help="Mouse button (default: left).")
 @click.option("--count", default=1, type=int, help="Number of clicks (default: 1).")
 def cmd_mouse_click(x: float, y: float, button: str, count: int) -> None:
-    """Click the mouse at coordinates (X, Y)."""
+    """Click the mouse at (X, Y) — viewport pixels from the top-left corner."""
     try:
         _ok(send_command("mouse_click", {"x": x, "y": y, "button": button, "count": count}, start_if_needed=False))
     except Exception as exc:
@@ -440,7 +443,7 @@ def cmd_mouse_click(x: float, y: float, button: str, count: int) -> None:
 @click.argument("x2", type=float)
 @click.argument("y2", type=float)
 def cmd_mouse_drag(x1: float, y1: float, x2: float, y2: float) -> None:
-    """Drag the mouse from (X1, Y1) to (X2, Y2)."""
+    """Drag the mouse from (X1, Y1) to (X2, Y2) — viewport pixels from the top-left corner."""
     try:
         _ok(send_command("mouse_drag", {"x1": x1, "y1": y1, "x2": x2, "y2": y2}, start_if_needed=False))
     except Exception as exc:
@@ -474,31 +477,37 @@ def cmd_mouse_up(button: str) -> None:
 # ── Wait ──────────────────────────────────────────────────────────────────────
 
 @cli.command("wait", context_settings=CONTEXT_SETTINGS)
-@click.argument("value")
+@click.argument("seconds_or_text")
 @click.option("--gone", is_flag=True, default=False,
-              help="Wait for VALUE text to disappear instead of appear.")
-def cmd_wait(value: str, gone: bool) -> None:
-    """Wait for SECONDS or until TEXT appears or disappears.
+              help="Wait for SECONDS_OR_TEXT to disappear instead of appear.")
+def cmd_wait(seconds_or_text: str, gone: bool) -> None:
+    """Wait for N seconds (float) or until TEXT appears/disappears.
 
     \b
-    If VALUE is a number, wait that many seconds (max 60).
-    Otherwise, wait until VALUE text appears on the page.
-    With --gone, wait until VALUE text disappears.
+    SECONDS_OR_TEXT:
+      If a number  → wait exactly that many seconds (e.g. 2, 0.5). Max 60.
+                     NOTE: unit is SECONDS, not milliseconds.
+                     --gone is ignored when a number is given.
+      If text      → wait until that text appears on the page.
+                     Add --gone to wait until it disappears instead.
 
     \b
     Examples:
-        bridgic-browser wait 3          # wait 3 seconds
-        bridgic-browser wait "Submit"   # wait for text to appear
+        bridgic-browser wait 2                 # wait 2 seconds  (NOT 2000!)
+        bridgic-browser wait 0.5               # wait 500 ms
+        bridgic-browser wait "Submit"          # wait for text to appear
         bridgic-browser wait --gone "Loading"  # wait for text to disappear
     """
+    value = seconds_or_text
     try:
-        # Try to parse as a number for time-based wait
+        # Try to parse as a number for time-based wait.
+        # --gone is irrelevant for numeric waits (no text to watch for).
         try:
             seconds = float(value)
         except ValueError:
             seconds = None
 
-        if seconds is not None and not gone:
+        if seconds is not None:
             _ok(send_command("wait", {"seconds": seconds}, start_if_needed=False))
         elif gone:
             _ok(send_command("wait", {"text_gone": value}, start_if_needed=False))
@@ -831,7 +840,12 @@ def cmd_eval(code: str) -> None:
 @click.argument("ref")
 @click.argument("code")
 def cmd_eval_on(ref: str, code: str) -> None:
-    """Evaluate JavaScript with a REF element as the argument."""
+    """Evaluate JavaScript CODE with the REF element passed as the first argument.
+
+    CODE must be an arrow function or named function that accepts the element:
+      bridgic-browser eval-on @abc123 "(el) => el.textContent"
+      bridgic-browser eval-on @abc123 "(el) => el.getBoundingClientRect()"
+    """
     try:
         _ok(send_command("eval_on", {"ref": _strip_ref(ref), "code": code}, start_if_needed=False))
     except Exception as exc:

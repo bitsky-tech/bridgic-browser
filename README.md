@@ -12,7 +12,7 @@
 - **Python-based Tools** - Used for agent / workflow code generation; Easier integration with [Bridgic](https://github.com/bitsky-tech/bridgic) 
 - **Snapshot with Semantic Invariance** - A representation of page snapshot based on accessibility tree and a specially designed ref-generation algorithm that ensures element refs remain unchanged across page reloads
 - **Skills** - Used for guided exploration and code generation; Compatible with most of coding agents
-- **Stealth Mode (Enabled by Default)** - 50+ Chrome args and optimizations to bypass bot detection
+- **Stealth Mode (Enabled by Default)** - Mode-aware anti-detection: 50+ Chrome args + JS patches in headless mode; minimal ~11 flags in headed mode to match real Chrome fingerprint
 - **Dual Launch Mode** - Automatically switches between isolated sessions and persistent contexts
 - **Nested iframe Support** - Supports DOM element operations within multi-level nested iframes
 
@@ -514,10 +514,9 @@ for file in browser.download_manager.downloaded_files:
 
 Stealth mode is **enabled by default** and includes:
 
-- 50+ Chrome arguments to disable automation detection
-- Disabled automation-revealing features (`navigator.webdriver`, etc.)
-- Human-like browser fingerprint
-- Optional extensions (uBlock Origin Lite, I still don't care about cookies, Force Background Tab) for non-headless mode
+- **Headless mode**: 50+ Chrome args + JS init script patching `navigator.webdriver`, `window.chrome`, WebGL, `document.hasFocus()`, `visibilityState`, and more. All patched functions spoof `Function.prototype.toString` to return `[native code]`.
+- **Headed mode**: minimal ~11 flags only (matching real Chrome); JS patches are skipped entirely so third-party challenge iframes (e.g. Cloudflare Turnstile) see unmodified native APIs.
+- Optional extensions (uBlock Origin Lite, I don't care about cookies, Force Background Tab) for headed mode
 
 ```python
 # Stealth is ON by default
