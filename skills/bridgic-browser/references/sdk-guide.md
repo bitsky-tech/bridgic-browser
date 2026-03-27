@@ -17,8 +17,9 @@ Use this guide when the output should be Python automation code (`bridgic.browse
 ## Installation and Imports
 
 ```bash
-pip install bridgic-browser
-playwright install chromium
+uv init --bare
+uv add bridgic-browser
+uv run playwright install chromium
 ```
 
 ```python
