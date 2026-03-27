@@ -1,0 +1,235 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"     # e.g. git tag v0.0.2 && git push origin v0.0.2
+  workflow_dispatch:   # Manual trigger (testpypi validation or emergency pypi)
+    inputs:
+      version:
+        description: "Version (e.g. 0.0.2 or 0.0.3rc1)"
+        required: true
+      repo:
+        description: "Target repo"
+        required: true
+        default: "testpypi"
+        type: choice
+        options:
+          - testpypi
+          - pypi
+
+permissions:
+  contents: write       # gh release create
+  pull-requests: write  # gh pr create
+
+jobs:
+  # ── Resolve version + target repo ──────────────────────────────────────────
+  setup:
+    name: Setup
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+      repo: ${{ steps.vars.outputs.repo }}
+    steps:
+      - name: Determine version and target repo
+        id: vars
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REPO: ${{ inputs.repo }}
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"   # strip leading "v": v0.0.2 → 0.0.2
+            REPO="pypi"
+          else
+            VERSION="$INPUT_VERSION"
+            REPO="$INPUT_REPO"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO"       >> "$GITHUB_OUTPUT"
+          echo "Resolved: version=$VERSION  repo=$REPO"
+
+  # ── Validate version ────────────────────────────────────────────────────────
+  validate-version:
+    name: Validate Version
+    runs-on: ubuntu-22.04
+    needs: setup
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check version format (PEP 440)
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+          REPO: ${{ needs.setup.outputs.repo }}
+        run: python3 scripts/version_check.py --version "$VERSION" --repo "$REPO" --package bridgic-browser
+
+      - name: Verify branch is main (workflow_dispatch + pypi only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TARGET_REPO: ${{ needs.setup.outputs.repo }}
+        run: |
+          if [[ "$TARGET_REPO" == "pypi" && "$GITHUB_REF_NAME" != "main" ]]; then
+            echo "❌ PyPI releases via workflow_dispatch must be triggered from 'main' (current: $GITHUB_REF_NAME)"
+            exit 1
+          fi
+
+      - name: Verify tag matches pyproject.toml (tag push only)
+        if: github.event_name == 'push'
+        env:
+          TAG_VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          PYPROJECT_VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          if [[ "$PYPROJECT_VERSION" != "$TAG_VERSION" ]]; then
+            echo "❌ Tag version ($TAG_VERSION) does not match pyproject.toml ($PYPROJECT_VERSION)"
+            echo "   Update pyproject.toml on the release branch before tagging."
+            exit 1
+          fi
+          echo "✅ Version match: $PYPROJECT_VERSION"
+
+  # ── Unit tests ──────────────────────────────────────────────────────────────
+  run-tests:
+    name: Run Tests
+    runs-on: ubuntu-22.04
+    needs: validate-version
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Cache uv dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-py3.11-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-py3.11-
+
+      - run: uv sync --group dev
+      - run: uv run playwright install chromium
+      - run: uv run pytest tests/ --tb=short -q -m "not integration"
+
+  # ── Build wheel + sdist ─────────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-22.04
+    needs: run-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - run: uv build
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # ── Publish to PyPI (requires "production" environment approval) ─────────────
+  publish-pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-22.04
+    needs: [setup, build]
+    if: needs.setup.outputs.repo == 'pypi'
+    environment: production
+    steps:
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        run: uv publish dist/*
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
+
+  # ── Publish to TestPyPI (no approval required) ──────────────────────────────
+  publish-testpypi:
+    name: Publish to TestPyPI
+    runs-on: ubuntu-22.04
+    needs: [setup, build]
+    if: needs.setup.outputs.repo == 'testpypi'
+    steps:
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to TestPyPI
+        run: uv publish --publish-url https://test.pypi.org/legacy/ dist/*
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.TESTPYPI_TOKEN }}
+
+  # ── Create GitHub Release (tag push + pypi only) ────────────────────────────
+  create-github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-22.04
+    needs: [setup, publish-pypi]
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          gh release create "v${VERSION}" dist/* \
+            --title "v${VERSION}" \
+            --generate-notes
+
+  # ── Open main→dev sync PR (tag push + pypi only) ────────────────────────────
+  open-sync-pr:
+    name: Open main→dev sync PR
+    runs-on: ubuntu-22.04
+    needs: [setup, publish-pypi]
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Open sync PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          EXISTING=$(gh pr list --base dev --head main --json number --jq '.[0].number // empty')
+          if [[ -n "$EXISTING" ]]; then
+            echo "Sync PR #${EXISTING} already exists, skipping."
+          else
+            gh pr create \
+              --base dev \
+              --head main \
+              --title "chore: sync main→dev after v${VERSION}" \
+              --body "Automated sync PR after releasing \`v${VERSION}\` to PyPI. Please review and merge to keep \`dev\` up to date."
+          fi
