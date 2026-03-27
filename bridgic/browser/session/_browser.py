@@ -666,7 +666,12 @@ class Browser:
             viewport = self._viewport or fallback_viewport
             viewport_width = viewport.get("width", 1600)
             viewport_height = viewport.get("height", 900)
-            stealth_args = self._stealth_builder.build_args(viewport_width, viewport_height, hide_window=self._headless)
+            stealth_args = self._stealth_builder.build_args(
+                viewport_width,
+                viewport_height,
+                headless_intent=self._headless,
+                locale=self._locale,
+            )
             args_list.extend(stealth_args)
 
             # Add extension args if applicable
@@ -901,8 +906,16 @@ class Browser:
                 logger.debug(f"Context options: {context_options}")
                 self._context = await self._browser.new_context(**context_options)
 
-            # Inject JS stealth patches before any page script runs
-            if self._stealth_builder:
+            # Inject JS stealth patches before any page script runs.
+            # Headed mode (self._headless=False) skips the init script entirely
+            # so Cloudflare Turnstile's challenge iframe sees original, unmodified
+            # browser APIs — the same as playwright CLI (which injects nothing).
+            # context.add_init_script() runs in ALL frames including challenge
+            # iframes; patching window.chrome (configurable:false),
+            # navigator.permissions.query, and WebGL prototype inside the
+            # Turnstile iframe causes detectable API inconsistencies that fail
+            # the challenge even when the browser binary is fine.
+            if self._stealth_builder and self._headless:
                 init_script = self._stealth_builder.get_init_script(locale=self._locale)
                 if init_script:
                     await self._context.add_init_script(init_script)
@@ -925,11 +938,11 @@ class Browser:
                 f"Playwright started (persistent_context={self.use_persistent_context}, "
                 f"stealth={self.stealth_enabled})"
             )
-        except Exception:
+        except BaseException:
             logger.exception("Failed to start browser; rolling back partial startup state")
             try:
                 await self.close()
-            except Exception:
+            except BaseException:
                 logger.exception("Failed to roll back browser startup state")
             raise
 
@@ -1075,6 +1088,11 @@ class Browser:
         errors: List[str] = []
         shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
         context_key: Optional[str] = None
+        # Deferred re-raise: if CancelledError / KeyboardInterrupt arrives during any
+        # cleanup await we record it here, finish ALL cleanup steps, then re-raise at
+        # the very end.  This ensures no Playwright/Chromium process is left orphaned
+        # just because one step was interrupted.
+        _pending_cancel: Optional[BaseException] = None
 
         # Auto-stop active tracing before context/page teardown so trace data is saved.
         if self._context:
@@ -1114,6 +1132,15 @@ class Browser:
                         except Exception as cleanup_exc:
                             errors.append(f"tracing.tmp_cleanup: {cleanup_exc}")
                     errors.append(f"tracing.stop: {e}")
+                except BaseException as e:
+                    if output_path and os.path.exists(output_path):
+                        try:
+                            os.remove(output_path)
+                        except Exception as cleanup_exc:
+                            errors.append(f"tracing.tmp_cleanup: {cleanup_exc}")
+                    errors.append(f"tracing.stop: {e}")
+                    if _pending_cancel is None:
+                        _pending_cancel = e
                 finally:
                     self._tracing_state[context_key] = False
 
@@ -1178,13 +1205,16 @@ class Browser:
 
         # Close page (with timeout to guard against hung beforeunload handlers)
         if self._page:
+            _page = self._page
+            self._page = None
             try:
                 await asyncio.wait_for(
-                    self._page.close(), timeout=self._PAGE_CLOSE_TIMEOUT,
+                    _page.close(), timeout=self._PAGE_CLOSE_TIMEOUT,
                 )
-            except Exception as e:
+            except BaseException as e:
                 errors.append(f"page.close: {e}")
-            self._page = None
+                if not isinstance(e, Exception) and _pending_cancel is None:
+                    _pending_cancel = e
 
         # Detach download manager before context closes to remove handlers
         if self._download_manager and self._context:
@@ -1203,15 +1233,19 @@ class Browser:
                         extra_page.close(run_before_unload=False),
                         timeout=self._PAGE_CLOSE_TIMEOUT,
                     )
-                except Exception:
-                    pass  # best-effort; context.close() will handle it
+                except BaseException as e:
+                    if not isinstance(e, Exception) and _pending_cancel is None:
+                        _pending_cancel = e
+                    # best-effort; context.close() will handle remaining pages
 
         # Close context
         # NOTE: In persistent context mode, closing context will auto close browser
         if self._context:
+            _context = self._context
+            self._context = None
             try:
                 await asyncio.wait_for(
-                    self._context.close(),
+                    _context.close(),
                     timeout=self._CONTEXT_CLOSE_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -1220,14 +1254,19 @@ class Browser:
                 )
             except Exception as e:
                 errors.append(f"context.close: {e}")
-            self._context = None
+            except BaseException as e:
+                errors.append(f"context.close: {e}")
+                if _pending_cancel is None:
+                    _pending_cancel = e
 
         # Close browser (only needed in normal launch mode, not persistent context)
         # In persistent context mode, browser is None or already closed
         if self._browser:
+            _browser = self._browser
+            self._browser = None
             try:
                 await asyncio.wait_for(
-                    self._browser.close(),
+                    _browser.close(),
                     timeout=self._BROWSER_CLOSE_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -1236,13 +1275,18 @@ class Browser:
                 )
             except Exception as e:
                 errors.append(f"browser.close: {e}")
-            self._browser = None
+            except BaseException as e:
+                errors.append(f"browser.close: {e}")
+                if _pending_cancel is None:
+                    _pending_cancel = e
 
         # Stop playwright
         if self._playwright:
+            _playwright = self._playwright
+            self._playwright = None
             try:
                 await asyncio.wait_for(
-                    self._playwright.stop(),
+                    _playwright.stop(),
                     timeout=self._PLAYWRIGHT_STOP_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -1251,7 +1295,10 @@ class Browser:
                 )
             except Exception as e:
                 errors.append(f"playwright.stop: {e}")
-            self._playwright = None
+            except BaseException as e:
+                errors.append(f"playwright.stop: {e}")
+                if _pending_cancel is None:
+                    _pending_cancel = e
 
         # Clean up temporary user data directory in a thread so the synchronous
         # shutil.rmtree (potentially large cache trees) does not block the loop.
@@ -1265,8 +1312,10 @@ class Browser:
                     None, lambda: shutil.rmtree(tmp_dir, ignore_errors=True),
                 )
                 logger.debug(f"Cleaned up temporary user data dir: {tmp_dir}")
-            except Exception as e:
+            except BaseException as e:
                 errors.append(f"temp_dir cleanup: {e}")
+                if not isinstance(e, Exception) and _pending_cancel is None:
+                    _pending_cancel = e
 
         # Clear snapshot cache
         self._last_snapshot = None
@@ -1308,6 +1357,9 @@ class Browser:
             logger.warning(f"Browser closed with errors: {errors}")
         else:
             logger.info("Browser closed")
+
+        if _pending_cancel is not None:
+            raise _pending_cancel
 
         return result
 

@@ -7,7 +7,9 @@ from pathlib import Path
 from bridgic.browser.session import StealthConfig, StealthArgsBuilder, create_stealth_config
 from bridgic.browser.session._stealth import (
     CHROME_STEALTH_ARGS,
+    CHROME_STEALTH_ARGS_HEADED,
     CHROME_DISABLED_COMPONENTS,
+    CHROME_DISABLED_COMPONENTS_HEADED,
     CHROME_DOCKER_ARGS,
     CHROME_DISABLE_SECURITY_ARGS,
     CHROME_IGNORE_DEFAULT_ARGS,
@@ -358,31 +360,31 @@ class TestNewHeadlessMode:
         assert config.use_new_headless is False
 
     def test_build_args_headless_new_in_headless_mode(self):
-        """--headless=new and companion args appear when headless=True and use_new_headless=True."""
+        """--headless=new and companion args appear when headless_intent=True and use_new_headless=True."""
         builder = StealthArgsBuilder(StealthConfig(use_new_headless=True))
-        args = builder.build_args(hide_window=True)
+        args = builder.build_args(headless_intent=True)
         assert "--headless=new" in args
         assert "--hide-scrollbars" in args
         assert "--mute-audio" in args
         assert any("blink-settings" in a for a in args)
 
     def test_build_args_no_headless_new_when_headed(self):
-        """--headless=new must NOT appear when headless=False."""
+        """--headless=new must NOT appear when headless_intent=False."""
         builder = StealthArgsBuilder(StealthConfig(use_new_headless=True))
-        args = builder.build_args(hide_window=False)
+        args = builder.build_args(headless_intent=False)
         assert "--headless=new" not in args
 
     def test_build_args_no_headless_new_when_disabled(self):
         """--headless=new must NOT appear when use_new_headless=False."""
         builder = StealthArgsBuilder(StealthConfig(use_new_headless=False))
-        args = builder.build_args(hide_window=True)
+        args = builder.build_args(headless_intent=True)
         assert "--headless=new" not in args
 
-    def test_build_args_default_headless_param_is_true(self):
-        """Default headless param is True so existing callers get --headless=new."""
+    def test_build_args_default_headless_intent_is_true(self):
+        """Default headless_intent=True so existing callers get --headless=new."""
         builder = StealthArgsBuilder(StealthConfig(use_new_headless=True))
         args_default = builder.build_args()
-        args_explicit = builder.build_args(hide_window=True)
+        args_explicit = builder.build_args(headless_intent=True)
         assert args_default == args_explicit
 
 
@@ -428,6 +430,172 @@ class TestInitScriptPatches:
         assert "37446" in script  # UNMASKED_RENDERER_WEBGL
         assert "Intel Inc." in script
         assert "Intel Iris OpenGL Engine" in script
+
+    def test_init_script_webgl_conditional_spoof(self):
+        """WebGL spoof must be conditional — only fires for SwiftShader/Google GPU."""
+        script = StealthArgsBuilder(StealthConfig()).get_init_script()
+        # Conditional check must be present
+        assert "_val.includes('Google')" in script
+        assert "_val.includes('SwiftShader')" in script
+        # Unconditional return must NOT be present (would break headed Apple Silicon)
+        assert "if (parameter === 37445) return 'Intel Inc.';" not in script
+        assert "if (parameter === 37446) return 'Intel Iris OpenGL Engine';" not in script
+
+    def test_init_script_fn_tostring_spoofing(self):
+        """_mkNative / Function.prototype.toString spoofing must be present and first."""
+        script = StealthArgsBuilder(StealthConfig()).get_init_script()
+        # Framework must be present
+        assert "_mkNative" in script
+        assert "_nativeFns" in script
+        assert "Function.prototype.toString" in script
+        assert "[native code]" in script
+        # getParameter must be registered as native
+        assert "_mkNative(function getParameter" in script
+        # permissions.query must be registered as native
+        assert "_mkNative(function query" in script
+        # _mkNative setup must appear before any usage (i.e. before navigator.webdriver)
+        mk_pos = script.index("const _mkNative")
+        wd_pos = script.index("navigator.webdriver")
+        assert mk_pos < wd_pos, "_mkNative must be defined before first usage"
+
+    def test_init_script_document_hasfocus(self):
+        """document.hasFocus must be patched to return true in headless."""
+        script = StealthArgsBuilder(StealthConfig()).get_init_script()
+        assert "document.hasFocus" in script
+        assert "_mkNative(function hasFocus" in script
+
+    def test_init_script_document_visibility(self):
+        """document.hidden and visibilityState must be patched."""
+        script = StealthArgsBuilder(StealthConfig()).get_init_script()
+        assert "defineProperty(document, 'hidden'" in script
+        assert "defineProperty(document, 'visibilityState'" in script
+        assert "'visible'" in script
+
+    def test_init_script_notification_permission(self):
+        """Notification.permission guard must be present."""
+        script = StealthArgsBuilder(StealthConfig()).get_init_script()
+        assert "Notification.permission" in script
+        assert "'default'" in script
+
+    def test_init_script_webdriver_conditional(self):
+        """navigator.webdriver must check the prototype first, not override unconditionally."""
+        script = StealthArgsBuilder(StealthConfig()).get_init_script()
+        # Must check the prototype descriptor before patching — avoids creating
+        # a detectable own-property on navigator where real Chrome has none
+        assert "Navigator.prototype, 'webdriver'" in script
+        assert "getOwnPropertyDescriptor" in script
+        # The unconditional one-liner form must not be present (that's the old broken form)
+        assert "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });" not in script
+
+
+class TestHeadedModeArgs:
+    """Tests for headed mode (headless_intent=False) Chrome args."""
+
+    def test_headed_excludes_background_networking(self):
+        """--disable-background-networking must NOT appear in headed mode."""
+        builder = StealthArgsBuilder(StealthConfig())
+        args = builder.build_args(headless_intent=False)
+        assert "--disable-background-networking" not in args
+
+    def test_headed_excludes_renderer_backgrounding(self):
+        builder = StealthArgsBuilder(StealthConfig())
+        args = builder.build_args(headless_intent=False)
+        assert "--disable-renderer-backgrounding" not in args
+
+    def test_headed_excludes_component_update(self):
+        builder = StealthArgsBuilder(StealthConfig())
+        args = builder.build_args(headless_intent=False)
+        assert "--disable-component-update" not in args
+
+    def test_headed_excludes_sync(self):
+        builder = StealthArgsBuilder(StealthConfig())
+        args = builder.build_args(headless_intent=False)
+        assert "--disable-sync" not in args
+
+    def test_headed_excludes_domain_reliability(self):
+        builder = StealthArgsBuilder(StealthConfig())
+        args = builder.build_args(headless_intent=False)
+        assert "--disable-domain-reliability" not in args
+
+    def test_headed_excludes_field_trial_config(self):
+        builder = StealthArgsBuilder(StealthConfig())
+        args = builder.build_args(headless_intent=False)
+        assert "--disable-field-trial-config" not in args
+
+    def test_headed_excludes_metrics_recording(self):
+        builder = StealthArgsBuilder(StealthConfig())
+        args = builder.build_args(headless_intent=False)
+        assert "--metrics-recording-only" not in args
+
+    def test_headed_includes_automation_controlled(self):
+        """AutomationControlled must remain in headed mode."""
+        builder = StealthArgsBuilder(StealthConfig())
+        args = builder.build_args(headless_intent=False)
+        assert "--disable-blink-features=AutomationControlled" in args
+
+    def test_headed_no_headless_new(self):
+        """headed mode must never add --headless=new even with use_new_headless=True."""
+        builder = StealthArgsBuilder(StealthConfig(use_new_headless=True))
+        args = builder.build_args(headless_intent=False)
+        assert "--headless=new" not in args
+
+    def test_headed_disable_features_minimal(self):
+        """Headed mode --disable-features= must not contain heavy user-facing features."""
+        builder = StealthArgsBuilder(StealthConfig())
+        args = builder.build_args(headless_intent=False)
+        df_args = [a for a in args if a.startswith("--disable-features=")]
+        assert len(df_args) == 1
+        assert "AutomationControlled" in df_args[0]
+        # These are real user features; disabling them is detectable
+        assert "HttpsUpgrades" not in df_args[0]
+        assert "MediaRouter" not in df_args[0]
+        assert "Translate" not in df_args[0]
+
+    def test_headed_lang_from_locale(self):
+        """--lang arg must reflect the passed locale in headed mode."""
+        builder = StealthArgsBuilder(StealthConfig())
+        args = builder.build_args(headless_intent=False, locale="zh-CN")
+        assert "--lang=zh-CN" in args
+
+    def test_headed_lang_normalises_underscore(self):
+        builder = StealthArgsBuilder(StealthConfig())
+        args = builder.build_args(headless_intent=False, locale="zh_CN")
+        assert "--lang=zh-CN" in args
+
+    def test_headed_lang_default_en_us(self):
+        """--lang defaults to en-US when no locale passed in headed mode."""
+        builder = StealthArgsBuilder(StealthConfig())
+        args = builder.build_args(headless_intent=False, locale=None)
+        assert "--lang=en-US" in args
+
+    def test_headless_still_has_full_flags(self):
+        """headless_intent=True (default) should still contain all original flags."""
+        builder = StealthArgsBuilder(StealthConfig())
+        args = builder.build_args(headless_intent=True)
+        assert "--disable-background-networking" in args
+        assert "--disable-component-update" in args
+        assert "--disable-sync" in args
+
+    def test_default_headless_intent_backward_compat(self):
+        """build_args() with no headless_intent arg defaults to headless=True behaviour."""
+        builder = StealthArgsBuilder(StealthConfig())
+        args_default = builder.build_args()
+        args_explicit = builder.build_args(headless_intent=True)
+        assert args_default == args_explicit
+
+    def test_headed_fewer_args_than_headless(self):
+        """Headed mode should produce significantly fewer args than headless mode."""
+        builder = StealthArgsBuilder(StealthConfig())
+        headed_args = builder.build_args(headless_intent=False)
+        headless_args = builder.build_args(headless_intent=True)
+        assert len(headed_args) < len(headless_args)
+
+    def test_headed_constants_exported(self):
+        """New headed constants are importable and contain expected values."""
+        assert len(CHROME_STEALTH_ARGS_HEADED) >= 5
+        assert "--disable-blink-features=AutomationControlled" in CHROME_STEALTH_ARGS_HEADED
+        assert len(CHROME_DISABLED_COMPONENTS_HEADED) >= 1
+        assert "AutomationControlled" in CHROME_DISABLED_COMPONENTS_HEADED
 
 
 class TestCreateStealthConfig:

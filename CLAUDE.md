@@ -112,7 +112,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 
 ### Stealth
 
-`StealthConfig` (default enabled) applies 50+ Chrome arguments to evade bot detection, plus a JS init script injected into every page via `context.add_init_script()`.
+`StealthConfig` (default enabled) applies Chrome arguments and a JS init script to evade bot detection. The strategy is **mode-aware**: headless mode uses a full 50+ flag set; headed mode uses a minimal ~11 flag set to match real Chrome user behavior.
 
 Key options:
 - `enable_extensions=True` requires user's `headless=False` — Chrome does not load extensions in any headless mode (`--headless` or `--headless=new`)
@@ -132,7 +132,9 @@ Key distinction:
 - `Browser._headless` — **user's intent** (hide the window?)
 - `options["headless"]` passed to Playwright — **binary selection** (which binary to pick?)
 
-`StealthArgsBuilder.build_args(hide_window=True)` injects `--headless=new`, `--hide-scrollbars`, `--mute-audio`, and `--blink-settings=...` explicitly (these are normally injected by Playwright when `headless=True`, but since we pass `headless=False`, we add them manually).
+`StealthArgsBuilder.build_args(headless_intent=True, locale=None)`:
+- `headless_intent=True` (default, headless mode): uses `CHROME_STEALTH_ARGS` (50+ flags) + `CHROME_DISABLED_COMPONENTS` (28 features). Injects `--headless=new`, `--hide-scrollbars`, `--mute-audio`, and `--blink-settings=...` explicitly (Playwright normally adds these when `headless=True`, but since we pass `headless=False`, we add them manually).
+- `headless_intent=False` (headed mode): uses `CHROME_STEALTH_ARGS_HEADED` (~11 flags) + `CHROME_DISABLED_COMPONENTS_HEADED` (3 features). Uses `--lang={locale}` (not hardcoded `en-US`). Never adds `--headless=new`. Goal: fingerprint indistinguishable from a real Chrome user — excessive disable-* flags in headed mode create a detectable anomaly and can break Cloudflare Turnstile's AJAX challenge requests.
 
 This redirect is skipped when:
 - `StealthConfig.use_new_headless=False` (opt-out to restore old headless-shell)
@@ -141,7 +143,9 @@ This redirect is skipped when:
 **System Chrome vs extensions trade-off**:
 System Chrome (v137+) removed `--load-extension` CLI support, so extensions only work with Playwright's bundled "Chrome for Testing" (the default). The CLI daemon does NOT auto-switch to system Chrome — it uses Playwright's default browser to keep extensions working. Users who explicitly set `channel="chrome"` or `executable_path` in config get the system Chrome Dock icon but lose extension loading. With system Chrome, the new-headless-mode redirect is also skipped; Playwright's `headless=True` is passed directly.
 
-**JS init script** (`_STEALTH_INIT_SCRIPT_TEMPLATE` in `_stealth.py`) patches these navigator/window properties before any page script runs:
+**JS init script** (`_STEALTH_INIT_SCRIPT_TEMPLATE` in `_stealth.py`) — **headless mode only**. Skipped entirely in headed mode (`self._headless=False`) because `context.add_init_script()` runs in ALL frames including Cloudflare Turnstile's challenge iframe; patching `window.chrome` (`configurable:false`), `navigator.permissions.query`, and WebGL prototype inside the iframe causes detectable API inconsistencies that fail the challenge. Playwright CLI injects nothing and passes Turnstile; bridgic matches that behaviour in headed mode.
+
+When active (headless mode), patches these navigator/window properties before any page script runs:
 - `navigator.webdriver` → `undefined`
 - `navigator.plugins` / `navigator.mimeTypes` → realistic PDF Viewer entries (5 plugins, 2 MIME types); each plugin holds its own per-plugin mime copies so `enabledPlugin` refs are correct
 - `navigator.languages` → derived from `Browser(locale=...)` to keep `navigator.language === navigator.languages[0]` (e.g. `["zh-CN", "zh", "en"]` for `locale="zh-CN"`); defaults to `["en-US", "en"]`
@@ -151,9 +155,9 @@ System Chrome (v137+) removed `--load-extension` CLI support, so extensions only
 - `navigator.deviceMemory` → `8` (headless environments may return `undefined`)
 - `navigator.hardwareConcurrency` → `8` when value is 0 or 1 (headless may report fewer cores)
 - `navigator.connection` → `{ effectiveType: '4g', downlink: 10, rtt: 100, saveData: false }` when absent
-- `WebGLRenderingContext` / `WebGL2RenderingContext` → `getParameter(37445)` returns `'Intel Inc.'`, `getParameter(37446)` returns `'Intel Iris OpenGL Engine'` (masks SwiftShader which is a well-known bot signal)
+- `WebGLRenderingContext` / `WebGL2RenderingContext` → `getParameter(37445/37446)` **conditionally** returns `'Intel Inc.'` / `'Intel Iris OpenGL Engine'` only when the real vendor contains `'Google'` or `'SwiftShader'` (masks SwiftShader which is a well-known bot signal). On headed Apple Silicon Mac the real `'Apple Inc.'` value is preserved so the WebGL fingerprint stays consistent with DPI, Canvas, and font rendering signals.
 
-`get_init_script(locale=None)` accepts the locale and performs the `__BRIDGIC_LANGS__` substitution before returning the script. Called from `_browser.py:_start()` with `self._locale`.
+`get_init_script(locale=None)` accepts the locale and performs the `__BRIDGIC_LANGS__` substitution before returning the script. Called from `_browser.py:_start()` with `self._locale` only when `self._headless=True`.
 
 **Extensions** (headed mode only, all MV3):
 - uBlock Origin Lite — content/ad blocking

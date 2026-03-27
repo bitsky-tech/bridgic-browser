@@ -245,10 +245,14 @@ class TestControlTools:
 
     @pytest.mark.asyncio
     async def test_close(self):
-        """close() kills the browser instance (separate browser to avoid fixture conflict)."""
+        """close() shuts down a started browser (separate instance to avoid fixture conflict)."""
         b = Browser(headless=True, stealth=False, viewport={"width": 800, "height": 600})
+        await b._start()
         result = await b.close()
-        assert "close" in result.lower() or "browser" in result.lower() or result
+        assert "closed" in result.lower()
+        # Verify idempotent: second close on an already-stopped instance returns immediately
+        result2 = await b.close()
+        assert "closed" in result2.lower()
 
 # ==================== 4. Action Tools (13 tools) ====================
 

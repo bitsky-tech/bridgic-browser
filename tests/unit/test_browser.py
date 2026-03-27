@@ -374,6 +374,28 @@ class TestBrowserStartStop:
             mock_playwright.stop.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_headed_mode_skips_init_script(self, mock_playwright):
+        """In headed mode (headless=False) add_init_script must NOT be called."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(headless=False)  # headed mode, stealth enabled by default
+            await browser._start()
+
+            mock_playwright.chromium.launch.return_value.new_context.return_value.add_init_script.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_headless_mode_injects_init_script(self, mock_playwright):
+        """In headless mode (headless=True) add_init_script must be called."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(headless=True)  # headless mode, stealth enabled by default
+            await browser._start()
+
+            mock_playwright.chromium.launch.return_value.new_context.return_value.add_init_script.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_kill_cleanup(self, mock_playwright, mock_context, mock_page):
         """Test that stop cleans up all resources."""
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
