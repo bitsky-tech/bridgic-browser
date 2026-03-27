@@ -25,6 +25,7 @@ from .._constants import BRIDGIC_HOME
 from ..errors import BridgicBrowserError, InvalidInputError
 from ._transport import (
     get_transport,
+    read_run_info,
     write_run_info,
     remove_run_info,
 )
@@ -107,7 +108,8 @@ async def _handle_search(browser: "Browser", args: Dict[str, Any]) -> str:
 
 async def _handle_snapshot(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.get_snapshot_text(
-        start_from_char=args.get("start_from_char", 0),
+        offset=args.get("offset", 0),
+        limit=args.get("limit", 10000),
         interactive=args.get("interactive", False),
         full_page=args.get("full_page", True),
         from_cli=True,
@@ -452,7 +454,7 @@ async def _handle_video_stop(browser: "Browser", args: Dict[str, Any]) -> str:
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 async def _handle_close(browser: "Browser", _args: Dict[str, Any]) -> str:
-    return await browser.stop()
+    return await browser.close()
 
 
 async def _handle_resize(browser: "Browser", args: Dict[str, Any]) -> str:
@@ -727,7 +729,7 @@ def _write_close_report(
     artifacts = getattr(browser, "_last_shutdown_artifacts", {})
     errors = list(getattr(browser, "_last_shutdown_errors", []))
     if timed_out:
-        errors.append(f"browser.stop() timed out after {_DAEMON_STOP_TIMEOUT:.0f}s")
+        errors.append(f"browser.close() timed out after {_DAEMON_STOP_TIMEOUT:.0f}s")
     if stop_exc is not None:
         errors.append(str(stop_exc))
 
@@ -759,7 +761,6 @@ def _build_browser_kwargs() -> Dict[str, Any]:
       2. ~/.bridgic/bridgic-browser.json  — user persistent config
       3. ./bridgic-browser.json           — project-local config
       4. BRIDGIC_BROWSER_JSON env var     — runtime override (full JSON)
-      5. BRIDGIC_HEADLESS env var         — backward-compatible single override
     """
     kwargs: Dict[str, Any] = {"headless": True}
 
@@ -787,11 +788,7 @@ def _build_browser_kwargs() -> Dict[str, Any]:
         except Exception:
             logger.warning("[daemon] failed to parse BRIDGIC_BROWSER_JSON: %s", raw)
 
-    # 4. BRIDGIC_HEADLESS env var — backward-compatible single override
-    if "BRIDGIC_HEADLESS" in os.environ:
-        kwargs["headless"] = os.environ["BRIDGIC_HEADLESS"] != "0"
-
-    # 5. Headed-mode defaults.
+    # 4. Headed-mode defaults.
     #    Playwright's bundled "Chrome for Testing" supports --load-extension so
     #    extensions (uBlock, cookie consent, …) load correctly.  System Chrome
     #    v137+ removed that flag, so we do NOT auto-switch to executable_path.
@@ -812,8 +809,7 @@ async def run_daemon() -> None:
 
     kwargs = _build_browser_kwargs()
     browser = Browser(**kwargs)
-    await browser.start()
-    logger.info("[daemon] browser started (kwargs=%s)", {k: v for k, v in kwargs.items() if k != "proxy"})
+    logger.info("[daemon] browser ready (lazy start, kwargs=%s)", {k: v for k, v in kwargs.items() if k != "proxy"})
 
     stop_event = asyncio.Event()
     transport = get_transport()
@@ -841,18 +837,37 @@ async def run_daemon() -> None:
     _stop_timed_out = False
     _stop_exc: Optional[Exception] = None
     try:
-        await asyncio.wait_for(browser.stop(), timeout=_DAEMON_STOP_TIMEOUT)
+        await asyncio.wait_for(browser.close(), timeout=_DAEMON_STOP_TIMEOUT)
     except asyncio.TimeoutError:
         _stop_timed_out = True
-        logger.error("[daemon] browser.stop() timed out after %.0fs", _DAEMON_STOP_TIMEOUT)
+        logger.error("[daemon] browser.close() timed out after %.0fs", _DAEMON_STOP_TIMEOUT)
     except Exception as exc:
         _stop_exc = exc
-        logger.exception("[daemon] browser.stop() failed during shutdown")
+        logger.exception("[daemon] browser.close() failed during shutdown")
 
     _write_close_report(browser, timed_out=_stop_timed_out, stop_exc=_stop_exc)
 
-    transport.cleanup()
-    remove_run_info()
+    # Only clean up the socket and run-info if this daemon is still the owner.
+    # Primary race: `close` responds immediately and a new daemon can start
+    # (write_run_info + bind socket) before browser.close() finishes here.
+    # If we blindly call cleanup/remove_run_info we would delete the new
+    # daemon's socket file and run-info, causing the next command to spawn
+    # yet another daemon (with no page) and return NO_BROWSER_SESSION.
+    #
+    # Residual micro-race: there is a tiny window between read_run_info() and
+    # transport.cleanup() where a new daemon could start and write its run-info.
+    # This window is measured in microseconds (vs. the primary race which spans
+    # the entire browser.close() call — often seconds).  Eliminating it would
+    # require OS-level atomic file locking; the practical risk is negligible.
+    current_info = read_run_info()
+    if current_info is None or current_info.get("pid") == os.getpid():
+        transport.cleanup()
+        remove_run_info()
+    else:
+        logger.info(
+            "[daemon] skipping cleanup — run info belongs to pid=%s (ours=%d)",
+            current_info.get("pid"), os.getpid(),
+        )
 
 
 DAEMON_LOG_PATH = BRIDGIC_HOME / "logs" / "daemon.log"

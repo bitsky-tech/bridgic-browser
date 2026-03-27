@@ -192,6 +192,50 @@ class TestBrowserLaunchOptions:
             # (DownloadManager handles it instead)
             assert "downloads_path" not in options
 
+    def test_launch_options_new_headless_active(self):
+        """stealth+headless=True redirects to full Chromium binary via headless=False + --headless=new."""
+        browser = Browser(headless=True, stealth=True)
+        options = browser._get_launch_options()
+
+        # Playwright must receive headless=False to use the full chromium binary
+        assert options["headless"] is False
+        # The actual headless behaviour comes from --headless=new in args
+        assert "--headless=new" in options["args"]
+        assert "--hide-scrollbars" in options["args"]
+        assert "--mute-audio" in options["args"]
+
+    def test_launch_options_new_headless_disabled_by_config(self):
+        """use_new_headless=False restores chromium-headless-shell behaviour."""
+        from bridgic.browser.session import StealthConfig
+        browser = Browser(headless=True, stealth=StealthConfig(use_new_headless=False))
+        options = browser._get_launch_options()
+
+        assert options["headless"] is True
+        assert "--headless=new" not in options.get("args", [])
+
+    def test_launch_options_system_chrome_not_redirected(self):
+        """System Chrome (channel set) is NOT redirected to new headless mode."""
+        browser = Browser(headless=True, stealth=True, channel="chrome")
+        options = browser._get_launch_options()
+
+        assert options["headless"] is True
+        assert "--headless=new" not in options.get("args", [])
+
+    def test_launch_options_headless_false_unchanged(self):
+        """headless=False with stealth does NOT add --headless=new."""
+        browser = Browser(headless=False, stealth=True)
+        options = browser._get_launch_options()
+
+        assert options["headless"] is False
+        assert "--headless=new" not in options.get("args", [])
+
+    def test_launch_options_stealth_disabled_headless_unchanged(self):
+        """stealth=False leaves headless setting unchanged."""
+        browser = Browser(headless=True, stealth=False)
+        options = browser._get_launch_options()
+
+        assert options["headless"] is True
+
 
 class TestBrowserContextOptions:
     """Tests for Browser context options generation."""
@@ -211,6 +255,16 @@ class TestBrowserContextOptions:
         assert "viewport" not in options
         assert options["no_viewport"] is True
 
+    def test_context_options_stealth_no_viewport_has_screen_fallback(self):
+        """stealth=True + no_viewport=True: screen falls back to 1600×900 (window.screen spoof)."""
+        browser = Browser(stealth=True, no_viewport=True)
+        options = browser._get_context_options()
+
+        assert "viewport" not in options
+        assert options["no_viewport"] is True
+        # Even with no_viewport, stealth must set a screen size for window.screen spoofing
+        assert options["screen"] == {"width": 1600, "height": 900}
+
     def test_context_options_with_stealth(self):
         """Test context options include stealth settings."""
         browser = Browser(stealth=True)
@@ -219,6 +273,14 @@ class TestBrowserContextOptions:
         assert "permissions" in options
         assert "accept_downloads" in options
         assert "screen" in options  # Stealth adds screen to match viewport
+        assert options["screen"] == {"width": 1600, "height": 900}  # default viewport
+
+    def test_context_options_stealth_screen_matches_custom_viewport(self):
+        """stealth=True with custom viewport: screen must mirror viewport dimensions."""
+        browser = Browser(stealth=True, viewport={"width": 1280, "height": 720})
+        options = browser._get_context_options()
+
+        assert options["screen"] == {"width": 1280, "height": 720}
 
     def test_context_options_user_agent(self):
         """Test context options with custom user agent."""
@@ -261,7 +323,7 @@ class TestBrowserStartStop:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(stealth=False)
-            await browser.start()
+            await browser._start()
 
             assert browser._playwright is not None
             assert browser._context is not None
@@ -275,7 +337,7 @@ class TestBrowserStartStop:
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 browser = Browser(user_data_dir=tmpdir, stealth=False)
-                await browser.start()
+                await browser._start()
 
                 mock_playwright.chromium.launch_persistent_context.assert_called_once()
 
@@ -286,10 +348,10 @@ class TestBrowserStartStop:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(stealth=False)
-            await browser.start()
+            await browser._start()
 
             # Second start should just return
-            await browser.start()
+            await browser._start()
 
             # launch should only be called once
             assert mock_playwright.chromium.launch.call_count == 1
@@ -303,7 +365,7 @@ class TestBrowserStartStop:
 
             browser = Browser(stealth=False)
             with pytest.raises(RuntimeError, match="launch failed"):
-                await browser.start()
+                await browser._start()
 
             assert browser._playwright is None
             assert browser._browser is None
@@ -312,14 +374,36 @@ class TestBrowserStartStop:
             mock_playwright.stop.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_headed_mode_skips_init_script(self, mock_playwright):
+        """In headed mode (headless=False) add_init_script must NOT be called."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(headless=False)  # headed mode, stealth enabled by default
+            await browser._start()
+
+            mock_playwright.chromium.launch.return_value.new_context.return_value.add_init_script.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_headless_mode_injects_init_script(self, mock_playwright):
+        """In headless mode (headless=True) add_init_script must be called."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(headless=True)  # headless mode, stealth enabled by default
+            await browser._start()
+
+            mock_playwright.chromium.launch.return_value.new_context.return_value.add_init_script.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_kill_cleanup(self, mock_playwright, mock_context, mock_page):
         """Test that stop cleans up all resources."""
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(stealth=False)
-            await browser.start()
-            await browser.stop()
+            await browser._start()
+            await browser.close()
 
             assert browser._playwright is None
             assert browser._browser is None
@@ -333,12 +417,12 @@ class TestBrowserStartStop:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(headless=False, stealth=True)
-            await browser.start()
+            await browser._start()
 
             # Stealth with extensions creates temp dir
             temp_dir = browser._temp_user_data_dir
 
-            await browser.stop()
+            await browser.close()
 
             assert browser._temp_user_data_dir is None
 
@@ -371,7 +455,7 @@ class TestBrowserStartStop:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(stealth=False)
-            await browser.start()
+            await browser._start()
 
             context = browser._context
             page = browser._page
@@ -391,7 +475,7 @@ class TestBrowserStartStop:
 
             with patch.object(browser_module.tempfile, "mkstemp", return_value=(99, "/tmp/auto_trace.zip")):
                 with patch.object(browser_module.os, "close"):
-                    await browser.stop()
+                    await browser.close()
 
             context.tracing.stop.assert_awaited_once_with(path="/tmp/auto_trace.zip")
             page.close.assert_awaited()
@@ -411,7 +495,7 @@ class TestBrowserStartStop:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(stealth=False)
-            await browser.start()
+            await browser._start()
 
             context = browser._context
             page = browser._page
@@ -431,7 +515,7 @@ class TestBrowserStartStop:
 
             with patch.object(browser_module.tempfile, "mkstemp", return_value=(88, "/tmp/auto_trace_2.zip")):
                 with patch.object(browser_module.os, "close"):
-                    result = await browser.stop()
+                    result = await browser.close()
 
             assert "Browser closed successfully" in result
             assert os.path.abspath("/tmp/auto_trace_2.zip") in result
@@ -446,7 +530,7 @@ class TestBrowserStartStop:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(stealth=False)
-            await browser.start()
+            await browser._start()
 
             context = browser._context
             page = browser._page
@@ -469,7 +553,7 @@ class TestBrowserStartStop:
                 with patch.object(browser_module.os, "close"):
                     with patch.object(browser_module.os.path, "exists", side_effect=_exists):
                         with patch.object(browser_module.os, "remove") as mock_remove:
-                            result = await browser.stop()
+                            result = await browser.close()
 
             mock_remove.assert_called_once_with(temp_trace_path)
             assert "Browser closed with warnings" in result
@@ -484,7 +568,7 @@ class TestBrowserStartStop:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(stealth=False)
-            await browser.start()
+            await browser._start()
 
             context = browser._context
             page = browser._page
@@ -508,7 +592,7 @@ class TestBrowserStartStop:
             browser._console_messages[page_key] = [{"type": "log", "text": "x"}]
             browser._network_requests[page_key] = [{"url": "https://example.com"}]
 
-            await browser.stop()
+            await browser.close()
 
             page.remove_listener.assert_any_call("console", console_handler)
             page.remove_listener.assert_any_call("request", network_handler)
@@ -526,7 +610,7 @@ class TestBrowserStartStop:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(stealth=False)
-            await browser.start()
+            await browser._start()
 
             async def _slow_close():
                 await asyncio.sleep(1.0)
@@ -535,12 +619,30 @@ class TestBrowserStartStop:
             browser._context.close = AsyncMock(side_effect=_slow_close)
             browser._CONTEXT_CLOSE_TIMEOUT = 0.01
 
-            await browser.stop()
+            await browser.close()
 
             assert any(
                 warning.startswith("context.close: timeout after")
                 for warning in browser._last_shutdown_errors
             )
+
+    @pytest.mark.asyncio
+    async def test_ensure_started_recovers_from_inconsistent_state(self, mock_playwright, mock_context, mock_page):
+        """_ensure_started() resets cleanly when _playwright is set but _context is None."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            # Simulate inconsistent state: playwright alive, context lost
+            browser._context = None
+
+            # _ensure_started should detect the inconsistency, close, and restart
+            await browser._ensure_started()
+
+            assert browser._playwright is not None
+            assert browser._context is not None
 
 
 class TestBrowserNavigation:
@@ -553,7 +655,6 @@ class TestBrowserNavigation:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(stealth=False)
-            await browser.start()
             await browser.navigate_to("https://example.com")
 
             mock_page.goto.assert_called_once()
@@ -567,7 +668,6 @@ class TestBrowserNavigation:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(stealth=False)
-            await browser.start()
 
             # Set some cache
             browser._last_snapshot = MagicMock()
@@ -593,7 +693,6 @@ class TestBrowserNavigation:
             mock_page.goto = AsyncMock(side_effect=RuntimeError("boom"))
 
             browser = Browser(stealth=False)
-            await browser.start()
 
             with pytest.raises(OperationError):
                 await browser.navigate_to("https://example.com")
@@ -611,39 +710,23 @@ class TestBrowserSnapshot:
         assert exc_info.value.code == "NO_ACTIVE_PAGE"
 
     @pytest.mark.asyncio
-    async def test_navigate_to_without_context_raises_state_error(self):
-        browser = Browser(stealth=False)
+    async def test_navigate_to_auto_starts_browser(self, mock_playwright, mock_page):
+        """navigate_to lazily starts the browser without an explicit _start() call."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
-        with pytest.raises(StateError) as exc_info:
+            browser = Browser(stealth=False)
+            assert browser._playwright is None
+
             await browser.navigate_to("https://example.com")
-        assert exc_info.value.code == "NO_BROWSER_CONTEXT"
+
+            assert browser._playwright is not None
+            mock_page.goto.assert_called_once()
 
 
 class TestBrowserPageManagement:
     """Tests for Browser page management methods."""
 
-    @pytest.mark.asyncio
-    async def test_new_page(self, mock_playwright, mock_context, mock_page):
-        """Test creating a new page."""
-        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
-            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
-
-            browser = Browser(stealth=False)
-            await browser.start()
-
-            new_page = await browser.new_page()
-
-            mock_context.new_page.assert_called_once()
-            # new_page() returns the Playwright page from context.new_page()
-            assert new_page is mock_page
-
-    @pytest.mark.asyncio
-    async def test_new_page_without_context_raises_state_error(self):
-        browser = Browser(stealth=False)
-
-        with pytest.raises(StateError) as exc_info:
-            await browser.new_page()
-        assert exc_info.value.code == "NO_BROWSER_CONTEXT"
 
     @pytest.mark.asyncio
     async def test_get_pages(self, mock_playwright, mock_context, mock_page):
@@ -652,7 +735,7 @@ class TestBrowserPageManagement:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(stealth=False)
-            await browser.start()
+            await browser._start()
 
             pages = browser.get_pages()
 
@@ -666,7 +749,7 @@ class TestBrowserPageManagement:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(stealth=False)
-            await browser.start()
+            await browser._start()
 
             url = browser.get_current_page_url()
 
@@ -679,11 +762,24 @@ class TestBrowserPageManagement:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(stealth=False)
-            await browser.start()
+            await browser._start()
 
             title = await browser.get_current_page_title()
 
             assert title == "Example Page"
+
+    @pytest.mark.asyncio
+    async def test_new_tab_raises_when_browser_not_started(self):
+        """new_tab() raises StateError(BROWSER_NOT_STARTED) when called before navigate_to()."""
+        from bridgic.browser.errors import StateError
+
+        browser = Browser(stealth=False)
+        assert browser._playwright is None
+
+        with pytest.raises(StateError) as exc_info:
+            await browser.new_tab()
+
+        assert exc_info.value.code == "BROWSER_NOT_STARTED"
 
 
 class TestBrowserRefResolution:
@@ -695,7 +791,7 @@ class TestBrowserRefResolution:
         browser = Browser(stealth=False)
         browser._page = MagicMock()
         browser._last_snapshot = MagicMock(
-            refs={"e7": SimpleNamespace(role="generic", name=None, nth=None)}
+            refs={"e7": SimpleNamespace(role="generic", name=None, nth=None, playwright_ref=None, frame_path=None)}
         )
         browser._snapshot_generator = MagicMock()
 
@@ -721,7 +817,7 @@ class TestBrowserRefResolution:
         browser = Browser(stealth=False)
         browser._page = MagicMock()
         browser._last_snapshot = MagicMock(
-            refs={"e7": SimpleNamespace(role="generic", name=None, nth=None)}
+            refs={"e7": SimpleNamespace(role="generic", name=None, nth=None, playwright_ref=None, frame_path=None)}
         )
         browser._snapshot_generator = MagicMock()
 
@@ -749,7 +845,7 @@ class TestBrowserRefResolution:
         browser._page = MagicMock()
         browser._snapshot_generator = MagicMock()
         browser._last_snapshot = MagicMock(
-            refs={"e7": SimpleNamespace(role="button", name="自动检测", nth=None)}
+            refs={"e7": SimpleNamespace(role="button", name="Automatic detection", nth=None, playwright_ref=None, frame_path=None)}
         )
 
         ambiguous_locator = MagicMock()
@@ -765,7 +861,7 @@ class TestBrowserRefResolution:
         assert result is role_name_locator
         browser._page.get_by_role.assert_called_once_with(
             "button",
-            name="自动检测",
+            name="Automatic detection",
             exact=True,
         )
 
@@ -776,7 +872,7 @@ class TestBrowserRefResolution:
         browser._page = MagicMock()
         browser._snapshot_generator = MagicMock()
         browser._last_snapshot = MagicMock(
-            refs={"e7": SimpleNamespace(role="generic", name="自动检测", nth=None)}
+            refs={"e7": SimpleNamespace(role="generic", name="Automatic detection", nth=None, playwright_ref=None, frame_path=None)}
         )
 
         ambiguous_locator = MagicMock()
@@ -800,7 +896,7 @@ class TestBrowserRefResolution:
         browser._page = MagicMock()
         browser._snapshot_generator = MagicMock()
         browser._last_snapshot = MagicMock(
-            refs={"e7": SimpleNamespace(role="button", name=None, nth=1)}
+            refs={"e7": SimpleNamespace(role="button", name=None, nth=1, playwright_ref=None, frame_path=None)}
         )
 
         ambiguous_locator = MagicMock()
@@ -836,9 +932,9 @@ class TestBrowserChildFallback:
                 parent_ref=None,
             ),
             "e7": RefData(
-                selector='get_by_text("自动检测", exact=True)',
+                selector='get_by_text("Automatic detection", exact=True)',
                 role="generic",
-                name="自动检测",
+                name="Automatic detection",
                 nth=None,
                 text_content=None,
                 parent_ref="e6",
@@ -960,3 +1056,118 @@ class TestBrowserChildFallback:
         result = await browser.get_element_by_ref("e6")
 
         assert result is None
+
+
+class TestGetElementByRefAriaRef:
+    """Tests for the aria-ref O(1) fast-path in get_element_by_ref."""
+
+    def _make_browser_with_ref(self, playwright_ref, frame_path=None):
+        from bridgic.browser.session._snapshot import RefData
+        browser = Browser(stealth=False)
+        browser._page = MagicMock()
+        browser._snapshot_generator = MagicMock()
+        ref_data = RefData(
+            selector="get_by_role('button')",
+            role="button",
+            name="Submit",
+            nth=None,
+            playwright_ref=playwright_ref,
+            frame_path=frame_path,
+        )
+        browser._last_snapshot = MagicMock(refs={"myref": ref_data})
+        return browser
+
+    @pytest.mark.asyncio
+    async def test_aria_ref_fast_path_hit(self):
+        """When aria-ref count=1, return immediately without calling CSS locator."""
+        browser = self._make_browser_with_ref("e369")
+
+        ar_locator = MagicMock()
+        ar_locator.count = AsyncMock(return_value=1)
+        browser._page.locator.return_value = ar_locator
+
+        result = await browser.get_element_by_ref("myref")
+
+        assert result is ar_locator
+        browser._page.locator.assert_called_once_with("aria-ref=e369")
+        browser._snapshot_generator.get_locator_from_ref_async.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_aria_ref_falls_through_on_stale(self):
+        """When aria-ref count=0 (stale), fall through to CSS locator."""
+        browser = self._make_browser_with_ref("e369")
+
+        ar_locator = MagicMock()
+        ar_locator.count = AsyncMock(return_value=0)
+        browser._page.locator.return_value = ar_locator
+
+        css_locator = MagicMock()
+        css_locator.count = AsyncMock(return_value=1)
+        browser._snapshot_generator.get_locator_from_ref_async.return_value = css_locator
+
+        result = await browser.get_element_by_ref("myref")
+
+        assert result is css_locator
+        browser._snapshot_generator.get_locator_from_ref_async.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_aria_ref_falls_through_on_exception(self):
+        """When aria-ref raises, fall through silently — no exception propagates."""
+        browser = self._make_browser_with_ref("e369")
+
+        browser._page.locator.side_effect = Exception("engine not available")
+
+        css_locator = MagicMock()
+        css_locator.count = AsyncMock(return_value=1)
+        browser._snapshot_generator.get_locator_from_ref_async.return_value = css_locator
+
+        result = await browser.get_element_by_ref("myref")
+
+        assert result is css_locator
+
+    @pytest.mark.asyncio
+    async def test_aria_ref_skipped_when_playwright_ref_none(self):
+        """When playwright_ref=None, skip fast-path entirely."""
+        browser = self._make_browser_with_ref(playwright_ref=None)
+
+        css_locator = MagicMock()
+        css_locator.count = AsyncMock(return_value=1)
+        browser._snapshot_generator.get_locator_from_ref_async.return_value = css_locator
+
+        result = await browser.get_element_by_ref("myref")
+
+        assert result is css_locator
+        # page.locator should NOT have been called with aria-ref=...
+        for call in browser._page.locator.call_args_list:
+            assert "aria-ref=" not in str(call)
+
+    @pytest.mark.asyncio
+    async def test_aria_ref_iframe_uses_frame_locator_chain(self):
+        """For iframe elements, aria-ref is scoped via frame_locator chain.
+
+        Each frame stores its own _lastAriaSnapshotForQuery keyed by the full prefixed ref
+        (e.g. L1 stores "f1e99" → element).  Scoping the locator to the correct frame
+        ensures locator.evaluate() runs in the element's own frame context, not main frame.
+        This is critical for the covered-element check: without scoping, evaluate() would
+        run in the main frame where window.parent === window and the check mis-fires.
+        """
+        # Iframe element: playwright_ref has "f1" prefix, frame_path=[0]
+        browser = self._make_browser_with_ref("f1e99", frame_path=[0])
+
+        # Set up the frame_locator chain mock
+        frame_locator_mock = MagicMock()
+        nth_mock = MagicMock()
+        ar_locator = MagicMock()
+        ar_locator.count = AsyncMock(return_value=1)
+
+        browser._page.frame_locator.return_value = frame_locator_mock
+        frame_locator_mock.nth.return_value = nth_mock
+        nth_mock.locator.return_value = ar_locator
+
+        result = await browser.get_element_by_ref("myref")
+
+        assert result is ar_locator
+        # page.frame_locator("iframe") called once for the single frame_path level
+        browser._page.frame_locator.assert_called_once_with("iframe")
+        frame_locator_mock.nth.assert_called_once_with(0)
+        nth_mock.locator.assert_called_once_with("aria-ref=f1e99")

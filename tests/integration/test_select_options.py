@@ -26,9 +26,8 @@ FIXTURE_PATH = Path(__file__).resolve().parent.parent / "fixtures" / "select_opt
 async def browser():
     """Create a headless browser for select/options tests."""
     b = Browser(headless=True, stealth=False, viewport={"width": 1280, "height": 720})
-    await b.start()
     yield b
-    await b.stop()
+    await b.close()
 
 
 async def _open_and_snapshot(browser: Browser):

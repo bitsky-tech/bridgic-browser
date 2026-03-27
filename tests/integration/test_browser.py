@@ -14,9 +14,8 @@ from bridgic.browser.session import Browser
 async def browser_instance():
     """Create a real browser instance for integration tests."""
     browser = Browser(headless=True, stealth=False)
-    await browser.start()
     yield browser
-    await browser.stop()
+    await browser.close()
 
 
 @pytest.mark.integration

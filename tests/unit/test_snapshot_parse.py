@@ -374,6 +374,62 @@ class TestGetLocatorFromRefAsync:
         # .nth() must NOT be called — the stored nth is in a different key space
         filtered_locator.nth.assert_not_called()
 
+    def test_unnamed_generic_named_noise_child_resolves_via_parent_locator(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Unnamed generic with a named STRUCTURAL_NOISE child resolves via child → .locator('..').
+
+        Scenario mirrors a Semantic UI dropdown where the button div is unnamed
+        but contains a named <span class="text">Automatic detection</span>:
+
+            generic [ref=8944f251]:
+              generic "Automatic detection" [ref=5fcfa23c]
+
+        The unnamed parent cannot be targeted by get_by_role('generic') (returns 0).
+        Instead: resolve the named child (which uses CSS + has_text), then climb to
+        the DOM parent via .locator('..').
+        """
+        page = Mock()
+        # Child resolution mocks (named generic "Automatic detection" branch):
+        css_locator = Mock()
+        filtered_child = Mock()
+        parent_locator = Mock()
+        page.locator.return_value = css_locator
+        css_locator.filter.return_value = filtered_child
+        filtered_child.locator.return_value = parent_locator
+
+        refs = {
+            "8944f251": RefData(
+                selector="get_by_role('generic')",
+                role="generic",
+                name=None,
+                nth=None,
+                text_content=None,
+                parent_ref=None,
+            ),
+            "5fcfa23c": RefData(
+                selector='get_by_text("Automatic detection", exact=True)',
+                role="generic",
+                name="Automatic detection",
+                nth=None,  # unique element — no nth disambiguation
+                text_content=None,
+                parent_ref="8944f251",
+            ),
+        }
+
+        locator = gen.get_locator_from_ref_async(page, "8944f251", refs)
+
+        # Child is located inline with STRUCTURAL_NOISE_CSS_NAMED (span-inclusive)
+        page.locator.assert_called_once_with(
+            'div:not([role]), span:not([role]), legend, [role="generic"]'
+        )
+        css_locator.filter.assert_called_once()
+        # .locator('..') must be called on the resolved child to get the DOM parent
+        filtered_child.locator.assert_called_once_with('..')
+        assert locator is parent_locator
+        # nth is NOT applied — parent is anchored via child, not nth-counting
+        parent_locator.nth.assert_not_called()
+
     def test_unnamed_generic_no_text_child_falls_back_to_role(self, gen: SnapshotGenerator) -> None:
         """Unnamed generic with no text children still falls back to get_by_role."""
         page = Mock()
@@ -504,18 +560,18 @@ class TestGetLocatorFromRefAsync:
         page.get_by_text.return_value = text_locator
         refs = {
             "a1b2c3d4": RefData(
-                selector='get_by_text("自动检测", exact=True)',
+                selector='get_by_text("Automatic detection", exact=True)',
                 role="button",
                 name=None,
                 nth=None,
-                text_content="自动检测",
+                text_content="Automatic detection",
             )
         }
 
         locator = gen.get_locator_from_ref_async(page, "a1b2c3d4", refs)
 
         assert locator is text_locator
-        page.get_by_text.assert_called_once_with("自动检测", exact=True)
+        page.get_by_text.assert_called_once_with("Automatic detection", exact=True)
         text_locator.nth.assert_not_called()
 
     def test_bare_text_content_with_explicit_nth_skips_nth(self, gen: SnapshotGenerator) -> None:
@@ -1133,6 +1189,131 @@ class TestProcessPageSnapshotForAI:
 
         assert 'button "File Upload"' in result
 
+    # ------------------------------------------------------------------
+    # TEXT_LEAF_ROLES propagation in interactive mode
+    # ------------------------------------------------------------------
+
+    def test_text_node_under_interactive_parent_shown_in_interactive_mode(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """text pseudo-nodes with no playwright_ref inherit interactivity from
+        the nearest interactive ancestor (cursor=pointer parent).
+
+        Real-world case: dropdown items rendered as
+          <div class="item" @click>QQ</div>
+        produce "- generic [ref=eX] [cursor=pointer]\\n  - text: QQ" in the
+        Playwright snapshot.  Without the fix the text node (no [ref=...]) is
+        always filtered in -i mode; with the fix it is shown.
+        """
+        raw = (
+            '- generic [ref=e1] [cursor=pointer]\n'
+            '  - text: QQ'
+        )
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+        interactive_map = {"e1": True}
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
+
+        assert 'text "QQ"' in result
+
+    def test_text_node_under_non_interactive_parent_hidden_in_interactive_mode(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """text nodes whose direct and indirect ancestors are all non-interactive
+        must NOT appear in -i mode."""
+        raw = (
+            '- heading "Page Title" [ref=e1]\n'
+            '  - text: subtitle'
+        )
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+        # heading is not in INTERACTIVE_ROLES, no cursor=pointer → not kept
+        interactive_map = {"e1": False}
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
+
+        assert 'text "subtitle"' not in result
+        assert 'subtitle' not in result
+
+    def test_text_node_under_span_wrapper_inside_interactive_grandparent(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """A span wrapper between the clickable container and the text node must
+        not break propagation.
+
+        DOM: <div class="item" @click><span>QQ</span></div>
+        Snapshot:
+          - generic [ref=e1] [cursor=pointer]   ← interactive grandparent
+            - generic                            ← unnamed span wrapper, no cursor
+              - text: QQ
+        """
+        raw = (
+            '- generic [ref=e1] [cursor=pointer]\n'
+            '  - generic\n'
+            '    - text: QQ'
+        )
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+        interactive_map = {"e1": True}
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
+
+        assert 'text "QQ"' in result
+
+    def test_multiple_text_children_under_one_interactive_parent(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """All text children of an interactive parent appear in -i mode."""
+        raw = (
+            '- generic [ref=e1] [cursor=pointer]\n'
+            '  - text: 微信\n'
+            '- generic [ref=e2] [cursor=pointer]\n'
+            '  - text: 订单ID'
+        )
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+        interactive_map = {"e1": True, "e2": True}
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
+
+        assert '微信' in result
+        assert '订单ID' in result
+
+    def test_text_node_ref_is_assigned_and_stored(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """A text node kept via parent propagation gets a stable ref stored in refs."""
+        raw = (
+            '- generic [ref=e1] [cursor=pointer]\n'
+            '  - text: QQ'
+        )
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+        interactive_map = {"e1": True}
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
+
+        # At least one ref should be for a text-role node named "QQ"
+        text_ref = next(
+            (ref for ref, rd in refs.items() if rd.role == 'text' and rd.name == 'QQ'),
+            None,
+        )
+        assert text_ref is not None, "Expected a ref for text node 'QQ'"
+        assert f'[ref={text_ref}]' in result
+
+    def test_text_node_not_shown_without_interactive_ancestor(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Top-level text node with no parent at all is not shown in -i mode."""
+        raw = '- text: standalone'
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options)
+
+        assert 'standalone' not in result
+
 
 # ---------------------------------------------------------------------------
 # 4. Name dedup in clean_suffix
@@ -1456,7 +1637,7 @@ class TestExtractAndProcessPipeline:
         """Parent refs are correctly recorded for nested elements."""
         raw = (
             '- generic "Container" [ref=e1] [cursor=pointer]:\n'
-            '  - generic "自动检测" [ref=e2]\n'
+            '  - generic "Automatic detection" [ref=e2]\n'
             '  - generic [ref=e3]'
         )
 
@@ -1464,15 +1645,14 @@ class TestExtractAndProcessPipeline:
 
         container_ref = None
         child_named_ref = None
-        child_unnamed_ref = None
         for ref, data in refs.items():
             if data.name == "Container":
                 container_ref = ref
-            elif data.name == "自动检测":
+            elif data.name == "Automatic detection":
                 child_named_ref = ref
-            elif data.role == "generic" and data.name is None:
-                child_unnamed_ref = ref
 
+        # Unnamed generic elements (e3) are filtered before entering refs —
+        # should_have_ref = bool(name) — so only the named children appear.
         assert container_ref is not None
         assert child_named_ref is not None
         assert refs[container_ref].parent_ref is None
@@ -2376,3 +2556,82 @@ class TestYamlQuoteEndToEnd:
         assert '[ref=e175]' not in result
         assert '[ref=e183]' not in result
         assert '[ref=e4]' not in result
+
+
+# ---------------------------------------------------------------------------
+# playwright_ref storage in RefData (aria-ref fast-path)
+# ---------------------------------------------------------------------------
+
+class TestPlaywrightRefStorage:
+    """Verify that _process_page_snapshot_for_ai stores Playwright's ephemeral
+    aria-ref IDs (e.g. "e369") in RefData.playwright_ref for fast-path lookup."""
+
+    def test_playwright_ref_stored_for_named_element(self, gen: SnapshotGenerator) -> None:
+        """playwright_ref is stored for a regular named interactive element."""
+        raw = "- button \"Submit\" [ref=e1]"
+        refs: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw, refs, SnapshotOptions())
+        assert len(refs) == 1
+        ref_data = next(iter(refs.values()))
+        assert ref_data.playwright_ref == "e1"
+
+    def test_playwright_ref_stored_for_generic_with_name(self, gen: SnapshotGenerator) -> None:
+        """playwright_ref is stored even for structural-noise roles."""
+        raw = "- generic \"Automatic detection\" [ref=e42]"
+        refs: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw, refs, SnapshotOptions())
+        assert len(refs) == 1
+        ref_data = next(iter(refs.values()))
+        assert ref_data.playwright_ref == "e42"
+
+    def test_playwright_ref_is_none_when_no_ref_in_suffix(self, gen: SnapshotGenerator) -> None:
+        """Synthetic input without [ref=...] produces playwright_ref=None."""
+        raw = "- button \"Submit\""
+        refs: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw, refs, SnapshotOptions())
+        assert len(refs) == 1
+        ref_data = next(iter(refs.values()))
+        assert ref_data.playwright_ref is None
+
+    def test_playwright_ref_stored_in_interactive_mode(self, gen: SnapshotGenerator) -> None:
+        """playwright_ref is correctly stored when options.interactive=True."""
+        raw = "- button \"Login\" [ref=e7]"
+        refs: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw, refs, SnapshotOptions(interactive=True))
+        assert len(refs) == 1
+        ref_data = next(iter(refs.values()))
+        assert ref_data.playwright_ref == "e7"
+
+    def test_playwright_ref_stored_for_iframe_child(self, gen: SnapshotGenerator) -> None:
+        """playwright_ref is stored for elements inside iframes."""
+        raw = (
+            "- iframe \"frame\" [ref=e1]\n"
+            "  - button \"Go\" [ref=e2]"
+        )
+        refs: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(raw, refs, SnapshotOptions())
+        btn_data = next(d for d in refs.values() if d.role == "button")
+        assert btn_data.playwright_ref == "e2"
+        assert btn_data.frame_path == [0]
+
+    def test_playwright_ref_stored_for_yaml_quoted_line(self, gen: SnapshotGenerator) -> None:
+        """playwright_ref is correctly extracted from YAML-quoted lines after normalization.
+
+        Playwright emits YAML single-quoted lines when the element name contains
+        special characters (e.g. double quotes).  _normalize_raw_snapshot() strips
+        the outer single quotes before _process_page_snapshot_for_ai() runs, so the
+        [ref=...] suffix must still be captured correctly.
+        """
+        raw = "- 'row \"very long name\" [ref=e175]':"
+        normalized = SnapshotGenerator._normalize_raw_snapshot(raw)
+        refs: Dict[str, RefData] = {}
+        gen._reset_refs()
+        gen._process_page_snapshot_for_ai(normalized, refs, SnapshotOptions())
+        row_data = next((d for d in refs.values() if d.role == "row"), None)
+        assert row_data is not None, "row element should be tracked in refs"
+        assert row_data.playwright_ref == "e175"

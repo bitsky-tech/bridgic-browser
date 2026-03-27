@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Level 2 Frame</title>
+  <style>
+    body { font-family: sans-serif; padding: 10px; background: #fff4e0; }
+  </style>
+</head>
+<body>
+  <h3>Level 2 Frame</h3>
+
+  <button id="l2-btn" data-click-count="0"
+    onclick="this.dataset.clickCount = parseInt(this.dataset.clickCount||0)+1; this.dataset.clicked='true'">
+    Level 2 Button
+  </button>
+  <input type="text" id="l2-input" aria-label="Level 2 Input" placeholder="Level 2 Input">
+
+  <!-- Same name as in main frame and l1 — nth disambiguation test -->
+  <button id="l2-shared-btn" data-click-count="0"
+    onclick="this.dataset.clickCount = parseInt(this.dataset.clickCount||0)+1; this.dataset.clicked='true'">
+    Shared Button
+  </button>
+</body>
+</html>

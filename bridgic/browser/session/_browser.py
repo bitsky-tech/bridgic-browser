@@ -43,7 +43,7 @@ from ..errors import (
 
 logger = logging.getLogger(__name__)
 
-_MAX_CHAR_LIMIT = int(os.environ.get("BRIDGIC_MAX_CHARS", "30000"))
+_DEFAULT_SNAPSHOT_LIMIT = 10000
 
 _LAUNCH_DEBUG_LOG = os.path.expanduser("~/.bridgic/tmp/launch-debug.json")
 
@@ -242,15 +242,17 @@ async def _click_checkable_target(page, locator, bbox) -> None:
         cx = bbox["x"] + bbox["width"] / 2
         cy = bbox["y"] + bbox["height"] / 2
         if not await locator.is_visible():
+            logger.debug("_click_checkable_target: bbox present but is_visible()=False; using dispatch_event click")
             await locator.dispatch_event("click")
             return
 
         covered = await locator.evaluate(
-            f"(el) => {{ if (window.frameElement !== null) return false; "
+            f"(el) => {{ if (window.parent !== window) return false; "
             f"const t = document.elementFromPoint({cx}, {cy}); "
             f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
         )
         if covered:
+            logger.debug("_click_checkable_target: covered at (%.1f, %.1f), clicking intercepting element", cx, cy)
             if page:
                 await page.evaluate(f"document.elementFromPoint({cx}, {cy})?.click()")
             else:
@@ -262,6 +264,7 @@ async def _click_checkable_target(page, locator, bbox) -> None:
     if await locator.is_visible():
         await locator.click()
     else:
+        logger.debug("_click_checkable_target: no bbox and is_visible()=False; using dispatch_event click")
         await locator.dispatch_event("click")
 
 
@@ -571,7 +574,14 @@ class Browser:
 
     @property
     def headless(self) -> bool:
-        """Whether browser runs in headless mode."""
+        """Whether the user requested a windowless (headless) browser.
+
+        Reflects the *user's intent*, not the internal Playwright ``headless``
+        flag.  When stealth's new-headless mode is active, Playwright receives
+        ``headless=False`` internally so it selects the full Chromium binary,
+        but this property still returns ``True`` because Chrome itself runs
+        with ``--headless=new`` and has no visible window.
+        """
         return self._headless
 
     @property
@@ -656,7 +666,12 @@ class Browser:
             viewport = self._viewport or fallback_viewport
             viewport_width = viewport.get("width", 1600)
             viewport_height = viewport.get("height", 900)
-            stealth_args = self._stealth_builder.build_args(viewport_width, viewport_height)
+            stealth_args = self._stealth_builder.build_args(
+                viewport_width,
+                viewport_height,
+                headless_intent=self._headless,
+                locale=self._locale,
+            )
             args_list.extend(stealth_args)
 
             # Add extension args if applicable
@@ -695,7 +710,23 @@ class Browser:
         if self._timeout is not None:
             options["timeout"] = self._timeout * 1000.0
         if self._headless is not None:
-            options["headless"] = self._headless
+            # When the user wants no window + stealth is active, redirect Playwright
+            # to the full chromium binary by passing headless=False.  The actual
+            # "no window" behaviour comes from --headless=new added in build_args().
+            #
+            #   self._headless      → user intent   (hide the window?)
+            #   options["headless"] → Playwright arg (which binary to pick?)
+            #
+            # chromium-headless-shell is a stripped binary with detectable
+            # fingerprint differences; full chromium + --headless=new avoids that.
+            _use_full_binary = (
+                self._headless is True
+                and not _is_system_chrome       # system Chrome picks its own binary
+                and self._stealth_config is not None
+                and self._stealth_config.enabled
+                and self._stealth_config.use_new_headless
+            )
+            options["headless"] = False if _use_full_binary else self._headless
         if self._devtools is not None:
             options["devtools"] = self._devtools
         if self._proxy is not None:
@@ -734,9 +765,12 @@ class Browser:
             stealth_context_opts = self._stealth_builder.get_context_options()
             options.update(stealth_context_opts)
 
-            # Add screen size to match viewport (stealth recommendation)
+            # Add screen size to match viewport for correct window.screen values.
+            # Fall back to a standard desktop resolution when no_viewport=True.
             if self._viewport:
                 options["screen"] = self._viewport.copy()
+            else:
+                options["screen"] = {"width": 1600, "height": 900}
 
         # Add non-None context parameters (user values override stealth defaults)
         if self._viewport is not None and not self._no_viewport:
@@ -812,13 +846,19 @@ class Browser:
                 logger.info(f"Created temporary user data dir for stealth extensions: {self._temp_user_data_dir}")
             options["user_data_dir"] = self._temp_user_data_dir
         else:
+            # Safety net: use_persistent_context returned True but neither
+            # user_data_dir nor stealth extensions are active.  Playwright
+            # requires a non-None user_data_dir for launch_persistent_context,
+            # so pass "" which makes Playwright use a temporary directory.
+            # In practice this branch is unreachable today because
+            # use_persistent_context only returns True in the two cases above.
             options["user_data_dir"] = ""
 
         return options
 
     # ==================== Lifecycle ====================
 
-    async def start(self) -> None:
+    async def _start(self) -> None:
         """Start the browser.
 
         Automatically chooses between two launch modes:
@@ -866,8 +906,16 @@ class Browser:
                 logger.debug(f"Context options: {context_options}")
                 self._context = await self._browser.new_context(**context_options)
 
-            # Inject JS stealth patches before any page script runs
-            if self._stealth_builder:
+            # Inject JS stealth patches before any page script runs.
+            # Headed mode (self._headless=False) skips the init script entirely
+            # so Cloudflare Turnstile's challenge iframe sees original, unmodified
+            # browser APIs — the same as playwright CLI (which injects nothing).
+            # context.add_init_script() runs in ALL frames including challenge
+            # iframes; patching window.chrome (configurable:false),
+            # navigator.permissions.query, and WebGL prototype inside the
+            # Turnstile iframe causes detectable API inconsistencies that fail
+            # the challenge even when the browser binary is fine.
+            if self._stealth_builder and self._headless:
                 init_script = self._stealth_builder.get_init_script(locale=self._locale)
                 if init_script:
                     await self._context.add_init_script(init_script)
@@ -890,13 +938,32 @@ class Browser:
                 f"Playwright started (persistent_context={self.use_persistent_context}, "
                 f"stealth={self.stealth_enabled})"
             )
-        except Exception:
+        except BaseException:
             logger.exception("Failed to start browser; rolling back partial startup state")
             try:
-                await self.stop()
-            except Exception:
+                await self.close()
+            except BaseException:
                 logger.exception("Failed to roll back browser startup state")
             raise
+
+    async def _ensure_started(self) -> None:
+        """Auto-start the browser if not yet started.
+
+        Guarantees that both ``_playwright`` and ``_context`` are initialised
+        after this call returns.  If ``_playwright`` is set but ``_context`` is
+        None (inconsistent state caused by an external browser crash or a
+        partial ``close()``), the browser is fully reset before restarting.
+        """
+        if self._playwright is None:
+            await self._start()
+        elif self._context is None:
+            # _playwright exists but context was lost — do a clean reset.
+            logger.warning(
+                "[_ensure_started] inconsistent state: _playwright set but _context is None; "
+                "performing clean restart"
+            )
+            await self.close()
+            await self._start()
 
     # Timeout (seconds) applied to individual page.close() calls during
     # shutdown so that a hung beforeunload handler cannot block forever.
@@ -945,7 +1012,7 @@ class Browser:
         """Create a unique close-session directory and pre-allocate artifact paths.
 
         Called by the daemon before background teardown so paths can be reported
-        immediately to the client. Stores state for browser.stop() and the
+        immediately to the client. Stores state for browser.close() and the
         post-close report writer to consume.
 
         Returns
@@ -997,7 +1064,7 @@ class Browser:
 
         return artifacts
 
-    async def stop(self) -> str:
+    async def close(self) -> str:
         """Close the browser.
 
         Stops the browser and cleans up all resources. Automatically removes
@@ -1006,9 +1073,8 @@ class Browser:
         beforehand. Active tracing/video sessions are auto-finalized and their
         paths included in the result.
 
-        Safe to call even when :meth:`start` was never called (all internal
-        handles are ``None`` and every teardown step is guarded by a null-check,
-        so the method returns immediately without raising).
+        Safe to call even when the browser was never started — returns
+        ``"Browser closed."`` immediately without raising.
 
         Returns
         -------
@@ -1016,9 +1082,17 @@ class Browser:
             Operation result message. Includes auto-saved trace/video paths
             when active sessions were finalized during close.
         """
+        if self._playwright is None:
+            return "Browser closed."
+
         errors: List[str] = []
         shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
         context_key: Optional[str] = None
+        # Deferred re-raise: if CancelledError / KeyboardInterrupt arrives during any
+        # cleanup await we record it here, finish ALL cleanup steps, then re-raise at
+        # the very end.  This ensures no Playwright/Chromium process is left orphaned
+        # just because one step was interrupted.
+        _pending_cancel: Optional[BaseException] = None
 
         # Auto-stop active tracing before context/page teardown so trace data is saved.
         if self._context:
@@ -1058,6 +1132,15 @@ class Browser:
                         except Exception as cleanup_exc:
                             errors.append(f"tracing.tmp_cleanup: {cleanup_exc}")
                     errors.append(f"tracing.stop: {e}")
+                except BaseException as e:
+                    if output_path and os.path.exists(output_path):
+                        try:
+                            os.remove(output_path)
+                        except Exception as cleanup_exc:
+                            errors.append(f"tracing.tmp_cleanup: {cleanup_exc}")
+                    errors.append(f"tracing.stop: {e}")
+                    if _pending_cancel is None:
+                        _pending_cancel = e
                 finally:
                     self._tracing_state[context_key] = False
 
@@ -1122,13 +1205,16 @@ class Browser:
 
         # Close page (with timeout to guard against hung beforeunload handlers)
         if self._page:
+            _page = self._page
+            self._page = None
             try:
                 await asyncio.wait_for(
-                    self._page.close(), timeout=self._PAGE_CLOSE_TIMEOUT,
+                    _page.close(), timeout=self._PAGE_CLOSE_TIMEOUT,
                 )
-            except Exception as e:
+            except BaseException as e:
                 errors.append(f"page.close: {e}")
-            self._page = None
+                if not isinstance(e, Exception) and _pending_cancel is None:
+                    _pending_cancel = e
 
         # Detach download manager before context closes to remove handlers
         if self._download_manager and self._context:
@@ -1147,15 +1233,19 @@ class Browser:
                         extra_page.close(run_before_unload=False),
                         timeout=self._PAGE_CLOSE_TIMEOUT,
                     )
-                except Exception:
-                    pass  # best-effort; context.close() will handle it
+                except BaseException as e:
+                    if not isinstance(e, Exception) and _pending_cancel is None:
+                        _pending_cancel = e
+                    # best-effort; context.close() will handle remaining pages
 
         # Close context
         # NOTE: In persistent context mode, closing context will auto close browser
         if self._context:
+            _context = self._context
+            self._context = None
             try:
                 await asyncio.wait_for(
-                    self._context.close(),
+                    _context.close(),
                     timeout=self._CONTEXT_CLOSE_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -1164,14 +1254,19 @@ class Browser:
                 )
             except Exception as e:
                 errors.append(f"context.close: {e}")
-            self._context = None
+            except BaseException as e:
+                errors.append(f"context.close: {e}")
+                if _pending_cancel is None:
+                    _pending_cancel = e
 
         # Close browser (only needed in normal launch mode, not persistent context)
         # In persistent context mode, browser is None or already closed
         if self._browser:
+            _browser = self._browser
+            self._browser = None
             try:
                 await asyncio.wait_for(
-                    self._browser.close(),
+                    _browser.close(),
                     timeout=self._BROWSER_CLOSE_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -1180,13 +1275,18 @@ class Browser:
                 )
             except Exception as e:
                 errors.append(f"browser.close: {e}")
-            self._browser = None
+            except BaseException as e:
+                errors.append(f"browser.close: {e}")
+                if _pending_cancel is None:
+                    _pending_cancel = e
 
         # Stop playwright
         if self._playwright:
+            _playwright = self._playwright
+            self._playwright = None
             try:
                 await asyncio.wait_for(
-                    self._playwright.stop(),
+                    _playwright.stop(),
                     timeout=self._PLAYWRIGHT_STOP_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -1195,7 +1295,10 @@ class Browser:
                 )
             except Exception as e:
                 errors.append(f"playwright.stop: {e}")
-            self._playwright = None
+            except BaseException as e:
+                errors.append(f"playwright.stop: {e}")
+                if _pending_cancel is None:
+                    _pending_cancel = e
 
         # Clean up temporary user data directory in a thread so the synchronous
         # shutil.rmtree (potentially large cache trees) does not block the loop.
@@ -1209,8 +1312,10 @@ class Browser:
                     None, lambda: shutil.rmtree(tmp_dir, ignore_errors=True),
                 )
                 logger.debug(f"Cleaned up temporary user data dir: {tmp_dir}")
-            except Exception as e:
+            except BaseException as e:
                 errors.append(f"temp_dir cleanup: {e}")
+                if not isinstance(e, Exception) and _pending_cancel is None:
+                    _pending_cancel = e
 
         # Clear snapshot cache
         self._last_snapshot = None
@@ -1249,26 +1354,29 @@ class Browser:
         result = "\n".join(lines)
 
         if errors:
-            logger.warning(f"Browser stopped with errors: {errors}")
+            logger.warning(f"Browser closed with errors: {errors}")
         else:
-            logger.info("Browser stopped")
+            logger.info("Browser closed")
+
+        if _pending_cancel is not None:
+            raise _pending_cancel
 
         return result
 
     async def __aenter__(self) -> "Browser":
         """Async context manager entry - starts the browser.
-        
+
         Usage:
             async with Browser(headless=True) as browser:
                 await browser.navigate_to("https://example.com")
                 # Browser is automatically closed when exiting the context
         """
-        await self.start()
+        await self._start()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Async context manager exit - stops the browser."""
-        await self.stop()
+        """Async context manager exit - closes the browser."""
+        await self.close()
 
     # ==================== Page Management ====================
 
@@ -1306,11 +1414,12 @@ class Browser:
         InvalidInputError
             If url is empty.
         StateError
-            If no browser context is open (call start() first).
+            If context is unavailable after auto-start (should not normally occur).
         OperationError
             If navigation fails (network error, timeout, etc.).
         """
         try:
+            await self._ensure_started()
             logger.info(f"[navigate_to] start url={url}")
 
             url = url.strip()
@@ -1326,11 +1435,7 @@ class Browser:
                 # fail at navigation time with a clear Playwright error (intentional).
 
             if not self._page:
-                if not self._context:
-                    _raise_state_error(
-                        "No browser context is open. Call start() first.",
-                        code="NO_BROWSER_CONTEXT",
-                    )
+                # All tabs were closed (e.g. via close_tab); _context is still alive.
                 logger.info("No page is open, creating a new page in existing context")
                 self._page = await self._context.new_page()
 
@@ -1354,20 +1459,21 @@ class Browser:
             logger.error(f"[navigate_to] {error_msg}")
             _raise_operation_error(error_msg)
 
-    async def new_page(
+    async def _new_page(
         self,
         url: Optional[str] = None,
         wait_until: Literal["domcontentloaded", "load", "networkidle", "commit"] = "domcontentloaded",
         timeout: Optional[float] = None,
-    ) -> Optional[Page]:
-        if not self._context:
+    ) -> Page:
+        if self._context is None:
             _raise_state_error(
-                "No browser context is open. Call start() first.",
+                "No browser context is open. Use navigate_to() to start the browser first.",
                 code="NO_BROWSER_CONTEXT",
             )
         self._page = await self._context.new_page()
         if url:
             await self.navigate_to(url, wait_until=wait_until, timeout=timeout)
+        await self._page.bring_to_front()
         return self._page
 
     async def get_page_desc(self, page: Optional[Page] = None) -> Optional[PageDesc]:
@@ -1428,7 +1534,7 @@ class Browser:
         title = await page.title()
         return True, f"Switched to tab {page_id}: {page.url} (title: {title})"
 
-    async def close_page(self, page: Page | str) -> tuple[bool, str]:
+    async def _close_page(self, page: Page | str) -> tuple[bool, str]:
         """Close a page by Page object or page_id.
 
         Parameters
@@ -1792,7 +1898,60 @@ class Browser:
         try:
             if self._snapshot_generator is None:
                 self._snapshot_generator = SnapshotGenerator()
-            
+
+            ref_data = self._last_snapshot.refs.get(ref)
+
+            # ── aria-ref fast-path ─────────────────────────────────────────────────
+            # Playwright's aria-ref engine maps ephemeral IDs (e.g. "e369", "f1e5")
+            # directly to live DOM element pointers populated during snapshotForAI.
+            # O(1) lookup — no CSS reconstruction needed.
+            #
+            # Each frame stores its own _lastAriaSnapshotForQuery keyed by the FULL
+            # prefixed ref (e.g. L1 frame stores "f1e5" → element).  For iframe
+            # elements we therefore scope the locator to the correct frame first via
+            # frame_locator chain — this ensures locator.evaluate() and all other
+            # locator operations run in the element's own frame context, not the
+            # main frame.  Main-frame elements (frame_path=None) use page directly.
+            #
+            # Falls through silently if stale (count=0) or engine unavailable.
+            if ref_data and ref_data.playwright_ref:
+                try:
+                    ar_scope = self._page
+                    if ref_data.frame_path:
+                        for local_nth in ref_data.frame_path:
+                            ar_scope = ar_scope.frame_locator("iframe").nth(local_nth)
+                    ar_locator = ar_scope.locator(f"aria-ref={ref_data.playwright_ref}")
+                    ar_count = await ar_locator.count()
+                    if ar_count == 1:
+                        logger.debug(
+                            "[get_element_by_ref] aria-ref fast-path hit: ref=%s playwright_ref=%s frame_path=%s",
+                            ref, ref_data.playwright_ref, ref_data.frame_path,
+                        )
+                        return ar_locator
+                    # ar_count == 0 → snapshot is stale (DOM changed) — fall through
+                    # ar_count > 1  → should never happen for a direct pointer — fall through
+                    logger.debug(
+                        "[get_element_by_ref] aria-ref stale (count=%d), falling through to CSS: ref=%s playwright_ref=%s",
+                        ar_count, ref, ref_data.playwright_ref,
+                    )
+                except Exception as _ar_exc:
+                    logger.debug(
+                        "[get_element_by_ref] aria-ref exception (%s), falling through to CSS: ref=%s",
+                        _ar_exc, ref,
+                    )
+            # ── aria-ref fast-path end ─────────────────────────────────────────────
+
+            if ref_data is None:
+                logger.debug("[get_element_by_ref] ref not found in snapshot: %s", ref)
+            else:
+                logger.debug(
+                    "[get_element_by_ref] CSS path: ref=%s role=%s name=%r nth=%s frame_path=%s",
+                    ref,
+                    ref_data.role,
+                    ref_data.name,
+                    ref_data.nth,
+                    ref_data.frame_path,
+                )
             locator = self._snapshot_generator.get_locator_from_ref_async(
                 self._page, ref, self._last_snapshot.refs
             )
@@ -1802,7 +1961,6 @@ class Browser:
                 if count == 1:
                     return locator
                 elif count > 1:
-                    ref_data = self._last_snapshot.refs.get(ref)
                     can_recover_by_role_name = (
                         bool(ref_data and ref_data.name)
                         and ref_data.role not in SnapshotGenerator.ROLE_TEXT_MATCH_ROLES
@@ -1810,10 +1968,9 @@ class Browser:
                         and ref_data.role not in SnapshotGenerator.TEXT_LEAF_ROLES
                     )
                     if can_recover_by_role_name and ref_data:
-                        frame_path = getattr(ref_data, 'frame_path', None)
                         scope = self._page
-                        if frame_path:
-                            for local_nth in frame_path:
+                        if ref_data.frame_path:
+                            for local_nth in ref_data.frame_path:
                                 scope = scope.frame_locator("iframe").nth(local_nth)
                         role_name_locator = scope.get_by_role(
                             ref_data.role,
@@ -2069,7 +2226,8 @@ Before you return the element ref, reason about the state and elements for a sen
 
     async def get_snapshot_text(
         self,
-        start_from_char: int = 0,
+        offset: int = 0,
+        limit: int = _DEFAULT_SNAPSHOT_LIMIT,
         interactive: bool = False,
         full_page: bool = True,
         from_cli: bool = False,
@@ -2090,10 +2248,13 @@ Before you return the element ref, reason about the state and elements for a sen
 
         Parameters
         ----------
-        start_from_char : int, optional
+        offset : int, optional
             Pagination offset (character index into the full tree text).
-            Must be >= 0.  Use the ``next_start_char`` value from the
-            truncation notice to get the next page of content.  Default is 0.
+            Must be >= 0.  Use the ``next_offset`` value from the truncation
+            notice to get the next page of content.  Default is 0.
+        limit : int, optional
+            Maximum number of characters to return.  Must be >= 1.
+            Default is 10 000.
         interactive : bool, optional
             If True, only include clickable/editable elements (buttons, links,
             inputs, checkboxes, elements with cursor:pointer, etc.).
@@ -2112,23 +2273,30 @@ Before you return the element ref, reason about the state and elements for a sen
             Page header followed by the accessibility tree.  Lines with
             ``[ref=...]`` are interactive elements.
 
-            Output is truncated to ``BRIDGIC_MAX_CHARS`` (default 30 000)
-            characters.  When truncated, a ``[notice]`` at the end shows the
-            ``next_start_char`` value and the continuation call.
+            Output is truncated to ``limit`` characters.  When truncated, a
+            ``[notice]`` is prepended before the page content (after the header)
+            with the ``next_offset`` value and the continuation call.
 
         Raises
         ------
         InvalidInputError
-            If ``start_from_char`` is negative or beyond the total tree length.
+            If ``offset`` is negative, beyond the total tree length, or
+            ``limit`` is less than 1.
         OperationError
             If snapshot generation fails.
         """
         try:
-            if start_from_char < 0:
+            if offset < 0:
                 _raise_invalid_input(
-                    "start_from_char must be >= 0",
-                    code="INVALID_START_FROM_CHAR",
-                    details={"start_from_char": start_from_char},
+                    "offset must be >= 0",
+                    code="INVALID_OFFSET",
+                    details={"offset": offset},
+                )
+            if limit < 1:
+                _raise_invalid_input(
+                    "limit must be >= 1",
+                    code="INVALID_LIMIT",
+                    details={"limit": limit},
                 )
 
             snapshot = await self.get_snapshot(
@@ -2143,39 +2311,39 @@ Before you return the element ref, reason about the state and elements for a sen
 
             total_length = len(full_text)
 
-            if start_from_char > 0:
-                if start_from_char >= total_length:
+            if offset > 0:
+                if offset >= total_length:
                     _raise_invalid_input(
                         (
-                            f"start_from_char ({start_from_char}) exceeds total page state length "
+                            f"offset ({offset}) exceeds total page state length "
                             f"of {total_length} characters."
                         ),
-                        code="START_FROM_CHAR_OUT_OF_RANGE",
-                        details={"start_from_char": start_from_char, "total_length": total_length},
+                        code="OFFSET_OUT_OF_RANGE",
+                        details={"offset": offset, "total_length": total_length},
                     )
-                text = full_text[start_from_char:]
+                text = full_text[offset:]
             else:
                 text = full_text
 
             truncated = False
-            next_start_char: Optional[int] = None
+            next_offset: Optional[int] = None
 
-            if len(text) > _MAX_CHAR_LIMIT:
-                truncate_at = _MAX_CHAR_LIMIT
+            if len(text) > limit:
+                truncate_at = limit
 
-                paragraph_break = text.rfind("\n\n", _MAX_CHAR_LIMIT - 500, _MAX_CHAR_LIMIT)
+                paragraph_break = text.rfind("\n\n", limit - 500, limit)
                 if paragraph_break > 0:
                     truncate_at = paragraph_break
                 else:
-                    line_break = text.rfind("\n", 0, _MAX_CHAR_LIMIT)
+                    line_break = text.rfind("\n", 0, limit)
                     if line_break > 0:
                         truncate_at = line_break + 1
 
                 text = text[:truncate_at]
                 truncated = True
-                next_start_char = start_from_char + truncate_at
+                next_offset = offset + truncate_at
 
-            if truncated and next_start_char is not None:
+            if truncated and next_offset is not None:
                 continuation: str
                 if from_cli:
                     cli_flags = []
@@ -2183,25 +2351,30 @@ Before you return the element ref, reason about the state and elements for a sen
                         cli_flags.append("-i")
                     if not full_page:
                         cli_flags.append("-F")
-                    cli_flags.append(f"-s {next_start_char}")
+                    cli_flags.append(f"-o {next_offset}")
+                    cli_flags.append(f"-l {limit}")
                     cli_cmd = "bridgic-browser snapshot " + " ".join(cli_flags)
                     continuation = f"run: {cli_cmd}"
                 else:
                     continuation = (
-                        f"call get_snapshot_text(start_from_char={next_start_char}, "
+                        f"call get_snapshot_text(offset={next_offset}, "
+                        f"limit={limit}, "
                         f"interactive={interactive}, full_page={full_page})"
                     )
 
                 notice = (
-                    "\n\n[notice] Current page text is too long, returned portion starting "
-                    f"from character {start_from_char} (this segment length {len(text)} / total "
+                    "[notice] Current page text is too long, returned portion starting "
+                    f"from character {offset} (this segment length {len(text)} / total "
                     f"length {total_length} characters). To continue getting subsequent content: "
-                    f"{continuation}"
+                    f"{continuation}\n\n"
                 )
-                text = f"{text}{notice}"
+                logger.info("[get_snapshot_text] Successfully retrieved interface information")
+                return header + notice + text
 
             logger.info("[get_snapshot_text] Successfully retrieved interface information")
             return header + text
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to get interface information: {e}"
             logger.error(f"[get_snapshot_text] {error_msg}")
@@ -2610,10 +2783,17 @@ Before you return the element ref, reason about the state and elements for a sen
         Raises
         ------
         StateError
-            If no browser context is open (call start() first).
+            If the browser has not been started yet. Call ``navigate_to()``
+            first to open a page, then use this method to create additional tabs.
         OperationError
             If tab creation or navigation fails.
         """
+        if self._playwright is None:
+            _raise_state_error(
+                "Browser is not started. Use navigate_to() to open a page first, then you can create additional tabs.",
+                code="BROWSER_NOT_STARTED",
+            )
+
         try:
             logger.info(f"[new_tab] start url={url}")
 
@@ -2631,10 +2811,10 @@ Before you return the element ref, reason about the state and elements for a sen
                     # else: URLs starting with '/' are absolute paths; passed as-is and will
                     # fail at navigation time with a clear Playwright error (intentional).
 
-            page = await self.new_page(url, wait_until=wait_until, timeout=timeout)
-            page_id = generate_page_id(page) if page else "unknown"
+            page = await self._new_page(url, wait_until=wait_until, timeout=timeout)
+            page_id = generate_page_id(page)
             if url:
-                result = f"Opened new tab {page_id} at {page.url if page else url}"
+                result = f"Opened new tab {page_id} at {page.url}"
             else:
                 result = f"Created new blank tab {page_id}"
             logger.info(f"[new_tab] done {result}")
@@ -2737,7 +2917,7 @@ Before you return the element ref, reason about the state and elements for a sen
                 page = await self.get_current_page()
                 if page is None:
                     _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
-                success, closed_result = await self.close_page(page)
+                success, closed_result = await self._close_page(page)
                 if not success:
                     logger.error(f"[close_tab] {closed_result}")
                     _raise_state_error(
@@ -2747,7 +2927,7 @@ Before you return the element ref, reason about the state and elements for a sen
                     )
                 result = closed_result
             else:
-                success, closed_result = await self.close_page(page_id)
+                success, closed_result = await self._close_page(page_id)
                 if not success:
                     logger.error(f"[close_tab] {closed_result}")
                     _raise_state_error(
@@ -3074,7 +3254,7 @@ Before you return the element ref, reason about the state and elements for a sen
                     await locator.dispatch_event("click")
                 else:
                     covered = await locator.evaluate(
-                        f"(el) => {{ if (window.frameElement !== null) return false; "
+                        f"(el) => {{ if (window.parent !== window) return false; "
                         f"const t = document.elementFromPoint({cx}, {cy}); "
                         f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
                     )
@@ -3299,7 +3479,7 @@ Before you return the element ref, reason about the state and elements for a sen
                         await locator.hover(force=True)
                 else:
                     covered = await locator.evaluate(
-                        f"(el) => {{ if (window.frameElement !== null) return false; "
+                        f"(el) => {{ if (window.parent !== window) return false; "
                         f"const t = document.elementFromPoint({cx}, {cy}); "
                         f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
                     )
@@ -3579,7 +3759,7 @@ Before you return the element ref, reason about the state and elements for a sen
                         await locator.dispatch_event("click")
                     else:
                         covered = await locator.evaluate(
-                            f"(el) => {{ if (window.frameElement !== null) return false; "
+                            f"(el) => {{ if (window.parent !== window) return false; "
                             f"const t = document.elementFromPoint({cx}, {cy}); "
                             f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
                         )
@@ -3674,7 +3854,7 @@ Before you return the element ref, reason about the state and elements for a sen
                         await locator.dispatch_event("click")
                     else:
                         covered = await locator.evaluate(
-                            f"(el) => {{ if (window.frameElement !== null) return false; "
+                            f"(el) => {{ if (window.parent !== window) return false; "
                             f"const t = document.elementFromPoint({cx}, {cy}); "
                             f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
                         )
@@ -3762,7 +3942,7 @@ Before you return the element ref, reason about the state and elements for a sen
                     await locator.dispatch_event("dblclick")
                 else:
                     covered = await locator.evaluate(
-                        f"(el) => {{ if (window.frameElement !== null) return false; "
+                        f"(el) => {{ if (window.parent !== window) return false; "
                         f"const t = document.elementFromPoint({cx}, {cy}); "
                         f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
                     )

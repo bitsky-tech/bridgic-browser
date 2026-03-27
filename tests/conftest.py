@@ -152,10 +152,9 @@ async def browser_instance():
     )
 
     try:
-        await browser.start()
         yield browser
     finally:
-        await browser.stop()
+        await browser.close()
 
 
 @pytest_asyncio.fixture
@@ -173,7 +172,7 @@ async def browser_with_stealth():
     )
 
     try:
-        await browser.start()
+        await browser._start()
         yield browser
     finally:
-        await browser.stop()
+        await browser.close()

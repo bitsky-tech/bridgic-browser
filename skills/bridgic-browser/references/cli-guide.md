@@ -80,7 +80,7 @@ bridgic-browser snapshot -i
 bridgic-browser snapshot -F
 
 # Continue truncated snapshot output
-bridgic-browser snapshot -s 30000
+bridgic-browser snapshot -o 10000
 
 # Scroll: use --dy / --dx (not positional), supports negative values
 bridgic-browser scroll --dy 500        # scroll down 500px
@@ -116,16 +116,14 @@ Config precedence (low -> high):
 | Defaults | `headless=True` |
 | `~/.bridgic/bridgic-browser.json` | User-level persistent config |
 | `./bridgic-browser.json` | Project-specific config (daemon startup cwd) |
-| `BRIDGIC_BROWSER_JSON` | Full JSON override for any Browser parameters |
-| `BRIDGIC_HEADLESS` | `0` means headed mode |
-| `BRIDGIC_MAX_CHARS` | Max chars per `snapshot` page before pagination |
+| `BRIDGIC_BROWSER_JSON` | Full JSON override for any Browser parameters (e.g. `{"headless":false}`) |
 
 Environment variables and login state persistence are documented in `env-vars.md`.
 
 ## Non-Obvious CLI Behavior
 
 - Refs come from the latest snapshot. If page changed, re-run `snapshot` before interaction.
-- `snapshot` pagination is explicit: use `-s <offset>` whose value can be from truncation notice.
+- `snapshot` pagination is explicit: use `-o <offset>` (and optionally `-l <limit>`) whose value can be from truncation notice.
 - `snapshot -i` returns only clickable/editable elements — use for action selection, not full-page inspection.
 - CLI uses a persistent daemon/browser. State survives across commands until `close`.
 - After local Python code changes, restart daemon to pick up new code:
@@ -134,6 +132,15 @@ Environment variables and login state persistence are documented in `env-vars.md
 - `scroll` uses `--dy`/`--dx` options (not positional arguments) so negative values work correctly.
 - `screenshot`, `pdf`, `upload`, `storage-save`, `storage-load`, `trace-stop` convert their path argument to an absolute path on the **client side** before sending to daemon (daemon's working directory may differ).
 - For `network-start`, start capture before navigation if page-load requests are needed.
+- **`wait` unit is SECONDS, not milliseconds**: `bridgic-browser wait 2` waits 2 seconds. A numeric argument always takes the time path; `--gone` is ignored for numbers.
+  - `bridgic-browser wait 2.5` — pause 2.5 seconds
+  - `bridgic-browser wait "Submit"` — wait until "Submit" appears
+  - `bridgic-browser wait --gone "Loading"` — wait until "Loading" disappears (`--gone` only works with a text argument)
+- **`type` requires a focused element**: `type` sends keystrokes at the current cursor position. Run `bridgic-browser click @<ref>` or `bridgic-browser focus @<ref>` on the target input first.
+- **`mouse-move`, `mouse-click`, `mouse-drag` use viewport pixel coordinates** measured from the top-left corner of the browser viewport. Example: `bridgic-browser mouse-click 500 300`.
+- **`eval-on` CODE must be an arrow or named function** that accepts the element as its argument:
+  - `bridgic-browser eval-on @8d4b03a9 "(el) => el.textContent"` ✓
+  - `bridgic-browser eval-on @8d4b03a9 "el.textContent"` ✗ (not a function)
 
 ## When to Load Other References
 
