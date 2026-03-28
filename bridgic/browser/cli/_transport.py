@@ -47,6 +47,11 @@ def write_run_info(info: Dict[str, Any]) -> None:
     tmp_path = RUN_INFO_PATH.with_suffix(".tmp")
     tmp_path.write_text(json.dumps(info), encoding="utf-8")
     tmp_path.replace(RUN_INFO_PATH)
+    if sys.platform != "win32":
+        try:
+            os.chmod(RUN_INFO_PATH, 0o600)
+        except OSError:
+            pass
 
 
 def read_run_info() -> Optional[Dict[str, Any]]:
@@ -259,7 +264,8 @@ class TcpTransport(BaseTransport):
     def verify_auth(self, request_dict: Dict[str, Any]) -> bool:
         if self._token is None:
             return False  # token not yet initialised — reject all
-        return request_dict.get("_token") == self._token
+        client_token = request_dict.get("_token") or ""
+        return secrets.compare_digest(client_token, self._token)
 
     def probe(self) -> bool:
         info = read_run_info()
@@ -293,7 +299,10 @@ def get_transport() -> BaseTransport:
     if sys.platform == "win32":
         info = read_run_info()
         if info and info.get("transport") == "tcp":
-            return TcpTransport(port=info["port"], token=info["token"])
+            port = info.get("port")
+            token = info.get("token")
+            if port is not None and token is not None:
+                return TcpTransport(port=port, token=token)
         return TcpTransport()
     socket_path = os.environ.get("BRIDGIC_SOCKET", _default_socket_path())
     return UnixTransport(socket_path)

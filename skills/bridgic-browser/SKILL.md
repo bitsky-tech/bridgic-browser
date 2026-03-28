@@ -4,18 +4,29 @@ description: |
   Use when tasks involve browser automation with bridgic-browser via terminal CLI (`bridgic-browser ...`) or Python SDK (`from bridgic.browser.session import Browser`, `from bridgic.browser.tools import BrowserToolSetBuilder`). Trigger for navigation, scraping, form filling, accessibility snapshot refs, e2e checks, stealth browsing, CLI-SDK mapping/migration, and generating SDK code from CLI action steps.
 ---
 
-# bridgic-browser
+## Prerequisite (Important!!)
 
-Use progressive disclosure. Do not load every reference file by default.
+Before performing any operations, **MAKE SURE to use `uv`** to initialize the execution environment and install dependencies first. Note: DO NOT rely on any execution environment other than `uv`, to ensure the execution environment is isolated from the host machine.
 
-## Python Environment Requirements
+- **Initialize project**: `[ -f pyproject.toml  ] || uv init --bare --python 3.10`
+- **Install dependencies**: `uv add --upgrade bridgic-browser`.
+- **Install browser binaries** (one-time): `uv run playwright install chromium`
 
-- **Python**: >= 3.10
-- **Install package**: `pip install bridgic-browser`
-- **Install browser binaries** (one-time): `playwright install chromium`
-- **Dev mode** (repo): `make init-dev`
+The CLI tools (`references/cli-guide.md`) and the Python SDK (`references/sdk-guide.md`) come from the **same package** — installing one installs both.
 
-The CLI tool (`bridgic-browser`) and the Python SDK (`from bridgic.browser.session import Browser`) come from the **same package** — installing one installs both.
+## Strategies & Guidelines (Important!!)
+
+When writing browser automation or web scraping code, **ALWAYS follow this "explore first, then coding" strategy**:
+- First, use the `bridgic-browser` CLI tools to explore the page structure. It is recommended to use headed mode with the command `bridgic-browser open --headed <url>` during exploration.
+- Then, use the `bridgic-browser` Python SDK to write the code.
+
+Notes:
+- If the user clearly specifies exact steps that must be followed, try to perform the exploration according to those steps. If loops or branches appear during exploration, decide the best exploration path autonomously.
+- If you think you may need to return to the original page after clicking into a new page, try opening the new page in a new browser tab instead of using a “click then go back” approach. This is especially important when the original page already has interaction state (such as filled forms or applied filters); otherwise, that state may be lost after navigating back. Be sure to close the new tab promptly after finishing the related actions.
+- If exploration involves repeatedly clicking items in a list, you do not need to traverse every item (especially when the list is large).
+- If login, verification, or authorization is required during exploration, pause and ask the user to complete it manually, unless the user explicitly provides instructions in the task.
+- To avoid operating on websites too frequently, maintain human-like access intervals during both exploration and coding. You may simulate random wait times to reduce the risk of being blocked. Note: the `bridgic-browser wait` command parameter is in **seconds**, not milliseconds; for example, `bridgic-browser wait 2` or `bridgic-browser wait 3.2`.
+- After finishing exploration and code writing, automatically run testing/validation.
 
 ## Reference Files
 

@@ -70,8 +70,9 @@ class RefData:
     name: Optional[str] = None
     nth: Optional[int] = None
     text_content: Optional[str] = None
-    parent_ref: Optional[str] = None
+    parent_ref: Optional[str] = None  # nearest KEPT ancestor that was assigned a ref (not necessarily direct DOM parent — may skip unnamed/untracked intermediates)
     frame_path: Optional[List[int]] = None  # per-level local iframe indices, outermost→innermost; None = main frame
+    playwright_ref: Optional[str] = None  # Playwright's ephemeral aria-ref ID (e.g. "e369"); valid for the lifetime of the last snapshotForAI call
 
 
 @dataclass
@@ -339,6 +340,16 @@ class SnapshotGenerator:
         'presentation': '[role="presentation"]',
     }
 
+    # Span-inclusive CSS for the child-anchor path in get_locator_from_ref_async.
+    # Identical to STRUCTURAL_NOISE_CSS except 'generic' adds span:not([role]).
+    # nth is NEVER applied to locators built with this dict (we only use the child
+    # to navigate up via locator('..') to its DOM parent), so including <span>
+    # elements is safe even though Playwright maps many spans to 'text' role.
+    STRUCTURAL_NOISE_CSS_NAMED: Dict[str, str] = {
+        **STRUCTURAL_NOISE_CSS,
+        'generic': 'div:not([role]), span:not([role]), legend, [role="generic"]',
+    }
+
     # Pattern to strip YAML-style single-quote wrapping from snapshot lines.
     # Playwright wraps long/escaped-quote lines as: - 'role "name" [ref=eN]':
     _YAML_QUOTE_PATTERN = re.compile(
@@ -410,9 +421,10 @@ class SnapshotGenerator:
                              nth: int) -> str:
         """Derive a stable 8-hex-char ref from element semantics.
 
-        Uses a fixed namespace salt + CRC32 over all disambiguating fields.
-        With 32-bit output and a typical page of ~1 000 elements, the birthday
-        collision probability is ~N²/2³² ≈ 0.012 %, low enough to ignore.
+        Uses a fixed namespace salt + SHA-256 (first 4 bytes) over all
+        disambiguating fields.  With 32-bit output and a typical page of
+        ~1 000 elements, the birthday collision probability is
+        ~N²/2³² ≈ 0.012 %, low enough to ignore.
         \x1f (ASCII Unit Separator) is safe as a field delimiter: it cannot
         appear in HTML accessible names.
         """
@@ -635,7 +647,7 @@ class SnapshotGenerator:
         """
         # Separate structural noise without name (handle from suffix only)
         suffix_only_refs: Dict[str, str] = {}
-        batch_elements: list[Dict[str, Any]] = []
+        batch_elements: List[Dict[str, Any]] = []
 
         for ref, (role, name, nth) in refs_info.items():
             if role in self.STRUCTURAL_NOISE_ROLES and not name:
@@ -995,7 +1007,8 @@ class SnapshotGenerator:
             suffix = ref_suffixes.get(ref, '')
             is_interactive = self._is_element_interactive(role, info, suffix)
 
-            # Disabled interactive roles still included
+            # Disabled interactive roles are still included in the interactive snapshot
+            # so agents can report their state (e.g. "Submit button is disabled").
             if not is_interactive and role.lower() in self.INTERACTIVE_ROLES:
                 if info.get('isDisabled') or info.get('ariaDisabled'):
                     is_interactive = True
@@ -1093,16 +1106,17 @@ class SnapshotGenerator:
             return True
 
         # 9. Small icon check (Section 5.7)
-        # Size within 10-50px range + has semantic attributes
+        # Size within 10-50px range + has strong semantic attributes.
+        # NOTE: classAndId is intentionally excluded — almost every element has a CSS
+        # class, so it would cause false positives for decorative elements (badges,
+        # avatars, dividers, etc.) that happen to be small.  Only data-action and
+        # aria-label are strong enough signals; cursor=pointer is rule 10.
         width = info.get('width') or 0
         height = info.get('height') or 0
         if 10 <= width <= 50 and 10 <= height <= 50:
-            # Check for semantic attributes: class, role, data-action, aria-label
-            # Note: hasEventHandler already checked in rule 2, dataAction implies interactivity
             has_semantic = (
-                info.get('classAndId') or  # Contains class and id
-                info.get('dataAction') or  # data-action
-                '[aria-label' in (snapshot_suffix or '')  # aria-label
+                info.get('dataAction') or  # data-action="edit" etc.
+                '[aria-label' in (snapshot_suffix or '')  # aria-label (screen-reader accessible)
             )
             if has_semantic:
                 return True
@@ -1381,16 +1395,30 @@ class SnapshotGenerator:
                 should_keep = True
                 should_have_ref = bool(name)
 
+            # Extract Playwright's ephemeral aria-ref ID (e.g. "e369") for the fast-path.
+            # Must be done before clean_suffix strips [ref=...] from the line.
+            _pw_ref_match = ref_extract_pattern.search(suffix) if suffix else None
+            playwright_ref_for_element: Optional[str] = _pw_ref_match.group(1) if _pw_ref_match else None
+
             # In interactive-only mode, only keep interactive elements
             # Use interactive_map for precise filtering when available
             if options.interactive:
-                # Try to get ref from suffix for interactive_map lookup
-                ref_match_in_suffix = ref_extract_pattern.search(suffix) if suffix else None
-                original_ref = ref_match_in_suffix.group(1) if ref_match_in_suffix else None
+                # Reuse the ref already extracted above
+                original_ref = playwright_ref_for_element
 
                 if interactive_map and original_ref:
                     # Use the pre-computed interactive_map for precise filtering
                     is_effectively_interactive = interactive_map.get(original_ref, False)
+                elif role_lower in self.TEXT_LEAF_ROLES and playwright_ref_for_element is None:
+                    # Playwright does not assign [ref=...] to inline text nodes
+                    # (e.g. "- text: QQ"). In interactive mode, depth_stack entries
+                    # with kept=True are ancestors that passed the interactive filter
+                    # (cursor=pointer / INTERACTIVE_ROLES / ARIA state) — ordinary
+                    # structural containers (div, section, heading) are NOT kept.
+                    # So any() here means "this text lives inside an interactive
+                    # region", which is exactly when it should be visible regardless
+                    # of how many wrapper spans/divs sit in between.
+                    is_effectively_interactive = any(kept for _, kept, _, _ in depth_stack)
                 else:
                     # Fallback to basic role/attribute checks
                     is_effectively_interactive = (
@@ -1468,6 +1496,7 @@ class SnapshotGenerator:
                     text_content=text_content,
                     parent_ref=parent_ref,
                     frame_path=current_frame_path,
+                    playwright_ref=playwright_ref_for_element,
                 )
 
                 enhanced += f" [ref={ref}]"
@@ -1802,8 +1831,8 @@ class SnapshotGenerator:
             return arg[1:]
         if arg.startswith('ref='):
             return arg[4:]
-        if re.match(r'^[0-9a-f]{8}$', arg):
-            return arg
+        if re.match(r'^[0-9a-fA-F]{8}$', arg):
+            return arg.lower()
         return None
     
     def get_locator_from_ref_async(
@@ -1911,6 +1940,9 @@ class SnapshotGenerator:
             # get_by_role() returns 0 results for implicit generic/group roles.
             # Use a CSS-scoped locator to restrict to the correct element type,
             # keeping the nth index valid within the scoped set.
+            # STRUCTURAL_NOISE_CSS (no span) is used here because spans that carry
+            # accessible text are often mapped to 'text' role (not 'generic') by
+            # Playwright — including span:not([role]) would shift nth indices.
             css = self.STRUCTURAL_NOISE_CSS.get(ref_data.role)
             if css:
                 exact_text_pattern = text_pattern(match_text, exact=True)
@@ -1957,7 +1989,58 @@ class SnapshotGenerator:
                 # child text — a different key space. Still skip nth.
                 skip_nth = True
             else:
-                locator = scope.get_by_role(ref_data.role)
+                # No text-leaf child found; try a named STRUCTURAL_NOISE_ROLES child
+                # as an anchor — build its locator inline, then navigate up via '..'.
+                # e.g. generic [ref=8944f251]:
+                #        generic "Automatic detection" [ref=5fcfa23c, parent_ref=8944f251]
+                # Strategy: locate the child with span-inclusive CSS (STRUCTURAL_NOISE_CSS_NAMED),
+                # then call .locator('..') to get its DOM parent.  More precise than the
+                # earlier has= filter approach, which could match sibling menu items with
+                # the same text and return multiple ancestor divs as "the parent".
+                #
+                # Known limitation: .locator('..') navigates to the DIRECT DOM parent of
+                # the child element, which may be an unnamed intermediate container that
+                # does not appear in the snapshot (e.g. an unstyled <div class="content">
+                # between the interactive outer div and the <span>).  In such cases the
+                # returned locator targets the intermediate element rather than ref's DOM
+                # node.  This is rare in practice because:
+                #  (a) Playwright's a11y tree flattens most empty containers, and
+                #  (b) real-world libraries (e.g. Semantic UI) use flat single-level nesting.
+                # Invariant that makes this SAFE for direct children: parent_ref is the
+                # nearest KEPT ancestor WITH a ref.  An unnamed non-interactive noise
+                # element has should_keep=False, so it is never in depth_stack with
+                # kept=True.  Therefore if only unnamed non-interactive intermediates
+                # exist they won't "capture" parent_ref away from ref — the child still
+                # points here.  The bug manifests only when an unnamed element exists in
+                # the DOM but was excluded from the snapshot; fixing it would require
+                # XPath ancestor traversal which is disproportionate to the practical risk.
+                child_noise_ref_id = next(
+                    (
+                        k
+                        for k, d in refs.items()
+                        if d.parent_ref == ref
+                        and d.role in self.STRUCTURAL_NOISE_ROLES
+                        and d.name and d.name.strip()
+                    ),
+                    None,
+                )
+                if child_noise_ref_id:
+                    # Build the child locator inline using STRUCTURAL_NOISE_CSS_NAMED
+                    # (span-inclusive) — the child may be a <span class="text"> with
+                    # 'generic' role, which is missed by div-only CSS.  nth does NOT
+                    # apply to the result (we use the child only to navigate up via '..').
+                    child_ref_data = refs[child_noise_ref_id]
+                    child_name = child_ref_data.name.strip() if child_ref_data.name else None
+                    child_css = self.STRUCTURAL_NOISE_CSS_NAMED.get(child_ref_data.role) if child_name else None
+                    if child_css and child_name:
+                        child_text_pat = text_pattern(child_name, exact=True)
+                        locator = scope.locator(child_css).filter(has_text=child_text_pat).locator('..')
+                    else:
+                        locator = scope.get_by_role(ref_data.role)
+                    # key space differs from the 'generic:' nth space — skip nth.
+                    skip_nth = True
+                else:
+                    locator = scope.get_by_role(ref_data.role)
         elif normalized_text:
             locator = scope.get_by_text(normalized_text, exact=True)
             # nth was computed counting only unnamed elements of this role,

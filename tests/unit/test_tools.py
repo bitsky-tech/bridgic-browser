@@ -54,8 +54,9 @@ def mock_browser():
     browser.get_pages = MagicMock(return_value=[])
     browser.get_all_page_descs = AsyncMock(return_value=[])
     browser.switch_to_page = AsyncMock(return_value=(True, "Switched"))
-    browser.close_page = AsyncMock(return_value=(True, "Closed"))
-    browser.new_page = AsyncMock()
+    browser._close_page = AsyncMock(return_value=(True, "Closed"))
+    browser._ensure_started = AsyncMock()
+    browser._new_page = AsyncMock()
     browser.get_snapshot = AsyncMock()
     browser.get_element_by_ref = AsyncMock()
 
@@ -73,7 +74,7 @@ def mock_browser():
     browser.get_tabs = AsyncMock(return_value="Tab 1")
     browser.switch_tab = AsyncMock(return_value="Switched to tab")
     browser.close_tab = AsyncMock(return_value="Closed tab")
-    browser.stop = AsyncMock(return_value="Browser closed")
+    browser.close = AsyncMock(return_value="Browser closed")
     browser.browser_resize = AsyncMock(return_value="Resized browser to 800x600")
     browser.wait_for = AsyncMock(return_value="Waited")
     browser.get_snapshot_text = AsyncMock(return_value="- button 'Submit' [ref=e1]")
@@ -350,16 +351,14 @@ class TestPageControlTools:
     async def test_wait_for_text(self, mock_browser):
         """Test wait_for function with text parameter."""
 
-        mock_page = mock_browser.get_current_page.return_value
-        mock_locator = MagicMock()
-        mock_locator.first = MagicMock()
-        mock_locator.first.wait_for = AsyncMock()
-        mock_page.get_by_text = MagicMock(return_value=mock_locator)
+        mock_browser._wait_for_text_across_frames = AsyncMock()
 
         result = await Browser.wait_for(mock_browser, text="Loading complete")
 
-        mock_page.get_by_text.assert_called_once_with("Loading complete", exact=False)
-        mock_locator.first.wait_for.assert_called_once()
+        mock_browser._wait_for_text_across_frames.assert_called_once()
+        args, kwargs = mock_browser._wait_for_text_across_frames.call_args
+        assert "Loading complete" in args
+        assert kwargs.get("gone") is False
 
     @pytest.mark.asyncio
     async def test_get_current_page_info(self, mock_browser):
@@ -400,22 +399,22 @@ class TestTabManagementTools:
     async def test_new_tab(self, mock_browser):
         """Test new_tab with no URL opens a blank page."""
 
-        mock_browser.new_page.return_value = MagicMock()
+        mock_browser._new_page.return_value = MagicMock()
 
         result = await Browser.new_tab(mock_browser)
 
-        mock_browser.new_page.assert_called_once_with(None, wait_until="domcontentloaded", timeout=None)
+        mock_browser._new_page.assert_called_once_with(None, wait_until="domcontentloaded", timeout=None)
         assert "new" in result.lower() or "tab" in result.lower() or "blank" in result.lower()
 
     @pytest.mark.asyncio
     async def test_new_tab_with_url(self, mock_browser):
         """Test new_tab with URL."""
 
-        mock_browser.new_page.return_value = MagicMock()
+        mock_browser._new_page.return_value = MagicMock()
 
         result = await Browser.new_tab(mock_browser, "https://example.com")
 
-        mock_browser.new_page.assert_called_once_with(
+        mock_browser._new_page.assert_called_once_with(
             "https://example.com", wait_until="domcontentloaded", timeout=None
         )
 
@@ -451,7 +450,7 @@ class TestTabManagementTools:
 
         result = await Browser.close_tab(mock_browser, "page_123")
 
-        mock_browser.close_page.assert_called_once_with("page_123")
+        mock_browser._close_page.assert_called_once_with("page_123")
         assert isinstance(result, str)
         assert len(result) > 0
 
@@ -1428,15 +1427,11 @@ class TestVerifyTools:
     async def test_verify_text_visible(self, mock_browser):
         """Test verify_text_visible."""
 
-        mock_page = mock_browser.get_current_page.return_value
-        mock_locator = MagicMock()
-        mock_first = MagicMock()
-        mock_first.wait_for = AsyncMock()
-        mock_locator.first = mock_first
-        mock_page.get_by_text.return_value = mock_locator
+        mock_browser._wait_for_text_across_frames = AsyncMock()
 
         result = await Browser.verify_text_visible(mock_browser, text="Welcome")
 
+        mock_browser._wait_for_text_across_frames.assert_called_once()
         assert "PASS" in result
 
     @pytest.mark.asyncio
@@ -1559,10 +1554,10 @@ class TestStateTools:
         mock_snapshot.tree = long_text
         mock_browser.get_snapshot.return_value = mock_snapshot
 
-        result = await Browser.get_snapshot_text(mock_browser, start_from_char=0)
+        result = await Browser.get_snapshot_text(mock_browser, offset=0)
 
         assert len(result) < len(long_text) + 500
-        assert "start_from_char" in result
+        assert "offset=" in result
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("interactive,full_page", [
@@ -1588,26 +1583,37 @@ class TestStateTools:
         assert "button" in result or "Click me" in result
 
     @pytest.mark.asyncio
-    async def test_get_snapshot_text_negative_start_from_char(self, mock_browser):
-        """Negative start_from_char should raise InvalidInputError."""
+    async def test_get_snapshot_text_negative_offset(self, mock_browser):
+        """Negative offset should raise InvalidInputError."""
         mock_snapshot = MagicMock()
         mock_snapshot.tree = "- button 'Click me' [ref=e1]"
         mock_browser.get_snapshot.return_value = mock_snapshot
 
         with pytest.raises(InvalidInputError) as exc_info:
-            await Browser.get_snapshot_text(mock_browser, start_from_char=-1)
-        assert exc_info.value.code == "INVALID_START_FROM_CHAR"
+            await Browser.get_snapshot_text(mock_browser, offset=-1)
+        assert exc_info.value.code == "INVALID_OFFSET"
 
     @pytest.mark.asyncio
-    async def test_get_snapshot_text_start_from_char_out_of_range(self, mock_browser):
-        """Out-of-range start_from_char should raise InvalidInputError."""
+    async def test_get_snapshot_text_offset_out_of_range(self, mock_browser):
+        """Out-of-range offset should raise InvalidInputError."""
         mock_snapshot = MagicMock()
         mock_snapshot.tree = "abc"
         mock_browser.get_snapshot.return_value = mock_snapshot
 
         with pytest.raises(InvalidInputError) as exc_info:
-            await Browser.get_snapshot_text(mock_browser, start_from_char=99999)
-        assert exc_info.value.code == "START_FROM_CHAR_OUT_OF_RANGE"
+            await Browser.get_snapshot_text(mock_browser, offset=99999)
+        assert exc_info.value.code == "OFFSET_OUT_OF_RANGE"
+
+    @pytest.mark.asyncio
+    async def test_get_snapshot_text_invalid_limit(self, mock_browser):
+        """limit < 1 should raise InvalidInputError."""
+        mock_snapshot = MagicMock()
+        mock_snapshot.tree = "- button 'Click me' [ref=e1]"
+        mock_browser.get_snapshot.return_value = mock_snapshot
+
+        with pytest.raises(InvalidInputError) as exc_info:
+            await Browser.get_snapshot_text(mock_browser, limit=0)
+        assert exc_info.value.code == "INVALID_LIMIT"
 
     @pytest.mark.asyncio
     async def test_get_snapshot_text_snapshot_failed(self, mock_browser):

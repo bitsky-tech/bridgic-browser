@@ -28,27 +28,28 @@ This guide helps you choose the right tools for different browser automation sce
 
 ### Parameters
 
-- **start_from_char** (int, default 0): Pagination offset, must be `>= 0`. When the page state is long, the returned text may be truncated at ~30,000 characters. A `[notice]` at the end of the string tells you the **next_start_char** value to use for the next call to get the rest of the content.
+- **offset** (int, default 0): Pagination offset, must be `>= 0`. Use the `next_offset` value from the truncation notice to get the next page of content.
+- **limit** (int, default 10000): Maximum characters to return, must be `>= 1`.
 - **interactive** (bool, default False): If True, only clickable/editable elements are included (buttons, links, inputs, checkboxes, elements with `cursor:pointer`, etc.), with flattened output. Use for action-focused tasks.
 - **full_page** (bool, default True): If True (default), include all elements regardless of viewport position; if False, only viewport content.
 
 ### Truncation and pagination
 
-When the full tree exceeds the character limit, the tool returns a segment and appends a notice like:
+When the full tree exceeds `limit`, the tool returns a segment and prepends a notice (before the page content, right after the page header) like:
 
 ```
-[notice] Current page text is too long, returned portion starting from character 0 (this segment length 30000 / total length 45000 characters). To continue getting subsequent content: call get_snapshot_text(start_from_char=30000, interactive=False, full_page=True)
+[notice] Current page text is too long, returned portion starting from character 0 (this segment length 10000 / total length 45000 characters). To continue getting subsequent content: call get_snapshot_text(offset=10000, limit=10000, interactive=False, full_page=True)
 ```
 
-Use the given `start_from_char` in the next call to continue reading.
+Use the given `offset` in the next call to continue reading.
 
 ### Examples
 
 ```python
 # First call – get initial page state
 state = await browser.get_snapshot_text()
-# If state ends with [notice] and next_start_char=30000:
-# state_more = await browser.get_snapshot_text(start_from_char=30000)
+# If state contains [notice] (shown before page content) with next_offset=10000:
+# state_more = await browser.get_snapshot_text(offset=10000)
 
 # Only interactive elements (good for "what can I click?")
 state = await browser.get_snapshot_text(interactive=True)
@@ -86,10 +87,10 @@ await browser.click_element_by_ref("8d4b03a9")
 
 ### When to Use Coordinate-based Tools
 
-**Coordinate-based tools** use pixel positions:
+**Coordinate-based tools** use pixel positions measured from the **top-left corner of the browser viewport**:
 
 ```python
-# Click at specific coordinates
+# Click at specific coordinates (x=500px from left, y=300px from top)
 await browser.mouse_click(x=500, y=300)
 
 # Drag from one point to another
@@ -150,10 +151,13 @@ await browser.input_text_by_ref("d6a530b4", "search query", slowly=True)
 For typing at the current focus position:
 
 ```python
+# Must focus the target element first
+await browser.focus_element_by_ref("d6a530b4")
 await browser.type_text("hello world")
 ```
 
-- Types at cursor position (no ref needed)
+- **Requires a focused element** — call `focus_element_by_ref` or `click_element_by_ref` on the target first
+- Types at cursor position (no ref needed for `type_text` itself)
 - Triggers all keyboard events
 - Good for search boxes with autocomplete
 - Can add `submit=True` to press Enter after

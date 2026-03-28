@@ -87,22 +87,20 @@ def all_names(refs: Dict[str, dict]) -> Set[str]:
 async def browser():
     """Real browser on the test page."""
     b = Browser(headless=True, stealth=False, viewport={"width": 1280, "height": 720})
-    await b.start()
     await b.navigate_to(f"file://{TEST_PAGE_PATH.absolute()}")
     await asyncio.sleep(0.3)
     yield b
-    await b.stop()
+    await b.close()
 
 
 @pytest_asyncio.fixture
 async def role_text_match_browser():
     """Real browser on role_text_match_case.html."""
     b = Browser(headless=True, stealth=False, viewport={"width": 1280, "height": 720})
-    await b.start()
     await b.navigate_to(f"file://{ROLE_TEXT_MATCH_CASE_PATH.absolute()}")
     await asyncio.sleep(0.3)
     yield b
-    await b.stop()
+    await b.close()
 
 
 # ==================== Snapshot Mode Tests ====================

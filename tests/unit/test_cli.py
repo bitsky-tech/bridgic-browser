@@ -315,13 +315,15 @@ class TestSectionedGroupHelp:
         result = invoke_raw(["-h"])
         assert result.exit_code == 0
         assert "Usage:" in result.output
-        assert "[OPTIONS]" not in result.output
+        assert "-V" in result.output
+        assert "--version" in result.output
 
     def test_help_longhand_on_group(self):
         result = invoke_raw(["--help"])
         assert result.exit_code == 0
         assert "Usage:" in result.output
-        assert "[OPTIONS]" not in result.output
+        assert "-V" in result.output
+        assert "--version" in result.output
 
     def test_h_shorthand_on_subcommand(self):
         result = invoke_raw(["open", "-h"])
@@ -455,30 +457,39 @@ class TestCliCommandRouting:
 
     def test_snapshot_default(self):
         _, sc = invoke(["snapshot"])
-        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": True, "start_from_char": 0}, start_if_needed=False)
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": True, "offset": 0, "limit": 10000}, start_if_needed=False)
 
     def test_snapshot_interactive(self):
         _, sc = invoke(["snapshot", "--interactive"])
-        sc.assert_called_once_with("snapshot", {"interactive": True, "full_page": True, "start_from_char": 0}, start_if_needed=False)
+        sc.assert_called_once_with("snapshot", {"interactive": True, "full_page": True, "offset": 0, "limit": 10000}, start_if_needed=False)
 
     def test_snapshot_interactive_short(self):
         _, sc = invoke(["snapshot", "-i"])
-        sc.assert_called_once_with("snapshot", {"interactive": True, "full_page": True, "start_from_char": 0}, start_if_needed=False)
+        sc.assert_called_once_with("snapshot", {"interactive": True, "full_page": True, "offset": 0, "limit": 10000}, start_if_needed=False)
 
     def test_snapshot_no_full_page(self):
         _, sc = invoke(["snapshot", "--no-full-page"])
-        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": False, "start_from_char": 0}, start_if_needed=False)
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": False, "offset": 0, "limit": 10000}, start_if_needed=False)
 
     def test_snapshot_no_full_page_short(self):
         _, sc = invoke(["snapshot", "-F"])
-        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": False, "start_from_char": 0}, start_if_needed=False)
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": False, "offset": 0, "limit": 10000}, start_if_needed=False)
 
-    def test_snapshot_start_from_char(self):
-        _, sc = invoke(["snapshot", "-s", "5000"])
-        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": True, "start_from_char": 5000}, start_if_needed=False)
+    def test_snapshot_offset(self):
+        _, sc = invoke(["snapshot", "-o", "5000"])
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": True, "offset": 5000, "limit": 10000}, start_if_needed=False)
 
-    def test_snapshot_start_from_char_rejects_negative(self):
-        result, sc = invoke(["snapshot", "-s", "-1"])
+    def test_snapshot_limit(self):
+        _, sc = invoke(["snapshot", "-l", "3000"])
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": True, "offset": 0, "limit": 3000}, start_if_needed=False)
+
+    def test_snapshot_offset_rejects_negative(self):
+        result, sc = invoke(["snapshot", "-o", "-1"])
+        assert result.exit_code != 0
+        sc.assert_not_called()
+
+    def test_snapshot_limit_rejects_zero(self):
+        result, sc = invoke(["snapshot", "-l", "0"])
         assert result.exit_code != 0
         sc.assert_not_called()
 
@@ -1169,6 +1180,56 @@ class TestDaemonSocketSecurity:
                 _safe_remove_socket("/tmp/raced.sock")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Daemon cleanup race condition
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDaemonCleanupRace:
+    """Tests for the run_daemon() cleanup ownership guard.
+
+    When `close` responds immediately and a new daemon starts before the old
+    daemon's browser.close() finishes, the old daemon must NOT delete the new
+    daemon's socket and run-info file.
+
+    The guard logic in run_daemon():
+        current_info = read_run_info()
+        if current_info is None or current_info.get("pid") == os.getpid():
+            transport.cleanup()
+            remove_run_info()
+    """
+
+    def _run_guard(self, current_info, my_pid, transport, remove_fn):
+        """Replicate the run_daemon cleanup guard for white-box testing."""
+        if current_info is None or current_info.get("pid") == my_pid:
+            transport.cleanup()
+            remove_fn()
+
+    def test_cleanup_runs_when_run_info_is_gone(self):
+        """If run-info was already removed (None), clean up is safe."""
+        transport = MagicMock()
+        remove_fn = MagicMock()
+        self._run_guard(None, os.getpid(), transport, remove_fn)
+        transport.cleanup.assert_called_once()
+        remove_fn.assert_called_once()
+
+    def test_cleanup_runs_when_pid_matches(self):
+        """If run-info PID equals our PID, we are still the owner → clean up."""
+        transport = MagicMock()
+        remove_fn = MagicMock()
+        self._run_guard({"pid": os.getpid()}, os.getpid(), transport, remove_fn)
+        transport.cleanup.assert_called_once()
+        remove_fn.assert_called_once()
+
+    def test_cleanup_skipped_when_pid_differs(self):
+        """If run-info PID belongs to a new daemon → skip cleanup to avoid corruption."""
+        transport = MagicMock()
+        remove_fn = MagicMock()
+        my_pid = os.getpid()
+        self._run_guard({"pid": my_pid + 1}, my_pid, transport, remove_fn)
+        transport.cleanup.assert_not_called()
+        remove_fn.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # _handle_connection
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1363,7 +1424,7 @@ class TestDaemonHandlers:
         result = await _handle_snapshot(browser, {})
 
         browser.get_snapshot_text.assert_awaited_once_with(
-            start_from_char=0, interactive=False, full_page=True, from_cli=True
+            offset=0, limit=10000, interactive=False, full_page=True, from_cli=True
         )
         assert result == "- heading 'Example' [ref=e1]"
 
@@ -1374,7 +1435,7 @@ class TestDaemonHandlers:
         await _handle_snapshot(browser, {"interactive": True})
 
         browser.get_snapshot_text.assert_awaited_once_with(
-            start_from_char=0, interactive=True, full_page=True, from_cli=True
+            offset=0, limit=10000, interactive=True, full_page=True, from_cli=True
         )
 
     async def test_handle_snapshot_full_page_false(self):
@@ -1383,17 +1444,27 @@ class TestDaemonHandlers:
         browser.get_snapshot_text = AsyncMock(return_value="- button [ref=e1]")
         result = await _handle_snapshot(browser, {"full_page": False})
         browser.get_snapshot_text.assert_awaited_once_with(
-            start_from_char=0, interactive=False, full_page=False, from_cli=True
+            offset=0, limit=10000, interactive=False, full_page=False, from_cli=True
         )
         assert result == "- button [ref=e1]"
 
-    async def test_handle_snapshot_start_from_char(self):
-        """start_from_char is passed through to get_snapshot_text."""
+    async def test_handle_snapshot_offset(self):
+        """offset is passed through to get_snapshot_text."""
         browser = make_browser()
         browser.get_snapshot_text = AsyncMock(return_value="A" * 90)
-        result = await _handle_snapshot(browser, {"start_from_char": 10})
+        result = await _handle_snapshot(browser, {"offset": 10})
         browser.get_snapshot_text.assert_awaited_once_with(
-            start_from_char=10, interactive=False, full_page=True, from_cli=True
+            offset=10, limit=10000, interactive=False, full_page=True, from_cli=True
+        )
+        assert result == "A" * 90
+
+    async def test_handle_snapshot_limit(self):
+        """limit is passed through to get_snapshot_text."""
+        browser = make_browser()
+        browser.get_snapshot_text = AsyncMock(return_value="A" * 90)
+        result = await _handle_snapshot(browser, {"limit": 5000})
+        browser.get_snapshot_text.assert_awaited_once_with(
+            offset=0, limit=5000, interactive=False, full_page=True, from_cli=True
         )
         assert result == "A" * 90
 
@@ -2042,7 +2113,6 @@ class TestBuildBrowserKwargs:
             mock_path_cls.return_value.is_file.return_value = False
             with patch.dict(os.environ, {}, clear=False):
                 os.environ.pop("BRIDGIC_BROWSER_JSON", None)
-                os.environ.pop("BRIDGIC_HEADLESS", None)
                 kwargs = _build_browser_kwargs()
         assert kwargs["headless"] is True
 
@@ -2065,7 +2135,6 @@ class TestBuildBrowserKwargs:
             mock_path_cls.return_value = mock_local
 
             os.environ.pop("BRIDGIC_BROWSER_JSON", None)
-            os.environ.pop("BRIDGIC_HEADLESS", None)
             kwargs = _build_browser_kwargs()
 
         assert kwargs["headless"] is False
@@ -2090,7 +2159,6 @@ class TestBuildBrowserKwargs:
             mock_path_cls.return_value = mock_local
 
             os.environ.pop("BRIDGIC_BROWSER_JSON", None)
-            os.environ.pop("BRIDGIC_HEADLESS", None)
             kwargs = _build_browser_kwargs()
 
         assert kwargs["channel"] == "msedge"   # local overrides user
@@ -2113,30 +2181,11 @@ class TestBuildBrowserKwargs:
             mock_local.is_file.return_value = False
             mock_path_cls.return_value = mock_local
 
-            os.environ.pop("BRIDGIC_HEADLESS", None)
             kwargs = _build_browser_kwargs()
 
         assert kwargs["channel"] == "chromium"  # env JSON overrides user config
         assert kwargs["headless"] is False       # from user config (not in env JSON)
         assert kwargs["locale"] == "zh-CN"
-
-    def test_bridgic_headless_overrides_all(self, tmp_path):
-        """BRIDGIC_HEADLESS=0 overrides even BRIDGIC_BROWSER_JSON."""
-        fake_home = tmp_path / ".bridgic"
-        fake_home.mkdir()
-        env_json = json.dumps({"headless": True})
-
-        with (
-            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
-            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
-            patch.dict(os.environ, {"BRIDGIC_BROWSER_JSON": env_json, "BRIDGIC_HEADLESS": "0"}),
-        ):
-            mock_local = MagicMock()
-            mock_local.is_file.return_value = False
-            mock_path_cls.return_value = mock_local
-            kwargs = _build_browser_kwargs()
-
-        assert kwargs["headless"] is False  # BRIDGIC_HEADLESS=0 wins
 
     def test_invalid_env_json_is_ignored(self, tmp_path):
         """Malformed BRIDGIC_BROWSER_JSON is silently ignored (logged as warning)."""
@@ -2151,7 +2200,6 @@ class TestBuildBrowserKwargs:
             mock_local = MagicMock()
             mock_local.is_file.return_value = False
             mock_path_cls.return_value = mock_local
-            os.environ.pop("BRIDGIC_HEADLESS", None)
             kwargs = _build_browser_kwargs()  # must not raise
 
         assert kwargs["headless"] is True  # falls back to default
@@ -2174,7 +2222,6 @@ class TestBuildBrowserKwargs:
             mock_local = MagicMock()
             mock_local.is_file.return_value = False
             mock_path_cls.return_value = mock_local
-            os.environ.pop("BRIDGIC_HEADLESS", None)
             kwargs = _build_browser_kwargs()
 
         assert kwargs["proxy"] == {"server": "http://proxy:8080", "username": "u", "password": "p"}
@@ -2190,16 +2237,15 @@ class TestBuildBrowserKwargs:
         with (
             patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
             patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
-            patch.dict(os.environ, {"BRIDGIC_HEADLESS": "0"}, clear=False),
+            patch.dict(os.environ, {"BRIDGIC_BROWSER_JSON": json.dumps({"headless": False})}, clear=False),
         ):
             mock_local = MagicMock()
             mock_local.is_file.return_value = False
             mock_path_cls.return_value = mock_local
-            os.environ.pop("BRIDGIC_BROWSER_JSON", None)
             kwargs = _build_browser_kwargs()
 
         assert kwargs.get("chromium_sandbox") is True
-        # No executable_path auto-set — use Playwright's bundled browser for extension support
+        # No executable_path auto-set
         assert "executable_path" not in kwargs
 
     def test_headed_mode_preserves_explicit_chromium_sandbox_false(self, tmp_path):
@@ -2218,7 +2264,6 @@ class TestBuildBrowserKwargs:
             mock_local.is_file.return_value = False
             mock_path_cls.return_value = mock_local
             os.environ.pop("BRIDGIC_BROWSER_JSON", None)
-            os.environ.pop("BRIDGIC_HEADLESS", None)
             kwargs = _build_browser_kwargs()
 
         assert kwargs["chromium_sandbox"] is False
@@ -2237,7 +2282,6 @@ class TestBuildBrowserKwargs:
             mock_local.is_file.return_value = False
             mock_path_cls.return_value = mock_local
             os.environ.pop("BRIDGIC_BROWSER_JSON", None)
-            os.environ.pop("BRIDGIC_HEADLESS", None)
             kwargs = _build_browser_kwargs()
 
         assert "chromium_sandbox" not in kwargs

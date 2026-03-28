@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Nested Iframe Test</title>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    iframe { border: 1px solid #ccc; display: block; margin-top: 12px; }
+    .click-counter { display: inline-block; margin-left: 8px; color: #555; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <h1>Main Frame</h1>
+
+  <!-- Basic interactive elements -->
+  <button id="main-btn" data-click-count="0"
+    onclick="this.dataset.clickCount = parseInt(this.dataset.clickCount||0)+1; this.dataset.clicked='true'">
+    Main Button
+  </button>
+  <input type="text" id="main-input" aria-label="Main Input" placeholder="Main Input">
+
+  <!-- Same-name element as in iframes — tests nth disambiguation across frames -->
+  <button id="shared-btn" data-click-count="0"
+    onclick="this.dataset.clickCount = parseInt(this.dataset.clickCount||0)+1; this.dataset.clicked='true'">
+    Shared Button
+  </button>
+
+  <!-- Structural noise (unnamed generic with named child) in main frame -->
+  <div id="main-container">
+    <span id="main-label">Container Label</span>
+  </div>
+
+  <iframe
+    id="level1-frame"
+    src="nested_iframe_l1.html"
+    title="Level 1 Frame"
+    style="width:560px;height:280px;"
+  ></iframe>
+</body>
+</html>

@@ -35,7 +35,7 @@ For more install options, see [uv's official documentation](https://docs.astral.
    ```
    This will:
    - Configure git hooks for code quality
-   - Create a Python 3.10 virtual environment
+   - Create a Python 3.11 virtual environment
    - Install all development dependencies
    - Install Playwright browsers (Chromium)
 
@@ -69,27 +69,33 @@ make test-integration
 
 ### Development Workflow
 
-1. **Create a feature branch:**
+Branch naming convention:
+- `feature/` - New features
+- `bugfix/` - Bug fixes
+- `refactor/` - Code refactoring
+- `release/` - Release preparation (version bump / changelog)
+- `hotfix/` - Emergency fixes on top of `main`
+- `docs/` - Documentation updates
+
+Protected branches:
+- `main` and `dev` do not allow direct push from local branches
+- Use Pull Requests to merge into `main`/`dev`
+
+#### Day-to-day feature development
+
+```
+dev  →  feature/your-feature-name  →  PR → dev
+```
+
+1. **Create a feature branch from `dev`:**
    ```shell
+   git checkout dev
    git checkout -b feature/your-feature-name
    ```
-   
-   Branch naming convention:
-   - `feature/` - New features
-   - `bugfix/` - Bug fixes
-   - `refactor/` - Code refactoring
-   - `release/` - Release preparation (version/release docs/changelog)
-   - `docs/` - Documentation updates
-   
-   Protected branches:
-   - `main` and `dev` do not allow direct push from local branches
-   - Use Pull Requests to merge into `main`/`dev`
 
 2. **Make your changes and test:**
    ```shell
-   # Run tests
    make test-quick
-   
    ```
 
 3. **Commit your changes:**
@@ -98,10 +104,70 @@ make test-integration
    git commit -m "feat: description of your changes"
    ```
 
-4. **Push and create a Pull Request:**
+4. **Push and open a Pull Request targeting `dev`:**
    ```shell
    git push origin feature/your-feature-name
    ```
+
+#### Release process
+
+```
+dev  →  release/0.0.2  →  PR → main  →  tag v0.0.2
+                                              ↓
+                                    GitHub Actions publishes to PyPI
+                                    + creates GitHub Release
+                                    + opens main→dev sync PR
+```
+
+1. **Create a release branch from `dev`:**
+   ```shell
+   git checkout dev
+   git checkout -b release/0.0.2
+   ```
+
+2. **Update version and changelog:**
+   - Edit `pyproject.toml`: set `version = "0.0.2"`
+   - Update `CHANGELOG.md` (if maintained)
+   - Commit: `git commit -m "chore: bump version to 0.0.2"`
+
+3. **Open a PR from `release/0.0.2` → `main`** and merge after review.
+
+4. **Tag the release on `main` to trigger the automated publish:**
+   ```shell
+   git checkout main && git pull
+   git tag v0.0.2
+   git push origin v0.0.2
+   ```
+   GitHub Actions will:
+   - Validate the tag matches `pyproject.toml`
+   - Run tests
+   - Build and publish to PyPI (requires reviewer approval in the `production` environment)
+   - Create a GitHub Release with wheel and source distribution attached
+   - Open a `main→dev` sync PR automatically
+
+5. **Merge the sync PR** that GitHub Actions opens to keep `dev` up to date.
+
+> **Staging / TestPyPI**: To validate a release candidate, use the
+> **Release** workflow's manual trigger (`workflow_dispatch`). Select the
+> release branch, fill in the `version` field with the version that
+> matches `pyproject.toml` on that branch (e.g. `0.0.2rc1`), and select
+> `testpypi` from the `repo` dropdown. No tag needed.
+> The actual published version is always taken from `pyproject.toml` —
+> the `version` input is only used for format validation.
+
+#### Hotfix process
+
+For critical production bugs, cut directly from `main`:
+
+```
+main  →  hotfix/fix-critical-bug  →  PR → main  →  tag v0.0.3
+```
+
+After the tag is pushed, GitHub Actions runs the same release pipeline as a normal release.
+Remember to also merge the resulting `main→dev` sync PR.
+
+> **Version convention**: hotfixes bump the patch version (e.g. `0.0.2` → `0.0.3`).
+> PEP 440 `.post` releases are reserved for packaging/metadata corrections, not code fixes.
 
 ## Building the Package
 
@@ -148,7 +214,7 @@ bridgic-browser/
 
 ## Pull Request Process
 
-1. Ensure all tests pass (`make test-quick`)
+1. Ensure all tests pass (`make test` for PRs; `make test-quick` for quick local checks)
 2. Update documentation if needed
 3. Add tests for new functionality
 4. Request review from maintainers

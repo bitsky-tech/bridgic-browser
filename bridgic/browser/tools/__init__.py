@@ -9,8 +9,8 @@ Quick Start
 >>> from bridgic.browser.session import Browser
 >>> from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
 >>>
->>> browser = Browser(headless=False)
->>> await browser.start()
+>>> async with Browser(headless=False) as browser:
+>>>     pass  # browser auto-started via context manager
 >>>
 >>> # Select by category
 >>> builder = BrowserToolSetBuilder.for_categories(
@@ -63,7 +63,7 @@ All tools return a string message following a consistent format:
 - Failure: "FAIL: {description} - {reason}"
 
 **get_snapshot_text** returns the page state string (accessibility tree with refs). It may
-include a pagination notice when truncated; use start_from_char, interactive, and
+include a pagination notice when truncated; use offset, limit, interactive, and
 full_page to control pagination and scope (interactive-only or full-page by default).
 
 Tool Selection Guide

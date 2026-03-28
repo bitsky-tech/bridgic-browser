@@ -70,7 +70,7 @@ async def _send_command_async(command: str, args: Dict[str, Any]) -> str:
             )
 
         try:
-            resp = json.loads(raw.decode())
+            resp = json.loads(raw.decode(errors="replace"))
         except json.JSONDecodeError as exc:
             raise BridgicBrowserCommandError(
                 command=command,
@@ -193,20 +193,37 @@ def _spawn_daemon(headed: bool = False) -> None:
     Parameters
     ----------
     headed:
-        If True, set ``BRIDGIC_HEADLESS=0`` in the daemon environment so the
-        browser launches in headed (visible) mode.
+        If True, merge ``{"headless": false}`` into ``BRIDGIC_BROWSER_JSON``
+        in the daemon environment so the browser launches in headed (visible)
+        mode.
     """
     env = os.environ.copy()
     if headed:
-        env["BRIDGIC_HEADLESS"] = "0"
+        import json as _json
+        existing = _json.loads(env.get("BRIDGIC_BROWSER_JSON", "{}"))
+        existing["headless"] = False
+        env["BRIDGIC_BROWSER_JSON"] = _json.dumps(existing)
+
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "env": env,
+    }
+    if sys.platform == "win32":
+        # CREATE_NEW_PROCESS_GROUP detaches the daemon so it survives
+        # when the CLI process exits.  start_new_session=True only maps
+        # to this flag on Python ≥3.11; explicit creationflags works on
+        # all supported Python versions (≥3.10).
+        popen_kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+        )
+    else:
+        # POSIX: setsid() — new session, new process group.
+        popen_kwargs["start_new_session"] = True
 
     proc = subprocess.Popen(
         [sys.executable, "-m", "bridgic.browser", "daemon"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        # Detach from our process group so it survives when we exit
-        start_new_session=True,
-        env=env,
+        **popen_kwargs,
     )
 
     assert proc.stdout is not None

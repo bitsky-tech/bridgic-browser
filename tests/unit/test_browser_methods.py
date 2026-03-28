@@ -11,7 +11,7 @@ EXPECTED_METHODS = [
     "search", "navigate_to", "go_back", "go_forward",
     "reload_page", "scroll_to_text", "press_key", "evaluate_javascript",
     "get_current_page_info", "new_tab", "get_tabs", "switch_tab",
-    "close_tab", "stop", "browser_resize", "wait_for",
+    "close_tab", "close", "browser_resize", "wait_for",
     "get_snapshot_text",
     "input_text_by_ref", "click_element_by_ref", "get_dropdown_options_by_ref",
     "select_dropdown_option_by_ref", "hover_element_by_ref", "focus_element_by_ref",

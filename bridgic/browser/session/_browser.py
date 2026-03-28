@@ -43,9 +43,35 @@ from ..errors import (
 
 logger = logging.getLogger(__name__)
 
-_MAX_CHAR_LIMIT = int(os.environ.get("BRIDGIC_MAX_CHARS", "30000"))
+_DEFAULT_SNAPSHOT_LIMIT = 10000
 
 _LAUNCH_DEBUG_LOG = os.path.expanduser("~/.bridgic/tmp/launch-debug.json")
+
+
+def _detect_system_chrome() -> bool:
+    """Check if system Google Chrome is installed.
+
+    Used to auto-switch from Playwright's bundled "Chrome for Testing" (which
+    Google blocks for OAuth login) to the real system Chrome in headed mode.
+    """
+    if sys.platform == "darwin":
+        return os.path.isfile(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        )
+    elif sys.platform == "linux":
+        import shutil
+        return (
+            shutil.which("google-chrome") is not None
+            or shutil.which("google-chrome-stable") is not None
+        )
+    elif sys.platform == "win32":
+        for env_var in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+            base = os.environ.get(env_var, "")
+            if base:
+                path = os.path.join(base, "Google", "Chrome", "Application", "chrome.exe")
+                if os.path.isfile(path):
+                    return True
+    return False
 
 
 def _write_launch_debug_log(options: Dict[str, Any], mode: str) -> None:
@@ -242,15 +268,17 @@ async def _click_checkable_target(page, locator, bbox) -> None:
         cx = bbox["x"] + bbox["width"] / 2
         cy = bbox["y"] + bbox["height"] / 2
         if not await locator.is_visible():
+            logger.debug("_click_checkable_target: bbox present but is_visible()=False; using dispatch_event click")
             await locator.dispatch_event("click")
             return
 
         covered = await locator.evaluate(
-            f"(el) => {{ if (window.frameElement !== null) return false; "
+            f"(el) => {{ if (window.parent !== window) return false; "
             f"const t = document.elementFromPoint({cx}, {cy}); "
             f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
         )
         if covered:
+            logger.debug("_click_checkable_target: covered at (%.1f, %.1f), clicking intercepting element", cx, cy)
             if page:
                 await page.evaluate(f"document.elementFromPoint({cx}, {cy})?.click()")
             else:
@@ -262,6 +290,7 @@ async def _click_checkable_target(page, locator, bbox) -> None:
     if await locator.is_visible():
         await locator.click()
     else:
+        logger.debug("_click_checkable_target: no bbox and is_visible()=False; using dispatch_event click")
         await locator.dispatch_event("click")
 
 
@@ -299,10 +328,6 @@ class Browser:
         Stealth mode includes:
         - 50+ Chrome args to disable automation detection
         - Ignoring Playwright's automation-revealing default args
-        - Extensions (uBlock Origin, Cookie Consent, etc.) when headless=False
-
-        Note: Extensions require headless=False. If stealth with extensions is
-        enabled without user_data_dir, a temporary directory will be created.
     channel : str, optional
         Browser distribution channel. Use "chrome", "chrome-beta", "msedge", etc.
         for branded browsers, or "chromium" for new headless mode.
@@ -365,8 +390,8 @@ class Browser:
     # Default: headless with stealth (stealth is ON by default)
     >>> browser = Browser()  # stealth=True, headless=True
 
-    # Non-headless with full stealth (includes extensions)
-    >>> browser = Browser(headless=False)  # Auto temp user_data_dir for extensions
+    # Non-headless with stealth
+    >>> browser = Browser(headless=False)
 
     # Persistent session with stealth
     >>> browser = Browser(
@@ -395,7 +420,6 @@ class Browser:
     # Custom stealth config
     >>> browser = Browser(
     ...     stealth=StealthConfig(
-    ...         enable_extensions=False,  # No extensions
     ...         disable_security=True,    # For testing only
     ...     ),
     ... )
@@ -457,6 +481,14 @@ class Browser:
 
         if stealth is True:
             self._stealth_config = StealthConfig()
+        elif isinstance(stealth, dict):
+            # Config files pass stealth as a dict (e.g. {"disable_security": true}).
+            # Filter out unknown keys for backwards compatibility (e.g. removed
+            # "enable_extensions" from older config files).
+            import dataclasses as _dc
+            _known = {f.name for f in _dc.fields(StealthConfig)}
+            _filtered = {k: v for k, v in stealth.items() if k in _known}
+            self._stealth_config = StealthConfig(**_filtered)
         elif isinstance(stealth, StealthConfig):
             self._stealth_config = stealth
 
@@ -528,21 +560,17 @@ class Browser:
 
         Returns True if:
         - user_data_dir is provided, OR
-        - stealth mode with extensions is enabled (extensions need persistent context)
-          AND we're not using system Chrome (which dropped --load-extension in v137+)
+        - headed mode (persistent context looks like a real user profile)
         """
         # Explicit user_data_dir
         if self._user_data_dir is not None:
             return True
 
-        # Stealth with extensions needs persistent context (and headless=False).
-        # Skip for system Chrome (channel/executable_path) — extensions won't load.
-        if (
-            self._stealth_config
-            and self._stealth_config.can_use_extensions(self._headless)
-            and not self._channel
-            and not self._executable_path
-        ):
+        # headed mode always uses persistent context so the browser profile looks
+        # like a real user to bot-detection systems (Google OAuth, reCAPTCHA, etc.).
+        # launch + new_context produces an incognito-like context with no cookies or
+        # history, which is easily flagged as automation.
+        if not self._headless and not self._channel and not self._executable_path:
             return True
 
         return False
@@ -571,7 +599,14 @@ class Browser:
 
     @property
     def headless(self) -> bool:
-        """Whether browser runs in headless mode."""
+        """Whether the user requested a windowless (headless) browser.
+
+        Reflects the *user's intent*, not the internal Playwright ``headless``
+        flag.  When stealth's new-headless mode is active, Playwright receives
+        ``headless=False`` internally so it selects the full Chromium binary,
+        but this property still returns ``True`` because Chrome itself runs
+        with ``--headless=new`` and has no visible window.
+        """
         return self._headless
 
     @property
@@ -643,25 +678,52 @@ class Browser:
         args_list: List[str] = []
 
         # When using system Chrome (channel or executable_path), skip stealth
-        # Chrome args and extension loading — system Chrome v137+ doesn't
-        # support --load-extension and many stealth flags cause "unsupported
-        # flag" warnings.  Anti-detection still works via ignore_default_args
+        # Chrome args — many stealth flags cause "unsupported flag" warnings.
+        # Anti-detection still works via ignore_default_args
         # (removes --enable-automation) and the JS init script (patches
         # navigator.webdriver, plugins, chrome object, etc.).
         _is_system_chrome = bool(self._channel or self._executable_path)
 
-        # Add stealth args first (if enabled)
+        # In headed mode, auto-switch to system Chrome to avoid Google blocking
+        # "Chrome for Testing" (the Playwright-bundled binary) for OAuth login.
+        # System Chrome shows as a normal browser in the Dock (no "test" label)
+        # and passes Google's browser safety checks.
+        _auto_system_chrome = (
+            not self._headless
+            and self.stealth_enabled
+            and not _is_system_chrome
+            and _detect_system_chrome()
+        )
+        if _auto_system_chrome:
+            options["channel"] = "chrome"
+            logger.info(
+                "Headed mode: auto-switching to system Chrome for anti-detection "
+                "(Chrome for Testing is blocked by Google OAuth)"
+            )
+
+        # Add stealth args first (if enabled).
+        # When user explicitly set channel/executable_path (_is_system_chrome),
+        # skip stealth args entirely (existing behaviour).
+        # When auto-switched to system Chrome, still apply the minimal headed
+        # stealth args (they're compatible with system Chrome).
         if self._stealth_builder and not _is_system_chrome:
             fallback_viewport = {"width": 1600, "height": 900}
             viewport = self._viewport or fallback_viewport
             viewport_width = viewport.get("width", 1600)
             viewport_height = viewport.get("height", 900)
-            stealth_args = self._stealth_builder.build_args(viewport_width, viewport_height)
+            stealth_args = self._stealth_builder.build_args(
+                viewport_width,
+                viewport_height,
+                headless_intent=self._headless,
+                locale=self._locale,
+            )
+            if _auto_system_chrome:
+                # System Chrome shows a "unsupported command-line flag" warning
+                # banner for --disable-blink-features.  --test-type= (empty value)
+                # tells Chrome to suppress all bad-flag warnings without adding
+                # any web-detectable side effects.
+                stealth_args.append("--test-type=")
             args_list.extend(stealth_args)
-
-            # Add extension args if applicable
-            extension_args = self._stealth_builder.build_extension_args(self._headless)
-            args_list.extend(extension_args)
 
         # Add user-provided args (can override/extend stealth args)
         if self._args:
@@ -695,7 +757,24 @@ class Browser:
         if self._timeout is not None:
             options["timeout"] = self._timeout * 1000.0
         if self._headless is not None:
-            options["headless"] = self._headless
+            # When the user wants no window + stealth is active, redirect Playwright
+            # to the full chromium binary by passing headless=False.  The actual
+            # "no window" behaviour comes from --headless=new added in build_args().
+            #
+            #   self._headless      → user intent   (hide the window?)
+            #   options["headless"] → Playwright arg (which binary to pick?)
+            #
+            # chromium-headless-shell is a stripped binary with detectable
+            # fingerprint differences; full chromium + --headless=new avoids that.
+            _use_full_binary = (
+                self._headless is True
+                and not _is_system_chrome       # system Chrome picks its own binary
+                and not _auto_system_chrome      # auto-switched system Chrome too
+                and self._stealth_config is not None
+                and self._stealth_config.enabled
+                and self._stealth_config.use_new_headless
+            )
+            options["headless"] = False if _use_full_binary else self._headless
         if self._devtools is not None:
             options["devtools"] = self._devtools
         if self._proxy is not None:
@@ -734,9 +813,12 @@ class Browser:
             stealth_context_opts = self._stealth_builder.get_context_options()
             options.update(stealth_context_opts)
 
-            # Add screen size to match viewport (stealth recommendation)
+            # Add screen size to match viewport for correct window.screen values.
+            # Fall back to a standard desktop resolution when no_viewport=True.
             if self._viewport:
                 options["screen"] = self._viewport.copy()
+            else:
+                options["screen"] = {"width": 1600, "height": 900}
 
         # Add non-None context parameters (user values override stealth defaults)
         if self._viewport is not None and not self._no_viewport:
@@ -805,20 +887,20 @@ class Browser:
         # Determine user_data_dir
         if self._user_data_dir:
             options["user_data_dir"] = str(self._user_data_dir)
-        elif self._stealth_config and self._stealth_config.can_use_extensions(self._headless):
-            # Stealth with extensions needs persistent context, create temp dir
+        else:
+            # Playwright requires a non-None user_data_dir for
+            # launch_persistent_context; create a bridgic-managed temp dir so
+            # close() can clean it up correctly via shutil.rmtree.
             if not self._temp_user_data_dir:
                 self._temp_user_data_dir = tempfile.mkdtemp(prefix="bridgic-browser-")
-                logger.info(f"Created temporary user data dir for stealth extensions: {self._temp_user_data_dir}")
+                logger.info(f"Created temporary user data dir for headed mode: {self._temp_user_data_dir}")
             options["user_data_dir"] = self._temp_user_data_dir
-        else:
-            options["user_data_dir"] = ""
 
         return options
 
     # ==================== Lifecycle ====================
 
-    async def start(self) -> None:
+    async def _start(self) -> None:
         """Start the browser.
 
         Automatically chooses between two launch modes:
@@ -826,8 +908,7 @@ class Browser:
         - If `user_data_dir` is not provided: Uses `launch` + `new_context`
 
         When stealth mode is enabled, anti-detection args are automatically
-        applied. If stealth with extensions is enabled without user_data_dir,
-        a temporary directory is created automatically.
+        applied.
         """
         if self._playwright is not None:
             logger.warning("Playwright has already been started")
@@ -835,17 +916,13 @@ class Browser:
 
         logger.info("Starting playwright")
         if self.stealth_enabled:
-            extensions_enabled = (
-                self._stealth_config
-                and self._stealth_config.can_use_extensions(self._headless)
-            )
-            logger.info(f"Stealth mode enabled (extensions={extensions_enabled})")
+            logger.info("Stealth mode enabled")
 
         try:
             self._playwright = await async_playwright().start()
 
             if self.use_persistent_context:
-                # Mode 1: Persistent context (with user_data_dir or stealth extensions)
+                # Mode 1: Persistent context (with user_data_dir or headed mode)
                 logger.info("Using persistent context mode")
                 persistent_options = self._get_persistent_context_options()
                 logger.debug(f"Persistent context options: {persistent_options}")
@@ -866,8 +943,16 @@ class Browser:
                 logger.debug(f"Context options: {context_options}")
                 self._context = await self._browser.new_context(**context_options)
 
-            # Inject JS stealth patches before any page script runs
-            if self._stealth_builder:
+            # Inject JS stealth patches before any page script runs.
+            # Headed mode (self._headless=False) skips the init script entirely
+            # so Cloudflare Turnstile's challenge iframe sees original, unmodified
+            # browser APIs — the same as playwright CLI (which injects nothing).
+            # context.add_init_script() runs in ALL frames including challenge
+            # iframes; patching window.chrome (configurable:false),
+            # navigator.permissions.query, and WebGL prototype inside the
+            # Turnstile iframe causes detectable API inconsistencies that fail
+            # the challenge even when the browser binary is fine.
+            if self._stealth_builder and self._headless:
                 init_script = self._stealth_builder.get_init_script(locale=self._locale)
                 if init_script:
                     await self._context.add_init_script(init_script)
@@ -890,13 +975,32 @@ class Browser:
                 f"Playwright started (persistent_context={self.use_persistent_context}, "
                 f"stealth={self.stealth_enabled})"
             )
-        except Exception:
+        except BaseException:
             logger.exception("Failed to start browser; rolling back partial startup state")
             try:
-                await self.stop()
-            except Exception:
+                await self.close()
+            except BaseException:
                 logger.exception("Failed to roll back browser startup state")
             raise
+
+    async def _ensure_started(self) -> None:
+        """Auto-start the browser if not yet started.
+
+        Guarantees that both ``_playwright`` and ``_context`` are initialised
+        after this call returns.  If ``_playwright`` is set but ``_context`` is
+        None (inconsistent state caused by an external browser crash or a
+        partial ``close()``), the browser is fully reset before restarting.
+        """
+        if self._playwright is None:
+            await self._start()
+        elif self._context is None:
+            # _playwright exists but context was lost — do a clean reset.
+            logger.warning(
+                "[_ensure_started] inconsistent state: _playwright set but _context is None; "
+                "performing clean restart"
+            )
+            await self.close()
+            await self._start()
 
     # Timeout (seconds) applied to individual page.close() calls during
     # shutdown so that a hung beforeunload handler cannot block forever.
@@ -904,9 +1008,9 @@ class Browser:
     _TRACE_STOP_TIMEOUT = 10.0
     _VIDEO_PATH_TIMEOUT = 10.0
     _VIDEO_SAVE_AS_TIMEOUT = 120.0  # save_as copies a file; large recordings need more time
-    _CONTEXT_CLOSE_TIMEOUT = 10.0
-    _BROWSER_CLOSE_TIMEOUT = 10.0
-    _PLAYWRIGHT_STOP_TIMEOUT = 10.0
+    _CONTEXT_CLOSE_TIMEOUT = 15.0
+    _BROWSER_CLOSE_TIMEOUT = 15.0
+    _PLAYWRIGHT_STOP_TIMEOUT = 15.0
 
     def _clear_page_scoped_state(self, page: Optional[Page], errors: Optional[List[str]] = None) -> None:
         """Detach page-scoped listeners and drop cached state for one page."""
@@ -945,7 +1049,7 @@ class Browser:
         """Create a unique close-session directory and pre-allocate artifact paths.
 
         Called by the daemon before background teardown so paths can be reported
-        immediately to the client. Stores state for browser.stop() and the
+        immediately to the client. Stores state for browser.close() and the
         post-close report writer to consume.
 
         Returns
@@ -997,7 +1101,7 @@ class Browser:
 
         return artifacts
 
-    async def stop(self) -> str:
+    async def close(self) -> str:
         """Close the browser.
 
         Stops the browser and cleans up all resources. Automatically removes
@@ -1006,9 +1110,8 @@ class Browser:
         beforehand. Active tracing/video sessions are auto-finalized and their
         paths included in the result.
 
-        Safe to call even when :meth:`start` was never called (all internal
-        handles are ``None`` and every teardown step is guarded by a null-check,
-        so the method returns immediately without raising).
+        Safe to call even when the browser was never started — returns
+        ``"Browser closed."`` immediately without raising.
 
         Returns
         -------
@@ -1016,9 +1119,17 @@ class Browser:
             Operation result message. Includes auto-saved trace/video paths
             when active sessions were finalized during close.
         """
+        if self._playwright is None:
+            return "Browser closed."
+
         errors: List[str] = []
         shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
         context_key: Optional[str] = None
+        # Deferred re-raise: if CancelledError / KeyboardInterrupt arrives during any
+        # cleanup await we record it here, finish ALL cleanup steps, then re-raise at
+        # the very end.  This ensures no Playwright/Chromium process is left orphaned
+        # just because one step was interrupted.
+        _pending_cancel: Optional[BaseException] = None
 
         # Auto-stop active tracing before context/page teardown so trace data is saved.
         if self._context:
@@ -1058,6 +1169,15 @@ class Browser:
                         except Exception as cleanup_exc:
                             errors.append(f"tracing.tmp_cleanup: {cleanup_exc}")
                     errors.append(f"tracing.stop: {e}")
+                except BaseException as e:
+                    if output_path and os.path.exists(output_path):
+                        try:
+                            os.remove(output_path)
+                        except Exception as cleanup_exc:
+                            errors.append(f"tracing.tmp_cleanup: {cleanup_exc}")
+                    errors.append(f"tracing.stop: {e}")
+                    if _pending_cancel is None:
+                        _pending_cancel = e
                 finally:
                     self._tracing_state[context_key] = False
 
@@ -1122,13 +1242,16 @@ class Browser:
 
         # Close page (with timeout to guard against hung beforeunload handlers)
         if self._page:
+            _page = self._page
+            self._page = None
             try:
                 await asyncio.wait_for(
-                    self._page.close(), timeout=self._PAGE_CLOSE_TIMEOUT,
+                    _page.close(), timeout=self._PAGE_CLOSE_TIMEOUT,
                 )
-            except Exception as e:
+            except BaseException as e:
                 errors.append(f"page.close: {e}")
-            self._page = None
+                if not isinstance(e, Exception) and _pending_cancel is None:
+                    _pending_cancel = e
 
         # Detach download manager before context closes to remove handlers
         if self._download_manager and self._context:
@@ -1147,15 +1270,19 @@ class Browser:
                         extra_page.close(run_before_unload=False),
                         timeout=self._PAGE_CLOSE_TIMEOUT,
                     )
-                except Exception:
-                    pass  # best-effort; context.close() will handle it
+                except BaseException as e:
+                    if not isinstance(e, Exception) and _pending_cancel is None:
+                        _pending_cancel = e
+                    # best-effort; context.close() will handle remaining pages
 
         # Close context
         # NOTE: In persistent context mode, closing context will auto close browser
         if self._context:
+            _context = self._context
+            self._context = None
             try:
                 await asyncio.wait_for(
-                    self._context.close(),
+                    _context.close(),
                     timeout=self._CONTEXT_CLOSE_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -1164,14 +1291,19 @@ class Browser:
                 )
             except Exception as e:
                 errors.append(f"context.close: {e}")
-            self._context = None
+            except BaseException as e:
+                errors.append(f"context.close: {e}")
+                if _pending_cancel is None:
+                    _pending_cancel = e
 
         # Close browser (only needed in normal launch mode, not persistent context)
         # In persistent context mode, browser is None or already closed
         if self._browser:
+            _browser = self._browser
+            self._browser = None
             try:
                 await asyncio.wait_for(
-                    self._browser.close(),
+                    _browser.close(),
                     timeout=self._BROWSER_CLOSE_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -1180,13 +1312,18 @@ class Browser:
                 )
             except Exception as e:
                 errors.append(f"browser.close: {e}")
-            self._browser = None
+            except BaseException as e:
+                errors.append(f"browser.close: {e}")
+                if _pending_cancel is None:
+                    _pending_cancel = e
 
         # Stop playwright
         if self._playwright:
+            _playwright = self._playwright
+            self._playwright = None
             try:
                 await asyncio.wait_for(
-                    self._playwright.stop(),
+                    _playwright.stop(),
                     timeout=self._PLAYWRIGHT_STOP_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -1195,7 +1332,10 @@ class Browser:
                 )
             except Exception as e:
                 errors.append(f"playwright.stop: {e}")
-            self._playwright = None
+            except BaseException as e:
+                errors.append(f"playwright.stop: {e}")
+                if _pending_cancel is None:
+                    _pending_cancel = e
 
         # Clean up temporary user data directory in a thread so the synchronous
         # shutil.rmtree (potentially large cache trees) does not block the loop.
@@ -1209,8 +1349,10 @@ class Browser:
                     None, lambda: shutil.rmtree(tmp_dir, ignore_errors=True),
                 )
                 logger.debug(f"Cleaned up temporary user data dir: {tmp_dir}")
-            except Exception as e:
+            except BaseException as e:
                 errors.append(f"temp_dir cleanup: {e}")
+                if not isinstance(e, Exception) and _pending_cancel is None:
+                    _pending_cancel = e
 
         # Clear snapshot cache
         self._last_snapshot = None
@@ -1249,26 +1391,29 @@ class Browser:
         result = "\n".join(lines)
 
         if errors:
-            logger.warning(f"Browser stopped with errors: {errors}")
+            logger.warning(f"Browser closed with errors: {errors}")
         else:
-            logger.info("Browser stopped")
+            logger.info("Browser closed")
+
+        if _pending_cancel is not None:
+            raise _pending_cancel
 
         return result
 
     async def __aenter__(self) -> "Browser":
         """Async context manager entry - starts the browser.
-        
+
         Usage:
             async with Browser(headless=True) as browser:
                 await browser.navigate_to("https://example.com")
                 # Browser is automatically closed when exiting the context
         """
-        await self.start()
+        await self._start()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Async context manager exit - stops the browser."""
-        await self.stop()
+        """Async context manager exit - closes the browser."""
+        await self.close()
 
     # ==================== Page Management ====================
 
@@ -1306,11 +1451,12 @@ class Browser:
         InvalidInputError
             If url is empty.
         StateError
-            If no browser context is open (call start() first).
+            If context is unavailable after auto-start (should not normally occur).
         OperationError
             If navigation fails (network error, timeout, etc.).
         """
         try:
+            await self._ensure_started()
             logger.info(f"[navigate_to] start url={url}")
 
             url = url.strip()
@@ -1326,11 +1472,7 @@ class Browser:
                 # fail at navigation time with a clear Playwright error (intentional).
 
             if not self._page:
-                if not self._context:
-                    _raise_state_error(
-                        "No browser context is open. Call start() first.",
-                        code="NO_BROWSER_CONTEXT",
-                    )
+                # All tabs were closed (e.g. via close_tab); _context is still alive.
                 logger.info("No page is open, creating a new page in existing context")
                 self._page = await self._context.new_page()
 
@@ -1354,20 +1496,21 @@ class Browser:
             logger.error(f"[navigate_to] {error_msg}")
             _raise_operation_error(error_msg)
 
-    async def new_page(
+    async def _new_page(
         self,
         url: Optional[str] = None,
         wait_until: Literal["domcontentloaded", "load", "networkidle", "commit"] = "domcontentloaded",
         timeout: Optional[float] = None,
-    ) -> Optional[Page]:
-        if not self._context:
+    ) -> Page:
+        if self._context is None:
             _raise_state_error(
-                "No browser context is open. Call start() first.",
+                "No browser context is open. Use navigate_to() to start the browser first.",
                 code="NO_BROWSER_CONTEXT",
             )
         self._page = await self._context.new_page()
         if url:
             await self.navigate_to(url, wait_until=wait_until, timeout=timeout)
+        await self._page.bring_to_front()
         return self._page
 
     async def get_page_desc(self, page: Optional[Page] = None) -> Optional[PageDesc]:
@@ -1428,7 +1571,7 @@ class Browser:
         title = await page.title()
         return True, f"Switched to tab {page_id}: {page.url} (title: {title})"
 
-    async def close_page(self, page: Page | str) -> tuple[bool, str]:
+    async def _close_page(self, page: Page | str) -> tuple[bool, str]:
         """Close a page by Page object or page_id.
 
         Parameters
@@ -1792,7 +1935,60 @@ class Browser:
         try:
             if self._snapshot_generator is None:
                 self._snapshot_generator = SnapshotGenerator()
-            
+
+            ref_data = self._last_snapshot.refs.get(ref)
+
+            # ── aria-ref fast-path ─────────────────────────────────────────────────
+            # Playwright's aria-ref engine maps ephemeral IDs (e.g. "e369", "f1e5")
+            # directly to live DOM element pointers populated during snapshotForAI.
+            # O(1) lookup — no CSS reconstruction needed.
+            #
+            # Each frame stores its own _lastAriaSnapshotForQuery keyed by the FULL
+            # prefixed ref (e.g. L1 frame stores "f1e5" → element).  For iframe
+            # elements we therefore scope the locator to the correct frame first via
+            # frame_locator chain — this ensures locator.evaluate() and all other
+            # locator operations run in the element's own frame context, not the
+            # main frame.  Main-frame elements (frame_path=None) use page directly.
+            #
+            # Falls through silently if stale (count=0) or engine unavailable.
+            if ref_data and ref_data.playwright_ref:
+                try:
+                    ar_scope = self._page
+                    if ref_data.frame_path:
+                        for local_nth in ref_data.frame_path:
+                            ar_scope = ar_scope.frame_locator("iframe").nth(local_nth)
+                    ar_locator = ar_scope.locator(f"aria-ref={ref_data.playwright_ref}")
+                    ar_count = await ar_locator.count()
+                    if ar_count == 1:
+                        logger.debug(
+                            "[get_element_by_ref] aria-ref fast-path hit: ref=%s playwright_ref=%s frame_path=%s",
+                            ref, ref_data.playwright_ref, ref_data.frame_path,
+                        )
+                        return ar_locator
+                    # ar_count == 0 → snapshot is stale (DOM changed) — fall through
+                    # ar_count > 1  → should never happen for a direct pointer — fall through
+                    logger.debug(
+                        "[get_element_by_ref] aria-ref stale (count=%d), falling through to CSS: ref=%s playwright_ref=%s",
+                        ar_count, ref, ref_data.playwright_ref,
+                    )
+                except Exception as _ar_exc:
+                    logger.debug(
+                        "[get_element_by_ref] aria-ref exception (%s), falling through to CSS: ref=%s",
+                        _ar_exc, ref,
+                    )
+            # ── aria-ref fast-path end ─────────────────────────────────────────────
+
+            if ref_data is None:
+                logger.debug("[get_element_by_ref] ref not found in snapshot: %s", ref)
+            else:
+                logger.debug(
+                    "[get_element_by_ref] CSS path: ref=%s role=%s name=%r nth=%s frame_path=%s",
+                    ref,
+                    ref_data.role,
+                    ref_data.name,
+                    ref_data.nth,
+                    ref_data.frame_path,
+                )
             locator = self._snapshot_generator.get_locator_from_ref_async(
                 self._page, ref, self._last_snapshot.refs
             )
@@ -1802,7 +1998,6 @@ class Browser:
                 if count == 1:
                     return locator
                 elif count > 1:
-                    ref_data = self._last_snapshot.refs.get(ref)
                     can_recover_by_role_name = (
                         bool(ref_data and ref_data.name)
                         and ref_data.role not in SnapshotGenerator.ROLE_TEXT_MATCH_ROLES
@@ -1810,10 +2005,9 @@ class Browser:
                         and ref_data.role not in SnapshotGenerator.TEXT_LEAF_ROLES
                     )
                     if can_recover_by_role_name and ref_data:
-                        frame_path = getattr(ref_data, 'frame_path', None)
                         scope = self._page
-                        if frame_path:
-                            for local_nth in frame_path:
+                        if ref_data.frame_path:
+                            for local_nth in ref_data.frame_path:
                                 scope = scope.frame_locator("iframe").nth(local_nth)
                         role_name_locator = scope.get_by_role(
                             ref_data.role,
@@ -2069,7 +2263,8 @@ Before you return the element ref, reason about the state and elements for a sen
 
     async def get_snapshot_text(
         self,
-        start_from_char: int = 0,
+        offset: int = 0,
+        limit: int = _DEFAULT_SNAPSHOT_LIMIT,
         interactive: bool = False,
         full_page: bool = True,
         from_cli: bool = False,
@@ -2090,10 +2285,13 @@ Before you return the element ref, reason about the state and elements for a sen
 
         Parameters
         ----------
-        start_from_char : int, optional
+        offset : int, optional
             Pagination offset (character index into the full tree text).
-            Must be >= 0.  Use the ``next_start_char`` value from the
-            truncation notice to get the next page of content.  Default is 0.
+            Must be >= 0.  Use the ``next_offset`` value from the truncation
+            notice to get the next page of content.  Default is 0.
+        limit : int, optional
+            Maximum number of characters to return.  Must be >= 1.
+            Default is 10 000.
         interactive : bool, optional
             If True, only include clickable/editable elements (buttons, links,
             inputs, checkboxes, elements with cursor:pointer, etc.).
@@ -2112,23 +2310,30 @@ Before you return the element ref, reason about the state and elements for a sen
             Page header followed by the accessibility tree.  Lines with
             ``[ref=...]`` are interactive elements.
 
-            Output is truncated to ``BRIDGIC_MAX_CHARS`` (default 30 000)
-            characters.  When truncated, a ``[notice]`` at the end shows the
-            ``next_start_char`` value and the continuation call.
+            Output is truncated to ``limit`` characters.  When truncated, a
+            ``[notice]`` is prepended before the page content (after the header)
+            with the ``next_offset`` value and the continuation call.
 
         Raises
         ------
         InvalidInputError
-            If ``start_from_char`` is negative or beyond the total tree length.
+            If ``offset`` is negative, beyond the total tree length, or
+            ``limit`` is less than 1.
         OperationError
             If snapshot generation fails.
         """
         try:
-            if start_from_char < 0:
+            if offset < 0:
                 _raise_invalid_input(
-                    "start_from_char must be >= 0",
-                    code="INVALID_START_FROM_CHAR",
-                    details={"start_from_char": start_from_char},
+                    "offset must be >= 0",
+                    code="INVALID_OFFSET",
+                    details={"offset": offset},
+                )
+            if limit < 1:
+                _raise_invalid_input(
+                    "limit must be >= 1",
+                    code="INVALID_LIMIT",
+                    details={"limit": limit},
                 )
 
             snapshot = await self.get_snapshot(
@@ -2143,39 +2348,39 @@ Before you return the element ref, reason about the state and elements for a sen
 
             total_length = len(full_text)
 
-            if start_from_char > 0:
-                if start_from_char >= total_length:
+            if offset > 0:
+                if offset >= total_length:
                     _raise_invalid_input(
                         (
-                            f"start_from_char ({start_from_char}) exceeds total page state length "
+                            f"offset ({offset}) exceeds total page state length "
                             f"of {total_length} characters."
                         ),
-                        code="START_FROM_CHAR_OUT_OF_RANGE",
-                        details={"start_from_char": start_from_char, "total_length": total_length},
+                        code="OFFSET_OUT_OF_RANGE",
+                        details={"offset": offset, "total_length": total_length},
                     )
-                text = full_text[start_from_char:]
+                text = full_text[offset:]
             else:
                 text = full_text
 
             truncated = False
-            next_start_char: Optional[int] = None
+            next_offset: Optional[int] = None
 
-            if len(text) > _MAX_CHAR_LIMIT:
-                truncate_at = _MAX_CHAR_LIMIT
+            if len(text) > limit:
+                truncate_at = limit
 
-                paragraph_break = text.rfind("\n\n", _MAX_CHAR_LIMIT - 500, _MAX_CHAR_LIMIT)
+                paragraph_break = text.rfind("\n\n", limit - 500, limit)
                 if paragraph_break > 0:
                     truncate_at = paragraph_break
                 else:
-                    line_break = text.rfind("\n", 0, _MAX_CHAR_LIMIT)
+                    line_break = text.rfind("\n", 0, limit)
                     if line_break > 0:
                         truncate_at = line_break + 1
 
                 text = text[:truncate_at]
                 truncated = True
-                next_start_char = start_from_char + truncate_at
+                next_offset = offset + truncate_at
 
-            if truncated and next_start_char is not None:
+            if truncated and next_offset is not None:
                 continuation: str
                 if from_cli:
                     cli_flags = []
@@ -2183,25 +2388,30 @@ Before you return the element ref, reason about the state and elements for a sen
                         cli_flags.append("-i")
                     if not full_page:
                         cli_flags.append("-F")
-                    cli_flags.append(f"-s {next_start_char}")
+                    cli_flags.append(f"-o {next_offset}")
+                    cli_flags.append(f"-l {limit}")
                     cli_cmd = "bridgic-browser snapshot " + " ".join(cli_flags)
                     continuation = f"run: {cli_cmd}"
                 else:
                     continuation = (
-                        f"call get_snapshot_text(start_from_char={next_start_char}, "
+                        f"call get_snapshot_text(offset={next_offset}, "
+                        f"limit={limit}, "
                         f"interactive={interactive}, full_page={full_page})"
                     )
 
                 notice = (
-                    "\n\n[notice] Current page text is too long, returned portion starting "
-                    f"from character {start_from_char} (this segment length {len(text)} / total "
+                    "[notice] Current page text is too long, returned portion starting "
+                    f"from character {offset} (this segment length {len(text)} / total "
                     f"length {total_length} characters). To continue getting subsequent content: "
-                    f"{continuation}"
+                    f"{continuation}\n\n"
                 )
-                text = f"{text}{notice}"
+                logger.info("[get_snapshot_text] Successfully retrieved interface information")
+                return header + notice + text
 
             logger.info("[get_snapshot_text] Successfully retrieved interface information")
             return header + text
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to get interface information: {e}"
             logger.error(f"[get_snapshot_text] {error_msg}")
@@ -2272,10 +2482,14 @@ Before you return the element ref, reason about the state and elements for a sen
                 result = f"Searched on {engine.title()}: '{query}'"
                 logger.info(f"[search] done {result}")
                 return result
+            except BridgicBrowserError:
+                raise
             except Exception as e:
                 logger.error(f"[search] failed engine={engine} error={type(e).__name__}: {e}")
                 error_msg = f'Search on {engine} failed for "{query}": {str(e)}'
                 _raise_operation_error(error_msg)
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Search failed: {str(e)}"
             logger.error(f"[search] failed error={type(e).__name__}: {error_msg}")
@@ -2308,6 +2522,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Navigated back to: {page.url}"
             logger.info(f"[go_back] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to navigate back: {str(e)}"
             logger.error(f"[go_back] {error_msg}")
@@ -2342,6 +2558,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Navigated forward to: {page.url}"
             logger.info(f"[go_forward] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to navigate forward: {str(e)}"
             logger.error(f"[go_forward] {error_msg}")
@@ -2386,6 +2604,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Page reloaded: {page.url} (title: {title})"
             logger.info(f"[reload_page] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to reload page: {str(e)}"
             logger.error(f"[reload_page] {error_msg}")
@@ -2428,6 +2648,8 @@ Before you return the element ref, reason about the state and elements for a sen
             )
             logger.info(f"[get_current_page_info] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to get current page info: {str(e)}"
             logger.error(f"[get_current_page_info] {error_msg}")
@@ -2461,6 +2683,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Pressed key: {key}"
             logger.info(f"[press_key] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to press key: {str(e)}"
             logger.error(f"[press_key] {error_msg}")
@@ -2523,6 +2747,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 result = f"Text '{text}' not found or not visible"
                 logger.info(f"[scroll_to_text] done {result}")
                 return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to scroll to text: {str(e)}"
             logger.error(f"[scroll_to_text] {error_msg}")
@@ -2569,6 +2795,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 result_str = str(result)
                 logger.info(f"[evaluate_javascript] done result_preview={result_str[:200]!r} result_len={len(result_str)}")
                 return result_str
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to execute JavaScript: {str(e)}"
             logger.error(f"[evaluate_javascript] {error_msg}")
@@ -2610,10 +2838,17 @@ Before you return the element ref, reason about the state and elements for a sen
         Raises
         ------
         StateError
-            If no browser context is open (call start() first).
+            If the browser has not been started yet. Call ``navigate_to()``
+            first to open a page, then use this method to create additional tabs.
         OperationError
             If tab creation or navigation fails.
         """
+        if self._playwright is None:
+            _raise_state_error(
+                "Browser is not started. Use navigate_to() to open a page first, then you can create additional tabs.",
+                code="BROWSER_NOT_STARTED",
+            )
+
         try:
             logger.info(f"[new_tab] start url={url}")
 
@@ -2631,14 +2866,16 @@ Before you return the element ref, reason about the state and elements for a sen
                     # else: URLs starting with '/' are absolute paths; passed as-is and will
                     # fail at navigation time with a clear Playwright error (intentional).
 
-            page = await self.new_page(url, wait_until=wait_until, timeout=timeout)
-            page_id = generate_page_id(page) if page else "unknown"
+            page = await self._new_page(url, wait_until=wait_until, timeout=timeout)
+            page_id = generate_page_id(page)
             if url:
-                result = f"Opened new tab {page_id} at {page.url if page else url}"
+                result = f"Opened new tab {page_id} at {page.url}"
             else:
                 result = f"Created new blank tab {page_id}"
             logger.info(f"[new_tab] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to create new tab: {str(e)}"
             logger.error(f"[new_tab] {error_msg}")
@@ -2669,6 +2906,8 @@ Before you return the element ref, reason about the state and elements for a sen
             if not lines:
                 return "No open tabs"
             return "\n".join(lines)
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to get tabs info: {str(e)}"
             logger.error(f"[get_tabs] {error_msg}")
@@ -2705,6 +2944,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 )
             logger.info(f"[switch_tab] done page_id={page_id}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to switch tab: {str(e)}"
             logger.error(f"[switch_tab] {error_msg}")
@@ -2737,7 +2978,7 @@ Before you return the element ref, reason about the state and elements for a sen
                 page = await self.get_current_page()
                 if page is None:
                     _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
-                success, closed_result = await self.close_page(page)
+                success, closed_result = await self._close_page(page)
                 if not success:
                     logger.error(f"[close_tab] {closed_result}")
                     _raise_state_error(
@@ -2747,7 +2988,7 @@ Before you return the element ref, reason about the state and elements for a sen
                     )
                 result = closed_result
             else:
-                success, closed_result = await self.close_page(page_id)
+                success, closed_result = await self._close_page(page_id)
                 if not success:
                     logger.error(f"[close_tab] {closed_result}")
                     _raise_state_error(
@@ -2759,6 +3000,8 @@ Before you return the element ref, reason about the state and elements for a sen
 
             logger.info(f"[close_tab] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to close tab: {str(e)}"
             logger.error(f"[close_tab] {error_msg}")
@@ -2793,12 +3036,61 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Browser viewport resized to {width}x{height}"
             logger.info(f"[browser_resize] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to resize browser: {str(e)}"
             logger.error(f"[browser_resize] {error_msg}")
             _raise_operation_error(error_msg)
 
     # ==================== Wait ====================
+
+    async def _is_text_visible_in_any_frame(
+        self, page: "Page", text: str, exact: bool = False,
+    ) -> bool:
+        """Check whether *text* is visible in any frame (main + all iframes)."""
+        for frame in page.frames:
+            try:
+                locator = frame.get_by_text(text, exact=exact)
+                if await locator.count() > 0 and await locator.first.is_visible():
+                    return True
+            except Exception:
+                # Frame may have been detached or navigated away.
+                continue
+        return False
+
+    async def _wait_for_text_across_frames(
+        self,
+        page: "Page",
+        text: str,
+        *,
+        gone: bool = False,
+        exact: bool = False,
+        timeout_ms: float = 30000.0,
+    ) -> None:
+        """Poll all frames (main + iframes) until *text* appears or disappears.
+
+        Raises ``TimeoutError`` if the condition is not met within *timeout_ms*.
+        """
+        import time as _time
+
+        no_timeout = timeout_ms <= 0
+        deadline = _time.monotonic() + timeout_ms / 1000.0
+        poll_interval = 0.2  # 200 ms
+
+        while True:
+            found = await self._is_text_visible_in_any_frame(page, text, exact=exact)
+            if not gone and found:
+                return
+            if gone and not found:
+                return
+            if not no_timeout and _time.monotonic() >= deadline:
+                action = "disappear" if gone else "appear"
+                raise TimeoutError(
+                    f"Locator.wait_for: Timeout {timeout_ms:.0f}ms exceeded. "
+                    f"Text '{text}' did not {action}."
+                )
+            await asyncio.sleep(poll_interval)
 
     async def wait_for(
         self,
@@ -2862,15 +3154,17 @@ Before you return the element ref, reason about the state and elements for a sen
             timeout_ms = timeout * 1000.0
 
             if text is not None:
-                locator = page.get_by_text(text, exact=False)
-                await locator.first.wait_for(state="visible", timeout=timeout_ms)
+                await self._wait_for_text_across_frames(
+                    page, text, gone=False, timeout_ms=timeout_ms,
+                )
                 result = f"Text '{text}' appeared on the page"
                 logger.info(f"[wait_for] done {result}")
                 return result
 
             if text_gone is not None:
-                locator = page.get_by_text(text_gone, exact=False)
-                await locator.first.wait_for(state="hidden", timeout=timeout_ms)
+                await self._wait_for_text_across_frames(
+                    page, text_gone, gone=True, timeout_ms=timeout_ms,
+                )
                 result = f"Text '{text_gone}' disappeared from the page"
                 logger.info(f"[wait_for] done {result}")
                 return result
@@ -2883,6 +3177,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 return result
 
             _raise_invalid_input("No wait condition specified", code="INVALID_WAIT_CONDITION")
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Wait condition not met: {str(e)}"
             logger.error(f"[wait_for] {error_msg}")
@@ -3015,6 +3311,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[input_text_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[input_text_by_ref] Failed to input text: {type(e).__name__}: {e}')
             error_msg = f'Failed to input text to element {ref}: {e}'
@@ -3074,7 +3372,7 @@ Before you return the element ref, reason about the state and elements for a sen
                     await locator.dispatch_event("click")
                 else:
                     covered = await locator.evaluate(
-                        f"(el) => {{ if (window.frameElement !== null) return false; "
+                        f"(el) => {{ if (window.parent !== window) return false; "
                         f"const t = document.elementFromPoint({cx}, {cy}); "
                         f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
                     )
@@ -3098,6 +3396,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[click_element_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[click_element_by_ref] Failed to click element: {type(e).__name__}: {e}')
             error_msg = f'Failed to click element {ref}: {str(e)}'
@@ -3151,6 +3451,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[get_dropdown_options_by_ref] Retrieved dropdown options')
             return result
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[get_dropdown_options_by_ref] Failed to get dropdown options: {type(e).__name__}: {e}')
             error_msg = f'Failed to get dropdown options for element {ref}: {str(e)}'
@@ -3257,6 +3559,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[select_dropdown_option_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[select_dropdown_option_by_ref] Failed to select dropdown option: {type(e).__name__}: {e}')
             error_msg = f'Failed to select dropdown option "{text}" for element {ref}: {str(e)}'
@@ -3299,7 +3603,7 @@ Before you return the element ref, reason about the state and elements for a sen
                         await locator.hover(force=True)
                 else:
                     covered = await locator.evaluate(
-                        f"(el) => {{ if (window.frameElement !== null) return false; "
+                        f"(el) => {{ if (window.parent !== window) return false; "
                         f"const t = document.elementFromPoint({cx}, {cy}); "
                         f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
                     )
@@ -3331,6 +3635,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[hover_element_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[hover_element_by_ref] Failed to hover element: {type(e).__name__}: {e}')
             error_msg = f'Failed to hover element {ref}: {str(e)}'
@@ -3369,6 +3675,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[focus_element_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[focus_element_by_ref] Failed to focus element: {type(e).__name__}: {e}')
             error_msg = f'Failed to focus element {ref}: {str(e)}'
@@ -3410,6 +3718,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[evaluate_javascript_on_ref] Execution successful, result length: {len(result_str)}')
             return result_str
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[evaluate_javascript_on_ref] Failed to execute JavaScript: {type(e).__name__}: {e}')
             error_msg = f'Failed to execute JavaScript on element {ref}: {str(e)}'
@@ -3468,6 +3778,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[upload_file_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[upload_file_by_ref] Failed to upload file: {type(e).__name__}: {e}')
             error_msg = f'Failed to upload file to element {ref}: {str(e)}'
@@ -3509,6 +3821,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[drag_element_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[drag_element_by_ref] Failed to drag element: {type(e).__name__}: {e}')
             error_msg = f'Failed to drag element from {start_ref} to {end_ref}: {str(e)}'
@@ -3579,7 +3893,7 @@ Before you return the element ref, reason about the state and elements for a sen
                         await locator.dispatch_event("click")
                     else:
                         covered = await locator.evaluate(
-                            f"(el) => {{ if (window.frameElement !== null) return false; "
+                            f"(el) => {{ if (window.parent !== window) return false; "
                             f"const t = document.elementFromPoint({cx}, {cy}); "
                             f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
                         )
@@ -3615,6 +3929,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[check_checkbox_or_radio_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[check_checkbox_or_radio_by_ref] Failed to check element: {type(e).__name__}: {e}')
             error_msg = f'Failed to check element {ref}: {str(e)}'
@@ -3674,7 +3990,7 @@ Before you return the element ref, reason about the state and elements for a sen
                         await locator.dispatch_event("click")
                     else:
                         covered = await locator.evaluate(
-                            f"(el) => {{ if (window.frameElement !== null) return false; "
+                            f"(el) => {{ if (window.parent !== window) return false; "
                             f"const t = document.elementFromPoint({cx}, {cy}); "
                             f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
                         )
@@ -3711,6 +4027,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[uncheck_checkbox_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[uncheck_checkbox_by_ref] Failed to uncheck element: {type(e).__name__}: {e}')
             error_msg = f'Failed to uncheck element {ref}: {str(e)}'
@@ -3762,7 +4080,7 @@ Before you return the element ref, reason about the state and elements for a sen
                     await locator.dispatch_event("dblclick")
                 else:
                     covered = await locator.evaluate(
-                        f"(el) => {{ if (window.frameElement !== null) return false; "
+                        f"(el) => {{ if (window.parent !== window) return false; "
                         f"const t = document.elementFromPoint({cx}, {cy}); "
                         f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
                     )
@@ -3791,6 +4109,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[double_click_element_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[double_click_element_by_ref] Failed to double-click element: {type(e).__name__}: {e}')
             error_msg = f'Failed to double-click element {ref}: {str(e)}'
@@ -3837,6 +4157,8 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.info(f'[scroll_element_into_view_by_ref] {msg}')
             return msg
 
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             logger.error(f'[scroll_element_into_view_by_ref] Failed to scroll element into view: {type(e).__name__}: {e}')
             error_msg = f'Failed to scroll element {ref} into view: {str(e)}'
@@ -3870,6 +4192,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Moved mouse to coordinates ({x}, {y})"
             logger.info(f"[mouse_move] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to move mouse: {str(e)}"
             logger.error(f"[mouse_move] {error_msg}")
@@ -3928,6 +4252,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Mouse {click_type} at ({x}, {y}) with {button} button"
             logger.info(f"[mouse_click] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to click mouse: {str(e)}"
             logger.error(f"[mouse_click] {error_msg}")
@@ -3973,6 +4299,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Dragged mouse from ({start_x}, {start_y}) to ({end_x}, {end_y})"
             logger.info(f"[mouse_drag] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to drag mouse: {str(e)}"
             logger.error(f"[mouse_drag] {error_msg}")
@@ -4002,6 +4330,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Mouse {button} button pressed down"
             logger.info(f"[mouse_down] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to press mouse button: {str(e)}"
             logger.error(f"[mouse_down] {error_msg}")
@@ -4031,6 +4361,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Mouse {button} button released"
             logger.info(f"[mouse_up] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to release mouse button: {str(e)}"
             logger.error(f"[mouse_up] {error_msg}")
@@ -4074,6 +4406,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Scrolled mouse wheel: delta_x={delta_x}, delta_y={delta_y}"
             logger.info(f"[mouse_wheel] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to scroll mouse wheel: {str(e)}"
             logger.error(f"[mouse_wheel] {error_msg}")
@@ -4138,6 +4472,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Typed {len(text)} characters sequentially{submit_msg}"
             logger.info(f"[type_text] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to type sequentially: {str(e)}"
             logger.error(f"[type_text] {error_msg}")
@@ -4171,6 +4507,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Key '{key}' pressed down"
             logger.info(f"[key_down] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to press key down: {str(e)}"
             logger.error(f"[key_down] {error_msg}")
@@ -4200,6 +4538,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Key '{key}' released"
             logger.info(f"[key_up] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to release key: {str(e)}"
             logger.error(f"[key_up] {error_msg}")
@@ -4273,6 +4613,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 try:
                     await locator.fill(value)
                     filled_refs.append(ref)
+                except BridgicBrowserError:
+                    raise
                 except Exception as e:
                     errors.append(f"{ref}: {str(e)}")
 
@@ -4293,6 +4635,8 @@ Before you return the element ref, reason about the state and elements for a sen
 
             logger.info(f"[fill_form] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to fill form: {str(e)}"
             logger.error(f"[fill_form] {error_msg}")
@@ -4342,6 +4686,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Inserted text ({len(text)} characters)"
             logger.info(f"[insert_text] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to insert text: {str(e)}"
             logger.error(f"[insert_text] {error_msg}")
@@ -4432,6 +4778,8 @@ Before you return the element ref, reason about the state and elements for a sen
 
             logger.info(f"[take_screenshot] done")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to take screenshot: {str(e)}"
             logger.error(f"[take_screenshot] {error_msg}")
@@ -4561,6 +4909,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"PDF saved to: {output_path}"
             logger.info(f"[save_pdf] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to save PDF: {str(e)}"
             logger.error(f"[save_pdf] {error_msg}")
@@ -4612,6 +4962,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = "Console message capture started"
             logger.info(f"[start_console_capture] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to start console capture: {str(e)}"
             logger.error(f"[start_console_capture] {error_msg}")
@@ -4648,6 +5000,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = "Console capture stopped"
             logger.info(f"[stop_console_capture] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to stop console capture: {str(e)}"
             logger.error(f"[stop_console_capture] {error_msg}")
@@ -4709,6 +5063,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = json.dumps(messages, indent=2)
             logger.info(f"[get_console_messages] done count={len(messages)}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to get console messages: {str(e)}"
             logger.error(f"[get_console_messages] {error_msg}")
@@ -4761,6 +5117,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = "Network request capture started"
             logger.info(f"[start_network_capture] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to start network capture: {str(e)}"
             logger.error(f"[start_network_capture] {error_msg}")
@@ -4797,6 +5155,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = "Network capture stopped"
             logger.info(f"[stop_network_capture] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to stop network capture: {str(e)}"
             logger.error(f"[stop_network_capture] {error_msg}")
@@ -4865,6 +5225,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = json.dumps(requests, indent=2)
             logger.info(f"[get_network_requests] done count={len(requests)}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to get network requests: {str(e)}"
             logger.error(f"[get_network_requests] {error_msg}")
@@ -4896,6 +5258,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = "Network is idle"
             logger.info(f"[wait_for_network_idle] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to wait for network idle: {str(e)}"
             logger.error(f"[wait_for_network_idle] {error_msg}")
@@ -4958,6 +5322,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Dialog handler set up with default action: {default_action}"
             logger.info(f"[setup_dialog_handler] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to setup dialog handler: {str(e)}"
             logger.error(f"[setup_dialog_handler] {error_msg}")
@@ -5040,6 +5406,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Dialog handler ready to {action} the next dialog"
             logger.info(f"[handle_dialog] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to set up dialog handler: {str(e)}"
             logger.error(f"[handle_dialog] {error_msg}")
@@ -5071,6 +5439,8 @@ Before you return the element ref, reason about the state and elements for a sen
 
             logger.info(f"[remove_dialog_handler] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to remove dialog handler: {str(e)}"
             logger.error(f"[remove_dialog_handler] {error_msg}")
@@ -5117,6 +5487,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Storage state saved to: {output_path}"
             logger.info(f"[save_storage_state] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to save storage state: {str(e)}"
             logger.error(f"[save_storage_state] {error_msg}")
@@ -5171,6 +5543,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Storage state restored from: {filename} ({len(cookies)} cookies)"
             logger.info(f"[restore_storage_state] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to restore storage state: {str(e)}"
             logger.error(f"[restore_storage_state] {error_msg}")
@@ -5214,6 +5588,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 result = "All cookies cleared"
             logger.info(f"[clear_cookies] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to clear cookies: {str(e)}"
             logger.error(f"[clear_cookies] {error_msg}")
@@ -5279,6 +5655,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = json.dumps(cookies, indent=2)
             logger.info(f"[get_cookies] done count={len(cookies)}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to get cookies: {str(e)}"
             logger.error(f"[get_cookies] {error_msg}")
@@ -5368,6 +5746,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Cookie '{name}' set successfully"
             logger.info(f"[set_cookie] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to set cookie: {str(e)}"
             logger.error(f"[set_cookie] {error_msg}")
@@ -5425,6 +5805,8 @@ Before you return the element ref, reason about the state and elements for a sen
                     result,
                     details={"role": role, "name": accessible_name, "timeout": timeout},
                 )
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             if isinstance(e, (StateError, VerificationError)):
                 raise
@@ -5468,20 +5850,22 @@ Before you return the element ref, reason about the state and elements for a sen
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
-            locator = page.get_by_text(text, exact=exact)
-
             try:
-                await locator.first.wait_for(state="visible", timeout=timeout * 1000.0)
+                await self._wait_for_text_across_frames(
+                    page, text, exact=exact, timeout_ms=timeout * 1000.0,
+                )
                 result = f"PASS: Text '{text}' is visible on the page"
                 logger.info(f"[verify_text_visible] {result}")
                 return result
-            except Exception:
+            except TimeoutError:
                 result = f"FAIL: Text '{text}' is not visible on the page"
                 logger.warning(f"[verify_text_visible] {result}")
                 _raise_verification_error(
                     result,
                     details={"text": text, "exact": exact, "timeout": timeout},
                 )
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             if isinstance(e, (StateError, VerificationError)):
                 raise
@@ -5553,6 +5937,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 )
 
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             if isinstance(e, (StateError, VerificationError)):
                 raise
@@ -5637,6 +6023,8 @@ Before you return the element ref, reason about the state and elements for a sen
                         details={"state": state},
                     )
 
+            except BridgicBrowserError:
+                raise
             except Exception as e:
                 if isinstance(e, InvalidInputError):
                     raise
@@ -5653,6 +6041,8 @@ Before you return the element ref, reason about the state and elements for a sen
                     details={"ref": ref, "state": state},
                 )
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             if isinstance(e, (StateError, InvalidInputError, VerificationError)):
                 raise
@@ -5712,6 +6102,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 )
 
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             if isinstance(e, (StateError, VerificationError)):
                 raise
@@ -5767,6 +6159,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 )
 
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             if isinstance(e, (StateError, VerificationError)):
                 raise
@@ -5826,6 +6220,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = "Tracing started"
             logger.info(f"[start_tracing] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to start tracing: {str(e)}"
             logger.error(f"[start_tracing] {error_msg}")
@@ -5875,6 +6271,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"Trace saved to: {output_path}"
             logger.info(f"[stop_tracing] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to stop tracing: {str(e)}"
             logger.error(f"[stop_tracing] {error_msg}")
@@ -5935,6 +6333,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 return result
             else:
                 _raise_state_error("No video recording available for this page", code="NO_ACTIVE_RECORDING")
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to start video: {str(e)}"
             logger.error(f"[start_video] {error_msg}")
@@ -5978,7 +6378,7 @@ Before you return the element ref, reason about the state and elements for a sen
             # is invalid.  Actual file writing is deferred to browser close.
             resolved: Optional[str] = None
             if filename:
-                if filename.endswith(os.sep) or os.path.isdir(filename):
+                if filename.endswith(os.sep) or filename.endswith("/") or os.path.isdir(filename):
                     import time as _time
                     dest_dir = os.path.abspath(filename)
                     resolved = os.path.join(dest_dir, f"video_{_time.strftime('%Y%m%d_%H%M%S')}.webm")
@@ -6011,6 +6411,8 @@ Before you return the element ref, reason about the state and elements for a sen
                 )
             logger.info(f"[stop_video] done (deferred) {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to stop video: {str(e)}"
             logger.error(f"[stop_video] {error_msg}")
@@ -6047,6 +6449,8 @@ Before you return the element ref, reason about the state and elements for a sen
             result = f"New trace chunk started" + (f": {title}" if title else "")
             logger.info(f"[add_trace_chunk] done {result}")
             return result
+        except BridgicBrowserError:
+            raise
         except Exception as e:
             error_msg = f"Failed to add trace chunk: {str(e)}"
             logger.error(f"[add_trace_chunk] {error_msg}")

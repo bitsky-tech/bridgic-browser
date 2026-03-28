@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
@@ -61,7 +62,8 @@ class DownloadManagerConfig:
 
     def __post_init__(self):
         if isinstance(self.downloads_path, str):
-            self.downloads_path = Path(self.downloads_path).expanduser()
+            self.downloads_path = Path(self.downloads_path)
+        self.downloads_path = self.downloads_path.expanduser()
 
 
 class DownloadManager:
@@ -250,13 +252,27 @@ class DownloadManager:
                     logger.info(f"Download completed (temp): {path}")
                 return
 
+            # Sanitise filename to prevent path traversal and Windows-illegal chars.
+            safe_filename = self._sanitize_filename(suggested_filename)
+
             # Generate unique filename if needed
             target_filename = self._get_unique_filename(
                 self._config.downloads_path,
-                suggested_filename,
+                safe_filename,
                 overwrite=self._config.overwrite,
             )
             target_path = self._config.downloads_path / target_filename
+
+            # Final path-traversal guard: resolved path must stay inside downloads_path.
+            if not target_path.resolve().is_relative_to(
+                self._config.downloads_path.resolve()
+            ):
+                logger.warning(
+                    f"Download filename resolved outside downloads_path, "
+                    f"using fallback: {suggested_filename!r}"
+                )
+                target_filename = "download"
+                target_path = self._config.downloads_path / target_filename
 
             # Save with correct filename
             await download.save_as(str(target_path))
@@ -331,11 +347,36 @@ class DownloadManager:
         base, ext = os.path.splitext(filename)
         counter = 1
 
-        while True:
+        while counter <= 9999:
             new_filename = f"{base} ({counter}){ext}"
             if not (directory / new_filename).exists():
                 return new_filename
             counter += 1
+        # Extremely unlikely: 10000 collisions.  Return a name that is
+        # guaranteed unique by including the counter.
+        return f"{base} ({counter}){ext}"
+
+    # Characters illegal in Windows filenames (also covers / and \ for traversal).
+    _UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+    @staticmethod
+    def _sanitize_filename(filename: str) -> str:
+        """Sanitise a server-suggested filename for safe local storage.
+
+        Strips path separators (preventing traversal), replaces Windows-illegal
+        characters, and collapses leading/trailing dots/spaces (reserved on
+        Windows).  Falls back to ``"download"`` if the result is empty.
+        """
+        # Use only the basename (strip any directory components).
+        filename = os.path.basename(filename)
+
+        # Replace characters illegal on Windows (and dangerous on all platforms).
+        filename = DownloadManager._UNSAFE_FILENAME_RE.sub("_", filename)
+
+        # Strip leading/trailing dots and spaces (Windows reserved).
+        filename = filename.strip(". ")
+
+        return filename or "download"
 
     @staticmethod
     def _get_file_type(filename: str) -> Optional[str]:

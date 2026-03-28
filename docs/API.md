@@ -7,8 +7,8 @@ Short reference for the main session and download APIs. For tool lists and selec
 | Method / property | Description |
 |------------------|-------------|
 | `Browser(...)` | Constructor. Key args: `headless`, `viewport`, `user_data_dir`, `stealth`, `channel`, `proxy`, `downloads_path`, etc. |
-| `await browser.start()` | Launch browser and create context. |
-| `await browser.stop()` | Stop the browser, auto-cleans active capture listeners. |
+| `await browser._start()` | Launch browser and create context. Called automatically by `navigate_to` / `search` (lazy start); call directly only when you need explicit startup before any navigation. |
+| `await browser.close()` | Stop the browser, auto-cleans active capture listeners. No-op if never started. |
 | `await browser.navigate_to(url, wait_until="domcontentloaded", timeout=None)` | Navigate to URL with optional auto-prefix when missing protocol. `wait_until`: `"domcontentloaded"` (default), `"load"`, `"networkidle"`, or `"commit"`. `timeout` in seconds. |
 | `await browser.get_snapshot(interactive=False, full_page=True)` | Get `EnhancedSnapshot` (`.tree`, `.refs`). Raises `StateError` if no active page, `OperationError` if generation fails. Never returns `None`. |
 | `await browser.get_element_by_ref(ref)` | Get Playwright `Locator` for ref (e.g. `"8d4b03a9"`) or `None` if not found. Uses last cached snapshot refs — call `get_snapshot()` first. |
@@ -24,11 +24,11 @@ Short reference for the main session and download APIs. For tool lists and selec
 | `browser.user_data_dir` | `Path` or `None` — persistent context directory, or `None` for isolated mode. |
 | `browser.stealth_enabled` | `bool` — whether stealth mode is active. |
 | `browser.stealth_config` | `StealthConfig` or `None` — current stealth configuration. |
-| `browser.use_persistent_context` | `bool` — `True` when using `launch_persistent_context` (either `user_data_dir` set or stealth extensions enabled). |
+| `browser.use_persistent_context` | `bool` — `True` when using `launch_persistent_context` (either `user_data_dir` set or headed mode). |
 
 ## DownloadManager
 
-`Browser` creates and manages a `DownloadManager` automatically when `downloads_path` is provided. Access it via `browser.download_manager` after `start()`.
+`Browser` creates and manages a `DownloadManager` automatically when `downloads_path` is provided. Access it via `browser.download_manager` after the browser has started (via `navigate_to()`, `search()`, or `_start()`).
 
 | Method / property | Description |
 |------------------|-------------|
@@ -39,4 +39,4 @@ Short reference for the main session and download APIs. For tool lists and selec
 
 - **SnapshotOptions**: `interactive`, `full_page`.
 - **EnhancedSnapshot**: `.tree`, `.refs` (ref id → RefData).
-- **await browser.get_snapshot_text(start_from_char=0, interactive=False, full_page=True)**: Page state string for LLM, with optional pagination.
+- **await browser.get_snapshot_text(offset=0, limit=10000, interactive=False, full_page=True)**: Page state string for LLM, with optional pagination.

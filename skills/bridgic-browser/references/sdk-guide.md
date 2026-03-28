@@ -17,8 +17,9 @@ Use this guide when the output should be Python automation code (`bridgic.browse
 ## Installation and Imports
 
 ```bash
-pip install bridgic-browser
-playwright install chromium
+uv init --bare
+uv add bridgic-browser
+uv run playwright install chromium
 ```
 
 ```python
@@ -43,8 +44,8 @@ if __name__ == "__main__":
 ```
 
 Notes:
-- `navigate_to(...)` requires a started context/page.
-- `async with Browser(...)` handles start/stop automatically.
+- `async with Browser(...)` calls `_start()` in `__aenter__` and `close()` in `__aexit__` automatically.
+- Without the context manager, the browser starts lazily: `navigate_to(...)` and `search(...)` call `_ensure_started()` on first invocation.
 - `get_snapshot(...)` returns `EnhancedSnapshot` (never `None`); raises `StateError` if no active page, `OperationError` if generation fails.
 
 ## API Division: Raw Methods vs Tool Methods
@@ -76,7 +77,7 @@ Rule of thumb: if you're building an agent or want your script to behave like th
 | Verify | `verify_element_visible`, `verify_text_visible`, `verify_value`, `verify_element_state`, `verify_url`, `verify_title` |
 | Evaluate | `evaluate_javascript`, `evaluate_javascript_on_ref` |
 | Developer | `start_console_capture`, `stop_console_capture`, `get_console_messages`, `start_tracing`, `stop_tracing`, `add_trace_chunk`, `start_video`, `stop_video` |
-| Lifecycle | `stop`, `browser_resize` |
+| Lifecycle | `close`, `browser_resize` |
 
 ## Snapshot and Ref Rules
 
@@ -130,7 +131,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `take_screenshot(filename=None)` returns base64 data URL string.
 - `take_screenshot(filename="path.png")` writes file and returns a status string.
 - `verify_element_visible` uses `(role, accessible_name)` rather than ref.
-- `start_video` must run before `stop_video`; `stop_video` registers the destination path but does **not** close any pages. The actual `.webm` file is written by Playwright when pages close (via `stop()` or `close_tab()`).
+- `start_video` must run before `stop_video`; `stop_video` registers the destination path but does **not** close any pages. The actual `.webm` file is written by Playwright when pages close (via `close()` or `close_tab()`).
 
 ## SDK Error Handling
 
