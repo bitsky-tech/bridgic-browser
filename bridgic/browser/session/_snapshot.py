@@ -421,9 +421,10 @@ class SnapshotGenerator:
                              nth: int) -> str:
         """Derive a stable 8-hex-char ref from element semantics.
 
-        Uses a fixed namespace salt + CRC32 over all disambiguating fields.
-        With 32-bit output and a typical page of ~1 000 elements, the birthday
-        collision probability is ~N²/2³² ≈ 0.012 %, low enough to ignore.
+        Uses a fixed namespace salt + SHA-256 (first 4 bytes) over all
+        disambiguating fields.  With 32-bit output and a typical page of
+        ~1 000 elements, the birthday collision probability is
+        ~N²/2³² ≈ 0.012 %, low enough to ignore.
         \x1f (ASCII Unit Separator) is safe as a field delimiter: it cannot
         appear in HTML accessible names.
         """
@@ -646,7 +647,7 @@ class SnapshotGenerator:
         """
         # Separate structural noise without name (handle from suffix only)
         suffix_only_refs: Dict[str, str] = {}
-        batch_elements: list[Dict[str, Any]] = []
+        batch_elements: List[Dict[str, Any]] = []
 
         for ref, (role, name, nth) in refs_info.items():
             if role in self.STRUCTURAL_NOISE_ROLES and not name:

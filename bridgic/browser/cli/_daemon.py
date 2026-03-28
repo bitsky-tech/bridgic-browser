@@ -627,8 +627,8 @@ async def _handle_connection(
         if not raw:
             return
         try:
-            req = json.loads(raw.decode())
-        except json.JSONDecodeError as exc:
+            req = json.loads(raw.decode(errors="replace"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             resp = _response(
                 success=False,
                 result=f"Invalid JSON: {exc}",
@@ -740,7 +740,13 @@ def _write_close_report(
     if stop_exc is not None:
         errors.append(str(stop_exc))
 
-    status = "timeout" if timed_out else ("error" if errors else "success")
+    if timed_out:
+        status = "timeout"
+    elif errors:
+        all_timeouts = all("timeout after" in e.lower() for e in errors)
+        status = "success_with_timeouts" if all_timeouts else "error"
+    else:
+        status = "success"
     report = {
         "status": status,
         "closed_at": datetime.now(timezone.utc).isoformat(),

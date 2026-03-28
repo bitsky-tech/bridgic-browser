@@ -204,13 +204,26 @@ def _spawn_daemon(headed: bool = False) -> None:
         existing["headless"] = False
         env["BRIDGIC_BROWSER_JSON"] = _json.dumps(existing)
 
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "env": env,
+    }
+    if sys.platform == "win32":
+        # CREATE_NEW_PROCESS_GROUP detaches the daemon so it survives
+        # when the CLI process exits.  start_new_session=True only maps
+        # to this flag on Python ≥3.11; explicit creationflags works on
+        # all supported Python versions (≥3.10).
+        popen_kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+        )
+    else:
+        # POSIX: setsid() — new session, new process group.
+        popen_kwargs["start_new_session"] = True
+
     proc = subprocess.Popen(
         [sys.executable, "-m", "bridgic.browser", "daemon"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        # Detach from our process group so it survives when we exit
-        start_new_session=True,
-        env=env,
+        **popen_kwargs,
     )
 
     assert proc.stdout is not None
