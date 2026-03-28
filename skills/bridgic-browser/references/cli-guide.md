@@ -88,7 +88,7 @@ bridgic-browser scroll --dy -300       # scroll up 300px
 bridgic-browser scroll --dx 200        # scroll right 200px
 
 # Wait modes
-bridgic-browser wait 2.5
+bridgic-browser wait 2.5 # wait for 2.5 seconds
 bridgic-browser wait "Submit"
 bridgic-browser wait --gone "Loading"
 
@@ -133,7 +133,7 @@ Environment variables and login state persistence are documented in `env-vars.md
 - `screenshot`, `pdf`, `upload`, `storage-save`, `storage-load`, `trace-stop` convert their path argument to an absolute path on the **client side** before sending to daemon (daemon's working directory may differ).
 - For `network-start`, start capture before navigation if page-load requests are needed.
 - **`wait` unit is SECONDS, not milliseconds**: `bridgic-browser wait 2` waits 2 seconds. A numeric argument always takes the time path; `--gone` is ignored for numbers.
-  - `bridgic-browser wait 2.5` — pause 2.5 seconds
+  - `bridgic-browser wait 2.5` — wait for 2.5 seconds
   - `bridgic-browser wait "Submit"` — wait until "Submit" appears
   - `bridgic-browser wait --gone "Loading"` — wait until "Loading" disappears (`--gone` only works with a text argument)
 - **`type` requires a focused element**: `type` sends keystrokes at the current cursor position. Run `bridgic-browser click @<ref>` or `bridgic-browser focus @<ref>` on the target input first.
