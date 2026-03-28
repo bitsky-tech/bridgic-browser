@@ -351,16 +351,14 @@ class TestPageControlTools:
     async def test_wait_for_text(self, mock_browser):
         """Test wait_for function with text parameter."""
 
-        mock_page = mock_browser.get_current_page.return_value
-        mock_locator = MagicMock()
-        mock_locator.first = MagicMock()
-        mock_locator.first.wait_for = AsyncMock()
-        mock_page.get_by_text = MagicMock(return_value=mock_locator)
+        mock_browser._wait_for_text_across_frames = AsyncMock()
 
         result = await Browser.wait_for(mock_browser, text="Loading complete")
 
-        mock_page.get_by_text.assert_called_once_with("Loading complete", exact=False)
-        mock_locator.first.wait_for.assert_called_once()
+        mock_browser._wait_for_text_across_frames.assert_called_once()
+        args, kwargs = mock_browser._wait_for_text_across_frames.call_args
+        assert "Loading complete" in args
+        assert kwargs.get("gone") is False
 
     @pytest.mark.asyncio
     async def test_get_current_page_info(self, mock_browser):
@@ -1429,15 +1427,11 @@ class TestVerifyTools:
     async def test_verify_text_visible(self, mock_browser):
         """Test verify_text_visible."""
 
-        mock_page = mock_browser.get_current_page.return_value
-        mock_locator = MagicMock()
-        mock_first = MagicMock()
-        mock_first.wait_for = AsyncMock()
-        mock_locator.first = mock_first
-        mock_page.get_by_text.return_value = mock_locator
+        mock_browser._wait_for_text_across_frames = AsyncMock()
 
         result = await Browser.verify_text_visible(mock_browser, text="Welcome")
 
+        mock_browser._wait_for_text_across_frames.assert_called_once()
         assert "PASS" in result
 
     @pytest.mark.asyncio
