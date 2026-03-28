@@ -105,6 +105,7 @@ def _err(err: Exception | str) -> None:
 
 
 @click.group(cls=SectionedGroup, context_settings=CONTEXT_SETTINGS)
+@click.version_option(None, "-V", "--version", package_name="bridgic-browser", prog_name="bridgic-browser")
 def cli() -> None:
     """Bridgic Browser CLI — a comprehensive set of browser automation tools for AI agents.
 
