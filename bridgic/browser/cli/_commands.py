@@ -494,8 +494,8 @@ def cmd_wait(seconds_or_text: str, gone: bool) -> None:
 
     \b
     Examples:
-        bridgic-browser wait 2                 # wait 2 seconds  (NOT 2000!)
-        bridgic-browser wait 0.5               # wait 500 ms
+        bridgic-browser wait 2                 # wait for 2 seconds
+        bridgic-browser wait 0.5               # wait for 0.5 senond
         bridgic-browser wait "Submit"          # wait for text to appear
         bridgic-browser wait --gone "Loading"  # wait for text to disappear
     """

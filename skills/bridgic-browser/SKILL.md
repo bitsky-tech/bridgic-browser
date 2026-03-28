@@ -22,9 +22,10 @@ When writing browser automation or web scraping code, **ALWAYS follow this "expl
 
 Notes:
 - If the user clearly specifies exact steps that must be followed, try to perform the exploration according to those steps. If loops or branches appear during exploration, decide the best exploration path autonomously.
-- If exploration involves repeatedly clicking items in a list, MAKE SURE to open each item in a new browser tab, and remember to close the tab after visiting it. You do not need to traverse every item (especially when the list is large).
+- If you think you may need to return to the original page after clicking into a new page, try opening the new page in a new browser tab instead of using a “click then go back” approach. This is especially important when the original page already has interaction state (such as filled forms or applied filters); otherwise, that state may be lost after navigating back. Be sure to close the new tab promptly after finishing the related actions.
+- If exploration involves repeatedly clicking items in a list, you do not need to traverse every item (especially when the list is large).
 - If login, verification, or authorization is required during exploration, pause and ask the user to complete it manually, unless the user explicitly provides instructions in the task.
-- To avoid operating on websites too frequently, maintain human-like access intervals during both exploration and coding. You may simulate random wait times to reduce the risk of being blocked.
+- To avoid operating on websites too frequently, maintain human-like access intervals during both exploration and coding. You may simulate random wait times to reduce the risk of being blocked. Note: the `bridgic-browser wait` command parameter is in **seconds**, not milliseconds; for example, `bridgic-browser wait 2` or `bridgic-browser wait 3.2`.
 - After finishing exploration and code writing, automatically run testing/validation.
 
 ## Reference Files
