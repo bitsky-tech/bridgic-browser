@@ -8,8 +8,8 @@ description: |
 
 Before performing any operations, **MAKE SURE to use `uv`** to initialize the execution environment and install dependencies first. Note: DO NOT rely on any execution environment other than `uv`, to ensure the execution environment is isolated from the host machine.
 
-- **Python**: >= 3.10
-- **Install package**: `uv init --bare; uv add bridgic-browser`.
+- **Initialize project**: `[ -f pyproject.toml  ] || uv init --bare --python 3.10`
+- **Install dependencies**: `uv add --upgrade bridgic-browser`.
 - **Install browser binaries** (one-time): `uv run playwright install chromium`
 
 The CLI tools (`references/cli-guide.md`) and the Python SDK (`references/sdk-guide.md`) come from the **same package** — installing one installs both.
