@@ -177,10 +177,9 @@ Browser options are read at daemon startup from the following sources, in priori
 | Environment variables | See `skills/bridgic-browser/references/env-vars.md` |
 
 **Headed browser note:**
-When `headless=false`, the daemon uses Playwright’s bundled browser by default.
-This ensures stealth extensions (uBlock Origin Lite, cookie consent, Force Background Tab)
-load correctly — system Chrome v137+ no longer supports `--load-extension`.
-To use system Chrome instead, set:
+When `headless=false` and stealth is enabled, bridgic auto-switches to system Chrome
+(if installed) for better anti-detection (Chrome for Testing is blocked by Google OAuth).
+To override, set:
 - `channel`: e.g. `”chrome”`, `”msedge”`
 - `executable_path`: absolute path to a browser binary
 
@@ -488,9 +487,7 @@ from bridgic.browser.session import StealthConfig, Browser
 # Custom stealth configuration
 config = StealthConfig(
     enabled=True,
-    enable_extensions=True,  # Requires headless=False
     disable_security=False,
-    cookie_whitelist_domains=["example.com"],
 )
 
 browser = Browser(stealth=config, headless=False)
@@ -516,7 +513,6 @@ Stealth mode is **enabled by default** and includes:
 
 - **Headless mode**: 50+ Chrome args + JS init script patching `navigator.webdriver`, `window.chrome`, WebGL, `document.hasFocus()`, `visibilityState`, and more. All patched functions spoof `Function.prototype.toString` to return `[native code]`.
 - **Headed mode**: minimal ~11 flags only (matching real Chrome); JS patches are skipped entirely so third-party challenge iframes (e.g. Cloudflare Turnstile) see unmodified native APIs.
-- Optional extensions (uBlock Origin Lite, I don't care about cookies, Force Background Tab) for headed mode
 
 ```python
 # Stealth is ON by default
@@ -529,7 +525,6 @@ browser = Browser(stealth=False)
 from bridgic.browser.session import create_stealth_config
 
 config = create_stealth_config(
-    enable_extensions=False,
     disable_security=True,
 )
 browser = Browser(stealth=config)

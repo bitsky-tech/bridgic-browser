@@ -176,10 +176,9 @@ if __name__ == "__main__":
 | `./bridgic-browser.json` | 项目本地配置（daemon 启动时的工作目录） |
 | 环境变量 | 见 `skills/bridgic-browser/references/env-vars.md` |
 
-**有界面浏览器说明：**  
-当 `headless=false` 时，daemon 默认使用 Playwright 自带的浏览器。  
-这样可确保隐身扩展（uBlock Origin Lite、cookie 同意、Force Background Tab）正常加载——系统 Chrome v137+ 已不再支持 `--load-extension`。  
-若需改用系统 Chrome，请设置：
+**有界面浏览器说明：**
+当 `headless=false` 且启用隐身模式时，bridgic 会自动切换到系统 Chrome（如已安装），以获得更好的反检测效果（Chrome for Testing 会被 Google OAuth 拦截）。
+若需覆盖此行为，请设置：
 - `channel`：例如 `”chrome”`、`”msedge”`
 - `executable_path`：浏览器可执行文件的绝对路径
 
@@ -487,9 +486,7 @@ from bridgic.browser.session import StealthConfig, Browser
 # 自定义隐身配置
 config = StealthConfig(
     enabled=True,
-    enable_extensions=True,  # 需要 headless=False
     disable_security=False,
-    cookie_whitelist_domains=["example.com"],
 )
 
 browser = Browser(stealth=config, headless=False)
@@ -515,7 +512,6 @@ for file in browser.download_manager.downloaded_files:
 
 - **Headless 模式**：50+ Chrome 参数 + JS init script，修补 `navigator.webdriver`、`window.chrome`、WebGL、`document.hasFocus()`、`visibilityState` 等。所有被修补的函数均通过 `Function.prototype.toString` 欺骗返回 `[native code]`。
 - **Headed 模式**：仅使用 ~11 个最小 flag（与真实 Chrome 一致），完全跳过 JS 补丁注入，确保 Cloudflare Turnstile 等第三方 challenge iframe 看到未经修改的原生 API。
-- Headed 模式下可选用扩展（uBlock Origin Lite、I don't care about cookies、Force Background Tab）
 
 ```python
 # 隐身默认开启
@@ -528,7 +524,6 @@ browser = Browser(stealth=False)
 from bridgic.browser.session import create_stealth_config
 
 config = create_stealth_config(
-    enable_extensions=False,
     disable_security=True,
 )
 browser = Browser(stealth=config)

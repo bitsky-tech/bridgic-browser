@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 ROOT_DIR := $(shell git rev-parse --show-toplevel)
 
-.PHONY: init-dev test build publish clean download-extensions
+.PHONY: init-dev test build publish clean
 
 package_name := bridgic-browser
 repo ?= btsk
@@ -70,11 +70,6 @@ publish:
 		echo "==> No version specified, using current: $$ver"; \
 	fi; \
 	bash "$(ROOT_DIR)/scripts/release.sh" "$$ver" "$(repo)"
-
-download-extensions:
-	@echo "==> Downloading stealth extensions into bridgic/browser/extensions/ ..."
-	@uv run python scripts/download_extensions.py
-	@echo "==> Commit bridgic/browser/extensions/extensions.zip to include it in the package."
 
 # Show help
 help:

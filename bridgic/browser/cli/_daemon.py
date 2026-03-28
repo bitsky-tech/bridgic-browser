@@ -591,7 +591,10 @@ async def _dispatch(browser: "Browser", command: str, args: Dict[str, Any]) -> D
 
 
 _READ_TIMEOUT = 60.0  # seconds to wait for a command line from the client
-_DAEMON_STOP_TIMEOUT = float(os.environ.get("BRIDGIC_DAEMON_STOP_TIMEOUT", "45"))
+try:
+    _DAEMON_STOP_TIMEOUT = float(os.environ.get("BRIDGIC_DAEMON_STOP_TIMEOUT", "45"))
+except (ValueError, TypeError):
+    _DAEMON_STOP_TIMEOUT = 45.0
 
 
 def _setup_signal_handlers(stop_event: asyncio.Event) -> None:
@@ -680,8 +683,12 @@ async def _handle_connection(
 
         if command == "close":
             # Pre-allocate session dir + artifact paths; respond immediately
-            artifacts = browser.inspect_pending_close_artifacts()
-            session_dir = artifacts["session_dir"]
+            try:
+                artifacts = browser.inspect_pending_close_artifacts()
+            except Exception as exc:
+                logger.warning(f"[close] inspect_pending_close_artifacts failed: {exc}")
+                artifacts = {"session_dir": None, "trace": [], "video": [], "video_dir": None}
+            session_dir = artifacts.get("session_dir") or "(unknown)"
 
             lines = ["Browser closing in background."]
             if artifacts["trace"]:
@@ -789,12 +796,6 @@ def _build_browser_kwargs() -> Dict[str, Any]:
             logger.warning("[daemon] failed to parse BRIDGIC_BROWSER_JSON: %s", raw)
 
     # 4. Headed-mode defaults.
-    #    Playwright's bundled "Chrome for Testing" supports --load-extension so
-    #    extensions (uBlock, cookie consent, …) load correctly.  System Chrome
-    #    v137+ removed that flag, so we do NOT auto-switch to executable_path.
-    #    Users who explicitly set channel="chrome" or executable_path in config
-    #    accept the trade-off (no extensions, but "Google Chrome" Dock icon).
-    #
     #    chromium_sandbox=True prevents Playwright from adding --no-sandbox
     #    (which causes a warning banner on macOS system Chrome).
     if kwargs.get("headless") is False:

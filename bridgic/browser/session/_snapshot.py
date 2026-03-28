@@ -1830,8 +1830,8 @@ class SnapshotGenerator:
             return arg[1:]
         if arg.startswith('ref='):
             return arg[4:]
-        if re.match(r'^[0-9a-f]{8}$', arg):
-            return arg
+        if re.match(r'^[0-9a-fA-F]{8}$', arg):
+            return arg.lower()
         return None
     
     def get_locator_from_ref_async(
