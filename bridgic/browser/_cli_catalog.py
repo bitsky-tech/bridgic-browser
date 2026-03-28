@@ -131,7 +131,7 @@ CLI_COMMAND_META: dict[str, tuple[ToolCategory, str]] = {
     "cookies": (ToolCategory.STORAGE, "Get cookies [--domain DOMAIN] [--path PATH] [--name NAME]"),
     "cookie-set": (
         ToolCategory.STORAGE,
-        "Set a cookie NAME VALUE [--url] [--domain] [--path] [--expires] [--http-only] [--secure] [--same-site]",
+        "Set a cookie NAME VALUE [--domain] [--path] [--expires] [--http-only] [--secure] [--same-site]",
     ),
     "verify-visible": (ToolCategory.VERIFY, "Verify element with ROLE and NAME is visible [--timeout S]"),
     "verify-text": (ToolCategory.VERIFY, "Verify TEXT is visible on the page [--exact] [--timeout S]"),

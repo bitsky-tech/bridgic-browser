@@ -16,7 +16,7 @@ Use this reference when the task needs environment variable behavior or login st
 Notes:
 - Config file precedence for CLI (lowest -> highest): defaults, `~/.bridgic/bridgic-browser.json`, `./bridgic-browser.json`, `BRIDGIC_BROWSER_JSON`.
 - To start the daemon in headed mode, pass `--headed` to `bridgic-browser open` / `bridgic-browser search`, or set `{"headless": false}` in `BRIDGIC_BROWSER_JSON`.
-- When `headless=false` and neither `channel` nor `executable_path` is specified, the CLI daemon uses Playwright’s bundled “Chrome for Testing” browser to keep extension loading working. `chromium_sandbox=True` is auto-set to prevent `--no-sandbox` warnings. To use system Chrome instead (shows “Google Chrome” in Dock, no TEST badge), set `channel=”chrome”` or `executable_path` in config — but note that system Chrome v137+ no longer supports `--load-extension`, so extensions won’t load.
+- When `headless=false` (headed mode) with stealth enabled and neither `channel` nor `executable_path` is specified, the daemon **auto-switches to system Chrome** (`channel=”chrome”`) if detected on the machine. This avoids Playwright’s bundled “Chrome for Testing” which is blocked by Google OAuth and shows a “test” label in the macOS Dock. If system Chrome is not installed, it falls back to Chrome for Testing.
 
 ### Config Files and `BRIDGIC_BROWSER_JSON` Values
 
@@ -53,6 +53,7 @@ Notes:
 |---|---|---|
 | `enabled` | `true | false` | Default `true`. |
 | `disable_security` | `true | false` | Disables security features (testing only). |
+| `use_new_headless` | `true | false` | Default `true`. Use full Chromium binary with `--headless=new` instead of headless-shell. Only active when `enabled=true`, `headless=true`, and not using system Chrome (`channel`/`executable_path`). |
 | `in_docker` | `true | false` | Auto-detected by default. |
 | `permissions` | `string[]` | Default permissions for stealth context; top-level `permissions` overrides. |
 

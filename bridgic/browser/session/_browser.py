@@ -1008,9 +1008,9 @@ class Browser:
     _TRACE_STOP_TIMEOUT = 10.0
     _VIDEO_PATH_TIMEOUT = 10.0
     _VIDEO_SAVE_AS_TIMEOUT = 120.0  # save_as copies a file; large recordings need more time
-    _CONTEXT_CLOSE_TIMEOUT = 10.0
-    _BROWSER_CLOSE_TIMEOUT = 10.0
-    _PLAYWRIGHT_STOP_TIMEOUT = 10.0
+    _CONTEXT_CLOSE_TIMEOUT = 15.0
+    _BROWSER_CLOSE_TIMEOUT = 15.0
+    _PLAYWRIGHT_STOP_TIMEOUT = 15.0
 
     def _clear_page_scoped_state(self, page: Optional[Page], errors: Optional[List[str]] = None) -> None:
         """Detach page-scoped listeners and drop cached state for one page."""
@@ -3045,6 +3045,53 @@ Before you return the element ref, reason about the state and elements for a sen
 
     # ==================== Wait ====================
 
+    async def _is_text_visible_in_any_frame(
+        self, page: "Page", text: str, exact: bool = False,
+    ) -> bool:
+        """Check whether *text* is visible in any frame (main + all iframes)."""
+        for frame in page.frames:
+            try:
+                locator = frame.get_by_text(text, exact=exact)
+                if await locator.count() > 0 and await locator.first.is_visible():
+                    return True
+            except Exception:
+                # Frame may have been detached or navigated away.
+                continue
+        return False
+
+    async def _wait_for_text_across_frames(
+        self,
+        page: "Page",
+        text: str,
+        *,
+        gone: bool = False,
+        exact: bool = False,
+        timeout_ms: float = 30000.0,
+    ) -> None:
+        """Poll all frames (main + iframes) until *text* appears or disappears.
+
+        Raises ``TimeoutError`` if the condition is not met within *timeout_ms*.
+        """
+        import time as _time
+
+        no_timeout = timeout_ms <= 0
+        deadline = _time.monotonic() + timeout_ms / 1000.0
+        poll_interval = 0.2  # 200 ms
+
+        while True:
+            found = await self._is_text_visible_in_any_frame(page, text, exact=exact)
+            if not gone and found:
+                return
+            if gone and not found:
+                return
+            if not no_timeout and _time.monotonic() >= deadline:
+                action = "disappear" if gone else "appear"
+                raise TimeoutError(
+                    f"Locator.wait_for: Timeout {timeout_ms:.0f}ms exceeded. "
+                    f"Text '{text}' did not {action}."
+                )
+            await asyncio.sleep(poll_interval)
+
     async def wait_for(
         self,
         time_seconds: Optional[float] = None,
@@ -3107,15 +3154,17 @@ Before you return the element ref, reason about the state and elements for a sen
             timeout_ms = timeout * 1000.0
 
             if text is not None:
-                locator = page.get_by_text(text, exact=False)
-                await locator.first.wait_for(state="visible", timeout=timeout_ms)
+                await self._wait_for_text_across_frames(
+                    page, text, gone=False, timeout_ms=timeout_ms,
+                )
                 result = f"Text '{text}' appeared on the page"
                 logger.info(f"[wait_for] done {result}")
                 return result
 
             if text_gone is not None:
-                locator = page.get_by_text(text_gone, exact=False)
-                await locator.first.wait_for(state="hidden", timeout=timeout_ms)
+                await self._wait_for_text_across_frames(
+                    page, text_gone, gone=True, timeout_ms=timeout_ms,
+                )
                 result = f"Text '{text_gone}' disappeared from the page"
                 logger.info(f"[wait_for] done {result}")
                 return result
@@ -5801,14 +5850,14 @@ Before you return the element ref, reason about the state and elements for a sen
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
-            locator = page.get_by_text(text, exact=exact)
-
             try:
-                await locator.first.wait_for(state="visible", timeout=timeout * 1000.0)
+                await self._wait_for_text_across_frames(
+                    page, text, exact=exact, timeout_ms=timeout * 1000.0,
+                )
                 result = f"PASS: Text '{text}' is visible on the page"
                 logger.info(f"[verify_text_visible] {result}")
                 return result
-            except Exception:
+            except TimeoutError:
                 result = f"FAIL: Text '{text}' is not visible on the page"
                 logger.warning(f"[verify_text_visible] {result}")
                 _raise_verification_error(
