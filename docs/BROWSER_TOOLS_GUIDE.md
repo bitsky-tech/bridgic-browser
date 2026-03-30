@@ -38,7 +38,7 @@ This guide helps you choose the right tools for different browser automation sce
 When the full tree exceeds `limit`, or when `file` is explicitly provided, the full snapshot is saved to a file and only a notice with the file path is returned (no snapshot content):
 
 ```
-[notice] Page snapshot (45000 characters) saved to: /Users/you/.bridgic/bridgic-browser/snapshot/snapshot-20260330-143025-a7b2.txt
+[notice] Snapshot file (45000 characters, 1350 lines) saved to: /Users/you/.bridgic/bridgic-browser/snapshot/snapshot-20260330-143025-a7b2.txt
 ```
 
 Read the file to get the complete snapshot content.

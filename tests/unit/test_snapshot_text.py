@@ -236,7 +236,9 @@ async def test_get_snapshot_text_notice_contains_length_info(tmp_path) -> None:
     file_path = str(tmp_path / "snap.txt")
     result = await Browser.get_snapshot_text(mock_browser, limit=100, file=file_path)
 
-    assert "300 characters" in result
+    # total_chars includes header "[Page:  | ]\n" (12 chars) + 300 = 312
+    assert "312 characters" in result
+    assert "2 lines" in result
     assert "saved to:" in result
 
 

@@ -2417,9 +2417,12 @@ Before you return the element ref, reason about the state and elements for a sen
             total_length = len(full_text)
 
             if total_length > limit or file:
-                snapshot_file = self._write_snapshot_file(header + full_text, file)
+                file_content = header + full_text
+                total_chars = len(file_content)
+                total_lines = file_content.count("\n") + (1 if file_content and not file_content.endswith("\n") else 0)
+                snapshot_file = self._write_snapshot_file(file_content, file)
                 notice = (
-                    f"[notice] Page snapshot ({total_length} characters) "
+                    f"[notice] Snapshot file ({total_chars} characters, {total_lines} lines) "
                     f"saved to: {snapshot_file}\n"
                 )
                 logger.info("[get_snapshot_text] Snapshot saved to %s", snapshot_file)

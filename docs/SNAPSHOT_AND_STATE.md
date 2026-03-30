@@ -98,7 +98,7 @@ Browser method used to supply the page state to an LLM. It calls `browser.get_sn
 When the full tree is longer than `limit`, or when `file` is explicitly provided, the full snapshot is written to a file and a notice is returned instead of the snapshot content:
 
 ```
-[notice] Page snapshot (45000 characters) saved to: /Users/you/.bridgic/bridgic-browser/snapshot/snapshot-20260330-143025-a7b2.txt
+[notice] Snapshot file (45000 characters, 1350 lines) saved to: /Users/you/.bridgic/bridgic-browser/snapshot/snapshot-20260330-143025-a7b2.txt
 ```
 
 Read the file to get the complete snapshot content.
