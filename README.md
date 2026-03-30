@@ -167,12 +167,12 @@ if __name__ == "__main__":
 
 #### Configuration
 
-Browser options are read at daemon startup from the following sources, in priority order (highest last wins):
+Browser options are automatically loaded from the following sources (both CLI daemon and SDK `Browser()`), in priority order (highest last wins):
 
 | Source | Example |
 |--------|---------|
 | Defaults | `headless=True` |
-| `~/.bridgic/bridgic-browser.json` | User-level persistent config |
+| `~/.bridgic/bridgic-browser/bridgic-browser.json` | User-level persistent config |
 | `./bridgic-browser.json` | Project-local config (in cwd at daemon start) |
 | Environment variables | See `skills/bridgic-browser/references/env-vars.md` |
 
@@ -297,7 +297,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `go_back()` / `go_forward()` - Browser history navigation
 
 **Snapshot (1 tool):**
-- `get_snapshot_text(offset=0, limit=10000, interactive=False, full_page=True)` - Get page state string for LLM (accessibility tree with refs). **offset** must be `>= 0` and is used for pagination when the page is long: if the return value is truncated, a `[notice]` before the page content gives **next_offset** to call again. **limit** (default 10000) controls the maximum characters returned. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default).
+- `get_snapshot_text(limit=10000, interactive=False, full_page=True, file=None)` - Get page state string for LLM (accessibility tree with refs). **limit** (default 10000) controls the maximum characters returned. When the snapshot exceeds limit or **file** is explicitly provided, full content is saved to **file** (auto-generated under `~/.bridgic/bridgic-browser/snapshot/` if `None` and over limit) and only a notice with the file path is returned. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default).
 
 **Element Interaction (13 tools) - by ref:**
 - `click_element_by_ref(ref)` - Click element

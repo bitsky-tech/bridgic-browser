@@ -17,6 +17,13 @@ from bridgic.browser.session import Browser, StealthConfig
 import bridgic.browser.session._browser as _browser_module
 
 
+@pytest.fixture(autouse=True)
+def _isolate_config():
+    """Prevent real config files from affecting unit tests."""
+    with patch("bridgic.browser._config._load_config_sources", return_value={}):
+        yield
+
+
 class TestBrowserInitialization:
     """Tests for Browser initialization and configuration."""
 

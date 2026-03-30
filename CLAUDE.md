@@ -43,6 +43,7 @@ make playwright-install
 ```
 bridgic/browser/
 ├── __main__.py       # Entry point: routes `daemon` subcommand vs CLI
+├── _config.py        # Config file loading (shared by SDK + CLI daemon)
 ├── session/          # Core browser session
 │   ├── _browser.py       # Browser class – main entry point
 │   ├── _snapshot.py      # SnapshotGenerator + EnhancedSnapshot + RefData
@@ -61,7 +62,7 @@ bridgic/browser/
 
 ### Core data flow
 
-1. **`Browser`** (`session/_browser.py`) — instantiate; browser starts lazily on first `navigate_to` / `search`, or explicitly via `async with Browser(...) as b:` (calls `_start()`). Auto-selects:
+1. **`Browser`** (`session/_browser.py`) — instantiate; browser starts lazily on first `navigate_to` / `search`, or explicitly via `async with Browser(...) as b:` (calls `_start()`). `Browser()` **automatically loads config** from `~/.bridgic/bridgic-browser/bridgic-browser.json` → `./bridgic-browser.json` → `BRIDGIC_BROWSER_JSON` env var (via `_config.py:_load_config_sources()`). Explicit constructor params override config values; `headless` and `stealth` default to `None` (resolved to `True` if no config present). Auto-selects:
    - Isolated mode: `launch()` + `new_context()` (default, no `user_data_dir`)
    - Persistent mode: `launch_persistent_context(user_data_dir)` (preserves cookies/session)
 
@@ -103,7 +104,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 `get_snapshot(interactive=False, full_page=True)`:
 - `interactive=True` — flattened list of clickable/editable elements only (best for LLM action selection)
 - `full_page=False` — limit to viewport content only
-- `await browser.get_snapshot_text(...)` — returns a truncated string ready for LLM context, with pagination via `offset` and `limit` (default 10000)
+- `await browser.get_snapshot_text(...)` — returns a string ready for LLM context; when content exceeds `limit` (default 10000) or `file` is explicitly provided, full snapshot is saved to a file and only a notice with the file path is returned
 
 ### Stealth
 
@@ -180,27 +181,27 @@ bridgic-browser click @8d4b03a9
        │
        ▼
   _client.py                 Unix socket                   _daemon.py
- send_command("click",...)   ~/.bridgic/run/bridgic-browser.sock    asyncio server
+ send_command("click",...)   ~/.bridgic/bridgic-browser/run/bridgic-browser.sock    asyncio server
        │──── JSON request ─────────────────────────────►  + Browser instance
        │◄─── JSON response ────────────────────────────   dispatch → tool fn()
 ```
 
 Key implementation details:
 - **`_client.py`**: `send_command()` auto-starts the daemon if no socket exists. `_spawn_daemon()` uses `select.select()` + `os.read()` for the 30-second ready timeout (avoids blocking `proc.stdout.read()`). `start_if_needed=False` prevents auto-start for the `close` command.
-- **`_daemon.py`**: `run_daemon()` calls `_build_browser_kwargs()` then creates a `Browser(**kwargs)` instance (lazy start — Playwright does **not** launch immediately), writes `BRIDGIC_DAEMON_READY` to stdout, and serves one JSON command per connection. The browser's Playwright process starts on the first command that calls `_ensure_started()` (e.g. `navigate_to`). `asyncio.wait_for(reader.readline(), timeout=60)` prevents hanging on idle connections. Signal handling uses `loop.add_signal_handler()` (asyncio-safe).
-- **`_commands.py`**: 67 Click commands in 15 sections via `SectionedGroup`. `scroll` uses `--dy`/`--dx` options (not positional) to support negative values. `screenshot`/`pdf`/`upload`/`storage-save`/`storage-load`/`trace-stop` call `os.path.abspath()` on the client side before sending (daemon cwd may differ). `snapshot` supports `-i`/`--interactive`, `-f/-F`/`--full-page/--no-full-page`, `-o`/`--offset` (default 0), and `-l`/`--limit` (default 10000); it delegates to `browser.get_snapshot_text()` (which adds truncation/pagination).
+- **`_daemon.py`**: `run_daemon()` creates a `Browser()` instance directly (lazy start — Playwright does **not** launch immediately; `Browser.__init__` auto-loads config from `_config.py`), writes `BRIDGIC_DAEMON_READY` to stdout, and serves one JSON command per connection. The browser's Playwright process starts on the first command that calls `_ensure_started()` (e.g. `navigate_to`). `asyncio.wait_for(reader.readline(), timeout=60)` prevents hanging on idle connections. Signal handling uses `loop.add_signal_handler()` (asyncio-safe).
+- **`_commands.py`**: 67 Click commands in 15 sections via `SectionedGroup`. `scroll` uses `--dy`/`--dx` options (not positional) to support negative values. `screenshot`/`pdf`/`upload`/`storage-save`/`storage-load`/`trace-stop` call `os.path.abspath()` on the client side before sending (daemon cwd may differ). `snapshot` supports `-i`/`--interactive`, `-f/-F`/`--full-page/--no-full-page`, `-l`/`--limit` (default 10000), and `-s`/`--file` (overflow file path); it delegates to `browser.get_snapshot_text()`. When content exceeds limit or `--file` is provided, full snapshot is saved to a file (auto-generated under `~/.bridgic/bridgic-browser/snapshot/` when over limit, or the specified path).
   - **`wait`**: argument is named `SECONDS_OR_TEXT`. When the argument parses as a float it always takes the time-wait path (`wait_seconds`); when it is a string it takes the text-wait path (`text` or `text_gone` with `--gone`). The `--gone` flag is **only** meaningful with a string argument — a numeric argument with `--gone` is ignored (number always → time). Unit is **seconds**, not milliseconds. This is documented explicitly in the command docstring and in `_cli_catalog.py` to prevent LLM confusion. Text search traverses **all frames** (main + iframes) via polling, so text inside iframes is detectable.
   - **`type`**: docstring explicitly states the text goes into the **currently focused element** and that the user must `click` or `focus` the target first.
   - **`mouse-move` / `mouse-click` / `mouse-drag`**: coordinates are **viewport pixels from the top-left corner**; documented in both docstrings and `_cli_catalog.py`.
   - **`eval-on`**: CODE must be an arrow function or named function that receives the element as its argument (e.g. `"(el) => el.textContent"`); this calling convention is documented in the docstring with examples.
-- **`_build_browser_kwargs()`** priority chain (lowest → highest): defaults → `~/.bridgic/bridgic-browser.json` → `./bridgic-browser.json` → `BRIDGIC_BROWSER_JSON` env var. The `--headed` CLI flag merges `{"headless": false}` into `BRIDGIC_BROWSER_JSON` before spawning the daemon.
-- **`close` command fast-path**: the daemon calls `browser.inspect_pending_close_artifacts()` to pre-allocate a session dir and trace path, responds to the client immediately with those paths, then sets `stop_event`. Actual `browser.close()` runs after the client disconnects. After close, `_write_close_report()` writes `~/.bridgic/tmp/close-<timestamp>-<rand>/close-report.json` with status (`"success"`, `"success_with_timeouts"`, `"error"`, or `"timeout"`), artifact paths, and any errors.
+- **Config loading**: `Browser.__init__` auto-loads config via `_config.py:_load_config_sources()`. The `--headed` CLI flag merges `{"headless": false}` into `BRIDGIC_BROWSER_JSON` before spawning the daemon.
+- **`close` command fast-path**: the daemon calls `browser.inspect_pending_close_artifacts()` to pre-allocate a session dir and trace path, responds to the client immediately with those paths, then sets `stop_event`. Actual `browser.close()` runs after the client disconnects. After close, `_write_close_report()` writes `~/.bridgic/bridgic-browser/tmp/close-<timestamp>-<rand>/close-report.json` with status (`"success"`, `"success_with_timeouts"`, `"error"`, or `"timeout"`), artifact paths, and any errors.
 - **Daemon cleanup ownership guard**: after `browser.close()` finishes, `run_daemon()` reads the run-info file and compares its `pid` field to `os.getpid()` before calling `transport.cleanup()` / `remove_run_info()`. This prevents the outgoing daemon from deleting the new daemon's socket when a `close` is followed immediately by a new command (which starts a new daemon before the old one's shutdown completes). If the run-info is gone (`None`) the old daemon is still the owner and cleans up normally.
 
-Socket path: `BRIDGIC_SOCKET` env var (default `~/.bridgic/run/bridgic-browser.sock`).
+Socket path: `BRIDGIC_SOCKET` env var (default `~/.bridgic/bridgic-browser/run/bridgic-browser.sock`).
 The directory is created with `0o700` permissions on first use. Users upgrading from an older version that used `/tmp/bridgic-browser.sock` should stop any running daemon first (`bridgic-browser close`) before upgrading.
 
-Snapshot pagination: `get_snapshot_text(offset=0, limit=10000, ...)` — `offset` and `limit` are the two pagination parameters. Both must be ≥ 0 / ≥ 1 respectively.
+Snapshot overflow: `get_snapshot_text(limit=10000, file=None, ...)` — when content exceeds `limit` or `file` is explicitly provided, full snapshot is written to `file` (auto-generated if `None` and over limit) and only a notice with the file path is returned. `limit` must be ≥ 1. `file` is validated: empty/whitespace-only paths, null bytes, and existing directories raise `InvalidInputError`.
 
 ## Key Implementation Details & Playwright Internals
 

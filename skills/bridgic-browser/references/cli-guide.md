@@ -79,8 +79,8 @@ bridgic-browser snapshot -i
 # Snapshot viewport only (exclude off-screen nodes)
 bridgic-browser snapshot -F
 
-# Continue truncated snapshot output
-bridgic-browser snapshot -o 10000
+# Save full snapshot to a specific file when output is too long
+bridgic-browser snapshot -s /tmp/full-snapshot.txt
 
 # Scroll: use --dy / --dx (not positional), supports negative values
 bridgic-browser scroll --dy 500        # scroll down 500px
@@ -114,7 +114,7 @@ Config precedence (low -> high):
 | Source | Notes |
 |---|---|
 | Defaults | `headless=True` |
-| `~/.bridgic/bridgic-browser.json` | User-level persistent config |
+| `~/.bridgic/bridgic-browser/bridgic-browser.json` | User-level persistent config |
 | `./bridgic-browser.json` | Project-specific config (daemon startup cwd) |
 | `BRIDGIC_BROWSER_JSON` | Full JSON override for any Browser parameters (e.g. `{"headless":false}`) |
 
@@ -123,7 +123,7 @@ Environment variables and login state persistence are documented in `env-vars.md
 ## Non-Obvious CLI Behavior
 
 - Refs come from the latest snapshot. If page changed, re-run `snapshot` before interaction.
-- `snapshot` pagination is explicit: use `-o <offset>` (and optionally `-l <limit>`) whose value can be from truncation notice.
+- When `snapshot` output exceeds `-l <limit>`, or `-s <path>` is provided, full content is saved to a file (auto-generated under `~/.bridgic/bridgic-browser/snapshot/` or the specified path).
 - `snapshot -i` returns only clickable/editable elements — use for action selection, not full-page inspection.
 - CLI uses a persistent daemon/browser. State survives across commands until `close`.
 - After local Python code changes, restart daemon to pick up new code:

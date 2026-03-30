@@ -62,9 +62,10 @@ All tools return a string message following a consistent format:
 - Success: "PASS: {description}"
 - Failure: "FAIL: {description} - {reason}"
 
-**get_snapshot_text** returns the page state string (accessibility tree with refs). It may
-include a pagination notice when truncated; use offset, limit, interactive, and
-full_page to control pagination and scope (interactive-only or full-page by default).
+**get_snapshot_text** returns the page state string (accessibility tree with refs). When
+content exceeds limit or file is explicitly provided, full snapshot is saved to a file
+and only a notice with the file path is returned. Use limit, interactive, full_page,
+and file to control scope.
 
 Tool Selection Guide
 --------------------
