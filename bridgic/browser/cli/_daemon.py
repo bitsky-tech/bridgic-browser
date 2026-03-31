@@ -686,7 +686,7 @@ async def _handle_connection(
                 artifacts = browser.inspect_pending_close_artifacts()
             except Exception as exc:
                 logger.warning(f"[close] inspect_pending_close_artifacts failed: {exc}")
-                artifacts = {"session_dir": None, "trace": [], "video": [], "video_dir": None}
+                artifacts = {"session_dir": None, "trace": [], "video": []}
             session_dir = artifacts.get("session_dir") or "(unknown)"
 
             lines = ["Browser closing in background."]
@@ -696,9 +696,7 @@ async def _handle_connection(
             if artifacts["video"]:
                 lines.append("Video (generating in background, check later):")
                 lines.extend(f"  {p}" for p in artifacts["video"])
-            elif artifacts.get("video_dir"):
-                lines.append(f"Video (generating in background, check later): {artifacts['video_dir']}/")
-            lines.append(f"Close report: {session_dir}/close-report.json")
+            lines.append(f"Close report (generating in background, check later): {session_dir}/close-report.json")
 
             resp = _response(success=True, result="\n".join(lines))
             writer.write((json.dumps(resp) + "\n").encode())

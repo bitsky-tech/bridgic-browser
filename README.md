@@ -205,7 +205,7 @@ BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open 
 | Category | Commands |
 |----------|----------|
 | Navigation | `open`, `back`, `forward`, `reload`, `search`, `info` |
-| Snapshot | `snapshot [-i] [-f\|-F] [-o N] [-l N]` |
+| Snapshot | `snapshot [-i] [-f\|-F] [-l N] [-s FILE]` |
 | Element Interaction | `click`, `double-click`, `hover`, `focus`, `fill`, `select`, `options`, `check`, `uncheck`, `scroll-to`, `drag`, `upload`, `fill-form` |
 | Keyboard | `press`, `type`, `key-down`, `key-up` |
 | Mouse | `scroll`, `mouse-move`, `mouse-click`, `mouse-drag`, `mouse-down`, `mouse-up` |

@@ -204,7 +204,7 @@ BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open 
 | 类别 | 命令 |
 |----------|----------|
 | 导航 | `open`, `back`, `forward`, `reload`, `search`, `info` |
-| 快照 | `snapshot [-i] [-f\|-F] [-o N] [-l N]` |
+| 快照 | `snapshot [-i] [-f\|-F] [-l N] [-s FILE]` |
 | 元素交互 | `click`, `double-click`, `hover`, `focus`, `fill`, `select`, `options`, `check`, `uncheck`, `scroll-to`, `drag`, `upload`, `fill-form` |
 | 键盘 | `press`, `type`, `key-down`, `key-up` |
 | 鼠标 | `scroll`, `mouse-move`, `mouse-click`, `mouse-drag`, `mouse-down`, `mouse-up` |

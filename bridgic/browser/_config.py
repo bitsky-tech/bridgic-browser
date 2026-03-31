@@ -16,9 +16,12 @@ import os
 from pathlib import Path
 from typing import Any, Dict
 
-from ._constants import BRIDGIC_BROWSER_HOME
+from ._constants import BRIDGIC_HOME, BRIDGIC_BROWSER_HOME
 
 logger = logging.getLogger(__name__)
+
+# Old config path (pre-0.0.3): ~/.bridgic/bridgic-browser.json
+_LEGACY_CONFIG_PATH = BRIDGIC_HOME / "bridgic-browser.json"
 
 # Config file name, shared between user home and project directory
 _CONFIG_FILENAME = "bridgic-browser.json"
@@ -42,11 +45,20 @@ def _load_config_sources() -> Dict[str, Any]:
     """
     cfg: Dict[str, Any] = {}
 
+    # Warn if legacy config path exists (moved in 0.0.3)
+    if _LEGACY_CONFIG_PATH.is_file():
+        new_path = BRIDGIC_BROWSER_HOME / _CONFIG_FILENAME
+        logger.warning(
+            "Found config at deprecated path %s — "
+            "please move it to %s",
+            _LEGACY_CONFIG_PATH, new_path,
+        )
+
     # 1. User persistent config: ~/.bridgic/bridgic-browser/bridgic-browser.json
     user_cfg = BRIDGIC_BROWSER_HOME / _CONFIG_FILENAME
     if user_cfg.is_file():
         try:
-            cfg.update(json.loads(user_cfg.read_text()))
+            cfg.update(json.loads(user_cfg.read_text(encoding="utf-8")))
         except Exception:
             logger.warning("failed to parse user config %s", user_cfg, exc_info=True)
 
@@ -54,7 +66,7 @@ def _load_config_sources() -> Dict[str, Any]:
     local_cfg = Path(_CONFIG_FILENAME)
     if local_cfg.is_file():
         try:
-            cfg.update(json.loads(local_cfg.read_text()))
+            cfg.update(json.loads(local_cfg.read_text(encoding="utf-8")))
         except Exception:
             logger.warning("failed to parse local config %s", local_cfg, exc_info=True)
 

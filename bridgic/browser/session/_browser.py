@@ -88,10 +88,10 @@ def _write_launch_debug_log(options: Dict[str, Any], mode: str) -> None:
             "channel": options.get("channel"),
             "executable_path": str(options["executable_path"]) if options.get("executable_path") else None,
         }
-        with open(_LAUNCH_DEBUG_LOG, "w") as f:
+        with open(_LAUNCH_DEBUG_LOG, "w", encoding="utf-8") as f:
             _json.dump(record, f, indent=2)
     except Exception as e:
-        logger.warning(f"Failed to write launch debug log: {e}")
+        logger.warning("Failed to write launch debug log: %s", e)
 
 
 def _strip_playwright_call_log(message: str) -> str:
@@ -1065,6 +1065,55 @@ class Browser:
     _BROWSER_CLOSE_TIMEOUT = 15.0
     _PLAYWRIGHT_STOP_TIMEOUT = 15.0
 
+    @staticmethod
+    async def _force_kill_playwright_driver(pw: Any) -> None:
+        """Force-kill the Playwright Node driver process.
+
+        Accesses internal Playwright transport to send SIGKILL and waits for
+        the process to exit (avoids zombie processes).  Best-effort: silently
+        ignored if internals have changed.
+        """
+        try:
+            proc = pw._connection._transport._proc  # type: ignore[union-attr]
+            if proc and proc.returncode is None:
+                proc.kill()
+                # Short timeout: SIGKILL is immediate, but wait() depends on
+                # the event loop's child watcher which may misbehave at teardown.
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+                logger.debug("Force-killed Playwright driver process")
+        except Exception as exc:
+            logger.debug("_force_kill_playwright_driver skipped: %s", exc)
+
+    def _write_close_report(self, errors: List[str]) -> None:
+        """Write close-report.json into the close session directory."""
+        session_dir = self._close_session_dir
+        if not session_dir:
+            return
+        from datetime import datetime, timezone
+
+        if errors:
+            all_timeouts = all("timeout after" in e.lower() for e in errors)
+            status = "success_with_timeouts" if all_timeouts else "error"
+        else:
+            status = "success"
+
+        report = {
+            "status": status,
+            "closed_at": datetime.now(timezone.utc).isoformat(),
+            "trace_paths": self._last_shutdown_artifacts.get("trace", []),
+            "video_paths": self._last_shutdown_artifacts.get("video", []),
+            "warnings": [],
+            "errors": list(errors),
+        }
+        report_path = Path(session_dir) / "close-report.json"
+        try:
+            report_path.write_text(
+                json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8",
+            )
+            logger.info("close-report written: %s", report_path)
+        except Exception as exc:
+            logger.warning("failed to write close-report.json: %s", exc)
+
     def _clear_page_scoped_state(self, page: Optional[Page], errors: Optional[List[str]] = None) -> None:
         """Detach page-scoped listeners and drop cached state for one page."""
         if page is None:
@@ -1110,8 +1159,7 @@ class Browser:
         Dict with keys:
           session_dir : str         — unique per-close directory under BRIDGIC_TMP_DIR
           trace       : List[str]   — pre-created trace path (if tracing is active)
-          video       : List[str]   — known video path (if user set a filename)
-          video_dir   : Optional[str] — auto-save directory (if no explicit filename)
+          video       : List[str]   — pre-allocated video paths in session dir
         """
         import random
         from datetime import datetime
@@ -1126,7 +1174,6 @@ class Browser:
             "session_dir": str(session_dir),
             "trace": [],
             "video": [],
-            "video_dir": None,
         }
 
         if not self._context:
@@ -1150,7 +1197,17 @@ class Browser:
             if has_pending and pending_raw:
                 artifacts["video"].append(os.path.abspath(str(pending_raw)))
             else:
-                artifacts["video_dir"] = self._temp_video_dir or str(BRIDGIC_TMP_DIR)
+                # Pre-allocate video paths inside session dir so all artifacts
+                # are grouped together instead of scattered in tmp/ with hashes.
+                pages_with_video = [
+                    p for p in list(self._context.pages)
+                    if getattr(p, "video", None) is not None
+                ]
+                need_suffix = len(pages_with_video) > 1
+                for i in range(len(pages_with_video)):
+                    suffix = f"_{i + 1}" if need_suffix else ""
+                    video_path = str(session_dir / f"video{suffix}.webm")
+                    artifacts["video"].append(video_path)
 
         return artifacts
 
@@ -1174,6 +1231,13 @@ class Browser:
         """
         if self._playwright is None:
             return "Browser closed."
+
+        # Ensure a close session directory exists so trace/video artifacts are
+        # grouped together (e.g. close-{ts}-{rand}/trace.zip, video_1.webm).
+        # The CLI daemon calls inspect_pending_close_artifacts() before close(),
+        # but SDK users call close() directly — auto-create for them.
+        if not self._close_session_dir:
+            self.inspect_pending_close_artifacts()
 
         errors: List[str] = []
         shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
@@ -1238,6 +1302,29 @@ class Browser:
             for page in list(self._context.pages):
                 self._clear_page_scoped_state(page, errors)
 
+            # Navigate all pages to about:blank before video finalization to
+            # terminate service workers and ongoing network activity.  This
+            # prevents context.close() from hanging later.
+            #
+            # Must run BEFORE video finalization because _finalize_video()
+            # calls page.close() for each page — after that the page list is
+            # empty and about:blank would be a no-op.
+            #
+            # Skipped for temp_user_data_dir: that path force-kills the
+            # process immediately and never reaches context.close().
+            if not self._temp_user_data_dir:
+                for _nav_page in list(self._context.pages):
+                    try:
+                        await asyncio.wait_for(
+                            _nav_page.goto("about:blank", wait_until="commit"),
+                            timeout=self._PAGE_CLOSE_TIMEOUT,
+                        )
+                    except Exception as exc:
+                        logger.debug("close: about:blank navigation failed: %s", exc)
+                    except BaseException as e:
+                        if _pending_cancel is None:
+                            _pending_cancel = e
+
             # Save videos when: (a) video_start() was called and never stopped, or
             # (b) stop_video() deferred the save to close time.
             # Use a sentinel because pop() returns None both for "absent" and "stored None".
@@ -1260,6 +1347,11 @@ class Browser:
                 if pending_filename:
                     dest_dir = os.path.dirname(pending_filename)
                     dest_stem = os.path.splitext(os.path.basename(pending_filename))[0]
+                elif self._close_session_dir:
+                    # No explicit filename — save into session dir so all
+                    # close artifacts are grouped together.
+                    dest_dir = self._close_session_dir
+                    dest_stem = "video"
 
                 async def _finalize_video(page_: Any, video_: Any, idx: int) -> Optional[str]:
                     await asyncio.wait_for(page_.close(), timeout=self._PAGE_CLOSE_TIMEOUT)
@@ -1293,40 +1385,56 @@ class Browser:
         else:
             self._clear_page_scoped_state(self._page, errors)
 
-        # Close page (with timeout to guard against hung beforeunload handlers)
-        if self._page:
-            _page = self._page
+        # In persistent context mode with a temp user_data_dir, Chrome spends
+        # significant time flushing profile data (cookies, cache, IndexedDB) to
+        # disk on shutdown — data we will delete anyway via shutil.rmtree.
+        # Skip all graceful page/context/browser shutdown and force-kill the
+        # process immediately.  Trace and video artifacts have already been
+        # finalized above.
+        if self._temp_user_data_dir:
             self._page = None
-            try:
-                await asyncio.wait_for(
-                    _page.close(), timeout=self._PAGE_CLOSE_TIMEOUT,
-                )
-            except BaseException as e:
-                errors.append(f"page.close: {e}")
-                if not isinstance(e, Exception) and _pending_cancel is None:
-                    _pending_cancel = e
+            self._browser = None
+            self._context = None
+            if self._playwright:
+                _playwright = self._playwright
+                self._playwright = None
+                await self._force_kill_playwright_driver(_playwright)
 
-        # Detach download manager before context closes to remove handlers
-        if self._download_manager and self._context:
-            try:
-                self._download_manager.detach_from_context(self._context)
-            except Exception as e:
-                errors.append(f"download_manager.detach: {e}")
-
-        # Close all remaining pages in context before closing context.
-        # This avoids context.close() hanging on beforeunload handlers of extra
-        # tabs the user may have opened manually (or pages we didn't track).
-        if self._context:
-            for extra_page in list(self._context.pages):
+        else:
+            # Close page (with timeout to guard against hung beforeunload handlers)
+            if self._page:
+                _page = self._page
+                self._page = None
                 try:
                     await asyncio.wait_for(
-                        extra_page.close(run_before_unload=False),
-                        timeout=self._PAGE_CLOSE_TIMEOUT,
+                        _page.close(), timeout=self._PAGE_CLOSE_TIMEOUT,
                     )
                 except BaseException as e:
+                    errors.append(f"page.close: {e}")
                     if not isinstance(e, Exception) and _pending_cancel is None:
                         _pending_cancel = e
-                    # best-effort; context.close() will handle remaining pages
+
+            # Detach download manager before context closes to remove handlers
+            if self._download_manager and self._context:
+                try:
+                    self._download_manager.detach_from_context(self._context)
+                except Exception as e:
+                    errors.append(f"download_manager.detach: {e}")
+
+            # Close all remaining pages in context before closing context.
+            # This avoids context.close() hanging on beforeunload handlers of extra
+            # tabs the user may have opened manually (or pages we didn't track).
+            if self._context:
+                for extra_page in list(self._context.pages):
+                    try:
+                        await asyncio.wait_for(
+                            extra_page.close(run_before_unload=False),
+                            timeout=self._PAGE_CLOSE_TIMEOUT,
+                        )
+                    except BaseException as e:
+                        if not isinstance(e, Exception) and _pending_cancel is None:
+                            _pending_cancel = e
+                        # best-effort; context.close() will handle remaining pages
 
         # Close context
         # NOTE: In persistent context mode, closing context will auto close browser
@@ -1342,6 +1450,13 @@ class Browser:
                 errors.append(
                     f"context.close: timeout after {self._CONTEXT_CLOSE_TIMEOUT:.1f}s"
                 )
+                # context.close() hung — force-kill the entire Playwright driver
+                # so browser.close() and playwright.stop() don't also time out.
+                if self._playwright:
+                    _playwright = self._playwright
+                    self._playwright = None
+                    self._browser = None  # browser dies with driver
+                    await self._force_kill_playwright_driver(_playwright)
             except Exception as e:
                 errors.append(f"context.close: {e}")
             except BaseException as e:
@@ -1370,7 +1485,7 @@ class Browser:
                 if _pending_cancel is None:
                     _pending_cancel = e
 
-        # Stop playwright
+        # Stop playwright (temp_user_data_dir already handled above)
         if self._playwright:
             _playwright = self._playwright
             self._playwright = None
@@ -1383,6 +1498,7 @@ class Browser:
                 errors.append(
                     f"playwright.stop: timeout after {self._PLAYWRIGHT_STOP_TIMEOUT:.1f}s"
                 )
+                await self._force_kill_playwright_driver(_playwright)
             except Exception as e:
                 errors.append(f"playwright.stop: {e}")
             except BaseException as e:
@@ -1419,6 +1535,9 @@ class Browser:
             self._video_state.pop(context_key, None)
 
         # Flush all remaining state so a stopped instance holds no stale refs.
+        # NOTE: _close_session_dir is intentionally preserved (like
+        # _last_shutdown_artifacts / _last_shutdown_errors) so the daemon's
+        # _write_close_report() can read it after close() returns.
         self._console_messages.clear()
         self._network_requests.clear()
         self._console_handlers.clear()
@@ -1447,6 +1566,12 @@ class Browser:
             logger.warning(f"Browser closed with errors: {errors}")
         else:
             logger.info("Browser closed")
+
+        # Write close-report.json into the session dir so SDK and CLI
+        # produce identical artifacts.  The daemon's _write_close_report()
+        # may overwrite this later with additional daemon-level info
+        # (e.g. browser.close() overall timeout).
+        self._write_close_report(errors)
 
         if _pending_cancel is not None:
             raise _pending_cancel
@@ -2459,7 +2584,11 @@ Before you return the element ref, reason about the state and elements for a sen
 
         filepath.parent.mkdir(parents=True, exist_ok=True)
         filepath.write_text(content, encoding="utf-8")
-        filepath.chmod(0o600)
+        if sys.platform != "win32":
+            try:
+                filepath.chmod(0o600)
+            except OSError:
+                pass
         return str(filepath.resolve())
 
     # ==================== Navigation Tools ====================

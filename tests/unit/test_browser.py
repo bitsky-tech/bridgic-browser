@@ -452,7 +452,12 @@ class TestBrowserStartStop:
 
     @pytest.mark.asyncio
     async def test_stop_auto_saves_active_trace_and_video(self, mock_playwright):
-        """stop() auto-finalizes active tracing/video before teardown."""
+        """stop() auto-finalizes active tracing/video before teardown.
+
+        close() auto-calls inspect_pending_close_artifacts() which creates a
+        session directory and pre-allocates a trace path inside it, so trace
+        and video end up grouped in the same session dir.
+        """
         from bridgic.browser.session import _browser as browser_module
 
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
@@ -472,21 +477,27 @@ class TestBrowserStartStop:
 
             page.video = MagicMock()
             page.video.path = AsyncMock(return_value="/tmp/playwright-video.webm")
+            page.video.save_as = AsyncMock()
 
             context_key = browser_module._get_context_key(context)
             browser._tracing_state[context_key] = True
             browser._video_state[context_key] = True
 
-            with patch.object(browser_module.tempfile, "mkstemp", return_value=(99, "/tmp/auto_trace.zip")):
-                with patch.object(browser_module.os, "close"):
-                    await browser.close()
+            await browser.close()
 
-            context.tracing.stop.assert_awaited_once_with(path="/tmp/auto_trace.zip")
+            # Trace should be saved into the auto-created session dir
+            trace_call = context.tracing.stop.call_args
+            trace_path = trace_call.kwargs.get("path") or trace_call.args[0]
+            assert "close-" in trace_path
+            assert trace_path.endswith("trace.zip")
+
             page.close.assert_awaited()
-            assert browser._last_shutdown_artifacts["trace"] == [os.path.abspath("/tmp/auto_trace.zip")]
-            assert browser._last_shutdown_artifacts["video"] == [
-                os.path.abspath("/tmp/playwright-video.webm")
-            ]
+            assert browser._last_shutdown_artifacts["trace"] == [os.path.abspath(trace_path)]
+            # Video saved via save_as into session dir
+            assert len(browser._last_shutdown_artifacts["video"]) == 1
+            video_path = browser._last_shutdown_artifacts["video"][0]
+            assert "close-" in video_path
+            assert "video" in video_path
             assert context_key not in browser._tracing_state
             assert context_key not in browser._video_state
 
@@ -512,18 +523,17 @@ class TestBrowserStartStop:
 
             page.video = MagicMock()
             page.video.path = AsyncMock(return_value="/tmp/auto_video.webm")
+            page.video.save_as = AsyncMock()
 
             context_key = browser_module._get_context_key(context)
             browser._tracing_state[context_key] = True
             browser._video_state[context_key] = True
 
-            with patch.object(browser_module.tempfile, "mkstemp", return_value=(88, "/tmp/auto_trace_2.zip")):
-                with patch.object(browser_module.os, "close"):
-                    result = await browser.close()
+            result = await browser.close()
 
             assert "Browser closed successfully" in result
-            assert os.path.abspath("/tmp/auto_trace_2.zip") in result
-            assert os.path.abspath("/tmp/auto_video.webm") in result
+            assert "trace.zip" in result
+            assert "video" in result
 
     @pytest.mark.asyncio
     async def test_stop_warns_on_trace_finalize_failure(self, mock_playwright):
@@ -548,18 +558,11 @@ class TestBrowserStartStop:
             context_key = browser_module._get_context_key(context)
             browser._tracing_state[context_key] = True
 
-            temp_trace_path = "/tmp/auto_trace_failed.zip"
+            # close() auto-calls inspect_pending_close_artifacts() which
+            # pre-allocates a trace path.  When tracing.stop() fails, close()
+            # attempts to clean up the pre-allocated file.
+            result = await browser.close()
 
-            def _exists(path: str) -> bool:
-                return path == temp_trace_path
-
-            with patch.object(browser_module.tempfile, "mkstemp", return_value=(77, temp_trace_path)):
-                with patch.object(browser_module.os, "close"):
-                    with patch.object(browser_module.os.path, "exists", side_effect=_exists):
-                        with patch.object(browser_module.os, "remove") as mock_remove:
-                            result = await browser.close()
-
-            mock_remove.assert_called_once_with(temp_trace_path)
             assert "Browser closed with warnings" in result
             assert "tracing.stop: disk full" in result
 

@@ -233,7 +233,6 @@ def make_browser() -> MagicMock:
         "session_dir": "/tmp/close-test",
         "trace": [],
         "video": [],
-        "video_dir": None,
     })
     return b
 
@@ -1370,7 +1369,6 @@ class TestDaemonConnection:
             "session_dir": "/tmp/close-20240101-120000-abcd",
             "trace": [],
             "video": [],
-            "video_dir": None,
         })
         stop = asyncio.Event()
         req = json.dumps({"command": "close", "args": {}}).encode() + b"\n"
