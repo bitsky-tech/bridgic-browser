@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 
-from .._constants import BRIDGIC_HOME
+from .._constants import BRIDGIC_BROWSER_HOME
 from ..errors import BridgicBrowserError, InvalidInputError
 from ._transport import (
     get_transport,
@@ -108,11 +108,10 @@ async def _handle_search(browser: "Browser", args: Dict[str, Any]) -> str:
 
 async def _handle_snapshot(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.get_snapshot_text(
-        offset=args.get("offset", 0),
         limit=args.get("limit", 10000),
         interactive=args.get("interactive", False),
         full_page=args.get("full_page", True),
-        from_cli=True,
+        file=args.get("file", None),
     )
 
 
@@ -687,7 +686,7 @@ async def _handle_connection(
                 artifacts = browser.inspect_pending_close_artifacts()
             except Exception as exc:
                 logger.warning(f"[close] inspect_pending_close_artifacts failed: {exc}")
-                artifacts = {"session_dir": None, "trace": [], "video": [], "video_dir": None}
+                artifacts = {"session_dir": None, "trace": [], "video": []}
             session_dir = artifacts.get("session_dir") or "(unknown)"
 
             lines = ["Browser closing in background."]
@@ -697,9 +696,7 @@ async def _handle_connection(
             if artifacts["video"]:
                 lines.append("Video (generating in background, check later):")
                 lines.extend(f"  {p}" for p in artifacts["video"])
-            elif artifacts.get("video_dir"):
-                lines.append(f"Video (generating in background, check later): {artifacts['video_dir']}/")
-            lines.append(f"Close report: {session_dir}/close-report.json")
+            lines.append(f"Close report (generating in background, check later): {session_dir}/close-report.json")
 
             resp = _response(success=True, result="\n".join(lines))
             writer.write((json.dumps(resp) + "\n").encode())
@@ -766,57 +763,12 @@ def _write_close_report(
         logger.warning("[daemon] failed to write close-report.json: %s", exc)
 
 
-def _build_browser_kwargs() -> Dict[str, Any]:
-    """Build Browser constructor kwargs from config files and environment variables.
-
-    Priority (lowest → highest):
-      1. defaults                          — headless=True
-      2. ~/.bridgic/bridgic-browser.json  — user persistent config
-      3. ./bridgic-browser.json           — project-local config
-      4. BRIDGIC_BROWSER_JSON env var     — runtime override (full JSON)
-    """
-    kwargs: Dict[str, Any] = {"headless": True}
-
-    # 1. User persistent config: ~/.bridgic/bridgic-browser.json
-    user_cfg = BRIDGIC_HOME / "bridgic-browser.json"
-    if user_cfg.is_file():
-        try:
-            kwargs.update(json.loads(user_cfg.read_text()))
-        except Exception:
-            logger.warning("[daemon] failed to parse user config %s", user_cfg)
-
-    # 2. Project-local config: ./bridgic-browser.json
-    local_cfg = Path("bridgic-browser.json")
-    if local_cfg.is_file():
-        try:
-            kwargs.update(json.loads(local_cfg.read_text()))
-        except Exception:
-            logger.warning("[daemon] failed to parse local config %s", local_cfg)
-
-    # 3. BRIDGIC_BROWSER_JSON env var — full JSON override
-    raw = os.environ.get("BRIDGIC_BROWSER_JSON")
-    if raw:
-        try:
-            kwargs.update(json.loads(raw))
-        except Exception:
-            logger.warning("[daemon] failed to parse BRIDGIC_BROWSER_JSON: %s", raw)
-
-    # 4. Headed-mode defaults.
-    #    chromium_sandbox=True prevents Playwright from adding --no-sandbox
-    #    (which causes a warning banner on macOS system Chrome).
-    if kwargs.get("headless") is False:
-        kwargs.setdefault("chromium_sandbox", True)
-
-    return kwargs
-
-
-
 async def run_daemon() -> None:
     from bridgic.browser.session._browser import Browser
 
-    kwargs = _build_browser_kwargs()
-    browser = Browser(**kwargs)
-    logger.info("[daemon] browser ready (lazy start, kwargs=%s)", {k: v for k, v in kwargs.items() if k != "proxy"})
+    # Browser.__init__ auto-loads config from files and env vars.
+    browser = Browser()
+    logger.info("[daemon] browser ready (lazy start, config=%s)", {k: v for k, v in browser.get_config().items() if k != "proxy"})
 
     stop_event = asyncio.Event()
     transport = get_transport()
@@ -877,13 +829,13 @@ async def run_daemon() -> None:
         )
 
 
-DAEMON_LOG_PATH = BRIDGIC_HOME / "logs" / "daemon.log"
+DAEMON_LOG_PATH = BRIDGIC_BROWSER_HOME / "logs" / "daemon.log"
 
 
 def _setup_daemon_logging() -> None:
     """Configure daemon logging with both file and stderr output.
 
-    Writes bridgic.browser logs (DEBUG+) to ~/.bridgic/logs/daemon.log so
+    Writes bridgic.browser logs (DEBUG+) to ~/.bridgic/bridgic-browser/logs/daemon.log so
     that diagnostics are preserved even after the parent process closes the
     stdout pipe. Stderr still gets WARNING+ for immediate visibility.
     """

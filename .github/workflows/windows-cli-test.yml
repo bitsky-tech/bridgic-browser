@@ -205,7 +205,7 @@ jobs:
       - name: Verify — run-info cleaned up after close
         shell: pwsh
         run: |
-          $runInfo = "$env:USERPROFILE\.bridgic\run\bridgic-browser.json"
+          $runInfo = "$env:USERPROFILE\.bridgic\bridgic-browser\run\daemon.json"
           # Daemon responds to close immediately but cleans up asynchronously;
           # poll for up to 30 seconds before declaring failure.
           $timeout = 30

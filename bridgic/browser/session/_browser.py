@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     except ModuleNotFoundError:  # pragma: no cover - optional dependency
         OpenAILlm = Any  # type: ignore[misc,assignment]
 
-from .._constants import BRIDGIC_TMP_DIR
+from .._constants import BRIDGIC_TMP_DIR, BRIDGIC_SNAPSHOT_DIR
 
 from playwright.async_api import (
     async_playwright,
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_SNAPSHOT_LIMIT = 10000
 
-_LAUNCH_DEBUG_LOG = os.path.expanduser("~/.bridgic/tmp/launch-debug.json")
+_LAUNCH_DEBUG_LOG = str(BRIDGIC_TMP_DIR / "launch-debug.json")
 
 
 def _detect_system_chrome() -> bool:
@@ -75,7 +75,7 @@ def _detect_system_chrome() -> bool:
 
 
 def _write_launch_debug_log(options: Dict[str, Any], mode: str) -> None:
-    """Write Chrome launch args to ~/.bridgic/tmp/launch-debug.json for debugging."""
+    """Write Chrome launch args to launch-debug.json for debugging."""
     import datetime, json as _json
     try:
         os.makedirs(os.path.dirname(_LAUNCH_DEBUG_LOG), exist_ok=True)
@@ -88,10 +88,10 @@ def _write_launch_debug_log(options: Dict[str, Any], mode: str) -> None:
             "channel": options.get("channel"),
             "executable_path": str(options["executable_path"]) if options.get("executable_path") else None,
         }
-        with open(_LAUNCH_DEBUG_LOG, "w") as f:
+        with open(_LAUNCH_DEBUG_LOG, "w", encoding="utf-8") as f:
             _json.dump(record, f, indent=2)
     except Exception as e:
-        logger.warning(f"Failed to write launch debug log: {e}")
+        logger.warning("Failed to write launch debug log: %s", e)
 
 
 def _strip_playwright_call_log(message: str) -> str:
@@ -304,6 +304,12 @@ ClientCertificate = Dict[str, Any]
 class Browser:
     """Browser wrapper for Playwright with automatic launch mode selection.
 
+    Automatically loads configuration from config files and environment
+    variables on instantiation (same priority chain as the ``bridgic-browser``
+    CLI): ``~/.bridgic/bridgic-browser/bridgic-browser.json`` → ``./bridgic-browser.json`` →
+    ``BRIDGIC_BROWSER_JSON`` env var. Explicit constructor parameters override
+    config values.
+
     This class automatically chooses between `launch` + `new_context` and
     `launch_persistent_context` based on whether `user_data_dir` is provided.
 
@@ -312,16 +318,18 @@ class Browser:
 
     Parameters
     ----------
-    headless : bool, default True
-        Whether to run browser in headless mode.
+    headless : bool, optional
+        Whether to run browser in headless mode. Defaults to None (resolved
+        from config files or True if no config present).
     viewport : ViewportSize, optional
         Viewport size. Defaults to {"width": 1600, "height": 900}.
     user_data_dir : str | Path, optional
         Path to user data directory for persistent context. If provided,
         uses `launch_persistent_context`; otherwise uses `launch` + `new_context`.
-    stealth : bool | StealthConfig, default True
-        Stealth mode for bypassing bot detection. **Enabled by default.**
-        - True (default): Enable stealth with optimal StealthConfig
+    stealth : bool | StealthConfig, optional
+        Stealth mode for bypassing bot detection. Defaults to None (resolved
+        from config files or True if no config present).
+        - True: Enable stealth with optimal StealthConfig
         - False: Disable stealth mode completely
         - StealthConfig: Custom stealth configuration
 
@@ -428,11 +436,11 @@ class Browser:
     def __init__(
         self,
         # === Common frequently used parameters ===
-        headless: bool = True,
+        headless: Optional[bool] = None,
         viewport: Optional[ViewportSize] = None,
         user_data_dir: Optional[Union[str, Path]] = None,
         # === Stealth mode (enabled by default for best anti-detection) ===
-        stealth: Union[bool, StealthConfig, None] = True,
+        stealth: Union[bool, StealthConfig, None] = None,
         # === Browser launch parameters (commonly used) ===
         channel: Optional[str] = None,
         executable_path: Optional[Union[str, Path]] = None,
@@ -454,6 +462,51 @@ class Browser:
         # === All other parameters via kwargs ===
         **kwargs: Any,
     ):
+        # --- Load config from files and environment ---
+        from .._config import _load_config_sources
+        _cfg = _load_config_sources()
+
+        # Resolve parameters: explicit (non-None) > config > default.
+        # Always pop named-param keys from _cfg so they don't leak into
+        # _extra_kwargs (which would corrupt get_config() and Playwright options).
+        headless = headless if headless is not None else _cfg.pop('headless', True)
+        stealth = stealth if stealth is not None else _cfg.pop('stealth', True)
+        viewport = viewport if viewport is not None else _cfg.pop('viewport', None)
+        user_data_dir = user_data_dir if user_data_dir is not None else _cfg.pop('user_data_dir', None)
+        channel = channel if channel is not None else _cfg.pop('channel', None)
+        executable_path = executable_path if executable_path is not None else _cfg.pop('executable_path', None)
+        proxy = proxy if proxy is not None else _cfg.pop('proxy', None)
+        timeout = timeout if timeout is not None else _cfg.pop('timeout', None)
+        slow_mo = slow_mo if slow_mo is not None else _cfg.pop('slow_mo', None)
+        args = args if args is not None else _cfg.pop('args', None)
+        ignore_default_args = ignore_default_args if ignore_default_args is not None else _cfg.pop('ignore_default_args', None)
+        downloads_path = downloads_path if downloads_path is not None else _cfg.pop('downloads_path', None)
+        devtools = devtools if devtools is not None else _cfg.pop('devtools', None)
+        user_agent = user_agent if user_agent is not None else _cfg.pop('user_agent', None)
+        locale = locale if locale is not None else _cfg.pop('locale', None)
+        timezone_id = timezone_id if timezone_id is not None else _cfg.pop('timezone_id', None)
+        ignore_https_errors = ignore_https_errors if ignore_https_errors is not None else _cfg.pop('ignore_https_errors', None)
+        extra_http_headers = extra_http_headers if extra_http_headers is not None else _cfg.pop('extra_http_headers', None)
+        offline = offline if offline is not None else _cfg.pop('offline', None)
+        color_scheme = color_scheme if color_scheme is not None else _cfg.pop('color_scheme', None)
+        # Remove any named-param keys that were skipped above (explicit value won)
+        for _named_key in (
+            'headless', 'stealth', 'viewport', 'user_data_dir', 'channel',
+            'executable_path', 'proxy', 'timeout', 'slow_mo', 'args',
+            'ignore_default_args', 'downloads_path', 'devtools', 'user_agent',
+            'locale', 'timezone_id', 'ignore_https_errors', 'extra_http_headers',
+            'offline', 'color_scheme',
+        ):
+            _cfg.pop(_named_key, None)
+
+        # Merge remaining config into kwargs (pass-through params like chromium_sandbox)
+        for k, v in _cfg.items():
+            kwargs.setdefault(k, v)
+
+        # Headed mode: auto-set chromium_sandbox=True to prevent --no-sandbox warning
+        if headless is False:
+            kwargs.setdefault('chromium_sandbox', True)
+
         # Store all parameters
         self._headless = headless
         self._no_viewport = bool(kwargs.get("no_viewport", False))
@@ -1012,6 +1065,55 @@ class Browser:
     _BROWSER_CLOSE_TIMEOUT = 15.0
     _PLAYWRIGHT_STOP_TIMEOUT = 15.0
 
+    @staticmethod
+    async def _force_kill_playwright_driver(pw: Any) -> None:
+        """Force-kill the Playwright Node driver process.
+
+        Accesses internal Playwright transport to send SIGKILL and waits for
+        the process to exit (avoids zombie processes).  Best-effort: silently
+        ignored if internals have changed.
+        """
+        try:
+            proc = pw._connection._transport._proc  # type: ignore[union-attr]
+            if proc and proc.returncode is None:
+                proc.kill()
+                # Short timeout: SIGKILL is immediate, but wait() depends on
+                # the event loop's child watcher which may misbehave at teardown.
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+                logger.debug("Force-killed Playwright driver process")
+        except Exception as exc:
+            logger.debug("_force_kill_playwright_driver skipped: %s", exc)
+
+    def _write_close_report(self, errors: List[str]) -> None:
+        """Write close-report.json into the close session directory."""
+        session_dir = self._close_session_dir
+        if not session_dir:
+            return
+        from datetime import datetime, timezone
+
+        if errors:
+            all_timeouts = all("timeout after" in e.lower() for e in errors)
+            status = "success_with_timeouts" if all_timeouts else "error"
+        else:
+            status = "success"
+
+        report = {
+            "status": status,
+            "closed_at": datetime.now(timezone.utc).isoformat(),
+            "trace_paths": self._last_shutdown_artifacts.get("trace", []),
+            "video_paths": self._last_shutdown_artifacts.get("video", []),
+            "warnings": [],
+            "errors": list(errors),
+        }
+        report_path = Path(session_dir) / "close-report.json"
+        try:
+            report_path.write_text(
+                json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8",
+            )
+            logger.info("close-report written: %s", report_path)
+        except Exception as exc:
+            logger.warning("failed to write close-report.json: %s", exc)
+
     def _clear_page_scoped_state(self, page: Optional[Page], errors: Optional[List[str]] = None) -> None:
         """Detach page-scoped listeners and drop cached state for one page."""
         if page is None:
@@ -1057,8 +1159,7 @@ class Browser:
         Dict with keys:
           session_dir : str         — unique per-close directory under BRIDGIC_TMP_DIR
           trace       : List[str]   — pre-created trace path (if tracing is active)
-          video       : List[str]   — known video path (if user set a filename)
-          video_dir   : Optional[str] — auto-save directory (if no explicit filename)
+          video       : List[str]   — pre-allocated video paths in session dir
         """
         import random
         from datetime import datetime
@@ -1073,7 +1174,6 @@ class Browser:
             "session_dir": str(session_dir),
             "trace": [],
             "video": [],
-            "video_dir": None,
         }
 
         if not self._context:
@@ -1097,7 +1197,17 @@ class Browser:
             if has_pending and pending_raw:
                 artifacts["video"].append(os.path.abspath(str(pending_raw)))
             else:
-                artifacts["video_dir"] = self._temp_video_dir or str(BRIDGIC_TMP_DIR)
+                # Pre-allocate video paths inside session dir so all artifacts
+                # are grouped together instead of scattered in tmp/ with hashes.
+                pages_with_video = [
+                    p for p in list(self._context.pages)
+                    if getattr(p, "video", None) is not None
+                ]
+                need_suffix = len(pages_with_video) > 1
+                for i in range(len(pages_with_video)):
+                    suffix = f"_{i + 1}" if need_suffix else ""
+                    video_path = str(session_dir / f"video{suffix}.webm")
+                    artifacts["video"].append(video_path)
 
         return artifacts
 
@@ -1121,6 +1231,13 @@ class Browser:
         """
         if self._playwright is None:
             return "Browser closed."
+
+        # Ensure a close session directory exists so trace/video artifacts are
+        # grouped together (e.g. close-{ts}-{rand}/trace.zip, video_1.webm).
+        # The CLI daemon calls inspect_pending_close_artifacts() before close(),
+        # but SDK users call close() directly — auto-create for them.
+        if not self._close_session_dir:
+            self.inspect_pending_close_artifacts()
 
         errors: List[str] = []
         shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
@@ -1185,6 +1302,29 @@ class Browser:
             for page in list(self._context.pages):
                 self._clear_page_scoped_state(page, errors)
 
+            # Navigate all pages to about:blank before video finalization to
+            # terminate service workers and ongoing network activity.  This
+            # prevents context.close() from hanging later.
+            #
+            # Must run BEFORE video finalization because _finalize_video()
+            # calls page.close() for each page — after that the page list is
+            # empty and about:blank would be a no-op.
+            #
+            # Skipped for temp_user_data_dir: that path force-kills the
+            # process immediately and never reaches context.close().
+            if not self._temp_user_data_dir:
+                for _nav_page in list(self._context.pages):
+                    try:
+                        await asyncio.wait_for(
+                            _nav_page.goto("about:blank", wait_until="commit"),
+                            timeout=self._PAGE_CLOSE_TIMEOUT,
+                        )
+                    except Exception as exc:
+                        logger.debug("close: about:blank navigation failed: %s", exc)
+                    except BaseException as e:
+                        if _pending_cancel is None:
+                            _pending_cancel = e
+
             # Save videos when: (a) video_start() was called and never stopped, or
             # (b) stop_video() deferred the save to close time.
             # Use a sentinel because pop() returns None both for "absent" and "stored None".
@@ -1207,6 +1347,11 @@ class Browser:
                 if pending_filename:
                     dest_dir = os.path.dirname(pending_filename)
                     dest_stem = os.path.splitext(os.path.basename(pending_filename))[0]
+                elif self._close_session_dir:
+                    # No explicit filename — save into session dir so all
+                    # close artifacts are grouped together.
+                    dest_dir = self._close_session_dir
+                    dest_stem = "video"
 
                 async def _finalize_video(page_: Any, video_: Any, idx: int) -> Optional[str]:
                     await asyncio.wait_for(page_.close(), timeout=self._PAGE_CLOSE_TIMEOUT)
@@ -1240,40 +1385,56 @@ class Browser:
         else:
             self._clear_page_scoped_state(self._page, errors)
 
-        # Close page (with timeout to guard against hung beforeunload handlers)
-        if self._page:
-            _page = self._page
+        # In persistent context mode with a temp user_data_dir, Chrome spends
+        # significant time flushing profile data (cookies, cache, IndexedDB) to
+        # disk on shutdown — data we will delete anyway via shutil.rmtree.
+        # Skip all graceful page/context/browser shutdown and force-kill the
+        # process immediately.  Trace and video artifacts have already been
+        # finalized above.
+        if self._temp_user_data_dir:
             self._page = None
-            try:
-                await asyncio.wait_for(
-                    _page.close(), timeout=self._PAGE_CLOSE_TIMEOUT,
-                )
-            except BaseException as e:
-                errors.append(f"page.close: {e}")
-                if not isinstance(e, Exception) and _pending_cancel is None:
-                    _pending_cancel = e
+            self._browser = None
+            self._context = None
+            if self._playwright:
+                _playwright = self._playwright
+                self._playwright = None
+                await self._force_kill_playwright_driver(_playwright)
 
-        # Detach download manager before context closes to remove handlers
-        if self._download_manager and self._context:
-            try:
-                self._download_manager.detach_from_context(self._context)
-            except Exception as e:
-                errors.append(f"download_manager.detach: {e}")
-
-        # Close all remaining pages in context before closing context.
-        # This avoids context.close() hanging on beforeunload handlers of extra
-        # tabs the user may have opened manually (or pages we didn't track).
-        if self._context:
-            for extra_page in list(self._context.pages):
+        else:
+            # Close page (with timeout to guard against hung beforeunload handlers)
+            if self._page:
+                _page = self._page
+                self._page = None
                 try:
                     await asyncio.wait_for(
-                        extra_page.close(run_before_unload=False),
-                        timeout=self._PAGE_CLOSE_TIMEOUT,
+                        _page.close(), timeout=self._PAGE_CLOSE_TIMEOUT,
                     )
                 except BaseException as e:
+                    errors.append(f"page.close: {e}")
                     if not isinstance(e, Exception) and _pending_cancel is None:
                         _pending_cancel = e
-                    # best-effort; context.close() will handle remaining pages
+
+            # Detach download manager before context closes to remove handlers
+            if self._download_manager and self._context:
+                try:
+                    self._download_manager.detach_from_context(self._context)
+                except Exception as e:
+                    errors.append(f"download_manager.detach: {e}")
+
+            # Close all remaining pages in context before closing context.
+            # This avoids context.close() hanging on beforeunload handlers of extra
+            # tabs the user may have opened manually (or pages we didn't track).
+            if self._context:
+                for extra_page in list(self._context.pages):
+                    try:
+                        await asyncio.wait_for(
+                            extra_page.close(run_before_unload=False),
+                            timeout=self._PAGE_CLOSE_TIMEOUT,
+                        )
+                    except BaseException as e:
+                        if not isinstance(e, Exception) and _pending_cancel is None:
+                            _pending_cancel = e
+                        # best-effort; context.close() will handle remaining pages
 
         # Close context
         # NOTE: In persistent context mode, closing context will auto close browser
@@ -1289,6 +1450,13 @@ class Browser:
                 errors.append(
                     f"context.close: timeout after {self._CONTEXT_CLOSE_TIMEOUT:.1f}s"
                 )
+                # context.close() hung — force-kill the entire Playwright driver
+                # so browser.close() and playwright.stop() don't also time out.
+                if self._playwright:
+                    _playwright = self._playwright
+                    self._playwright = None
+                    self._browser = None  # browser dies with driver
+                    await self._force_kill_playwright_driver(_playwright)
             except Exception as e:
                 errors.append(f"context.close: {e}")
             except BaseException as e:
@@ -1317,7 +1485,7 @@ class Browser:
                 if _pending_cancel is None:
                     _pending_cancel = e
 
-        # Stop playwright
+        # Stop playwright (temp_user_data_dir already handled above)
         if self._playwright:
             _playwright = self._playwright
             self._playwright = None
@@ -1330,6 +1498,7 @@ class Browser:
                 errors.append(
                     f"playwright.stop: timeout after {self._PLAYWRIGHT_STOP_TIMEOUT:.1f}s"
                 )
+                await self._force_kill_playwright_driver(_playwright)
             except Exception as e:
                 errors.append(f"playwright.stop: {e}")
             except BaseException as e:
@@ -1366,6 +1535,9 @@ class Browser:
             self._video_state.pop(context_key, None)
 
         # Flush all remaining state so a stopped instance holds no stale refs.
+        # NOTE: _close_session_dir is intentionally preserved (like
+        # _last_shutdown_artifacts / _last_shutdown_errors) so the daemon's
+        # _write_close_report() can read it after close() returns.
         self._console_messages.clear()
         self._network_requests.clear()
         self._console_handlers.clear()
@@ -1394,6 +1566,12 @@ class Browser:
             logger.warning(f"Browser closed with errors: {errors}")
         else:
             logger.info("Browser closed")
+
+        # Write close-report.json into the session dir so SDK and CLI
+        # produce identical artifacts.  The daemon's _write_close_report()
+        # may overwrite this later with additional daemon-level info
+        # (e.g. browser.close() overall timeout).
+        self._write_close_report(errors)
 
         if _pending_cancel is not None:
             raise _pending_cancel
@@ -2263,11 +2441,10 @@ Before you return the element ref, reason about the state and elements for a sen
 
     async def get_snapshot_text(
         self,
-        offset: int = 0,
         limit: int = _DEFAULT_SNAPSHOT_LIMIT,
         interactive: bool = False,
         full_page: bool = True,
-        from_cli: bool = False,
+        file: Optional[str] = None,
     ) -> str:
         """Get the page accessibility tree as a formatted string with element refs.
 
@@ -2285,13 +2462,11 @@ Before you return the element ref, reason about the state and elements for a sen
 
         Parameters
         ----------
-        offset : int, optional
-            Pagination offset (character index into the full tree text).
-            Must be >= 0.  Use the ``next_offset`` value from the truncation
-            notice to get the next page of content.  Default is 0.
         limit : int, optional
             Maximum number of characters to return.  Must be >= 1.
-            Default is 10 000.
+            Default is 10 000.  When the snapshot exceeds this limit,
+            the full content is written to a file and only a notice with
+            the file path is returned (no snapshot content).
         interactive : bool, optional
             If True, only include clickable/editable elements (buttons, links,
             inputs, checkboxes, elements with cursor:pointer, etc.).
@@ -2299,10 +2474,14 @@ Before you return the element ref, reason about the state and elements for a sen
         full_page : bool, optional
             If True (default), include elements outside the viewport.
             If False, only include elements within the current viewport.
-        from_cli : bool, optional
-            Internal flag.  When True, the truncation notice shows a
-            ``bridgic-browser snapshot`` CLI command instead of a Python call.
-            Do not set this in SDK usage.
+        file : str or None, optional
+            File path to write the full snapshot.  When provided, the
+            snapshot is always saved to this file regardless of whether
+            content exceeds ``limit``, and only a notice with the file
+            path is returned (no snapshot content).  When ``None``
+            (default), file is only written if content exceeds ``limit``,
+            using an auto-generated path under
+            ``~/.bridgic/bridgic-browser/snapshot/``.
 
         Returns
         -------
@@ -2310,31 +2489,45 @@ Before you return the element ref, reason about the state and elements for a sen
             Page header followed by the accessibility tree.  Lines with
             ``[ref=...]`` are interactive elements.
 
-            Output is truncated to ``limit`` characters.  When truncated, a
-            ``[notice]`` is prepended before the page content (after the header)
-            with the ``next_offset`` value and the continuation call.
+            When the snapshot exceeds ``limit`` or ``file`` is provided,
+            a ``[notice]`` with the file path is returned instead of
+            the snapshot content.
 
         Raises
         ------
         InvalidInputError
-            If ``offset`` is negative, beyond the total tree length, or
-            ``limit`` is less than 1.
+            If ``limit`` is less than 1, or ``file`` is empty/whitespace-only,
+            contains null bytes, or points to an existing directory.
         OperationError
             If snapshot generation fails.
         """
         try:
-            if offset < 0:
-                _raise_invalid_input(
-                    "offset must be >= 0",
-                    code="INVALID_OFFSET",
-                    details={"offset": offset},
-                )
             if limit < 1:
                 _raise_invalid_input(
                     "limit must be >= 1",
                     code="INVALID_LIMIT",
                     details={"limit": limit},
                 )
+
+            if file is not None:
+                if not file.strip():
+                    _raise_invalid_input(
+                        "file path must not be empty",
+                        code="INVALID_FILE_PATH",
+                        details={"file": file},
+                    )
+                if "\x00" in file:
+                    _raise_invalid_input(
+                        "file path must not contain null bytes",
+                        code="INVALID_FILE_PATH",
+                        details={"file": repr(file)},
+                    )
+                if Path(file).is_dir():
+                    _raise_invalid_input(
+                        f"file path is an existing directory: {file}",
+                        code="INVALID_FILE_PATH",
+                        details={"file": file},
+                    )
 
             snapshot = await self.get_snapshot(
                 interactive=interactive,
@@ -2348,74 +2541,55 @@ Before you return the element ref, reason about the state and elements for a sen
 
             total_length = len(full_text)
 
-            if offset > 0:
-                if offset >= total_length:
-                    _raise_invalid_input(
-                        (
-                            f"offset ({offset}) exceeds total page state length "
-                            f"of {total_length} characters."
-                        ),
-                        code="OFFSET_OUT_OF_RANGE",
-                        details={"offset": offset, "total_length": total_length},
-                    )
-                text = full_text[offset:]
-            else:
-                text = full_text
-
-            truncated = False
-            next_offset: Optional[int] = None
-
-            if len(text) > limit:
-                truncate_at = limit
-
-                paragraph_break = text.rfind("\n\n", limit - 500, limit)
-                if paragraph_break > 0:
-                    truncate_at = paragraph_break
-                else:
-                    line_break = text.rfind("\n", 0, limit)
-                    if line_break > 0:
-                        truncate_at = line_break + 1
-
-                text = text[:truncate_at]
-                truncated = True
-                next_offset = offset + truncate_at
-
-            if truncated and next_offset is not None:
-                continuation: str
-                if from_cli:
-                    cli_flags = []
-                    if interactive:
-                        cli_flags.append("-i")
-                    if not full_page:
-                        cli_flags.append("-F")
-                    cli_flags.append(f"-o {next_offset}")
-                    cli_flags.append(f"-l {limit}")
-                    cli_cmd = "bridgic-browser snapshot " + " ".join(cli_flags)
-                    continuation = f"run: {cli_cmd}"
-                else:
-                    continuation = (
-                        f"call get_snapshot_text(offset={next_offset}, "
-                        f"limit={limit}, "
-                        f"interactive={interactive}, full_page={full_page})"
-                    )
-
+            if total_length > limit or file:
+                file_content = header + full_text
+                total_chars = len(file_content)
+                total_lines = file_content.count("\n") + (1 if file_content and not file_content.endswith("\n") else 0)
+                snapshot_file = self._write_snapshot_file(file_content, file)
                 notice = (
-                    "[notice] Current page text is too long, returned portion starting "
-                    f"from character {offset} (this segment length {len(text)} / total "
-                    f"length {total_length} characters). To continue getting subsequent content: "
-                    f"{continuation}\n\n"
+                    f"[notice] Snapshot file ({total_chars} characters, {total_lines} lines) "
+                    f"saved to: {snapshot_file}\n"
                 )
-                logger.info("[get_snapshot_text] Successfully retrieved interface information")
-                return header + notice + text
+                logger.info("[get_snapshot_text] Snapshot saved to %s", snapshot_file)
+                return header + notice
 
             logger.info("[get_snapshot_text] Successfully retrieved interface information")
-            return header + text
+            return header + full_text
         except BridgicBrowserError:
             raise
         except Exception as e:
             error_msg = f"Failed to get interface information: {e}"
             logger.error(f"[get_snapshot_text] {error_msg}")
             _raise_operation_error(error_msg)
+
+    def _write_snapshot_file(self, content: str, file: Optional[str] = None) -> str:
+        """Write snapshot content to a file and return the absolute path.
+
+        Callers must validate ``file`` before calling (get_snapshot_text does
+        this).  When ``file`` is None, an auto-generated path under
+        BRIDGIC_SNAPSHOT_DIR is used.
+        """
+        import random
+        from datetime import datetime
+
+        if file:
+            filepath = Path(file)
+        else:
+            snapshot_dir = BRIDGIC_SNAPSHOT_DIR
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            rand_suffix = f"{random.randint(0, 0xffff):04x}"
+            filename = f"snapshot-{ts}-{rand_suffix}.txt"
+            filepath = snapshot_dir / filename
+
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        filepath.write_text(content, encoding="utf-8")
+        if sys.platform != "win32":
+            try:
+                filepath.chmod(0o600)
+            except OSError:
+                pass
+        return str(filepath.resolve())
 
     # ==================== Navigation Tools ====================
 
@@ -6287,7 +6461,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
         Video recording is always running — Playwright starts recording as soon
         as a page is created (using the ``record_video_dir`` set at browser
-        creation, which defaults to ``~/.bridgic/tmp``).  This method simply
+        creation, which defaults to ``~/.bridgic/bridgic-browser/tmp``).  This method simply
         marks the session as "started" so that :meth:`stop_video` can later
         register where to save the file.
 

@@ -111,8 +111,8 @@ This model is the foundation of all correspondence in this guide.
 - `snapshot`:
   - `-i` -> `interactive=True`
   - `-F` -> `full_page=False`
-  - `-o N` -> `offset=N`
   - `-l N` -> `limit=N`
+  - `-s PATH` -> `file="PATH"` (always saves to file; omit for auto-generated only when over limit)
 - `wait` (**unit is SECONDS, not milliseconds**):
   - `wait 2.5` -> `wait_for(time_seconds=2.5)` — numeric argument always takes the time path; `--gone` is ignored
   - `wait "Done"` -> `wait_for(text="Done")`

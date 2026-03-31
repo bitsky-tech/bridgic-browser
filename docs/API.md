@@ -39,4 +39,4 @@ Short reference for the main session and download APIs. For tool lists and selec
 
 - **SnapshotOptions**: `interactive`, `full_page`.
 - **EnhancedSnapshot**: `.tree`, `.refs` (ref id → RefData).
-- **await browser.get_snapshot_text(offset=0, limit=10000, interactive=False, full_page=True)**: Page state string for LLM, with optional pagination.
+- **await browser.get_snapshot_text(limit=10000, interactive=False, full_page=True, file=None)**: Page state string for LLM; when content exceeds limit or file is explicitly provided, full snapshot is saved to file and only a notice with the file path is returned.

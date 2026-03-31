@@ -1546,18 +1546,24 @@ class TestStateTools:
         assert "button" in result or "Click me" in result
 
     @pytest.mark.asyncio
-    async def test_get_snapshot_text_pagination(self, mock_browser):
-        """Test get_snapshot_text with pagination."""
+    async def test_get_snapshot_text_overflow(self, mock_browser, tmp_path):
+        """Test get_snapshot_text writes file when content exceeds limit."""
 
         long_text = "x" * 50000
         mock_snapshot = MagicMock()
         mock_snapshot.tree = long_text
         mock_browser.get_snapshot.return_value = mock_snapshot
+        mock_browser._write_snapshot_file = Browser._write_snapshot_file.__get__(mock_browser)
 
-        result = await Browser.get_snapshot_text(mock_browser, offset=0)
+        file_path = str(tmp_path / "snap.txt")
+        result = await Browser.get_snapshot_text(mock_browser, file=file_path)
 
-        assert len(result) < len(long_text) + 500
-        assert "offset=" in result
+        assert "[notice]" in result
+        assert "saved to:" in result
+        assert file_path in result
+        written = (tmp_path / "snap.txt").read_text(encoding="utf-8")
+        assert long_text in written
+        assert written.startswith("[Page:")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("interactive,full_page", [
@@ -1581,28 +1587,6 @@ class TestStateTools:
             interactive=interactive, full_page=full_page
         )
         assert "button" in result or "Click me" in result
-
-    @pytest.mark.asyncio
-    async def test_get_snapshot_text_negative_offset(self, mock_browser):
-        """Negative offset should raise InvalidInputError."""
-        mock_snapshot = MagicMock()
-        mock_snapshot.tree = "- button 'Click me' [ref=e1]"
-        mock_browser.get_snapshot.return_value = mock_snapshot
-
-        with pytest.raises(InvalidInputError) as exc_info:
-            await Browser.get_snapshot_text(mock_browser, offset=-1)
-        assert exc_info.value.code == "INVALID_OFFSET"
-
-    @pytest.mark.asyncio
-    async def test_get_snapshot_text_offset_out_of_range(self, mock_browser):
-        """Out-of-range offset should raise InvalidInputError."""
-        mock_snapshot = MagicMock()
-        mock_snapshot.tree = "abc"
-        mock_browser.get_snapshot.return_value = mock_snapshot
-
-        with pytest.raises(InvalidInputError) as exc_info:
-            await Browser.get_snapshot_text(mock_browser, offset=99999)
-        assert exc_info.value.code == "OFFSET_OUT_OF_RANGE"
 
     @pytest.mark.asyncio
     async def test_get_snapshot_text_invalid_limit(self, mock_browser):

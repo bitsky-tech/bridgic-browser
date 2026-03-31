@@ -19,11 +19,11 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from .._constants import BRIDGIC_HOME
+from .._constants import BRIDGIC_BROWSER_HOME
 
 # ── Run info file ─────────────────────────────────────────────────────────────
 
-RUN_INFO_PATH = BRIDGIC_HOME / "run" / "bridgic-browser.json"
+RUN_INFO_PATH = BRIDGIC_BROWSER_HOME / "run" / "daemon.json"
 
 
 def _ensure_run_dir() -> None:
@@ -74,7 +74,7 @@ def remove_run_info() -> None:
 
 def _default_socket_path() -> str:
     """Return per-user default socket path."""
-    return str(BRIDGIC_HOME / "run" / "bridgic-browser.sock")
+    return str(BRIDGIC_BROWSER_HOME / "run" / "bridgic-browser.sock")
 
 
 def _ensure_socket_parent_dir(path: str) -> None:

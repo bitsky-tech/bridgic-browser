@@ -7,8 +7,8 @@ Two scenarios:
   B) stop_tracing() + stop_video() called first, then close()
      → artifacts already saved before close(), close() should be clean
 
-Note: close-report.json is written by the daemon (CLI path) only.
-      These tests cover the Python SDK path (direct browser.close()).
+close-report.json is written by Browser.close() itself (both SDK and CLI paths).
+      The daemon may overwrite it afterwards with additional timeout status.
 
 Run with:
     uv run pytest tests/integration/test_close_artifacts.py -v -s
@@ -60,7 +60,7 @@ async def test_close_direct_with_active_trace_and_video():
     artifacts = browser.inspect_pending_close_artifacts()
     print(f"\n  session_dir:       {artifacts['session_dir']}")
     print(f"  pre-alloc trace:   {artifacts['trace']}")
-    print(f"  pre-alloc video_dir: {artifacts.get('video_dir')}")
+    print(f"  pre-alloc video:   {artifacts.get('video')}")
 
     assert artifacts["trace"], "Expected a pre-allocated trace path"
     pre_trace = Path(artifacts["trace"][0])
