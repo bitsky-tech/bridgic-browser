@@ -47,6 +47,7 @@ Notes:
 - `async with Browser(...)` calls `_start()` in `__aenter__` and `close()` in `__aexit__` automatically.
 - Without the context manager, the browser starts lazily: `navigate_to(...)` and `search(...)` call `_ensure_started()` on first invocation.
 - `get_snapshot(...)` returns `EnhancedSnapshot` (never `None`); raises `StateError` if no active page, `OperationError` if generation fails.
+- **Default session is persistent**: `Browser()` (no args) saves the browser profile to `~/.bridgic/bridgic-browser/user_data/`. Use `Browser(clear_user_data=True)` for an ephemeral session with no saved profile. Use `Browser(user_data_dir="./my-profile")` to specify a custom profile path.
 
 ## API Division: Raw Methods vs Tool Methods
 

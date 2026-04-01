@@ -16,6 +16,7 @@ Use this reference when the task needs environment variable behavior or login st
 Notes:
 - Config file precedence (SDK + CLI, lowest -> highest): defaults, `~/.bridgic/bridgic-browser/bridgic-browser.json`, `./bridgic-browser.json`, `BRIDGIC_BROWSER_JSON`.
 - To start the daemon in headed mode, pass `--headed` to `bridgic-browser open` / `bridgic-browser search`, or set `{"headless": false}` in `BRIDGIC_BROWSER_JSON`.
+- To start with an ephemeral (no persistent profile) session, pass `--clear-user-data` to `bridgic-browser open` / `bridgic-browser search`, or set `{"clear_user_data": true}` in `BRIDGIC_BROWSER_JSON`. These flags are only meaningful when starting a new daemon; they are ignored if a session is already running.
 - When `headless=false` (headed mode) with stealth enabled and neither `channel` nor `executable_path` is specified, the daemon **auto-switches to system Chrome** (`channel=”chrome”`) if detected on the machine. This avoids Playwright’s bundled “Chrome for Testing” which is blocked by Google OAuth and shows a “test” label in the macOS Dock. If system Chrome is not installed, it falls back to Chrome for Testing.
 
 ### Config Files and `BRIDGIC_BROWSER_JSON` Values
@@ -28,7 +29,8 @@ Notes:
 |---|---|---|
 | `headless` | `true | false` | Default `true`. If `devtools=true`, headless is forced to `false`. |
 | `viewport` | `{ "width": int, "height": int }` or `null` | Default `1600x900` when `no_viewport` is not set. |
-| `user_data_dir` | string (path) | Enables persistent context. |
+| `user_data_dir` | string (path) | Custom path for persistent profile. Ignored when `clear_user_data=true`. |
+| `clear_user_data` | `true | false` | Default `false`. If `true`, use ephemeral session (`launch`+`new_context`, no profile saved). If `false`, use persistent profile (defaults to `~/.bridgic/bridgic-browser/user_data/`). |
 | `stealth` | `true | false` or object | Object uses the StealthConfig keys below. |
 | `channel` | string | Examples: `"chrome"`, `"msedge"`, `"chromium"`. |
 | `executable_path` | string (path) | Custom browser binary path. |
@@ -136,4 +138,4 @@ Details:
 - Requires an active page.
 - LocalStorage is applied to the current page origin; multi-origin storage may require navigating per origin before restore.
 - Playwright can include IndexedDB in storage state, but the wrapper does not expose that flag.
-- For long-lived login across restarts, use a persistent context: `Browser(user_data_dir=...)`.
+- For long-lived login across restarts, the default `Browser()` already saves state persistently to `~/.bridgic/bridgic-browser/user_data/`. Use `Browser(user_data_dir="./my-profile")` to choose a custom profile path, or `Browser(clear_user_data=True)` to opt out of persistence.

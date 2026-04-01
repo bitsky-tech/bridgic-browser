@@ -53,7 +53,7 @@ Reference files cover all use cases. Load only the one(s) relevant to the task:
 - Ref-based actions depend on the latest snapshot.
 - After navigation or major DOM updates, refs can become stale; refresh snapshot before ref actions.
 - CLI keeps state in a daemon session across invocations.
-- SDK keeps state in the Python process/context unless a persistent `user_data_dir` is configured.
+- SDK keeps state in the Python process/context. By default, browser profile (cookies, session) is persisted to `~/.bridgic/bridgic-browser/user_data/`; pass `clear_user_data=True` to `Browser()` for an ephemeral session.
 - Use exact command/method names from references; do not invent aliases.
 
 ## Bridge Workflow: CLI Actions -> Python Code

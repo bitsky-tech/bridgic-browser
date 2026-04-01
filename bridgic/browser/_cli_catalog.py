@@ -78,11 +78,11 @@ CLI_ALL_COMMANDS: list[str] = [
 
 # command_name -> (ToolCategory, one-line description)
 CLI_COMMAND_META: dict[str, tuple[ToolCategory, str]] = {
-    "open": (ToolCategory.NAVIGATION, "Navigate to URL (starts a browser session if needed) [--headed]"),
+    "open": (ToolCategory.NAVIGATION, "Navigate to URL (starts a browser session if needed) [--headed] [--clear-user-data]"),
     "back": (ToolCategory.NAVIGATION, "Go back to the previous page"),
     "forward": (ToolCategory.NAVIGATION, "Go forward to the next page"),
     "reload": (ToolCategory.NAVIGATION, "Reload the current page"),
-    "search": (ToolCategory.NAVIGATION, "Search the web using a search engine (starts a browser session if needed) [--headed] [--engine duckduckgo|google|bing]"),
+    "search": (ToolCategory.NAVIGATION, "Search the web using a search engine (starts a browser session if needed) [--headed] [--clear-user-data] [--engine duckduckgo|google|bing]"),
     "info": (ToolCategory.NAVIGATION, "Show current page URL, title, viewport, scroll position"),
     "snapshot": (ToolCategory.SNAPSHOT, "Get accessibility tree of the current page (full-page by default) with refs [-i] [-F viewport-only] [-l LIMIT] [-s FILE]"),
     "click": (ToolCategory.ELEMENT_INTERACTION, "Click an element by ref (@80365bf7 or 80365bf7)"),

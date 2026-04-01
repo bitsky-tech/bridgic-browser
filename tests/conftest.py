@@ -58,13 +58,6 @@ def temp_downloads_dir(temp_dir: Path) -> Path:
     return downloads
 
 
-@pytest.fixture
-def temp_user_data_dir(temp_dir: Path) -> Path:
-    """Create a temporary user data directory for browser."""
-    user_data = temp_dir / "user_data"
-    user_data.mkdir(parents=True, exist_ok=True)
-    return user_data
-
 
 @pytest.fixture
 def mock_page() -> MagicMock:
@@ -96,7 +89,7 @@ def mock_context(mock_page: MagicMock) -> MagicMock:
     context.pages = [mock_page]
     context.new_page = AsyncMock(return_value=mock_page)
     context.close = AsyncMock()
-    context.browser = MagicMock()
+    context.browser = None  # Playwright persistent contexts return None for .browser
     context.new_cdp_session = AsyncMock()
     context.add_init_script = AsyncMock()
     return context
@@ -148,6 +141,7 @@ async def browser_instance():
     browser = Browser(
         headless=True,
         stealth=False,  # Disable stealth for faster tests
+        clear_user_data=True,  # Ephemeral: no cross-test profile state
         viewport={"width": 1280, "height": 720},
     )
 
@@ -168,6 +162,7 @@ async def browser_with_stealth():
     browser = Browser(
         headless=True,
         stealth=True,
+        clear_user_data=True,  # Ephemeral: no cross-test profile state
         viewport={"width": 1280, "height": 720},
     )
 
