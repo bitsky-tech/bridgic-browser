@@ -30,7 +30,7 @@ playwright install chromium
 
 ### Quick Start
 
-#### CLI Tolls Usage
+#### CLI Tools Usage
 
 ```shell
 bridgic-browser open --headed https://example.com
@@ -41,7 +41,7 @@ bridgic-browser screenshot page.png
 bridgic-browser close
 ```
 
-#### Python Tolls Integration
+#### Python Tools Integration
 
 First, build tools:
 
