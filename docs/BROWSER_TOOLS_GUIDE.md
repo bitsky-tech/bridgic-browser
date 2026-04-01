@@ -28,34 +28,36 @@ This guide helps you choose the right tools for different browser automation sce
 
 ### Parameters
 
-- **offset** (int, default 0): Pagination offset, must be `>= 0`. Use the `next_offset` value from the truncation notice to get the next page of content.
 - **limit** (int, default 10000): Maximum characters to return, must be `>= 1`.
 - **interactive** (bool, default False): If True, only clickable/editable elements are included (buttons, links, inputs, checkboxes, elements with `cursor:pointer`, etc.), with flattened output. Use for action-focused tasks.
 - **full_page** (bool, default True): If True (default), include all elements regardless of viewport position; if False, only viewport content.
+- **file** (str or None, default None): File path to save the full snapshot. When provided, snapshot is always saved and only a notice is returned (regardless of limit). When `None`, file is only written if content exceeds `limit` (auto-generated under `~/.bridgic/bridgic-browser/snapshot/`). Raises `InvalidInputError` if the path is empty/whitespace-only, contains null bytes, or points to an existing directory.
 
-### Truncation and pagination
+### Overflow behavior
 
-When the full tree exceeds `limit`, the tool returns a segment and prepends a notice (before the page content, right after the page header) like:
+When the full tree exceeds `limit`, or when `file` is explicitly provided, the full snapshot is saved to a file and only a notice with the file path is returned (no snapshot content):
 
 ```
-[notice] Current page text is too long, returned portion starting from character 0 (this segment length 10000 / total length 45000 characters). To continue getting subsequent content: call get_snapshot_text(offset=10000, limit=10000, interactive=False, full_page=True)
+[notice] Snapshot file (45000 characters, 1350 lines) saved to: /Users/you/.bridgic/bridgic-browser/snapshot/snapshot-20260330-143025-a7b2.txt
 ```
 
-Use the given `offset` in the next call to continue reading.
+Read the file to get the complete snapshot content.
 
 ### Examples
 
 ```python
-# First call – get initial page state
+# Get page state
 state = await browser.get_snapshot_text()
-# If state contains [notice] (shown before page content) with next_offset=10000:
-# state_more = await browser.get_snapshot_text(offset=10000)
+# If state contains [notice] with file path, read the file for full content
 
 # Only interactive elements (good for "what can I click?")
 state = await browser.get_snapshot_text(interactive=True)
 
 # Viewport-only (override default full_page=True)
 state = await browser.get_snapshot_text(full_page=False)
+
+# Save overflow to a specific file
+state = await browser.get_snapshot_text(file="/tmp/snapshot.txt")
 ```
 
 ## Ref-based vs Coordinate-based Tools

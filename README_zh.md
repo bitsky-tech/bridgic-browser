@@ -13,7 +13,7 @@
 - **语义不变的快照** — 基于无障碍树与专门设计的 ref 生成算法，保证元素 ref 在页面重载后仍可对应同一元素
 - **Skills** — 用于引导探索与代码生成；兼容多数编程类智能体
 - **隐身模式（默认开启）** — 模式感知反检测策略：headless 模式使用 50+ Chrome 参数 + JS 补丁；headed 模式仅使用 ~11 个最小 flag，与真实 Chrome 指纹一致
-- **双启动模式** — 自动在隔离会话与持久化上下文之间切换
+- **持久化与临时会话** — 默认持久化 profile（`~/.bridgic/bridgic-browser/user_data/`）；传入 `clear_user_data=True` 可开启临时会话（无 profile）
 - **嵌套 iframe 支持** — 支持在多层嵌套 iframe 内对 DOM 元素进行操作
 
 ### 安装
@@ -167,12 +167,12 @@ if __name__ == "__main__":
 
 #### 配置
 
-浏览器选项在 daemon 启动时从以下来源读取，优先级从低到高（后者覆盖前者）：
+浏览器选项自动从以下来源加载（CLI daemon 和 SDK `Browser()` 共用），优先级从低到高（后者覆盖前者）：
 
 | 来源 | 示例 |
 |--------|---------|
-| 默认值 | `headless=True` |
-| `~/.bridgic/bridgic-browser.json` | 用户级持久配置 |
+| 默认值 | `headless=True`，`clear_user_data=False`（持久化 profile） |
+| `~/.bridgic/bridgic-browser/bridgic-browser.json` | 用户级持久配置 |
 | `./bridgic-browser.json` | 项目本地配置（daemon 启动时的工作目录） |
 | 环境变量 | 见 `skills/bridgic-browser/references/env-vars.md` |
 
@@ -197,6 +197,8 @@ JSON 来源支持任意 `Browser` 构造参数：
 ```bash
 # 单次环境变量覆盖
 BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open URL
+# 单次临时会话（无持久化 profile）
+BRIDGIC_BROWSER_JSON='{"clear_user_data":true}' bridgic-browser open URL
 ```
 
 #### 命令列表
@@ -204,7 +206,7 @@ BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open 
 | 类别 | 命令 |
 |----------|----------|
 | 导航 | `open`, `back`, `forward`, `reload`, `search`, `info` |
-| 快照 | `snapshot [-i] [-f\|-F] [-o N] [-l N]` |
+| 快照 | `snapshot [-i] [-f\|-F] [-l N] [-s FILE]` |
 | 元素交互 | `click`, `double-click`, `hover`, `focus`, `fill`, `select`, `options`, `check`, `uncheck`, `scroll-to`, `drag`, `upload`, `fill-form` |
 | 键盘 | `press`, `type`, `key-down`, `key-up` |
 | 鼠标 | `scroll`, `mouse-move`, `mouse-click`, `mouse-drag`, `mouse-down`, `mouse-up` |
@@ -296,7 +298,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `go_back()` / `go_forward()` - 浏览器历史导航
 
 **快照（1 个工具）：**
-- `get_snapshot_text(offset=0, limit=10000, interactive=False, full_page=True)` - 获取供 LLM 使用的页面状态字符串（带 ref 的无障碍树）。**offset** 必须 `>= 0`，长页面分页时使用：若返回值被截断，页面内容前的 `[notice]` 会给出 **next_offset** 供再次调用。**limit**（默认 10000）控制最多返回的字符数。**interactive** 与 **full_page** 与 `get_snapshot` 一致（仅交互元素或默认全页）。
+- `get_snapshot_text(limit=10000, interactive=False, full_page=True, file=None)` - 获取供 LLM 使用的页面状态字符串（带 ref 的无障碍树）。**limit**（默认 10000）控制最多返回的字符数。当快照超过 limit 或显式提供了 **file** 时，完整内容会保存到 **file**（若为 `None` 且超限则自动生成至 `~/.bridgic/bridgic-browser/snapshot/`），仅返回包含文件路径的提示。**interactive** 与 **full_page** 与 `get_snapshot` 一致（仅交互元素或默认全页）。
 
 **元素交互（13 个工具）- 通过 ref：**
 - `click_element_by_ref(ref)` - 点击元素
@@ -448,17 +450,23 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 ```python
 from bridgic.browser.session import Browser
 
-# 隔离会话（无持久化）
+# 持久化会话（默认 — profile 保存至 ~/.bridgic/bridgic-browser/user_data/）
 browser = Browser(
     headless=True,
     viewport={"width": 1600, "height": 900},
 )
 
-# 持久化会话（带用户数据）
+# 持久化会话（自定义 profile 路径）
 browser = Browser(
     headless=False,
     user_data_dir="./user_data",
     stealth=True,  # 默认启用
+)
+
+# 临时会话（无持久化 profile）
+browser = Browser(
+    headless=True,
+    clear_user_data=True,
 )
 ```
 
@@ -468,7 +476,8 @@ browser = Browser(
 |-----------|------|---------|-------------|
 | `headless` | bool | True | 无头模式运行 |
 | `viewport` | dict | 1600x900 | 浏览器视口大小 |
-| `user_data_dir` | str/Path | None | 持久化上下文路径 |
+| `user_data_dir` | str/Path | None | 持久化 profile 自定义路径（`clear_user_data=True` 时忽略） |
+| `clear_user_data` | bool | False | True 时使用临时会话（无 profile）；False 时使用持久化 profile |
 | `stealth` | bool/StealthConfig | True | 隐身模式配置 |
 | `channel` | str | None | 浏览器通道（chrome、msedge 等） |
 | `proxy` | dict | None | 代理设置 |

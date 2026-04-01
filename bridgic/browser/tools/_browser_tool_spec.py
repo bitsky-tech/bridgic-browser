@@ -115,7 +115,9 @@ class BrowserToolSpec(ToolSpec):
         if not tool_parameters:
             tool_parameters = create_func_params_json_schema(
                 func,
-                ignore_params=["self", "cls", "browser", "from_cli"]
+                # "file" is hidden because get_snapshot_text's file param is for
+                # CLI/internal use only — LLM agents should not specify file paths.
+                ignore_params=["self", "cls", "browser", "file"]
             )
 
         return cls(

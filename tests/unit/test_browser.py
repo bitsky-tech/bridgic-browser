@@ -17,6 +17,18 @@ from bridgic.browser.session import Browser, StealthConfig
 import bridgic.browser.session._browser as _browser_module
 
 
+@pytest.fixture(autouse=True)
+def _isolate_config():
+    """Prevent real config files and real filesystem side-effects from affecting unit tests."""
+    from bridgic.browser._constants import BRIDGIC_USER_DATA_DIR as _REAL_UDD
+    _mock_udd = MagicMock(spec=Path)
+    _mock_udd.__str__ = MagicMock(return_value=str(_REAL_UDD))
+    _mock_udd.mkdir = MagicMock()
+    with patch("bridgic.browser._config._load_config_sources", return_value={}), \
+         patch("bridgic.browser.session._browser.BRIDGIC_USER_DATA_DIR", _mock_udd):
+        yield
+
+
 class TestBrowserInitialization:
     """Tests for Browser initialization and configuration."""
 
@@ -28,7 +40,8 @@ class TestBrowserInitialization:
         assert browser.viewport == {"width": 1600, "height": 900}
         assert browser.user_data_dir is None
         assert browser.stealth_enabled is True  # Stealth is enabled by default
-        assert browser.use_persistent_context is False
+        assert browser.clear_user_data is False
+        assert browser.use_persistent_context is True  # default: persistent
 
     def test_custom_viewport(self):
         """Test Browser with custom viewport."""
@@ -94,16 +107,45 @@ class TestBrowserInitialization:
         assert exc_info.value.code == "VIEWPORT_CONFLICT"
 
     def test_headless_false_uses_persistent_context(self):
-        """Test that headed mode uses persistent context."""
+        """Headed mode uses persistent context (clear_user_data=False default)."""
         browser = Browser(headless=False, stealth=True)
 
         assert browser.use_persistent_context is True
 
-    def test_headless_true_no_persistent_context(self):
-        """Test that headless mode does not use persistent context."""
+    def test_headless_true_uses_persistent_context_by_default(self):
+        """Headless mode also uses persistent context by default (clear_user_data=False)."""
         browser = Browser(headless=True, stealth=True)
 
-        assert browser.use_persistent_context is False
+        assert browser.use_persistent_context is True
+
+    def test_clear_user_data_disables_persistent_context(self):
+        """clear_user_data=True disables persistent context regardless of headless mode."""
+        browser_headless = Browser(headless=True, clear_user_data=True)
+        browser_headed = Browser(headless=False, clear_user_data=True)
+
+        assert browser_headless.use_persistent_context is False
+        assert browser_headed.use_persistent_context is False
+
+    def test_config_file_clear_user_data_activates_ephemeral_mode(self):
+        """clear_user_data=True from config file activates ephemeral mode."""
+        with patch("bridgic.browser._config._load_config_sources", return_value={"clear_user_data": True}):
+            browser = Browser()
+            assert browser.clear_user_data is True
+            assert browser.use_persistent_context is False
+
+    def test_explicit_false_overrides_config_clear_user_data(self):
+        """Explicit clear_user_data=False in constructor wins over config file True."""
+        with patch("bridgic.browser._config._load_config_sources", return_value={"clear_user_data": True}):
+            browser = Browser(clear_user_data=False)
+            assert browser.clear_user_data is False
+            assert browser.use_persistent_context is True
+
+    def test_explicit_true_overrides_config_false_clear_user_data(self):
+        """Explicit clear_user_data=True in constructor wins over config file False."""
+        with patch("bridgic.browser._config._load_config_sources", return_value={"clear_user_data": False}):
+            browser = Browser(clear_user_data=True)
+            assert browser.clear_user_data is True
+            assert browser.use_persistent_context is False
 
     def test_downloads_path_creates_manager(self):
         """Test that downloads_path creates a download manager."""
@@ -136,6 +178,9 @@ class TestBrowserInitialization:
         assert config["channel"] == "chrome"
         assert config["slow_mo"] == 100
         assert config["stealth_enabled"] is True
+        # clear_user_data=False is not None, so it must appear in the returned dict
+        assert config["clear_user_data"] is False
+        assert config["use_persistent_context"] is True
 
 
 class TestBrowserLaunchOptions:
@@ -315,16 +360,17 @@ class TestBrowserStartStop:
 
     @pytest.mark.asyncio
     async def test_start_normal_mode(self, mock_playwright):
-        """Test starting browser in normal mode."""
+        """Test starting browser with clear_user_data=True uses launch() not persistent."""
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
-            browser = Browser(stealth=False)
+            browser = Browser(stealth=False, clear_user_data=True)
             await browser._start()
 
             assert browser._playwright is not None
             assert browser._context is not None
             mock_playwright.chromium.launch.assert_called_once()
+            mock_playwright.chromium.launch_persistent_context.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_start_persistent_mode(self, mock_playwright):
@@ -344,7 +390,7 @@ class TestBrowserStartStop:
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
-            browser = Browser(stealth=False)
+            browser = Browser(stealth=False, clear_user_data=True)
             await browser._start()
 
             # Second start should just return
@@ -360,7 +406,7 @@ class TestBrowserStartStop:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
             mock_playwright.chromium.launch = AsyncMock(side_effect=RuntimeError("launch failed"))
 
-            browser = Browser(stealth=False)
+            browser = Browser(stealth=False, clear_user_data=True)
             with pytest.raises(RuntimeError, match="launch failed"):
                 await browser._start()
 
@@ -379,7 +425,8 @@ class TestBrowserStartStop:
             browser = Browser(headless=False)  # headed mode, stealth enabled by default
             await browser._start()
 
-            mock_playwright.chromium.launch.return_value.new_context.return_value.add_init_script.assert_not_called()
+            # Persistent context returns context directly (no new_context call)
+            mock_playwright.chromium.launch_persistent_context.return_value.add_init_script.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_headless_mode_injects_init_script(self, mock_playwright):
@@ -390,7 +437,8 @@ class TestBrowserStartStop:
             browser = Browser(headless=True)  # headless mode, stealth enabled by default
             await browser._start()
 
-            mock_playwright.chromium.launch.return_value.new_context.return_value.add_init_script.assert_called_once()
+            # Persistent context returns context directly; stealth init script is injected
+            mock_playwright.chromium.launch_persistent_context.return_value.add_init_script.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_kill_cleanup(self, mock_playwright, mock_context, mock_page):
@@ -408,20 +456,60 @@ class TestBrowserStartStop:
             assert browser._page is None
 
     @pytest.mark.asyncio
-    async def test_kill_cleans_temp_dir(self, mock_playwright):
-        """Test that stop cleans up temporary user data directory."""
+    async def test_clear_user_data_uses_launch_not_persistent(self, mock_playwright):
+        """clear_user_data=True uses launch()+new_context() not launch_persistent_context."""
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
-            browser = Browser(headless=False, stealth=True)
+            browser = Browser(clear_user_data=True, stealth=False)
+            assert browser.use_persistent_context is False
+            assert browser.clear_user_data is True
+
             await browser._start()
 
-            # Headed mode creates temp dir
-            temp_dir = browser._temp_user_data_dir
+            # Should have called launch() not launch_persistent_context()
+            mock_playwright.chromium.launch.assert_called_once()
+            mock_playwright.chromium.launch_persistent_context.assert_not_called()
 
             await browser.close()
 
-            assert browser._temp_user_data_dir is None
+    @pytest.mark.asyncio
+    async def test_clear_user_data_true_ignores_user_data_dir(self, mock_playwright):
+        """clear_user_data=True causes launch()+new_context() even when user_data_dir is set."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(clear_user_data=True, user_data_dir="/tmp/myprofile", stealth=False)
+            assert browser.use_persistent_context is False
+
+            await browser._start()
+
+            mock_playwright.chromium.launch.assert_called_once()
+            mock_playwright.chromium.launch_persistent_context.assert_not_called()
+
+            await browser.close()
+
+    @pytest.mark.asyncio
+    async def test_default_persistent_uses_bridgic_user_data_dir(self, mock_playwright):
+        """Default (clear_user_data=False, no user_data_dir) passes BRIDGIC_USER_DATA_DIR to launch_persistent_context."""
+        from bridgic.browser._constants import BRIDGIC_USER_DATA_DIR
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            assert browser.use_persistent_context is True
+            assert browser.clear_user_data is False
+
+            await browser._start()
+
+            mock_playwright.chromium.launch_persistent_context.assert_called_once()
+            call_kwargs = mock_playwright.chromium.launch_persistent_context.call_args
+            # _isolate_config fixture patches BRIDGIC_USER_DATA_DIR with a MagicMock whose
+            # str() returns str(BRIDGIC_USER_DATA_DIR), so this check remains meaningful.
+            assert call_kwargs.kwargs.get("user_data_dir") == str(BRIDGIC_USER_DATA_DIR)
+
+            await browser.close()
 
     @pytest.mark.asyncio
     async def test_async_context_manager_uses_start_and_kill(self, mock_playwright, mock_context, mock_page):
@@ -445,7 +533,12 @@ class TestBrowserStartStop:
 
     @pytest.mark.asyncio
     async def test_stop_auto_saves_active_trace_and_video(self, mock_playwright):
-        """stop() auto-finalizes active tracing/video before teardown."""
+        """stop() auto-finalizes active tracing/video before teardown.
+
+        close() auto-calls inspect_pending_close_artifacts() which creates a
+        session directory and pre-allocates a trace path inside it, so trace
+        and video end up grouped in the same session dir.
+        """
         from bridgic.browser.session import _browser as browser_module
 
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
@@ -465,21 +558,27 @@ class TestBrowserStartStop:
 
             page.video = MagicMock()
             page.video.path = AsyncMock(return_value="/tmp/playwright-video.webm")
+            page.video.save_as = AsyncMock()
 
             context_key = browser_module._get_context_key(context)
             browser._tracing_state[context_key] = True
             browser._video_state[context_key] = True
 
-            with patch.object(browser_module.tempfile, "mkstemp", return_value=(99, "/tmp/auto_trace.zip")):
-                with patch.object(browser_module.os, "close"):
-                    await browser.close()
+            await browser.close()
 
-            context.tracing.stop.assert_awaited_once_with(path="/tmp/auto_trace.zip")
+            # Trace should be saved into the auto-created session dir
+            trace_call = context.tracing.stop.call_args
+            trace_path = trace_call.kwargs.get("path") or trace_call.args[0]
+            assert "close-" in trace_path
+            assert trace_path.endswith("trace.zip")
+
             page.close.assert_awaited()
-            assert browser._last_shutdown_artifacts["trace"] == [os.path.abspath("/tmp/auto_trace.zip")]
-            assert browser._last_shutdown_artifacts["video"] == [
-                os.path.abspath("/tmp/playwright-video.webm")
-            ]
+            assert browser._last_shutdown_artifacts["trace"] == [os.path.abspath(trace_path)]
+            # Video saved via save_as into session dir
+            assert len(browser._last_shutdown_artifacts["video"]) == 1
+            video_path = browser._last_shutdown_artifacts["video"][0]
+            assert "close-" in video_path
+            assert "video" in video_path
             assert context_key not in browser._tracing_state
             assert context_key not in browser._video_state
 
@@ -505,18 +604,17 @@ class TestBrowserStartStop:
 
             page.video = MagicMock()
             page.video.path = AsyncMock(return_value="/tmp/auto_video.webm")
+            page.video.save_as = AsyncMock()
 
             context_key = browser_module._get_context_key(context)
             browser._tracing_state[context_key] = True
             browser._video_state[context_key] = True
 
-            with patch.object(browser_module.tempfile, "mkstemp", return_value=(88, "/tmp/auto_trace_2.zip")):
-                with patch.object(browser_module.os, "close"):
-                    result = await browser.close()
+            result = await browser.close()
 
             assert "Browser closed successfully" in result
-            assert os.path.abspath("/tmp/auto_trace_2.zip") in result
-            assert os.path.abspath("/tmp/auto_video.webm") in result
+            assert "trace.zip" in result
+            assert "video" in result
 
     @pytest.mark.asyncio
     async def test_stop_warns_on_trace_finalize_failure(self, mock_playwright):
@@ -541,18 +639,11 @@ class TestBrowserStartStop:
             context_key = browser_module._get_context_key(context)
             browser._tracing_state[context_key] = True
 
-            temp_trace_path = "/tmp/auto_trace_failed.zip"
+            # close() auto-calls inspect_pending_close_artifacts() which
+            # pre-allocates a trace path.  When tracing.stop() fails, close()
+            # attempts to clean up the pre-allocated file.
+            result = await browser.close()
 
-            def _exists(path: str) -> bool:
-                return path == temp_trace_path
-
-            with patch.object(browser_module.tempfile, "mkstemp", return_value=(77, temp_trace_path)):
-                with patch.object(browser_module.os, "close"):
-                    with patch.object(browser_module.os.path, "exists", side_effect=_exists):
-                        with patch.object(browser_module.os, "remove") as mock_remove:
-                            result = await browser.close()
-
-            mock_remove.assert_called_once_with(temp_trace_path)
             assert "Browser closed with warnings" in result
             assert "tracing.stop: disk full" in result
 

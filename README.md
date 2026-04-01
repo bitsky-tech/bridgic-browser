@@ -13,7 +13,7 @@
 - **Snapshot with Semantic Invariance** - A representation of page snapshot based on accessibility tree and a specially designed ref-generation algorithm that ensures element refs remain unchanged across page reloads
 - **Skills** - Used for guided exploration and code generation; Compatible with most of coding agents
 - **Stealth Mode (Enabled by Default)** - Mode-aware anti-detection: 50+ Chrome args + JS patches in headless mode; minimal ~11 flags in headed mode to match real Chrome fingerprint
-- **Dual Launch Mode** - Automatically switches between isolated sessions and persistent contexts
+- **Persistent & Ephemeral Sessions** - Persistent profile by default (`~/.bridgic/bridgic-browser/user_data/`); pass `clear_user_data=True` for an ephemeral session with no profile
 - **Nested iframe Support** - Supports DOM element operations within multi-level nested iframes
 
 ### Installation
@@ -167,12 +167,12 @@ if __name__ == "__main__":
 
 #### Configuration
 
-Browser options are read at daemon startup from the following sources, in priority order (highest last wins):
+Browser options are automatically loaded from the following sources (both CLI daemon and SDK `Browser()`), in priority order (highest last wins):
 
 | Source | Example |
 |--------|---------|
-| Defaults | `headless=True` |
-| `~/.bridgic/bridgic-browser.json` | User-level persistent config |
+| Defaults | `headless=True`, `clear_user_data=False` (persistent profile) |
+| `~/.bridgic/bridgic-browser/bridgic-browser.json` | User-level persistent config |
 | `./bridgic-browser.json` | Project-local config (in cwd at daemon start) |
 | Environment variables | See `skills/bridgic-browser/references/env-vars.md` |
 
@@ -198,6 +198,8 @@ The JSON sources accept any `Browser` constructor parameter:
 ```bash
 # One-shot env override
 BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open URL
+# One-shot ephemeral session (no persistent profile)
+BRIDGIC_BROWSER_JSON='{"clear_user_data":true}' bridgic-browser open URL
 ```
 
 #### Command List
@@ -205,7 +207,7 @@ BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open 
 | Category | Commands |
 |----------|----------|
 | Navigation | `open`, `back`, `forward`, `reload`, `search`, `info` |
-| Snapshot | `snapshot [-i] [-f\|-F] [-o N] [-l N]` |
+| Snapshot | `snapshot [-i] [-f\|-F] [-l N] [-s FILE]` |
 | Element Interaction | `click`, `double-click`, `hover`, `focus`, `fill`, `select`, `options`, `check`, `uncheck`, `scroll-to`, `drag`, `upload`, `fill-form` |
 | Keyboard | `press`, `type`, `key-down`, `key-up` |
 | Mouse | `scroll`, `mouse-move`, `mouse-click`, `mouse-drag`, `mouse-down`, `mouse-up` |
@@ -297,7 +299,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `go_back()` / `go_forward()` - Browser history navigation
 
 **Snapshot (1 tool):**
-- `get_snapshot_text(offset=0, limit=10000, interactive=False, full_page=True)` - Get page state string for LLM (accessibility tree with refs). **offset** must be `>= 0` and is used for pagination when the page is long: if the return value is truncated, a `[notice]` before the page content gives **next_offset** to call again. **limit** (default 10000) controls the maximum characters returned. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default).
+- `get_snapshot_text(limit=10000, interactive=False, full_page=True, file=None)` - Get page state string for LLM (accessibility tree with refs). **limit** (default 10000) controls the maximum characters returned. When the snapshot exceeds limit or **file** is explicitly provided, full content is saved to **file** (auto-generated under `~/.bridgic/bridgic-browser/snapshot/` if `None` and over limit) and only a notice with the file path is returned. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default).
 
 **Element Interaction (13 tools) - by ref:**
 - `click_element_by_ref(ref)` - Click element
@@ -449,17 +451,23 @@ The main class for browser automation with automatic launch mode selection:
 ```python
 from bridgic.browser.session import Browser
 
-# Isolated session (no persistence)
+# Persistent session (default — profile saved to ~/.bridgic/bridgic-browser/user_data/)
 browser = Browser(
     headless=True,
     viewport={"width": 1600, "height": 900},
 )
 
-# Persistent session (with user data)
+# Persistent session with custom profile path
 browser = Browser(
     headless=False,
     user_data_dir="./user_data",
     stealth=True,  # Enabled by default
+)
+
+# Ephemeral session (no persistent profile)
+browser = Browser(
+    headless=True,
+    clear_user_data=True,
 )
 ```
 
@@ -469,7 +477,8 @@ browser = Browser(
 |-----------|------|---------|-------------|
 | `headless` | bool | True | Run in headless mode |
 | `viewport` | dict | 1600x900 | Browser viewport size |
-| `user_data_dir` | str/Path | None | Path for persistent context |
+| `user_data_dir` | str/Path | None | Custom path for persistent profile (ignored when `clear_user_data=True`) |
+| `clear_user_data` | bool | False | If True, use ephemeral session (no profile); if False, use persistent profile |
 | `stealth` | bool/StealthConfig | True | Stealth mode configuration |
 | `channel` | str | None | Browser channel (chrome, msedge, etc.) |
 | `proxy` | dict | None | Proxy settings |

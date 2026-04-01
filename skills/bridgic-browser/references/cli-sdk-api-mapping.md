@@ -26,8 +26,8 @@ CLI commands and SDK tool methods are **intentionally aligned**:
 - This means CLI behavior and SDK tool-method behavior are equivalent by design. Understanding one side gives you the other.
 
 State model difference:
-- **CLI**: browser state lives in the daemon process, persists across multiple short-lived CLI invocations, resets on `close`.
-- **SDK**: browser state lives in the Python process, scoped to the `Browser` object lifetime (`async with Browser(...) as browser:`).
+- **CLI**: browser state lives in the daemon process, persists across multiple short-lived CLI invocations, resets on `close`. Browser profile is saved to `~/.bridgic/bridgic-browser/user_data/` by default; use `--clear-user-data` on `open`/`search` to start with no profile.
+- **SDK**: browser state lives in the Python process, scoped to the `Browser` object lifetime (`async with Browser(...) as browser:`). Profile is also persisted by default; use `Browser(clear_user_data=True)` for an ephemeral session.
 
 This model is the foundation of all correspondence in this guide.
 
@@ -111,8 +111,8 @@ This model is the foundation of all correspondence in this guide.
 - `snapshot`:
   - `-i` -> `interactive=True`
   - `-F` -> `full_page=False`
-  - `-o N` -> `offset=N`
   - `-l N` -> `limit=N`
+  - `-s PATH` -> `file="PATH"` (always saves to file; omit for auto-generated only when over limit)
 - `wait` (**unit is SECONDS, not milliseconds**):
   - `wait 2.5` -> `wait_for(time_seconds=2.5)` — numeric argument always takes the time path; `--gone` is ignored
   - `wait "Done"` -> `wait_for(text="Done")`

@@ -5,7 +5,7 @@ This document describes how page snapshots and the LLM-facing page state work in
 ## Overview
 
 - **Snapshot** (programmatic): `Browser.get_snapshot()` returns an `EnhancedSnapshot` with a tree string and a refs map. Used when you need structured access to both the tree and ref metadata.
-- **Page state for LLM** (tool): `browser.get_snapshot_text(...)` returns a single string (the same tree, possibly truncated with pagination). Use this from tools/agents so the LLM can read the page and choose refs to interact with.
+- **Page state for LLM** (tool): `browser.get_snapshot_text(...)` returns a single string (the same tree; when content exceeds `limit`, full snapshot is saved to a file and only a notice with the file path is returned). Use this from tools/agents so the LLM can read the page and choose refs to interact with.
 - **Element by ref**: `Browser.get_element_by_ref(ref)` returns a Playwright `Locator` for a given ref, using the **last** snapshot’s refs. So the flow is: get snapshot or get_snapshot_text → parse refs from the tree → get_element_by_ref(ref) → click/fill/etc.
 
 ## SnapshotOptions
@@ -79,29 +79,29 @@ When using `Browser`, you typically use `browser.get_snapshot()` and `browser.ge
 
 ## get_snapshot_text
 
-Browser method used to supply the page state to an LLM. It calls `browser.get_snapshot(interactive=..., full_page=...)` and returns the tree string, with optional truncation and pagination.
+Browser method used to supply the page state to an LLM. It calls `browser.get_snapshot(interactive=..., full_page=...)` and returns the tree string. When content exceeds the limit or `file` is explicitly provided, the full snapshot is saved to a file and only a notice with the file path is returned.
 
-- **Signature**: `await browser.get_snapshot_text(offset=0, limit=10000, interactive=False, full_page=True) -> str`
-- **Returns**: The accessibility tree string. May be truncated when the full tree exceeds `limit`; if so, a `[notice]` is shown before the page content (right after the page header) explaining how to continue (see below).
+- **Signature**: `await browser.get_snapshot_text(limit=10000, interactive=False, full_page=True, file=None) -> str`
+- **Returns**: The accessibility tree string. When the full tree exceeds `limit` or `file` is explicitly provided, full content is saved to a file and a `[notice]` with the file path is returned instead of the snapshot content.
 
 ### Parameters
 
-| Parameter     | Type | Default | Description |
-|---------------|------|---------|-------------|
-| `offset`      | int  | 0       | Character offset for pagination. Must be `>= 0`. Use the `next_offset` value from the truncation notice to get the next segment. |
-| `limit`       | int  | 10000   | Maximum characters to return. Must be `>= 1`. |
-| `interactive` | bool | False   | Same as `SnapshotOptions.interactive`: only interactive elements, flattened. |
-| `full_page`   | bool | True    | Same as `SnapshotOptions.full_page`: include all elements regardless of viewport position. |
+| Parameter     | Type        | Default | Description |
+|---------------|-------------|---------|-------------|
+| `limit`       | int         | 10000   | Maximum characters to return. Must be `>= 1`. |
+| `interactive` | bool        | False   | Same as `SnapshotOptions.interactive`: only interactive elements, flattened. |
+| `full_page`   | bool        | True    | Same as `SnapshotOptions.full_page`: include all elements regardless of viewport position. |
+| `file`        | str or None | None    | File path to save the full snapshot. When provided, snapshot is always saved to this file and only a notice is returned. When `None`, file is only written if content exceeds `limit` (auto-generated under `~/.bridgic/bridgic-browser/snapshot/`). Raises `InvalidInputError` if the path is empty/whitespace-only, contains null bytes, or points to an existing directory. |
 
-### Truncation and pagination
+### Overflow behavior
 
-When the full tree is longer than `limit`, the returned string is cut and a notice is prepended before the page content (right after the page header), for example:
+When the full tree is longer than `limit`, or when `file` is explicitly provided, the full snapshot is written to a file and a notice is returned instead of the snapshot content:
 
 ```
-[notice] Current page text is too long, returned portion starting from character 0 (this segment length 10000 / total length 45000 characters). To continue getting subsequent content: call get_snapshot_text(offset=10000, limit=10000, interactive=False, full_page=True)
+[notice] Snapshot file (45000 characters, 1350 lines) saved to: /Users/you/.bridgic/bridgic-browser/snapshot/snapshot-20260330-143025-a7b2.txt
 ```
 
-Use the given `offset` (e.g. `10000`) in the next call to get the rest.
+Read the file to get the complete snapshot content.
 
 ### Relation to get_snapshot
 
@@ -125,7 +125,7 @@ If the page changes (e.g. after navigation or dynamic update), take a new snapsh
 
 ## CLI: bridgic-browser snapshot
 
-The `snapshot` command is the CLI equivalent of `browser.get_snapshot_text()`. It shares the same parameters and delegates to the same implementation (truncation, pagination, and all).
+The `snapshot` command is the CLI equivalent of `browser.get_snapshot_text()`. It shares the same parameters and delegates to the same implementation.
 
 ```
 bridgic-browser snapshot [OPTIONS]
@@ -134,9 +134,10 @@ Options:
   -i, --interactive   Only show clickable/editable elements.
   -f, --full-page     Include elements outside the viewport (default).
   -F, --no-full-page  Limit to viewport-only elements.
-  -o, --offset INT    Pagination offset (use next_offset from the truncation
-                      notice). Default: 0.
   -l, --limit INT     Max characters to return. Default: 10000.
+  -s, --file PATH     File path to save full snapshot. When provided, snapshot is
+                      always saved to this file. Default: auto-generated in
+                      ~/.bridgic/bridgic-browser/snapshot/ (only when over limit).
 ```
 
 Examples:
@@ -145,9 +146,9 @@ Examples:
 bridgic-browser snapshot                     # full tree
 bridgic-browser snapshot -i                  # interactive elements only
 bridgic-browser snapshot -F                  # viewport-only
-bridgic-browser snapshot -o 10000            # page 2 of a long snapshot
-bridgic-browser snapshot -o 10000 -l 5000    # custom limit
-bridgic-browser snapshot -i -F -o 10000      # combined
+bridgic-browser snapshot -l 5000             # custom limit
+bridgic-browser snapshot -s /tmp/snap.txt    # save overflow to specific file
+bridgic-browser snapshot -i -F -l 5000       # combined
 ```
 
 ### Environment variables

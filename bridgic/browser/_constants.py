@@ -9,8 +9,17 @@ from pathlib import Path
 # Root directory for all Bridgic user data: ~/.bridgic
 BRIDGIC_HOME = Path.home() / ".bridgic"
 
+# Product-specific directory: ~/.bridgic/bridgic-browser
+BRIDGIC_BROWSER_HOME = BRIDGIC_HOME / "bridgic-browser"
+
 # Default directory for temporary files (video recordings, etc.)
-BRIDGIC_TMP_DIR = BRIDGIC_HOME / "tmp"
+BRIDGIC_TMP_DIR = BRIDGIC_BROWSER_HOME / "tmp"
+
+# Default directory for snapshot overflow files
+BRIDGIC_SNAPSHOT_DIR = BRIDGIC_BROWSER_HOME / "snapshot"
+
+# Default persistent user data directory for browser sessions
+BRIDGIC_USER_DATA_DIR = BRIDGIC_BROWSER_HOME / "user_data"
 
 
 class ToolCategory(Enum):

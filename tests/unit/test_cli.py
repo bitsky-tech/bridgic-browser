@@ -32,7 +32,6 @@ from bridgic.browser.errors import (
 )
 from bridgic.browser.cli._commands import _strip_ref, cli, SectionedGroup
 from bridgic.browser.cli._daemon import (
-    _build_browser_kwargs,
     _dispatch,
     _handle_connection,
     _handle_open,
@@ -234,7 +233,6 @@ def make_browser() -> MagicMock:
         "session_dir": "/tmp/close-test",
         "trace": [],
         "video": [],
-        "video_dir": None,
     })
     return b
 
@@ -419,11 +417,15 @@ class TestCliCommandRouting:
 
     def test_open(self):
         _, sc = invoke(["open", "https://example.com"])
-        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=False)
+        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=False, clear_user_data=False)
 
     def test_open_headed(self):
         _, sc = invoke(["open", "--headed", "https://example.com"])
-        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=True)
+        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=True, clear_user_data=False)
+
+    def test_open_clear_user_data(self):
+        _, sc = invoke(["open", "--clear-user-data", "https://example.com"])
+        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=False, clear_user_data=True)
 
     def test_back(self):
         _, sc = invoke(["back"])
@@ -439,15 +441,19 @@ class TestCliCommandRouting:
 
     def test_search_default_engine(self):
         _, sc = invoke(["search", "python async"])
-        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=False)
+        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=False, clear_user_data=False)
 
     def test_search_custom_engine(self):
         _, sc = invoke(["search", "query", "--engine", "google"])
-        sc.assert_called_once_with("search", {"query": "query", "engine": "google"}, headed=False)
+        sc.assert_called_once_with("search", {"query": "query", "engine": "google"}, headed=False, clear_user_data=False)
 
     def test_search_headed(self):
         _, sc = invoke(["search", "--headed", "python async"])
-        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=True)
+        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=True, clear_user_data=False)
+
+    def test_search_clear_user_data(self):
+        _, sc = invoke(["search", "--clear-user-data", "python async"])
+        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=False, clear_user_data=True)
 
     def test_info(self):
         _, sc = invoke(["info"])
@@ -457,36 +463,37 @@ class TestCliCommandRouting:
 
     def test_snapshot_default(self):
         _, sc = invoke(["snapshot"])
-        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": True, "offset": 0, "limit": 10000}, start_if_needed=False)
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": True, "limit": 10000, "file": None}, start_if_needed=False)
 
     def test_snapshot_interactive(self):
         _, sc = invoke(["snapshot", "--interactive"])
-        sc.assert_called_once_with("snapshot", {"interactive": True, "full_page": True, "offset": 0, "limit": 10000}, start_if_needed=False)
+        sc.assert_called_once_with("snapshot", {"interactive": True, "full_page": True, "limit": 10000, "file": None}, start_if_needed=False)
 
     def test_snapshot_interactive_short(self):
         _, sc = invoke(["snapshot", "-i"])
-        sc.assert_called_once_with("snapshot", {"interactive": True, "full_page": True, "offset": 0, "limit": 10000}, start_if_needed=False)
+        sc.assert_called_once_with("snapshot", {"interactive": True, "full_page": True, "limit": 10000, "file": None}, start_if_needed=False)
 
     def test_snapshot_no_full_page(self):
         _, sc = invoke(["snapshot", "--no-full-page"])
-        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": False, "offset": 0, "limit": 10000}, start_if_needed=False)
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": False, "limit": 10000, "file": None}, start_if_needed=False)
 
     def test_snapshot_no_full_page_short(self):
         _, sc = invoke(["snapshot", "-F"])
-        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": False, "offset": 0, "limit": 10000}, start_if_needed=False)
-
-    def test_snapshot_offset(self):
-        _, sc = invoke(["snapshot", "-o", "5000"])
-        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": True, "offset": 5000, "limit": 10000}, start_if_needed=False)
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": False, "limit": 10000, "file": None}, start_if_needed=False)
 
     def test_snapshot_limit(self):
         _, sc = invoke(["snapshot", "-l", "3000"])
-        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": True, "offset": 0, "limit": 3000}, start_if_needed=False)
+        sc.assert_called_once_with("snapshot", {"interactive": False, "full_page": True, "limit": 3000, "file": None}, start_if_needed=False)
 
-    def test_snapshot_offset_rejects_negative(self):
-        result, sc = invoke(["snapshot", "-o", "-1"])
-        assert result.exit_code != 0
-        sc.assert_not_called()
+    def test_snapshot_file_option(self):
+        """Relative path is absolutized via os.path.abspath."""
+        _, sc = invoke(["snapshot", "-s", "snap.txt"])
+        call_args = sc.call_args
+        assert call_args[0][0] == "snapshot"
+        sent_path = call_args[0][1]["file"]
+        assert os.path.isabs(sent_path)
+        assert sent_path.endswith("snap.txt")
+        assert call_args[1]["start_if_needed"] is False
 
     def test_snapshot_limit_rejects_zero(self):
         result, sc = invoke(["snapshot", "-l", "0"])
@@ -1099,10 +1106,10 @@ class TestBrowserClosedDetection:
 
 class TestDaemonSocketSecurity:
     def test_default_socket_path_is_user_scoped(self, tmp_path):
-        fake_home = tmp_path / ".bridgic"
-        with patch("bridgic.browser.cli._transport.BRIDGIC_HOME", fake_home):
+        fake_browser_home = tmp_path / ".bridgic" / "bridgic-browser"
+        with patch("bridgic.browser.cli._transport.BRIDGIC_BROWSER_HOME", fake_browser_home):
             path = _default_socket_path()
-        assert path == str(fake_home / "run" / "bridgic-browser.sock")
+        assert path == str(fake_browser_home / "run" / "bridgic-browser.sock")
 
     def test_safe_remove_socket_removes_owned_socket(self):
         mock_path = MagicMock()
@@ -1370,7 +1377,6 @@ class TestDaemonConnection:
             "session_dir": "/tmp/close-20240101-120000-abcd",
             "trace": [],
             "video": [],
-            "video_dir": None,
         })
         stop = asyncio.Event()
         req = json.dumps({"command": "close", "args": {}}).encode() + b"\n"
@@ -1424,7 +1430,7 @@ class TestDaemonHandlers:
         result = await _handle_snapshot(browser, {})
 
         browser.get_snapshot_text.assert_awaited_once_with(
-            offset=0, limit=10000, interactive=False, full_page=True, from_cli=True
+            limit=10000, interactive=False, full_page=True, file=None
         )
         assert result == "- heading 'Example' [ref=e1]"
 
@@ -1435,7 +1441,7 @@ class TestDaemonHandlers:
         await _handle_snapshot(browser, {"interactive": True})
 
         browser.get_snapshot_text.assert_awaited_once_with(
-            offset=0, limit=10000, interactive=True, full_page=True, from_cli=True
+            limit=10000, interactive=True, full_page=True, file=None
         )
 
     async def test_handle_snapshot_full_page_false(self):
@@ -1444,19 +1450,9 @@ class TestDaemonHandlers:
         browser.get_snapshot_text = AsyncMock(return_value="- button [ref=e1]")
         result = await _handle_snapshot(browser, {"full_page": False})
         browser.get_snapshot_text.assert_awaited_once_with(
-            offset=0, limit=10000, interactive=False, full_page=False, from_cli=True
+            limit=10000, interactive=False, full_page=False, file=None
         )
         assert result == "- button [ref=e1]"
-
-    async def test_handle_snapshot_offset(self):
-        """offset is passed through to get_snapshot_text."""
-        browser = make_browser()
-        browser.get_snapshot_text = AsyncMock(return_value="A" * 90)
-        result = await _handle_snapshot(browser, {"offset": 10})
-        browser.get_snapshot_text.assert_awaited_once_with(
-            offset=10, limit=10000, interactive=False, full_page=True, from_cli=True
-        )
-        assert result == "A" * 90
 
     async def test_handle_snapshot_limit(self):
         """limit is passed through to get_snapshot_text."""
@@ -1464,9 +1460,19 @@ class TestDaemonHandlers:
         browser.get_snapshot_text = AsyncMock(return_value="A" * 90)
         result = await _handle_snapshot(browser, {"limit": 5000})
         browser.get_snapshot_text.assert_awaited_once_with(
-            offset=0, limit=5000, interactive=False, full_page=True, from_cli=True
+            limit=5000, interactive=False, full_page=True, file=None
         )
         assert result == "A" * 90
+
+    async def test_handle_snapshot_file(self):
+        """file is passed through to get_snapshot_text."""
+        browser = make_browser()
+        browser.get_snapshot_text = AsyncMock(return_value="[notice] ...")
+        result = await _handle_snapshot(browser, {"file": "/tmp/snap.txt"})
+        browser.get_snapshot_text.assert_awaited_once_with(
+            limit=10000, interactive=False, full_page=True, file="/tmp/snap.txt"
+        )
+        assert result == "[notice] ..."
 
     async def test_handle_click_calls_tool(self):
         browser = make_browser()
@@ -1997,6 +2003,49 @@ class TestClientSendCommand:
         assert "python -m playwright install" in str(exc_info.value)
         assert "Daemon log:" in str(exc_info.value)
 
+    def test_spawn_daemon_clear_user_data_injects_env(self):
+        """_spawn_daemon(clear_user_data=True) injects clear_user_data into BRIDGIC_BROWSER_JSON."""
+        import io, json
+        from bridgic.browser.cli import _client
+
+        captured_env: dict = {}
+
+        def fake_popen(_cmd, **kwargs):
+            captured_env.update(kwargs.get("env", {}))
+            proc = MagicMock()
+            # Emit READY_SIGNAL so _spawn_daemon completes without timeout
+            proc.stdout = io.BytesIO(b"BRIDGIC_DAEMON_READY\n")
+            return proc
+
+        with patch("bridgic.browser.cli._client.subprocess.Popen", side_effect=fake_popen):
+            _client._spawn_daemon(clear_user_data=True)
+
+        raw = captured_env.get("BRIDGIC_BROWSER_JSON", "{}")
+        merged = json.loads(raw)
+        assert merged.get("clear_user_data") is True
+        assert "headless" not in merged  # headed flag not set
+
+    def test_spawn_daemon_headed_and_clear_user_data_both_inject(self):
+        """_spawn_daemon(headed=True, clear_user_data=True) sets both keys in BRIDGIC_BROWSER_JSON."""
+        import io, json
+        from bridgic.browser.cli import _client
+
+        captured_env: dict = {}
+
+        def fake_popen(_cmd, **kwargs):
+            captured_env.update(kwargs.get("env", {}))
+            proc = MagicMock()
+            proc.stdout = io.BytesIO(b"BRIDGIC_DAEMON_READY\n")
+            return proc
+
+        with patch("bridgic.browser.cli._client.subprocess.Popen", side_effect=fake_popen):
+            _client._spawn_daemon(headed=True, clear_user_data=True)
+
+        raw = captured_env.get("BRIDGIC_BROWSER_JSON", "{}")
+        merged = json.loads(raw)
+        assert merged.get("headless") is False
+        assert merged.get("clear_user_data") is True
+
     @pytest.mark.asyncio
     async def test_send_command_async_uses_success_field_when_present(self):
         from bridgic.browser.cli._client import _send_command_async
@@ -2100,201 +2149,6 @@ class TestDaemonLogging:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# _build_browser_kwargs  (config file + env var priority chain)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestBuildBrowserKwargs:
-    """Tests for the _build_browser_kwargs priority chain."""
-
-    def test_defaults_headless_true(self):
-        """With no config files or env vars, headless defaults to True."""
-        with patch("bridgic.browser.cli._daemon.Path") as mock_path_cls:
-            mock_path_cls.home.return_value.__truediv__ = lambda s, p: _non_existent()
-            mock_path_cls.return_value.is_file.return_value = False
-            with patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("BRIDGIC_BROWSER_JSON", None)
-                kwargs = _build_browser_kwargs()
-        assert kwargs["headless"] is True
-
-
-    def test_user_config_file_applied(self, tmp_path):
-        """~/.bridgic/bridgic-browser.json values are loaded."""
-        fake_home = tmp_path / ".bridgic"
-        fake_home.mkdir()
-        cfg = fake_home / "bridgic-browser.json"
-        cfg.write_text(json.dumps({"headless": False, "channel": "chrome"}))
-
-        with (
-            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
-            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
-            patch.dict(os.environ, {}, clear=False),
-        ):
-            # local config doesn't exist
-            mock_local = MagicMock()
-            mock_local.is_file.return_value = False
-            mock_path_cls.return_value = mock_local
-
-            os.environ.pop("BRIDGIC_BROWSER_JSON", None)
-            kwargs = _build_browser_kwargs()
-
-        assert kwargs["headless"] is False
-        assert kwargs["channel"] == "chrome"
-
-    def test_local_config_overrides_user_config(self, tmp_path):
-        """./bridgic-browser.json overrides ~/.bridgic/bridgic-browser.json."""
-        fake_home = tmp_path / ".bridgic"
-        fake_home.mkdir()
-        user_cfg = fake_home / "bridgic-browser.json"
-        user_cfg.write_text(json.dumps({"headless": False, "channel": "chrome"}))
-        local_json = json.dumps({"channel": "msedge"})
-
-        with (
-            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
-            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
-            patch.dict(os.environ, {}, clear=False),
-        ):
-            mock_local = MagicMock()
-            mock_local.is_file.return_value = True
-            mock_local.read_text.return_value = local_json
-            mock_path_cls.return_value = mock_local
-
-            os.environ.pop("BRIDGIC_BROWSER_JSON", None)
-            kwargs = _build_browser_kwargs()
-
-        assert kwargs["channel"] == "msedge"   # local overrides user
-        assert kwargs["headless"] is False      # from user config (not overridden)
-
-    def test_env_json_overrides_config_files(self, tmp_path):
-        """BRIDGIC_BROWSER_JSON overrides both config files."""
-        fake_home = tmp_path / ".bridgic"
-        fake_home.mkdir()
-        user_cfg = fake_home / "bridgic-browser.json"
-        user_cfg.write_text(json.dumps({"channel": "chrome", "headless": False}))
-        env_json = json.dumps({"channel": "chromium", "locale": "zh-CN"})
-
-        with (
-            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
-            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
-            patch.dict(os.environ, {"BRIDGIC_BROWSER_JSON": env_json}, clear=False),
-        ):
-            mock_local = MagicMock()
-            mock_local.is_file.return_value = False
-            mock_path_cls.return_value = mock_local
-
-            kwargs = _build_browser_kwargs()
-
-        assert kwargs["channel"] == "chromium"  # env JSON overrides user config
-        assert kwargs["headless"] is False       # from user config (not in env JSON)
-        assert kwargs["locale"] == "zh-CN"
-
-    def test_invalid_env_json_is_ignored(self, tmp_path):
-        """Malformed BRIDGIC_BROWSER_JSON is silently ignored (logged as warning)."""
-        fake_home = tmp_path / ".bridgic"
-        fake_home.mkdir()
-
-        with (
-            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
-            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
-            patch.dict(os.environ, {"BRIDGIC_BROWSER_JSON": "not valid json"}, clear=False),
-        ):
-            mock_local = MagicMock()
-            mock_local.is_file.return_value = False
-            mock_path_cls.return_value = mock_local
-            kwargs = _build_browser_kwargs()  # must not raise
-
-        assert kwargs["headless"] is True  # falls back to default
-
-    def test_complex_params_passed_through(self, tmp_path):
-        """Complex nested params (proxy, viewport) are passed through as-is."""
-        fake_home = tmp_path / ".bridgic"
-        fake_home.mkdir()
-        env_json = json.dumps({
-            "proxy": {"server": "http://proxy:8080", "username": "u", "password": "p"},
-            "viewport": {"width": 1280, "height": 720},
-            "extra_http_headers": {"X-Custom": "value"},
-        })
-
-        with (
-            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
-            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
-            patch.dict(os.environ, {"BRIDGIC_BROWSER_JSON": env_json}, clear=False),
-        ):
-            mock_local = MagicMock()
-            mock_local.is_file.return_value = False
-            mock_path_cls.return_value = mock_local
-            kwargs = _build_browser_kwargs()
-
-        assert kwargs["proxy"] == {"server": "http://proxy:8080", "username": "u", "password": "p"}
-        assert kwargs["viewport"] == {"width": 1280, "height": 720}
-        assert kwargs["extra_http_headers"] == {"X-Custom": "value"}
-
-
-    def test_headed_mode_sets_chromium_sandbox(self, tmp_path):
-        """Headed mode auto-sets chromium_sandbox=True to prevent --no-sandbox warning."""
-        fake_home = tmp_path / ".bridgic"
-        fake_home.mkdir()
-
-        with (
-            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
-            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
-            patch.dict(os.environ, {"BRIDGIC_BROWSER_JSON": json.dumps({"headless": False})}, clear=False),
-        ):
-            mock_local = MagicMock()
-            mock_local.is_file.return_value = False
-            mock_path_cls.return_value = mock_local
-            kwargs = _build_browser_kwargs()
-
-        assert kwargs.get("chromium_sandbox") is True
-        # No executable_path auto-set
-        assert "executable_path" not in kwargs
-
-    def test_headed_mode_preserves_explicit_chromium_sandbox_false(self, tmp_path):
-        """If user explicitly sets chromium_sandbox=false, headed mode does not override it."""
-        fake_home = tmp_path / ".bridgic"
-        fake_home.mkdir()
-        cfg = fake_home / "bridgic-browser.json"
-        cfg.write_text(json.dumps({"headless": False, "chromium_sandbox": False}))
-
-        with (
-            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
-            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
-            patch.dict(os.environ, {}, clear=False),
-        ):
-            mock_local = MagicMock()
-            mock_local.is_file.return_value = False
-            mock_path_cls.return_value = mock_local
-            os.environ.pop("BRIDGIC_BROWSER_JSON", None)
-            kwargs = _build_browser_kwargs()
-
-        assert kwargs["chromium_sandbox"] is False
-
-    def test_headless_mode_no_chromium_sandbox_default(self, tmp_path):
-        """Headless mode (default) does not set chromium_sandbox."""
-        fake_home = tmp_path / ".bridgic"
-        fake_home.mkdir()
-
-        with (
-            patch("bridgic.browser.cli._daemon.BRIDGIC_HOME", fake_home),
-            patch("bridgic.browser.cli._daemon.Path") as mock_path_cls,
-            patch.dict(os.environ, {}, clear=False),
-        ):
-            mock_local = MagicMock()
-            mock_local.is_file.return_value = False
-            mock_path_cls.return_value = mock_local
-            os.environ.pop("BRIDGIC_BROWSER_JSON", None)
-            kwargs = _build_browser_kwargs()
-
-        assert "chromium_sandbox" not in kwargs
-
-
-def _non_existent() -> MagicMock:
-    """Return a MagicMock that acts like a non-existent path."""
-    m = MagicMock()
-    m.is_file.return_value = False
-    return m
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Transport layer
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2355,7 +2209,7 @@ class TestTransport:
 
     def test_write_run_info_overwrites_existing(self, tmp_path):
         """write_run_info must succeed even when the file already exists (Windows replace() semantics)."""
-        fake_path = tmp_path / "run" / "bridgic-browser.json"
+        fake_path = tmp_path / "run" / "daemon.json"
         with patch("bridgic.browser.cli._transport.RUN_INFO_PATH", fake_path):
             write_run_info({"transport": "unix", "pid": 1})
             write_run_info({"transport": "unix", "pid": 2})  # must not raise
@@ -2363,7 +2217,7 @@ class TestTransport:
         assert result["pid"] == 2
 
     def test_write_and_read_run_info(self, tmp_path):
-        fake_path = tmp_path / "run" / "bridgic-browser.json"
+        fake_path = tmp_path / "run" / "daemon.json"
         with patch("bridgic.browser.cli._transport.RUN_INFO_PATH", fake_path):
             write_run_info({"transport": "unix", "socket": "/tmp/test.sock", "pid": 42})
             result = read_run_info()

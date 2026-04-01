@@ -9,7 +9,8 @@ If browser tests are disabled (SKIP_BROWSER_TESTS=1), the fixture will skip.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+import re
+from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import quote
 
 import pytest
@@ -92,121 +93,189 @@ async def test_get_snapshot_text_interactive_filters_non_interactive(browser_ins
     assert "Header Title" in snapshot_all
 
 
-@pytest.mark.integration
 @pytest.mark.asyncio
-async def test_get_snapshot_text_pagination_offset_slices_text(browser_instance) -> None:
-    html = """
-<!doctype html>
-<html><head><meta charset="utf-8" /><title>pagination test</title></head>
-<body>
-  <button>Alpha</button>
-  <button>Beta</button>
-  <button>Gamma</button>
-</body></html>
-""".strip()
-    await browser_instance.navigate_to(_data_url(html))
-
-    full = await browser_instance.get_snapshot_text(offset=0)
-    assert len(full) > 20
-
-    # The header line ([Page: url | title]\n) is always prepended regardless of
-    # offset. Offsets are relative to snapshot.tree (post-header).
-    header_len = full.index('\n') + 1
-    start = 10
-    sliced = await browser_instance.get_snapshot_text(offset=start)
-    assert sliced == full[:header_len] + full[header_len + start:]
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_get_snapshot_text_pagination_offset_exceeds_total_length(browser_instance) -> None:
-    html = "<!doctype html><html><body><button>Short</button></body></html>"
-    await browser_instance.navigate_to(_data_url(html))
-
-    full = await browser_instance.get_snapshot_text()
-    # offset is validated against len(snapshot.tree), which does NOT include the header
-    # line prepended by get_snapshot_text. Subtract the header to get the correct boundary.
-    header_len = full.index('\n') + 1
-    tree_len = len(full) - header_len
-    with pytest.raises(InvalidInputError) as exc_info:
-        await browser_instance.get_snapshot_text(offset=tree_len)
-    assert exc_info.value.code == "OFFSET_OUT_OF_RANGE"
-
-
-@pytest.mark.asyncio
-async def test_get_snapshot_text_truncates_and_adds_notice_with_next_offset() -> None:
-    # Use a mock snapshot with a long tree so truncation is deterministic and does not
-    # depend on Playwright including long paragraph text in the accessibility tree.
-    long_tree = "x" * 500  # Exceeds limit=250 so get_snapshot_text will truncate and add notice
+async def test_get_snapshot_text_overflow_writes_file_and_returns_notice(tmp_path) -> None:
+    """When content exceeds limit, full snapshot is written to file and only notice is returned."""
+    long_tree = "x" * 500
     mock_browser = MagicMock(spec=Browser)
     mock_browser.get_snapshot = AsyncMock(
         return_value=EnhancedSnapshot(tree=long_tree, refs={})
     )
+    mock_browser._write_snapshot_file = Browser._write_snapshot_file.__get__(mock_browser)
 
-    result = await Browser.get_snapshot_text(mock_browser, offset=0, limit=250)
+    file_path = str(tmp_path / "snap.txt")
+    result = await Browser.get_snapshot_text(mock_browser, limit=250, file=file_path)
 
     assert "[notice]" in result
-    assert "offset=250" in result
-    assert "call get_snapshot_text(" in result
-    assert "run: bridgic-browser snapshot" not in result
+    assert "saved to:" in result
+    assert file_path in result
+    # Should NOT contain any snapshot content
+    assert "x" * 50 not in result
+
+    # Verify file was written with header + full content
+    written = (tmp_path / "snap.txt").read_text(encoding="utf-8")
+    assert long_tree in written
+    assert written.startswith("[Page:")
 
 
 @pytest.mark.asyncio
-async def test_get_snapshot_text_truncation_next_offset_accounts_for_offset() -> None:
-    # Use a mock snapshot with a long tree so that offset=50 still leaves
-    # more than limit chars, triggering truncation and a notice that mentions
-    # the offset (does not depend on real browser snapshot length).
-    # Tree length 500: after slice from 50 we have 450 chars, so truncation + notice.
+async def test_get_snapshot_text_no_file_when_within_limit() -> None:
+    """When content fits within limit and file is None, no file is written."""
+    short_tree = "- button 'Click' [ref=e1]"
+    mock_browser = MagicMock(spec=Browser)
+    mock_browser.get_snapshot = AsyncMock(
+        return_value=EnhancedSnapshot(tree=short_tree, refs={})
+    )
+
+    result = await Browser.get_snapshot_text(mock_browser, limit=10000)
+
+    assert "[notice]" not in result
+    assert "saved to:" not in result
+    assert short_tree in result
+
+
+@pytest.mark.asyncio
+async def test_get_snapshot_text_explicit_file_saves_even_within_limit(tmp_path) -> None:
+    """When file is explicitly provided, snapshot is always saved regardless of limit."""
+    short_tree = "- button 'Click' [ref=e1]"
+    mock_browser = MagicMock(spec=Browser)
+    mock_browser.get_snapshot = AsyncMock(
+        return_value=EnhancedSnapshot(tree=short_tree, refs={})
+    )
+    mock_browser._write_snapshot_file = Browser._write_snapshot_file.__get__(mock_browser)
+
+    file_path = str(tmp_path / "snap.txt")
+    result = await Browser.get_snapshot_text(mock_browser, limit=10000, file=file_path)
+
+    # Should return notice, not snapshot content
+    assert "[notice]" in result
+    assert "saved to:" in result
+    assert file_path in result
+    assert short_tree not in result
+
+    # File should contain header + full content
+    written = (tmp_path / "snap.txt").read_text(encoding="utf-8")
+    assert short_tree in written
+    assert written.startswith("[Page:")
+
+
+@pytest.mark.asyncio
+async def test_get_snapshot_text_default_file_in_snapshot_dir(tmp_path) -> None:
+    """When file is None, auto-generated path is under BRIDGIC_SNAPSHOT_DIR."""
     long_tree = "y" * 500
     mock_browser = MagicMock(spec=Browser)
     mock_browser.get_snapshot = AsyncMock(
         return_value=EnhancedSnapshot(tree=long_tree, refs={})
     )
+    mock_browser._write_snapshot_file = Browser._write_snapshot_file.__get__(mock_browser)
 
-    start = 50
-    result = await Browser.get_snapshot_text(mock_browser, offset=start, limit=200)
+    with patch("bridgic.browser.session._browser.BRIDGIC_SNAPSHOT_DIR", tmp_path):
+        result = await Browser.get_snapshot_text(mock_browser, limit=250)
 
-    assert "[notice]" in result
-    assert f"from character {start}" in result
+        assert "[notice]" in result
+        assert "saved to:" in result
+        assert str(tmp_path) in result
+        # Verify file was actually created on disk
+        files = list(tmp_path.glob("snapshot-*.txt"))
+        assert len(files) == 1
+        assert files[0].read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
-async def test_get_snapshot_text_truncation_notice_preserves_snapshot_mode_params() -> None:
+async def test_get_snapshot_text_file_name_format(tmp_path) -> None:
+    """Auto-generated filename matches snapshot-YYYYMMDD-HHMMSS-XXXX.txt pattern."""
     long_tree = "z" * 500
     mock_browser = MagicMock(spec=Browser)
     mock_browser.get_snapshot = AsyncMock(
         return_value=EnhancedSnapshot(tree=long_tree, refs={})
     )
+    mock_browser._write_snapshot_file = Browser._write_snapshot_file.__get__(mock_browser)
 
-    result = await Browser.get_snapshot_text(
-        mock_browser,
-        offset=0,
-        limit=120,
-        interactive=True,
-        full_page=False,
-    )
+    with patch("bridgic.browser.session._browser.BRIDGIC_SNAPSHOT_DIR", tmp_path):
+        result = await Browser.get_snapshot_text(mock_browser, limit=250)
 
-    assert "interactive=True, full_page=False" in result
-    assert "call get_snapshot_text(" in result
-    assert "run: bridgic-browser snapshot" not in result
+    # Extract file path from notice
+    match = re.search(r"saved to: (.+)", result)
+    assert match is not None
+    filepath = match.group(1).strip()
+    filename = filepath.split("/")[-1]
+    assert re.match(r"snapshot-\d{8}-\d{6}-[0-9a-f]{4}\.txt$", filename)
 
 
 @pytest.mark.asyncio
-async def test_get_snapshot_text_truncation_notice_cli_only() -> None:
-    long_tree = "q" * 500
+async def test_get_snapshot_text_overflow_returns_no_snapshot_content(tmp_path) -> None:
+    """When content exceeds limit, the returned string contains NO snapshot text."""
+    tree_content = "- button 'UniqueMarker12345' [ref=abc123]\n" * 50
+    mock_browser = MagicMock(spec=Browser)
+    mock_browser.get_snapshot = AsyncMock(
+        return_value=EnhancedSnapshot(tree=tree_content, refs={})
+    )
+    mock_browser._write_snapshot_file = Browser._write_snapshot_file.__get__(mock_browser)
+
+    file_path = str(tmp_path / "snap.txt")
+    result = await Browser.get_snapshot_text(mock_browser, limit=100, file=file_path)
+
+    assert "UniqueMarker12345" not in result
+    assert "[notice]" in result
+
+    # But file has full content
+    written = (tmp_path / "snap.txt").read_text(encoding="utf-8")
+    assert "UniqueMarker12345" in written
+
+
+@pytest.mark.asyncio
+async def test_get_snapshot_text_notice_contains_length_info(tmp_path) -> None:
+    """Notice includes total length and limit in the message."""
+    long_tree = "a" * 300
     mock_browser = MagicMock(spec=Browser)
     mock_browser.get_snapshot = AsyncMock(
         return_value=EnhancedSnapshot(tree=long_tree, refs={})
     )
+    mock_browser._write_snapshot_file = Browser._write_snapshot_file.__get__(mock_browser)
 
-    result = await Browser.get_snapshot_text(
-        mock_browser,
-        offset=0,
-        limit=120,
-        interactive=True,
-        full_page=False,
-        from_cli=True,
-    )
+    file_path = str(tmp_path / "snap.txt")
+    result = await Browser.get_snapshot_text(mock_browser, limit=100, file=file_path)
 
-    assert "run: bridgic-browser snapshot -i -F -o 120 -l 120" in result
-    assert "call get_snapshot_text(" not in result
+    # total_chars includes header "[Page:  | ]\n" (12 chars) + 300 = 312
+    assert "312 characters" in result
+    assert "2 lines" in result
+    assert "saved to:" in result
+
+
+# ── file parameter validation ──
+
+
+@pytest.mark.asyncio
+async def test_get_snapshot_text_rejects_empty_file_path() -> None:
+    """Empty string for file should raise InvalidInputError."""
+    mock_browser = MagicMock(spec=Browser)
+    with pytest.raises(InvalidInputError) as exc_info:
+        await Browser.get_snapshot_text(mock_browser, file="")
+    assert exc_info.value.code == "INVALID_FILE_PATH"
+
+
+@pytest.mark.asyncio
+async def test_get_snapshot_text_rejects_whitespace_only_file_path() -> None:
+    """Whitespace-only string for file should raise InvalidInputError."""
+    mock_browser = MagicMock(spec=Browser)
+    with pytest.raises(InvalidInputError) as exc_info:
+        await Browser.get_snapshot_text(mock_browser, file="   ")
+    assert exc_info.value.code == "INVALID_FILE_PATH"
+
+
+@pytest.mark.asyncio
+async def test_get_snapshot_text_rejects_null_byte_in_file_path() -> None:
+    """File path containing null bytes should raise InvalidInputError."""
+    mock_browser = MagicMock(spec=Browser)
+    with pytest.raises(InvalidInputError) as exc_info:
+        await Browser.get_snapshot_text(mock_browser, file="/tmp/snap\x00.txt")
+    assert exc_info.value.code == "INVALID_FILE_PATH"
+
+
+@pytest.mark.asyncio
+async def test_get_snapshot_text_rejects_directory_as_file_path(tmp_path) -> None:
+    """Existing directory as file path should raise InvalidInputError."""
+    mock_browser = MagicMock(spec=Browser)
+    with pytest.raises(InvalidInputError) as exc_info:
+        await Browser.get_snapshot_text(mock_browser, file=str(tmp_path))
+    assert exc_info.value.code == "INVALID_FILE_PATH"
