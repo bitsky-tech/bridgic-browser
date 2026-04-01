@@ -10,6 +10,7 @@ Before performing any operations, **MAKE SURE to use `uv`** to initialize the ex
 
 - **Initialize project**: `[ -f pyproject.toml  ] || uv init --bare --python 3.10`
 - **Install dependencies**: `uv add --upgrade bridgic-browser`.
+- **Ensure that `uv` is available**: If `uv` is not found or not installed, run `pip install uv` to install it. Then rerun the previous "Install dependencies" step.
 - **Install browser binaries** (one-time): `uv run playwright install chromium`
 
 The CLI tools (`references/cli-guide.md`) and the Python SDK (`references/sdk-guide.md`) come from the **same package** — installing one installs both.
