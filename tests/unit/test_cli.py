@@ -417,11 +417,15 @@ class TestCliCommandRouting:
 
     def test_open(self):
         _, sc = invoke(["open", "https://example.com"])
-        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=False)
+        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=False, clear_user_data=False)
 
     def test_open_headed(self):
         _, sc = invoke(["open", "--headed", "https://example.com"])
-        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=True)
+        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=True, clear_user_data=False)
+
+    def test_open_clear_user_data(self):
+        _, sc = invoke(["open", "--clear-user-data", "https://example.com"])
+        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=False, clear_user_data=True)
 
     def test_back(self):
         _, sc = invoke(["back"])
@@ -437,15 +441,19 @@ class TestCliCommandRouting:
 
     def test_search_default_engine(self):
         _, sc = invoke(["search", "python async"])
-        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=False)
+        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=False, clear_user_data=False)
 
     def test_search_custom_engine(self):
         _, sc = invoke(["search", "query", "--engine", "google"])
-        sc.assert_called_once_with("search", {"query": "query", "engine": "google"}, headed=False)
+        sc.assert_called_once_with("search", {"query": "query", "engine": "google"}, headed=False, clear_user_data=False)
 
     def test_search_headed(self):
         _, sc = invoke(["search", "--headed", "python async"])
-        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=True)
+        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=True, clear_user_data=False)
+
+    def test_search_clear_user_data(self):
+        _, sc = invoke(["search", "--clear-user-data", "python async"])
+        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=False, clear_user_data=True)
 
     def test_info(self):
         _, sc = invoke(["info"])
@@ -1994,6 +2002,49 @@ class TestClientSendCommand:
         assert "Daemon output (tail):" in str(exc_info.value)
         assert "python -m playwright install" in str(exc_info.value)
         assert "Daemon log:" in str(exc_info.value)
+
+    def test_spawn_daemon_clear_user_data_injects_env(self):
+        """_spawn_daemon(clear_user_data=True) injects clear_user_data into BRIDGIC_BROWSER_JSON."""
+        import io, json
+        from bridgic.browser.cli import _client
+
+        captured_env: dict = {}
+
+        def fake_popen(_cmd, **kwargs):
+            captured_env.update(kwargs.get("env", {}))
+            proc = MagicMock()
+            # Emit READY_SIGNAL so _spawn_daemon completes without timeout
+            proc.stdout = io.BytesIO(b"BRIDGIC_DAEMON_READY\n")
+            return proc
+
+        with patch("bridgic.browser.cli._client.subprocess.Popen", side_effect=fake_popen):
+            _client._spawn_daemon(clear_user_data=True)
+
+        raw = captured_env.get("BRIDGIC_BROWSER_JSON", "{}")
+        merged = json.loads(raw)
+        assert merged.get("clear_user_data") is True
+        assert "headless" not in merged  # headed flag not set
+
+    def test_spawn_daemon_headed_and_clear_user_data_both_inject(self):
+        """_spawn_daemon(headed=True, clear_user_data=True) sets both keys in BRIDGIC_BROWSER_JSON."""
+        import io, json
+        from bridgic.browser.cli import _client
+
+        captured_env: dict = {}
+
+        def fake_popen(_cmd, **kwargs):
+            captured_env.update(kwargs.get("env", {}))
+            proc = MagicMock()
+            proc.stdout = io.BytesIO(b"BRIDGIC_DAEMON_READY\n")
+            return proc
+
+        with patch("bridgic.browser.cli._client.subprocess.Popen", side_effect=fake_popen):
+            _client._spawn_daemon(headed=True, clear_user_data=True)
+
+        raw = captured_env.get("BRIDGIC_BROWSER_JSON", "{}")
+        merged = json.loads(raw)
+        assert merged.get("headless") is False
+        assert merged.get("clear_user_data") is True
 
     @pytest.mark.asyncio
     async def test_send_command_async_uses_success_field_when_present(self):

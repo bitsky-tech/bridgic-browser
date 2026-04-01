@@ -6,7 +6,7 @@ Short reference for the main session and download APIs. For tool lists and selec
 
 | Method / property | Description |
 |------------------|-------------|
-| `Browser(...)` | Constructor. Key args: `headless`, `viewport`, `user_data_dir`, `stealth`, `channel`, `proxy`, `downloads_path`, etc. |
+| `Browser(...)` | Constructor. Key args: `headless`, `viewport`, `user_data_dir`, `clear_user_data`, `stealth`, `channel`, `proxy`, `downloads_path`, etc. |
 | `await browser._start()` | Launch browser and create context. Called automatically by `navigate_to` / `search` (lazy start); call directly only when you need explicit startup before any navigation. |
 | `await browser.close()` | Stop the browser, auto-cleans active capture listeners. No-op if never started. |
 | `await browser.navigate_to(url, wait_until="domcontentloaded", timeout=None)` | Navigate to URL with optional auto-prefix when missing protocol. `wait_until`: `"domcontentloaded"` (default), `"load"`, `"networkidle"`, or `"commit"`. `timeout` in seconds. |
@@ -21,10 +21,11 @@ Short reference for the main session and download APIs. For tool lists and selec
 | `browser.headless` | `bool` — whether the browser runs in headless mode. |
 | `browser.viewport` | `dict` or `None` — current viewport size configuration. |
 | `browser.channel` | `str` or `None` — browser distribution channel. |
-| `browser.user_data_dir` | `Path` or `None` — persistent context directory, or `None` for isolated mode. |
+| `browser.user_data_dir` | `Path` or `None` — explicit custom profile directory, or `None` when using the default `~/.bridgic/bridgic-browser/user_data/`. Ignored when `clear_user_data=True` (ephemeral mode). |
+| `browser.clear_user_data` | `bool` — `True` for ephemeral mode (no persistent profile); `False` (default) for persistent profile. |
 | `browser.stealth_enabled` | `bool` — whether stealth mode is active. |
 | `browser.stealth_config` | `StealthConfig` or `None` — current stealth configuration. |
-| `browser.use_persistent_context` | `bool` — `True` when using `launch_persistent_context` (either `user_data_dir` set or headed mode). |
+| `browser.use_persistent_context` | `bool` — `True` when using `launch_persistent_context` (`clear_user_data=False`); `False` when using ephemeral `launch`+`new_context` (`clear_user_data=True`). |
 
 ## DownloadManager
 

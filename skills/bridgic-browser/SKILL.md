@@ -10,6 +10,7 @@ Before performing any operations, **MAKE SURE to use `uv`** to initialize the ex
 
 - **Initialize project**: `[ -f pyproject.toml  ] || uv init --bare --python 3.10`
 - **Install dependencies**: `uv add --upgrade bridgic-browser`.
+- **Ensure that `uv` is available**: If `uv` is not found or not installed, run `pip install uv` to install it. Then rerun the previous "Install dependencies" step.
 - **Install browser binaries** (one-time): `uv run playwright install chromium`
 
 The CLI tools (`references/cli-guide.md`) and the Python SDK (`references/sdk-guide.md`) come from the **same package** — installing one installs both.
@@ -53,7 +54,7 @@ Reference files cover all use cases. Load only the one(s) relevant to the task:
 - Ref-based actions depend on the latest snapshot.
 - After navigation or major DOM updates, refs can become stale; refresh snapshot before ref actions.
 - CLI keeps state in a daemon session across invocations.
-- SDK keeps state in the Python process/context unless a persistent `user_data_dir` is configured.
+- SDK keeps state in the Python process/context. By default, browser profile (cookies, session) is persisted to `~/.bridgic/bridgic-browser/user_data/`; pass `clear_user_data=True` to `Browser()` for an ephemeral session.
 - Use exact command/method names from references; do not invent aliases.
 
 ## Bridge Workflow: CLI Actions -> Python Code

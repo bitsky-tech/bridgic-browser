@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import signal
 import sys
 import tempfile
 from urllib.parse import urlparse
@@ -15,7 +16,7 @@ if TYPE_CHECKING:
     except ModuleNotFoundError:  # pragma: no cover - optional dependency
         OpenAILlm = Any  # type: ignore[misc,assignment]
 
-from .._constants import BRIDGIC_TMP_DIR, BRIDGIC_SNAPSHOT_DIR
+from .._constants import BRIDGIC_TMP_DIR, BRIDGIC_SNAPSHOT_DIR, BRIDGIC_USER_DATA_DIR
 
 from playwright.async_api import (
     async_playwright,
@@ -310,11 +311,14 @@ class Browser:
     ``BRIDGIC_BROWSER_JSON`` env var. Explicit constructor parameters override
     config values.
 
-    This class automatically chooses between `launch` + `new_context` and
-    `launch_persistent_context` based on whether `user_data_dir` is provided.
+    This class automatically chooses between ``launch_persistent_context`` and
+    ``launch`` + ``new_context`` based on the ``clear_user_data`` parameter.
 
-    - With `user_data_dir`: Uses `launch_persistent_context` for session persistence
-    - Without `user_data_dir`: Uses `launch` + `new_context` for isolated sessions
+    - ``clear_user_data=False`` (default): Uses ``launch_persistent_context`` for
+      session persistence. Uses the explicit ``user_data_dir`` if provided, otherwise
+      defaults to ``~/.bridgic/bridgic-browser/user_data/``.
+    - ``clear_user_data=True``: Uses ``launch`` + ``new_context`` for ephemeral sessions
+      (no persistent profile; ``user_data_dir`` is ignored).
 
     Parameters
     ----------
@@ -324,8 +328,14 @@ class Browser:
     viewport : ViewportSize, optional
         Viewport size. Defaults to {"width": 1600, "height": 900}.
     user_data_dir : str | Path, optional
-        Path to user data directory for persistent context. If provided,
-        uses `launch_persistent_context`; otherwise uses `launch` + `new_context`.
+        Path to user data directory for persistent context. Only used when
+        ``clear_user_data=False`` (the default). When not provided, defaults to
+        ``~/.bridgic/bridgic-browser/user_data/``. Ignored when ``clear_user_data=True``.
+    clear_user_data : bool, optional
+        If True, start an ephemeral browser session (``launch`` + ``new_context``,
+        no persistent profile; ``user_data_dir`` is ignored). If False (default),
+        use ``launch_persistent_context`` with a persistent profile. Defaults to
+        None (resolved from config files or False if no config present).
     stealth : bool | StealthConfig, optional
         Stealth mode for bypassing bot detection. Defaults to None (resolved
         from config files or True if no config present).
@@ -439,6 +449,7 @@ class Browser:
         headless: Optional[bool] = None,
         viewport: Optional[ViewportSize] = None,
         user_data_dir: Optional[Union[str, Path]] = None,
+        clear_user_data: Optional[bool] = None,
         # === Stealth mode (enabled by default for best anti-detection) ===
         stealth: Union[bool, StealthConfig, None] = None,
         # === Browser launch parameters (commonly used) ===
@@ -473,6 +484,7 @@ class Browser:
         stealth = stealth if stealth is not None else _cfg.pop('stealth', True)
         viewport = viewport if viewport is not None else _cfg.pop('viewport', None)
         user_data_dir = user_data_dir if user_data_dir is not None else _cfg.pop('user_data_dir', None)
+        clear_user_data = clear_user_data if clear_user_data is not None else _cfg.pop('clear_user_data', False)
         channel = channel if channel is not None else _cfg.pop('channel', None)
         executable_path = executable_path if executable_path is not None else _cfg.pop('executable_path', None)
         proxy = proxy if proxy is not None else _cfg.pop('proxy', None)
@@ -491,7 +503,7 @@ class Browser:
         color_scheme = color_scheme if color_scheme is not None else _cfg.pop('color_scheme', None)
         # Remove any named-param keys that were skipped above (explicit value won)
         for _named_key in (
-            'headless', 'stealth', 'viewport', 'user_data_dir', 'channel',
+            'headless', 'stealth', 'viewport', 'user_data_dir', 'clear_user_data', 'channel',
             'executable_path', 'proxy', 'timeout', 'slow_mo', 'args',
             'ignore_default_args', 'downloads_path', 'devtools', 'user_agent',
             'locale', 'timezone_id', 'ignore_https_errors', 'extra_http_headers',
@@ -523,11 +535,11 @@ class Browser:
         else:
             self._viewport = viewport or {"width": 1600, "height": 900}
         self._user_data_dir = Path(user_data_dir).expanduser() if user_data_dir else None
+        self._clear_user_data: bool = clear_user_data
 
         # Stealth configuration
         self._stealth_config: Optional[StealthConfig] = None
         self._stealth_builder: Optional[StealthArgsBuilder] = None
-        self._temp_user_data_dir: Optional[str] = None  # For auto-created temp dir
         self._temp_video_dir: Optional[str] = None  # For auto-created video dir
         self._preallocated_trace_path: Optional[str] = None
         self._close_session_dir: Optional[str] = None
@@ -609,24 +621,13 @@ class Browser:
 
     @property
     def use_persistent_context(self) -> bool:
-        """Whether to use persistent context mode.
+        """Whether to use persistent context mode (unrelated to headless/headed mode).
 
-        Returns True if:
-        - user_data_dir is provided, OR
-        - headed mode (persistent context looks like a real user profile)
+        Priority (highest to lowest):
+        - clear_user_data=True  → always False (fresh launch+new_context, user_data_dir ignored)
+        - clear_user_data=False → always True (persistent; user_data_dir if set, else default dir)
         """
-        # Explicit user_data_dir
-        if self._user_data_dir is not None:
-            return True
-
-        # headed mode always uses persistent context so the browser profile looks
-        # like a real user to bot-detection systems (Google OAuth, reCAPTCHA, etc.).
-        # launch + new_context produces an incognito-like context with no cookies or
-        # history, which is easily flagged as automation.
-        if not self._headless and not self._channel and not self._executable_path:
-            return True
-
-        return False
+        return not self._clear_user_data
 
     @property
     def stealth_enabled(self) -> bool:
@@ -673,6 +674,11 @@ class Browser:
         return self._user_data_dir
 
     @property
+    def clear_user_data(self) -> bool:
+        """Whether user data is cleared on each browser start (ephemeral mode)."""
+        return self._clear_user_data
+
+    @property
     def channel(self) -> Optional[str]:
         """Browser distribution channel."""
         return self._channel
@@ -690,6 +696,7 @@ class Browser:
             "viewport": self._viewport,
             "no_viewport": self._no_viewport,
             "user_data_dir": str(self._user_data_dir) if self._user_data_dir else None,
+            "clear_user_data": self._clear_user_data,
             "stealth_enabled": self.stealth_enabled,
             "channel": self._channel,
             "executable_path": str(self._executable_path) if self._executable_path else None,
@@ -937,17 +944,14 @@ class Browser:
         # Add context options
         options.update(self._get_context_options())
 
-        # Determine user_data_dir
+        # Determine user_data_dir (only reached when clear_user_data=False)
         if self._user_data_dir:
             options["user_data_dir"] = str(self._user_data_dir)
         else:
-            # Playwright requires a non-None user_data_dir for
-            # launch_persistent_context; create a bridgic-managed temp dir so
-            # close() can clean it up correctly via shutil.rmtree.
-            if not self._temp_user_data_dir:
-                self._temp_user_data_dir = tempfile.mkdtemp(prefix="bridgic-browser-")
-                logger.info(f"Created temporary user data dir for headed mode: {self._temp_user_data_dir}")
-            options["user_data_dir"] = self._temp_user_data_dir
+            # No custom path: use the default persistent profile directory.
+            BRIDGIC_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+            options["user_data_dir"] = str(BRIDGIC_USER_DATA_DIR)
+            logger.info(f"Using default user data dir: {BRIDGIC_USER_DATA_DIR}")
 
         return options
 
@@ -957,8 +961,8 @@ class Browser:
         """Start the browser.
 
         Automatically chooses between two launch modes:
-        - If `user_data_dir` is provided: Uses `launch_persistent_context`
-        - If `user_data_dir` is not provided: Uses `launch` + `new_context`
+        - If `clear_user_data=False` (default): Uses `launch_persistent_context` (persistent profile)
+        - If `clear_user_data=True`: Uses `launch` + `new_context` (ephemeral, no profile)
 
         When stealth mode is enabled, anti-detection args are automatically
         applied.
@@ -975,7 +979,7 @@ class Browser:
             self._playwright = await async_playwright().start()
 
             if self.use_persistent_context:
-                # Mode 1: Persistent context (with user_data_dir or headed mode)
+                # Mode 1: Persistent context (clear_user_data=False)
                 logger.info("Using persistent context mode")
                 persistent_options = self._get_persistent_context_options()
                 logger.debug(f"Persistent context options: {persistent_options}")
@@ -985,7 +989,7 @@ class Browser:
                 )
                 self._browser = self._context.browser
             else:
-                # Mode 2: Normal launch + new_context (without user_data_dir)
+                # Mode 2: Ephemeral launch + new_context (clear_user_data=True)
                 logger.info("Using normal launch mode")
                 launch_options = self._get_launch_options()
                 logger.debug(f"Launch options: {launch_options}")
@@ -1067,20 +1071,52 @@ class Browser:
 
     @staticmethod
     async def _force_kill_playwright_driver(pw: Any) -> None:
-        """Force-kill the Playwright Node driver process.
+        """Force-kill the Playwright Node driver process (and its process group when safe).
 
-        Accesses internal Playwright transport to send SIGKILL and waits for
-        the process to exit (avoids zombie processes).  Best-effort: silently
-        ignored if internals have changed.
+        On macOS/Linux we attempt to kill the entire process group so that
+        Chrome child processes are also terminated (killing only the Node driver
+        leaves Chrome as orphans on macOS).
+
+        Safety guard — same-pgid check:
+            The daemon is spawned with start_new_session=True (setsid), so its
+            pgid equals its own pid. The Node driver inherits that same pgid.
+            Calling killpg(pgid) without the guard would SIGKILL the daemon
+            itself, aborting close-report writes and leaving the socket file
+            behind. When the driver shares our pgid we fall back to killing only
+            the driver process (original behaviour — Chrome children remain
+            orphans in this case, but that is unavoidable without psutil).
+
+        Windows: os.getpgid / os.killpg are POSIX-only; on Windows we always
+        fall back to proc.kill() directly.
+
+        Accesses internal Playwright transport — best-effort: silently ignored
+        if internals have changed.
         """
         try:
             proc = pw._connection._transport._proc  # type: ignore[union-attr]
             if proc and proc.returncode is None:
-                proc.kill()
+                killed_via_group = False
+                if sys.platform != "win32":
+                    try:
+                        pgid = os.getpgid(proc.pid)
+                        # Guard: do NOT send SIGKILL to our own process group.
+                        # The daemon (and direct SDK callers) share the same pgid
+                        # as the Node driver because the driver is spawned without
+                        # start_new_session=True and inherits the caller's pgrp.
+                        if pgid != os.getpgid(os.getpid()):
+                            os.killpg(pgid, signal.SIGKILL)
+                            killed_via_group = True
+                            logger.debug(
+                                "Force-killed Playwright driver process group (pgid=%d)", pgid
+                            )
+                    except (ProcessLookupError, OSError):
+                        pass  # process already gone or pgid lookup failed
+                if not killed_via_group:
+                    proc.kill()
+                    logger.debug("Force-killed Playwright driver process only")
                 # Short timeout: SIGKILL is immediate, but wait() depends on
                 # the event loop's child watcher which may misbehave at teardown.
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
-                logger.debug("Force-killed Playwright driver process")
         except Exception as exc:
             logger.debug("_force_kill_playwright_driver skipped: %s", exc)
 
@@ -1309,21 +1345,17 @@ class Browser:
             # Must run BEFORE video finalization because _finalize_video()
             # calls page.close() for each page — after that the page list is
             # empty and about:blank would be a no-op.
-            #
-            # Skipped for temp_user_data_dir: that path force-kills the
-            # process immediately and never reaches context.close().
-            if not self._temp_user_data_dir:
-                for _nav_page in list(self._context.pages):
-                    try:
-                        await asyncio.wait_for(
-                            _nav_page.goto("about:blank", wait_until="commit"),
-                            timeout=self._PAGE_CLOSE_TIMEOUT,
-                        )
-                    except Exception as exc:
-                        logger.debug("close: about:blank navigation failed: %s", exc)
-                    except BaseException as e:
-                        if _pending_cancel is None:
-                            _pending_cancel = e
+            for _nav_page in list(self._context.pages):
+                try:
+                    await asyncio.wait_for(
+                        _nav_page.goto("about:blank", wait_until="commit"),
+                        timeout=self._PAGE_CLOSE_TIMEOUT,
+                    )
+                except Exception as exc:
+                    logger.debug("close: about:blank navigation failed: %s", exc)
+                except BaseException as e:
+                    if _pending_cancel is None:
+                        _pending_cancel = e
 
             # Save videos when: (a) video_start() was called and never stopped, or
             # (b) stop_video() deferred the save to close time.
@@ -1385,56 +1417,40 @@ class Browser:
         else:
             self._clear_page_scoped_state(self._page, errors)
 
-        # In persistent context mode with a temp user_data_dir, Chrome spends
-        # significant time flushing profile data (cookies, cache, IndexedDB) to
-        # disk on shutdown — data we will delete anyway via shutil.rmtree.
-        # Skip all graceful page/context/browser shutdown and force-kill the
-        # process immediately.  Trace and video artifacts have already been
-        # finalized above.
-        if self._temp_user_data_dir:
+        # Close page (with timeout to guard against hung beforeunload handlers)
+        if self._page:
+            _page = self._page
             self._page = None
-            self._browser = None
-            self._context = None
-            if self._playwright:
-                _playwright = self._playwright
-                self._playwright = None
-                await self._force_kill_playwright_driver(_playwright)
+            try:
+                await asyncio.wait_for(
+                    _page.close(), timeout=self._PAGE_CLOSE_TIMEOUT,
+                )
+            except BaseException as e:
+                errors.append(f"page.close: {e}")
+                if not isinstance(e, Exception) and _pending_cancel is None:
+                    _pending_cancel = e
 
-        else:
-            # Close page (with timeout to guard against hung beforeunload handlers)
-            if self._page:
-                _page = self._page
-                self._page = None
+        # Detach download manager before context closes to remove handlers
+        if self._download_manager and self._context:
+            try:
+                self._download_manager.detach_from_context(self._context)
+            except Exception as e:
+                errors.append(f"download_manager.detach: {e}")
+
+        # Close all remaining pages in context before closing context.
+        # This avoids context.close() hanging on beforeunload handlers of extra
+        # tabs the user may have opened manually (or pages we didn't track).
+        if self._context:
+            for extra_page in list(self._context.pages):
                 try:
                     await asyncio.wait_for(
-                        _page.close(), timeout=self._PAGE_CLOSE_TIMEOUT,
+                        extra_page.close(run_before_unload=False),
+                        timeout=self._PAGE_CLOSE_TIMEOUT,
                     )
                 except BaseException as e:
-                    errors.append(f"page.close: {e}")
                     if not isinstance(e, Exception) and _pending_cancel is None:
                         _pending_cancel = e
-
-            # Detach download manager before context closes to remove handlers
-            if self._download_manager and self._context:
-                try:
-                    self._download_manager.detach_from_context(self._context)
-                except Exception as e:
-                    errors.append(f"download_manager.detach: {e}")
-
-            # Close all remaining pages in context before closing context.
-            # This avoids context.close() hanging on beforeunload handlers of extra
-            # tabs the user may have opened manually (or pages we didn't track).
-            if self._context:
-                for extra_page in list(self._context.pages):
-                    try:
-                        await asyncio.wait_for(
-                            extra_page.close(run_before_unload=False),
-                            timeout=self._PAGE_CLOSE_TIMEOUT,
-                        )
-                    except BaseException as e:
-                        if not isinstance(e, Exception) and _pending_cancel is None:
-                            _pending_cancel = e
-                        # best-effort; context.close() will handle remaining pages
+                    # best-effort; context.close() will handle remaining pages
 
         # Close context
         # NOTE: In persistent context mode, closing context will auto close browser
@@ -1485,7 +1501,6 @@ class Browser:
                 if _pending_cancel is None:
                     _pending_cancel = e
 
-        # Stop playwright (temp_user_data_dir already handled above)
         if self._playwright:
             _playwright = self._playwright
             self._playwright = None
@@ -1504,23 +1519,6 @@ class Browser:
             except BaseException as e:
                 errors.append(f"playwright.stop: {e}")
                 if _pending_cancel is None:
-                    _pending_cancel = e
-
-        # Clean up temporary user data directory in a thread so the synchronous
-        # shutil.rmtree (potentially large cache trees) does not block the loop.
-        if self._temp_user_data_dir:
-            tmp_dir = self._temp_user_data_dir
-            self._temp_user_data_dir = None
-            try:
-                import shutil
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    None, lambda: shutil.rmtree(tmp_dir, ignore_errors=True),
-                )
-                logger.debug(f"Cleaned up temporary user data dir: {tmp_dir}")
-            except BaseException as e:
-                errors.append(f"temp_dir cleanup: {e}")
-                if not isinstance(e, Exception) and _pending_cancel is None:
                     _pending_cancel = e
 
         # Clear snapshot cache

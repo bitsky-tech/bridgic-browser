@@ -18,6 +18,9 @@ BRIDGIC_TMP_DIR = BRIDGIC_BROWSER_HOME / "tmp"
 # Default directory for snapshot overflow files
 BRIDGIC_SNAPSHOT_DIR = BRIDGIC_BROWSER_HOME / "snapshot"
 
+# Default persistent user data directory for browser sessions
+BRIDGIC_USER_DATA_DIR = BRIDGIC_BROWSER_HOME / "user_data"
+
 
 class ToolCategory(Enum):
     """Browser tool categories.

@@ -122,10 +122,12 @@ def cli() -> None:
 @click.argument("url")
 @click.option("--headed", is_flag=True, default=False,
               help="Launch the browser in headed (visible) mode.")
-def cmd_open(url: str, headed: bool) -> None:
+@click.option("--clear-user-data", is_flag=True, default=False,
+              help="Start with a fresh browser profile (no persistent user data). Ignored if a session is already running.")
+def cmd_open(url: str, headed: bool, clear_user_data: bool) -> None:
     """Navigate to URL (starts a browser session if needed)."""
     try:
-        _ok(send_command("open", {"url": url}, headed=headed))
+        _ok(send_command("open", {"url": url}, headed=headed, clear_user_data=clear_user_data))
     except Exception as exc:
         _err(exc)
 
@@ -166,10 +168,12 @@ def cmd_reload() -> None:
 )
 @click.option("--headed", is_flag=True, default=False,
               help="Launch the browser in headed (visible) mode.")
-def cmd_search(query: str, engine: str, headed: bool) -> None:
+@click.option("--clear-user-data", is_flag=True, default=False,
+              help="Start with a fresh browser profile (no persistent user data). Ignored if a session is already running.")
+def cmd_search(query: str, engine: str, headed: bool, clear_user_data: bool) -> None:
     """Search the web using a search engine (starts a browser session if needed)."""
     try:
-        _ok(send_command("search", {"query": query, "engine": engine}, headed=headed))
+        _ok(send_command("search", {"query": query, "engine": engine}, headed=headed, clear_user_data=clear_user_data))
     except Exception as exc:
         _err(exc)
 

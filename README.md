@@ -13,7 +13,7 @@
 - **Snapshot with Semantic Invariance** - A representation of page snapshot based on accessibility tree and a specially designed ref-generation algorithm that ensures element refs remain unchanged across page reloads
 - **Skills** - Used for guided exploration and code generation; Compatible with most of coding agents
 - **Stealth Mode (Enabled by Default)** - Mode-aware anti-detection: 50+ Chrome args + JS patches in headless mode; minimal ~11 flags in headed mode to match real Chrome fingerprint
-- **Dual Launch Mode** - Automatically switches between isolated sessions and persistent contexts
+- **Persistent & Ephemeral Sessions** - Persistent profile by default (`~/.bridgic/bridgic-browser/user_data/`); pass `clear_user_data=True` for an ephemeral session with no profile
 - **Nested iframe Support** - Supports DOM element operations within multi-level nested iframes
 
 ### Installation
@@ -30,7 +30,7 @@ playwright install chromium
 
 ### Quick Start
 
-#### CLI Tolls Usage
+#### CLI Tools Usage
 
 ```shell
 bridgic-browser open --headed https://example.com
@@ -41,7 +41,7 @@ bridgic-browser screenshot page.png
 bridgic-browser close
 ```
 
-#### Python Tolls Integration
+#### Python Tools Integration
 
 First, build tools:
 
@@ -171,7 +171,7 @@ Browser options are automatically loaded from the following sources (both CLI da
 
 | Source | Example |
 |--------|---------|
-| Defaults | `headless=True` |
+| Defaults | `headless=True`, `clear_user_data=False` (persistent profile) |
 | `~/.bridgic/bridgic-browser/bridgic-browser.json` | User-level persistent config |
 | `./bridgic-browser.json` | Project-local config (in cwd at daemon start) |
 | Environment variables | See `skills/bridgic-browser/references/env-vars.md` |
@@ -198,6 +198,8 @@ The JSON sources accept any `Browser` constructor parameter:
 ```bash
 # One-shot env override
 BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open URL
+# One-shot ephemeral session (no persistent profile)
+BRIDGIC_BROWSER_JSON='{"clear_user_data":true}' bridgic-browser open URL
 ```
 
 #### Command List
@@ -449,17 +451,23 @@ The main class for browser automation with automatic launch mode selection:
 ```python
 from bridgic.browser.session import Browser
 
-# Isolated session (no persistence)
+# Persistent session (default — profile saved to ~/.bridgic/bridgic-browser/user_data/)
 browser = Browser(
     headless=True,
     viewport={"width": 1600, "height": 900},
 )
 
-# Persistent session (with user data)
+# Persistent session with custom profile path
 browser = Browser(
     headless=False,
     user_data_dir="./user_data",
     stealth=True,  # Enabled by default
+)
+
+# Ephemeral session (no persistent profile)
+browser = Browser(
+    headless=True,
+    clear_user_data=True,
 )
 ```
 
@@ -469,7 +477,8 @@ browser = Browser(
 |-----------|------|---------|-------------|
 | `headless` | bool | True | Run in headless mode |
 | `viewport` | dict | 1600x900 | Browser viewport size |
-| `user_data_dir` | str/Path | None | Path for persistent context |
+| `user_data_dir` | str/Path | None | Custom path for persistent profile (ignored when `clear_user_data=True`) |
+| `clear_user_data` | bool | False | If True, use ephemeral session (no profile); if False, use persistent profile |
 | `stealth` | bool/StealthConfig | True | Stealth mode configuration |
 | `channel` | str | None | Browser channel (chrome, msedge, etc.) |
 | `proxy` | dict | None | Proxy settings |

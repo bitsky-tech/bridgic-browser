@@ -63,8 +63,8 @@ bridgic/browser/
 ### Core data flow
 
 1. **`Browser`** (`session/_browser.py`) — instantiate; browser starts lazily on first `navigate_to` / `search`, or explicitly via `async with Browser(...) as b:` (calls `_start()`). `Browser()` **automatically loads config** from `~/.bridgic/bridgic-browser/bridgic-browser.json` → `./bridgic-browser.json` → `BRIDGIC_BROWSER_JSON` env var (via `_config.py:_load_config_sources()`). Explicit constructor params override config values; `headless` and `stealth` default to `None` (resolved to `True` if no config present). Auto-selects:
-   - Isolated mode: `launch()` + `new_context()` (default, no `user_data_dir`)
-   - Persistent mode: `launch_persistent_context(user_data_dir)` (preserves cookies/session)
+   - Persistent mode (default, `clear_user_data=False`): `launch_persistent_context(user_data_dir)` — uses provided `user_data_dir`, or `~/.bridgic/bridgic-browser/user_data/` by default
+   - Ephemeral mode (`clear_user_data=True`): `launch()` + `new_context()` — no profile, `user_data_dir` ignored
 
 2. **`await browser.get_snapshot()`** → returns `EnhancedSnapshot`:
    - `.tree: str` — accessibility tree lines like `- button "Submit" [ref=8d4b03a9]`
@@ -194,8 +194,8 @@ Key implementation details:
   - **`type`**: docstring explicitly states the text goes into the **currently focused element** and that the user must `click` or `focus` the target first.
   - **`mouse-move` / `mouse-click` / `mouse-drag`**: coordinates are **viewport pixels from the top-left corner**; documented in both docstrings and `_cli_catalog.py`.
   - **`eval-on`**: CODE must be an arrow function or named function that receives the element as its argument (e.g. `"(el) => el.textContent"`); this calling convention is documented in the docstring with examples.
-- **Config loading**: `Browser.__init__` auto-loads config via `_config.py:_load_config_sources()`. The `--headed` CLI flag merges `{"headless": false}` into `BRIDGIC_BROWSER_JSON` before spawning the daemon.
-- **`close` command fast-path**: the daemon calls `browser.inspect_pending_close_artifacts()` to pre-allocate a session dir, trace path, and video paths (all grouped under `~/.bridgic/bridgic-browser/tmp/close-<timestamp>-<rand>/`), responds to the client immediately with those paths, then sets `stop_event`. Actual `browser.close()` runs after the client disconnects. For **temp user_data_dir** sessions (headed mode without explicit `user_data_dir`), `close()` skips graceful page/context/browser shutdown and force-kills the Playwright driver process immediately — Chrome's profile flush is pointless since the temp dir gets deleted via `shutil.rmtree`. After close, `_write_close_report()` writes `close-report.json` in the session dir with status (`"success"`, `"success_with_timeouts"`, `"error"`, or `"timeout"`), artifact paths, and any errors.
+- **Config loading**: `Browser.__init__` auto-loads config via `_config.py:_load_config_sources()`. The `--headed` CLI flag merges `{"headless": false}` into `BRIDGIC_BROWSER_JSON` before spawning the daemon. The `--clear-user-data` CLI flag merges `{"clear_user_data": true}` into `BRIDGIC_BROWSER_JSON`.
+- **`close` command fast-path**: the daemon calls `browser.inspect_pending_close_artifacts()` to pre-allocate a session dir, trace path, and video paths (all grouped under `~/.bridgic/bridgic-browser/tmp/close-<timestamp>-<rand>/`), responds to the client immediately with those paths, then sets `stop_event`. Actual `browser.close()` runs after the client disconnects. After close, `_write_close_report()` writes `close-report.json` in the session dir with status (`"success"`, `"success_with_timeouts"`, `"error"`, or `"timeout"`), artifact paths, and any errors.
 - **Daemon cleanup ownership guard**: after `browser.close()` finishes, `run_daemon()` reads the run-info file and compares its `pid` field to `os.getpid()` before calling `transport.cleanup()` / `remove_run_info()`. This prevents the outgoing daemon from deleting the new daemon's socket when a `close` is followed immediately by a new command (which starts a new daemon before the old one's shutdown completes). If the run-info is gone (`None`) the old daemon is still the owner and cleans up normally.
 
 Socket path: `BRIDGIC_SOCKET` env var (default `~/.bridgic/bridgic-browser/run/bridgic-browser.sock`).
