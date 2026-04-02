@@ -22,6 +22,7 @@ When writing browser automation or web scraping code, **ALWAYS follow this "expl
 - Then, use the `bridgic-browser` Python SDK to write the code.
 
 Notes:
+- Whenever invoking the `bridgic-browser` CLI, you must call it using `uv run`.
 - If the user clearly specifies exact steps that must be followed, try to perform the exploration according to those steps. If loops or branches appear during exploration, decide the best exploration path autonomously.
 - If you think you may need to return to the original page after clicking into a new page, try opening the new page in a new browser tab instead of using a “click then go back” approach. This is especially important when the original page already has interaction state (such as filled forms or applied filters); otherwise, that state may be lost after navigating back. Be sure to close the new tab promptly after finishing the related actions.
 - If exploration involves repeatedly clicking items in a list, you do not need to traverse every item (especially when the list is large).
