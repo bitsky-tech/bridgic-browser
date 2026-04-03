@@ -1117,7 +1117,10 @@ class Browser:
         if internals have changed.
         """
         try:
-            proc = pw._connection._transport._proc  # type: ignore[union-attr]
+            # async_playwright().start() returns AsyncPlaywright (wrapper);
+            # _connection lives on _impl_obj, not on the wrapper itself.
+            _inner = getattr(pw, "_impl_obj", pw)
+            proc = _inner._connection._transport._proc  # type: ignore[union-attr]
             if proc and proc.returncode is None:
                 killed_via_group = False
                 if sys.platform != "win32":
