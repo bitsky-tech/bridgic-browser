@@ -1344,6 +1344,8 @@ class Browser:
         if not self._close_session_dir:
             self.inspect_pending_close_artifacts()
 
+        import time as _time
+        _close_t0 = _time.monotonic()
         errors: List[str] = []
         shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
         context_key: Optional[str] = None
@@ -1404,8 +1406,12 @@ class Browser:
                 finally:
                     self._tracing_state[context_key] = False
 
+            logger.debug("[close] tracing done at +%.2fs", _time.monotonic() - _close_t0)
+
             # Always clear page-scoped listeners/caches for every context page.
-            for page in list(self._context.pages):
+            _pages_before_clear = list(self._context.pages)
+            logger.debug("[close] pages before clear: %d", len(_pages_before_clear))
+            for page in _pages_before_clear:
                 self._clear_page_scoped_state(page, errors)
 
             # Navigate all pages to about:blank before video finalization to
@@ -1426,6 +1432,8 @@ class Browser:
                 except BaseException as e:
                     if _pending_cancel is None:
                         _pending_cancel = e
+
+            logger.debug("[close] about:blank done at +%.2fs", _time.monotonic() - _close_t0)
 
             # Save videos when: (a) video_start() was called and never stopped, or
             # (b) stop_video() deferred the save to close time.
@@ -1495,6 +1503,8 @@ class Browser:
                     elif r is not None:
                         _deferred_video_saves.append(r)
 
+                logger.debug("[close] Phase 1 video done at +%.2fs, deferred=%d",
+                             _time.monotonic() - _close_t0, len(_deferred_video_saves))
                 self._video_state[context_key] = False
                 # We may have closed the current page above.
                 self._page = None
@@ -1525,7 +1535,9 @@ class Browser:
         # This avoids context.close() hanging on beforeunload handlers of extra
         # tabs the user may have opened manually (or pages we didn't track).
         if self._context:
-            for extra_page in list(self._context.pages):
+            _remaining_pages = list(self._context.pages)
+            logger.debug("[close] remaining pages before extra close: %d", len(_remaining_pages))
+            for extra_page in _remaining_pages:
                 try:
                     await asyncio.wait_for(
                         extra_page.close(run_before_unload=False),
@@ -1539,14 +1551,27 @@ class Browser:
         # Close context
         # NOTE: In persistent context mode, closing context will auto close browser
         if self._context:
+            import time as _time
+            _pages_at_close = list(self._context.pages) if self._context else []
+            logger.debug(
+                "[close] about to call context.close() — pages_left=%d, "
+                "persistent=%s, headless=%s",
+                len(_pages_at_close), self.use_persistent_context, self._headless,
+            )
             _context = self._context
             self._context = None
+            _t0 = _time.monotonic()
             try:
                 await asyncio.wait_for(
                     _context.close(),
                     timeout=self._CONTEXT_CLOSE_TIMEOUT,
                 )
+                logger.debug("[close] context.close() completed in %.2fs", _time.monotonic() - _t0)
             except asyncio.TimeoutError:
+                logger.warning(
+                    "[close] context.close() TIMED OUT after %.2fs (limit=%.1fs)",
+                    _time.monotonic() - _t0, self._CONTEXT_CLOSE_TIMEOUT,
+                )
                 errors.append(
                     f"context.close: timeout after {self._CONTEXT_CLOSE_TIMEOUT:.1f}s"
                 )
@@ -1557,6 +1582,7 @@ class Browser:
                     self._playwright = None
                     self._browser = None  # browser dies with driver
                     await self._force_kill_playwright_driver(_playwright)
+                    logger.debug("[close] force-killed playwright driver after context.close timeout")
             except Exception as e:
                 errors.append(f"context.close: {e}")
             except BaseException as e:
