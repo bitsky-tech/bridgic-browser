@@ -984,9 +984,32 @@ class Browser:
                 persistent_options = self._get_persistent_context_options()
                 logger.debug(f"Persistent context options: {persistent_options}")
                 _write_launch_debug_log(persistent_options, mode="persistent_context")
-                self._context = await self._playwright.chromium.launch_persistent_context(
-                    **persistent_options
-                )
+                # Retry on profile lock errors (e.g. after close-then-open race
+                # where the old Chrome process hasn't fully released
+                # user_data_dir/SingletonLock yet).
+                _max_retries = 3
+                _last_exc: Optional[Exception] = None
+                for _attempt in range(_max_retries + 1):
+                    try:
+                        self._context = await self._playwright.chromium.launch_persistent_context(
+                            **persistent_options
+                        )
+                        break
+                    except Exception as exc:
+                        if _attempt < _max_retries and self._is_profile_lock_error(exc):
+                            logger.warning(
+                                "[_start] profile locked (attempt %d/%d), retrying in 1s: %s",
+                                _attempt + 1, _max_retries, exc,
+                            )
+                            user_data_dir = persistent_options.get("user_data_dir")
+                            if user_data_dir:
+                                self._try_clear_stale_lock(str(user_data_dir))
+                            await asyncio.sleep(1.0)
+                            _last_exc = exc
+                            continue
+                        raise
+                else:
+                    raise _last_exc  # type: ignore[misc]
                 self._browser = self._context.browser
             else:
                 # Mode 2: Ephemeral launch + new_context (clear_user_data=True)
@@ -1119,6 +1142,51 @@ class Browser:
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
         except Exception as exc:
             logger.debug("_force_kill_playwright_driver skipped: %s", exc)
+
+    @staticmethod
+    def _is_profile_lock_error(exc: Exception) -> bool:
+        """Check if the exception is a Chrome profile lock error (SingletonLock)."""
+        msg = str(exc).lower()
+        return any(pattern in msg for pattern in (
+            "user data directory is already in use",
+            "failed to create a processsingleton",
+            "profile is already in use",
+            "singletonlock",
+        ))
+
+    @staticmethod
+    def _try_clear_stale_lock(user_data_dir: str) -> None:
+        """Remove SingletonLock if the holding Chrome process is dead.
+
+        Chrome creates ``user_data_dir/SingletonLock`` as a symlink whose
+        target is ``hostname-pid``.  If the PID is no longer alive, the lock
+        is stale and safe to remove so Chrome can reuse the profile.
+
+        Best-effort — silently ignored on any error or on Windows (Chrome uses
+        a named mutex there, not a symlink).
+        """
+        if sys.platform == "win32":
+            return
+        lock_path = Path(user_data_dir) / "SingletonLock"
+        try:
+            if not lock_path.is_symlink() and not lock_path.exists():
+                return
+            target = os.readlink(str(lock_path))
+            # Format: "hostname-pid"
+            pid = int(target.rsplit("-", 1)[-1])
+            try:
+                os.kill(pid, 0)  # check if alive
+            except ProcessLookupError:
+                # Process dead — stale lock, remove it
+                lock_path.unlink(missing_ok=True)
+                logger.info(
+                    "[_try_clear_stale_lock] removed stale SingletonLock (pid=%d dead) in %s",
+                    pid, user_data_dir,
+                )
+            except PermissionError:
+                pass  # alive but different user
+        except Exception:
+            pass  # best-effort
 
     def _write_close_report(self, errors: List[str]) -> None:
         """Write close-report.json into the close session directory."""
@@ -1278,6 +1346,7 @@ class Browser:
         errors: List[str] = []
         shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
         context_key: Optional[str] = None
+        _deferred_video_saves: List[tuple] = []  # populated in Phase 1, consumed in Phase 2
         # Deferred re-raise: if CancelledError / KeyboardInterrupt arrives during any
         # cleanup await we record it here, finish ALL cleanup steps, then re-raise at
         # the very end.  This ensures no Playwright/Chromium process is left orphaned
@@ -1365,6 +1434,15 @@ class Browser:
             has_pending_save = pending_save_raw is not _absent
             pending_filename: Optional[str] = pending_save_raw if has_pending_save else None  # type: ignore[assignment]
 
+            # Video processing is split into two phases:
+            #   Phase 1 (here): close video pages to trigger Chrome to finalize
+            #     the video temp files.  This must happen before context.close().
+            #   Phase 2 (after context.close): call video.save_as() to copy the
+            #     finalized temp files to their destinations.  save_as() only
+            #     needs the Playwright Node driver (not Chrome), so it works
+            #     after context.close().  This lets context.close() run sooner,
+            #     releasing Chrome's SingletonLock on user_data_dir quickly —
+            #     critical for close-then-open sequences.
             if self._video_state.get(context_key) or has_pending_save:
                 pages_with_video = [
                     (p, p.video)
@@ -1385,31 +1463,24 @@ class Browser:
                     dest_dir = self._close_session_dir
                     dest_stem = "video"
 
-                async def _finalize_video(page_: Any, video_: Any, idx: int) -> Optional[str]:
+                # Phase 1: close video pages (triggers Chrome video finalization)
+                async def _close_video_page(page_: Any, video_: Any, idx: int) -> tuple:
                     await asyncio.wait_for(page_.close(), timeout=self._PAGE_CLOSE_TIMEOUT)
                     if dest_dir is not None and dest_stem is not None:
                         suffix = f"_{idx}" if need_suffix else ""
                         dest = os.path.join(dest_dir, f"{dest_stem}{suffix}{dest_ext}")
-                        await asyncio.wait_for(
-                            video_.save_as(dest),
-                            timeout=self._VIDEO_SAVE_AS_TIMEOUT,
-                        )
-                        return dest
-                    vp = await asyncio.wait_for(
-                        video_.path(),
-                        timeout=self._VIDEO_PATH_TIMEOUT,
-                    )
-                    return os.path.abspath(str(vp))
+                        return (video_, dest)
+                    return (video_, None)
 
                 results = await asyncio.gather(
-                    *(_finalize_video(p, v, i + 1) for i, (p, v) in enumerate(pages_with_video)),
+                    *(_close_video_page(p, v, i + 1) for i, (p, v) in enumerate(pages_with_video)),
                     return_exceptions=True,
                 )
                 for r in results:
                     if isinstance(r, BaseException):
-                        errors.append(f"video.finalize: {r}")
+                        errors.append(f"video.page_close: {r}")
                     elif r is not None:
-                        shutdown_artifacts["video"].append(r)
+                        _deferred_video_saves.append(r)
 
                 self._video_state[context_key] = False
                 # We may have closed the current page above.
@@ -1498,6 +1569,34 @@ class Browser:
                 errors.append(f"browser.close: {e}")
             except BaseException as e:
                 errors.append(f"browser.close: {e}")
+                if _pending_cancel is None:
+                    _pending_cancel = e
+
+        # Phase 2: save video files now that Chrome has exited and the profile
+        # lock is released.  save_as() only needs the Playwright Node driver
+        # (still alive) to copy the finalized temp files.
+        for video_obj, dest in _deferred_video_saves:
+            try:
+                if dest:
+                    await asyncio.wait_for(
+                        video_obj.save_as(dest),
+                        timeout=self._VIDEO_SAVE_AS_TIMEOUT,
+                    )
+                    shutdown_artifacts["video"].append(dest)
+                else:
+                    vp = await asyncio.wait_for(
+                        video_obj.path(),
+                        timeout=self._VIDEO_PATH_TIMEOUT,
+                    )
+                    shutdown_artifacts["video"].append(os.path.abspath(str(vp)))
+            except asyncio.TimeoutError:
+                errors.append(
+                    f"video.save_as: timeout after {self._VIDEO_SAVE_AS_TIMEOUT:.1f}s"
+                )
+            except Exception as e:
+                errors.append(f"video.save_as: {e}")
+            except BaseException as e:
+                errors.append(f"video.save_as: {e}")
                 if _pending_cancel is None:
                     _pending_cancel = e
 

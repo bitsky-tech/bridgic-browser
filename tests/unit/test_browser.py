@@ -1259,3 +1259,52 @@ class TestGetElementByRefAriaRef:
         browser._page.frame_locator.assert_called_once_with("iframe")
         frame_locator_mock.nth.assert_called_once_with(0)
         nth_mock.locator.assert_called_once_with("aria-ref=f1e99")
+
+
+class TestProfileLockHelpers:
+    """Tests for SingletonLock detection and cleanup helpers."""
+
+    def test_is_profile_lock_error_matches_known_patterns(self):
+        assert Browser._is_profile_lock_error(
+            Exception("user data directory is already in use")
+        )
+        assert Browser._is_profile_lock_error(
+            Exception("Failed to create a ProcessSingleton for the profile")
+        )
+        assert Browser._is_profile_lock_error(
+            Exception("Error: profile is already in use by another Chrome process")
+        )
+        assert Browser._is_profile_lock_error(
+            Exception("Something about SingletonLock failed")
+        )
+
+    def test_is_profile_lock_error_rejects_unrelated(self):
+        assert not Browser._is_profile_lock_error(Exception("timeout"))
+        assert not Browser._is_profile_lock_error(Exception("connection refused"))
+        assert not Browser._is_profile_lock_error(Exception(""))
+
+    def test_try_clear_stale_lock_removes_dead_pid(self, tmp_path):
+        """Stale lock (dead PID) should be removed."""
+        lock = tmp_path / "SingletonLock"
+        # Use a PID that almost certainly doesn't exist
+        lock.symlink_to("localhost-999999999")
+        Browser._try_clear_stale_lock(str(tmp_path))
+        assert not lock.exists() and not lock.is_symlink()
+
+    def test_try_clear_stale_lock_keeps_alive_pid(self, tmp_path):
+        """Lock held by a living process should NOT be removed."""
+        lock = tmp_path / "SingletonLock"
+        lock.symlink_to(f"localhost-{os.getpid()}")  # our own PID — definitely alive
+        Browser._try_clear_stale_lock(str(tmp_path))
+        assert lock.is_symlink()  # still there
+
+    def test_try_clear_stale_lock_no_lock_file(self, tmp_path):
+        """No lock file — should return silently."""
+        Browser._try_clear_stale_lock(str(tmp_path))  # no error
+
+    def test_try_clear_stale_lock_unparseable_target(self, tmp_path):
+        """Lock with unparseable target — should return silently."""
+        lock = tmp_path / "SingletonLock"
+        lock.symlink_to("garbage")
+        Browser._try_clear_stale_lock(str(tmp_path))  # no error
+        assert lock.is_symlink()  # left untouched
