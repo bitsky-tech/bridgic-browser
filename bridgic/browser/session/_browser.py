@@ -3,7 +3,6 @@ import base64
 import json
 import logging
 import os
-import shutil
 import signal
 import sys
 import tempfile
@@ -1352,7 +1351,6 @@ class Browser:
         errors: List[str] = []
         shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
         context_key: Optional[str] = None
-        _deferred_video_saves: List[tuple] = []  # populated in Phase 1, consumed in Phase 2
         # Deferred re-raise: if CancelledError / KeyboardInterrupt arrives during any
         # cleanup await we record it here, finish ALL cleanup steps, then re-raise at
         # the very end.  This ensures no Playwright/Chromium process is left orphaned
@@ -1446,15 +1444,6 @@ class Browser:
             has_pending_save = pending_save_raw is not _absent
             pending_filename: Optional[str] = pending_save_raw if has_pending_save else None  # type: ignore[assignment]
 
-            # Video processing is split into two phases:
-            #   Phase 1 (here): close video pages to trigger Chrome to finalize
-            #     the video temp files.  This must happen before context.close().
-            #   Phase 2 (after context.close): call video.save_as() to copy the
-            #     finalized temp files to their destinations.  save_as() only
-            #     needs the Playwright Node driver (not Chrome), so it works
-            #     after context.close().  This lets context.close() run sooner,
-            #     releasing Chrome's SingletonLock on user_data_dir quickly —
-            #     critical for close-then-open sequences.
             if self._video_state.get(context_key) or has_pending_save:
                 pages_with_video = [
                     (p, p.video)
@@ -1475,39 +1464,34 @@ class Browser:
                     dest_dir = self._close_session_dir
                     dest_stem = "video"
 
-                # Phase 1: close video pages (triggers Chrome video finalization)
-                # and capture the temp file path via video.path() while the
-                # Playwright protocol is still alive (before context.close).
-                async def _close_video_page(page_: Any, video_: Any, idx: int) -> tuple:
+                async def _finalize_video(page_: Any, video_: Any, idx: int) -> Optional[str]:
                     await asyncio.wait_for(page_.close(), timeout=self._PAGE_CLOSE_TIMEOUT)
-                    # Get temp video path NOW — video.path() needs Playwright
-                    # protocol which dies after context.close().
-                    temp_path: Optional[str] = None
-                    try:
-                        vp = await asyncio.wait_for(
-                            video_.path(), timeout=self._VIDEO_PATH_TIMEOUT,
-                        )
-                        temp_path = os.path.abspath(str(vp))
-                    except Exception:
-                        pass  # best-effort; video may not have been recorded
                     if dest_dir is not None and dest_stem is not None:
                         suffix = f"_{idx}" if need_suffix else ""
                         dest = os.path.join(dest_dir, f"{dest_stem}{suffix}{dest_ext}")
-                        return (temp_path, dest)
-                    return (temp_path, None)
+                        await asyncio.wait_for(
+                            video_.save_as(dest),
+                            timeout=self._VIDEO_SAVE_AS_TIMEOUT,
+                        )
+                        return dest
+                    vp = await asyncio.wait_for(
+                        video_.path(),
+                        timeout=self._VIDEO_PATH_TIMEOUT,
+                    )
+                    return os.path.abspath(str(vp))
 
                 results = await asyncio.gather(
-                    *(_close_video_page(p, v, i + 1) for i, (p, v) in enumerate(pages_with_video)),
+                    *(_finalize_video(p, v, i + 1) for i, (p, v) in enumerate(pages_with_video)),
                     return_exceptions=True,
                 )
                 for r in results:
                     if isinstance(r, BaseException):
-                        errors.append(f"video.page_close: {r}")
+                        errors.append(f"video.finalize: {r}")
                     elif r is not None:
-                        _deferred_video_saves.append(r)
+                        shutdown_artifacts["video"].append(r)
 
-                logger.debug("[close] Phase 1 video done at +%.2fs, deferred=%d",
-                             _time.monotonic() - _close_t0, len(_deferred_video_saves))
+                logger.debug("[close] video finalize done at +%.2fs, videos=%d",
+                             _time.monotonic() - _close_t0, len(shutdown_artifacts["video"]))
                 self._video_state[context_key] = False
                 # We may have closed the current page above.
                 self._page = None
@@ -1611,26 +1595,6 @@ class Browser:
                 errors.append(f"browser.close: {e}")
             except BaseException as e:
                 errors.append(f"browser.close: {e}")
-                if _pending_cancel is None:
-                    _pending_cancel = e
-
-        # Phase 2: copy video files now that Chrome has exited and the profile
-        # lock is released.  We use shutil.copy2 (pure file I/O) instead of
-        # video.save_as() because the Playwright protocol connection is dead
-        # after context.close().  The temp paths were captured in Phase 1.
-        for temp_path, dest in _deferred_video_saves:
-            try:
-                if temp_path and dest:
-                    os.makedirs(os.path.dirname(dest), exist_ok=True)
-                    shutil.copy2(temp_path, dest)
-                    shutdown_artifacts["video"].append(dest)
-                elif temp_path:
-                    # No explicit destination — return the temp path directly.
-                    shutdown_artifacts["video"].append(temp_path)
-            except Exception as e:
-                errors.append(f"video.copy: {e}")
-            except BaseException as e:
-                errors.append(f"video.copy: {e}")
                 if _pending_cancel is None:
                     _pending_cancel = e
 
