@@ -556,31 +556,38 @@ class TestBrowserStartStop:
             context.tracing.stop = AsyncMock()
             context.pages = [page]
 
-            page.video = MagicMock()
-            page.video.path = AsyncMock(return_value="/tmp/playwright-video.webm")
-            page.video.save_as = AsyncMock()
+            # Create a real temp file so shutil.copy2 works in Phase 2
+            _tmp_video = tempfile.NamedTemporaryFile(suffix=".webm", delete=False)
+            _tmp_video.write(b"fake video data")
+            _tmp_video.close()
+            try:
+                page.video = MagicMock()
+                page.video.path = AsyncMock(return_value=_tmp_video.name)
+                page.video.save_as = AsyncMock()
 
-            context_key = browser_module._get_context_key(context)
-            browser._tracing_state[context_key] = True
-            browser._video_state[context_key] = True
+                context_key = browser_module._get_context_key(context)
+                browser._tracing_state[context_key] = True
+                browser._video_state[context_key] = True
 
-            await browser.close()
+                await browser.close()
 
-            # Trace should be saved into the auto-created session dir
-            trace_call = context.tracing.stop.call_args
-            trace_path = trace_call.kwargs.get("path") or trace_call.args[0]
-            assert "close-" in trace_path
-            assert trace_path.endswith("trace.zip")
+                # Trace should be saved into the auto-created session dir
+                trace_call = context.tracing.stop.call_args
+                trace_path = trace_call.kwargs.get("path") or trace_call.args[0]
+                assert "close-" in trace_path
+                assert trace_path.endswith("trace.zip")
 
-            page.close.assert_awaited()
-            assert browser._last_shutdown_artifacts["trace"] == [os.path.abspath(trace_path)]
-            # Video saved via save_as into session dir
-            assert len(browser._last_shutdown_artifacts["video"]) == 1
-            video_path = browser._last_shutdown_artifacts["video"][0]
-            assert "close-" in video_path
-            assert "video" in video_path
-            assert context_key not in browser._tracing_state
-            assert context_key not in browser._video_state
+                page.close.assert_awaited()
+                assert browser._last_shutdown_artifacts["trace"] == [os.path.abspath(trace_path)]
+                # Video copied via shutil.copy2 into session dir
+                assert len(browser._last_shutdown_artifacts["video"]) == 1
+                video_path = browser._last_shutdown_artifacts["video"][0]
+                assert "close-" in video_path
+                assert "video" in video_path
+                assert context_key not in browser._tracing_state
+                assert context_key not in browser._video_state
+            finally:
+                os.unlink(_tmp_video.name)
 
     @pytest.mark.asyncio
     async def test_stop_reports_auto_saved_paths(self, mock_playwright):
@@ -602,19 +609,27 @@ class TestBrowserStartStop:
             context.tracing.stop = AsyncMock()
             context.pages = [page]
 
-            page.video = MagicMock()
-            page.video.path = AsyncMock(return_value="/tmp/auto_video.webm")
-            page.video.save_as = AsyncMock()
+            # Create a real temp file so shutil.copy2 works in Phase 2
+            _tmp_video = tempfile.NamedTemporaryFile(suffix=".webm", delete=False)
+            _tmp_video.write(b"fake video data")
+            _tmp_video.close()
+            try:
+                page.video = MagicMock()
+                page.video.path = AsyncMock(return_value=_tmp_video.name)
+                page.video.save_as = AsyncMock()
 
-            context_key = browser_module._get_context_key(context)
-            browser._tracing_state[context_key] = True
-            browser._video_state[context_key] = True
+                context_key = browser_module._get_context_key(context)
+                browser._tracing_state[context_key] = True
+                browser._video_state[context_key] = True
 
-            result = await browser.close()
+                result = await browser.close()
 
-            assert "Browser closed successfully" in result
-            assert "trace.zip" in result
-            assert "video" in result
+                assert "Browser closed successfully" in result
+                assert "trace.zip" in result
+                assert "video" in result
+            finally:
+                if os.path.exists(_tmp_video.name):
+                    os.unlink(_tmp_video.name)
 
     @pytest.mark.asyncio
     async def test_stop_warns_on_trace_finalize_failure(self, mock_playwright):

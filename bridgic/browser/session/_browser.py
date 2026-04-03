@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import shutil
 import signal
 import sys
 import tempfile
@@ -1464,13 +1465,25 @@ class Browser:
                     dest_stem = "video"
 
                 # Phase 1: close video pages (triggers Chrome video finalization)
+                # and capture the temp file path via video.path() while the
+                # Playwright protocol is still alive (before context.close).
                 async def _close_video_page(page_: Any, video_: Any, idx: int) -> tuple:
                     await asyncio.wait_for(page_.close(), timeout=self._PAGE_CLOSE_TIMEOUT)
+                    # Get temp video path NOW — video.path() needs Playwright
+                    # protocol which dies after context.close().
+                    temp_path: Optional[str] = None
+                    try:
+                        vp = await asyncio.wait_for(
+                            video_.path(), timeout=self._VIDEO_PATH_TIMEOUT,
+                        )
+                        temp_path = os.path.abspath(str(vp))
+                    except Exception:
+                        pass  # best-effort; video may not have been recorded
                     if dest_dir is not None and dest_stem is not None:
                         suffix = f"_{idx}" if need_suffix else ""
                         dest = os.path.join(dest_dir, f"{dest_stem}{suffix}{dest_ext}")
-                        return (video_, dest)
-                    return (video_, None)
+                        return (temp_path, dest)
+                    return (temp_path, None)
 
                 results = await asyncio.gather(
                     *(_close_video_page(p, v, i + 1) for i, (p, v) in enumerate(pages_with_video)),
@@ -1572,31 +1585,23 @@ class Browser:
                 if _pending_cancel is None:
                     _pending_cancel = e
 
-        # Phase 2: save video files now that Chrome has exited and the profile
-        # lock is released.  save_as() only needs the Playwright Node driver
-        # (still alive) to copy the finalized temp files.
-        for video_obj, dest in _deferred_video_saves:
+        # Phase 2: copy video files now that Chrome has exited and the profile
+        # lock is released.  We use shutil.copy2 (pure file I/O) instead of
+        # video.save_as() because the Playwright protocol connection is dead
+        # after context.close().  The temp paths were captured in Phase 1.
+        for temp_path, dest in _deferred_video_saves:
             try:
-                if dest:
-                    await asyncio.wait_for(
-                        video_obj.save_as(dest),
-                        timeout=self._VIDEO_SAVE_AS_TIMEOUT,
-                    )
+                if temp_path and dest:
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    shutil.copy2(temp_path, dest)
                     shutdown_artifacts["video"].append(dest)
-                else:
-                    vp = await asyncio.wait_for(
-                        video_obj.path(),
-                        timeout=self._VIDEO_PATH_TIMEOUT,
-                    )
-                    shutdown_artifacts["video"].append(os.path.abspath(str(vp)))
-            except asyncio.TimeoutError:
-                errors.append(
-                    f"video.save_as: timeout after {self._VIDEO_SAVE_AS_TIMEOUT:.1f}s"
-                )
+                elif temp_path:
+                    # No explicit destination — return the temp path directly.
+                    shutdown_artifacts["video"].append(temp_path)
             except Exception as e:
-                errors.append(f"video.save_as: {e}")
+                errors.append(f"video.copy: {e}")
             except BaseException as e:
-                errors.append(f"video.save_as: {e}")
+                errors.append(f"video.copy: {e}")
                 if _pending_cancel is None:
                     _pending_cancel = e
 
