@@ -984,9 +984,32 @@ class Browser:
                 persistent_options = self._get_persistent_context_options()
                 logger.debug(f"Persistent context options: {persistent_options}")
                 _write_launch_debug_log(persistent_options, mode="persistent_context")
-                self._context = await self._playwright.chromium.launch_persistent_context(
-                    **persistent_options
-                )
+                # Retry on profile lock errors (e.g. after close-then-open race
+                # where the old Chrome process hasn't fully released
+                # user_data_dir/SingletonLock yet).
+                _max_retries = 3
+                _last_exc: Optional[Exception] = None
+                for _attempt in range(_max_retries + 1):
+                    try:
+                        self._context = await self._playwright.chromium.launch_persistent_context(
+                            **persistent_options
+                        )
+                        break
+                    except Exception as exc:
+                        if _attempt < _max_retries and self._is_profile_lock_error(exc):
+                            logger.warning(
+                                "[_start] profile locked (attempt %d/%d), retrying in 1s: %s",
+                                _attempt + 1, _max_retries, exc,
+                            )
+                            user_data_dir = persistent_options.get("user_data_dir")
+                            if user_data_dir:
+                                self._try_clear_stale_lock(str(user_data_dir))
+                            await asyncio.sleep(1.0)
+                            _last_exc = exc
+                            continue
+                        raise
+                else:
+                    raise _last_exc  # type: ignore[misc]
                 self._browser = self._context.browser
             else:
                 # Mode 2: Ephemeral launch + new_context (clear_user_data=True)
@@ -1065,9 +1088,9 @@ class Browser:
     _TRACE_STOP_TIMEOUT = 10.0
     _VIDEO_PATH_TIMEOUT = 10.0
     _VIDEO_SAVE_AS_TIMEOUT = 120.0  # save_as copies a file; large recordings need more time
-    _CONTEXT_CLOSE_TIMEOUT = 15.0
-    _BROWSER_CLOSE_TIMEOUT = 15.0
-    _PLAYWRIGHT_STOP_TIMEOUT = 15.0
+    _CONTEXT_CLOSE_TIMEOUT = 5.0
+    _BROWSER_CLOSE_TIMEOUT = 5.0
+    _PLAYWRIGHT_STOP_TIMEOUT = 5.0
 
     @staticmethod
     async def _force_kill_playwright_driver(pw: Any) -> None:
@@ -1093,7 +1116,10 @@ class Browser:
         if internals have changed.
         """
         try:
-            proc = pw._connection._transport._proc  # type: ignore[union-attr]
+            # async_playwright().start() returns AsyncPlaywright (wrapper);
+            # _connection lives on _impl_obj, not on the wrapper itself.
+            _inner = getattr(pw, "_impl_obj", pw)
+            proc = _inner._connection._transport._proc  # type: ignore[union-attr]
             if proc and proc.returncode is None:
                 killed_via_group = False
                 if sys.platform != "win32":
@@ -1119,6 +1145,51 @@ class Browser:
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
         except Exception as exc:
             logger.debug("_force_kill_playwright_driver skipped: %s", exc)
+
+    @staticmethod
+    def _is_profile_lock_error(exc: Exception) -> bool:
+        """Check if the exception is a Chrome profile lock error (SingletonLock)."""
+        msg = str(exc).lower()
+        return any(pattern in msg for pattern in (
+            "user data directory is already in use",
+            "failed to create a processsingleton",
+            "profile is already in use",
+            "singletonlock",
+        ))
+
+    @staticmethod
+    def _try_clear_stale_lock(user_data_dir: str) -> None:
+        """Remove SingletonLock if the holding Chrome process is dead.
+
+        Chrome creates ``user_data_dir/SingletonLock`` as a symlink whose
+        target is ``hostname-pid``.  If the PID is no longer alive, the lock
+        is stale and safe to remove so Chrome can reuse the profile.
+
+        Best-effort — silently ignored on any error or on Windows (Chrome uses
+        a named mutex there, not a symlink).
+        """
+        if sys.platform == "win32":
+            return
+        lock_path = Path(user_data_dir) / "SingletonLock"
+        try:
+            if not lock_path.is_symlink() and not lock_path.exists():
+                return
+            target = os.readlink(str(lock_path))
+            # Format: "hostname-pid"
+            pid = int(target.rsplit("-", 1)[-1])
+            try:
+                os.kill(pid, 0)  # check if alive
+            except ProcessLookupError:
+                # Process dead — stale lock, remove it
+                lock_path.unlink(missing_ok=True)
+                logger.info(
+                    "[_try_clear_stale_lock] removed stale SingletonLock (pid=%d dead) in %s",
+                    pid, user_data_dir,
+                )
+            except PermissionError:
+                pass  # alive but different user
+        except Exception:
+            pass  # best-effort
 
     def _write_close_report(self, errors: List[str]) -> None:
         """Write close-report.json into the close session directory."""
@@ -1275,6 +1346,8 @@ class Browser:
         if not self._close_session_dir:
             self.inspect_pending_close_artifacts()
 
+        import time as _time
+        _close_t0 = _time.monotonic()
         errors: List[str] = []
         shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
         context_key: Optional[str] = None
@@ -1334,8 +1407,12 @@ class Browser:
                 finally:
                     self._tracing_state[context_key] = False
 
+            logger.debug("[close] tracing done at +%.2fs", _time.monotonic() - _close_t0)
+
             # Always clear page-scoped listeners/caches for every context page.
-            for page in list(self._context.pages):
+            _pages_before_clear = list(self._context.pages)
+            logger.debug("[close] pages before clear: %d", len(_pages_before_clear))
+            for page in _pages_before_clear:
                 self._clear_page_scoped_state(page, errors)
 
             # Navigate all pages to about:blank before video finalization to
@@ -1356,6 +1433,8 @@ class Browser:
                 except BaseException as e:
                     if _pending_cancel is None:
                         _pending_cancel = e
+
+            logger.debug("[close] about:blank done at +%.2fs", _time.monotonic() - _close_t0)
 
             # Save videos when: (a) video_start() was called and never stopped, or
             # (b) stop_video() deferred the save to close time.
@@ -1411,6 +1490,8 @@ class Browser:
                     elif r is not None:
                         shutdown_artifacts["video"].append(r)
 
+                logger.debug("[close] video finalize done at +%.2fs, videos=%d",
+                             _time.monotonic() - _close_t0, len(shutdown_artifacts["video"]))
                 self._video_state[context_key] = False
                 # We may have closed the current page above.
                 self._page = None
@@ -1441,7 +1522,9 @@ class Browser:
         # This avoids context.close() hanging on beforeunload handlers of extra
         # tabs the user may have opened manually (or pages we didn't track).
         if self._context:
-            for extra_page in list(self._context.pages):
+            _remaining_pages = list(self._context.pages)
+            logger.debug("[close] remaining pages before extra close: %d", len(_remaining_pages))
+            for extra_page in _remaining_pages:
                 try:
                     await asyncio.wait_for(
                         extra_page.close(run_before_unload=False),
@@ -1455,14 +1538,27 @@ class Browser:
         # Close context
         # NOTE: In persistent context mode, closing context will auto close browser
         if self._context:
+            import time as _time
+            _pages_at_close = list(self._context.pages) if self._context else []
+            logger.debug(
+                "[close] about to call context.close() — pages_left=%d, "
+                "persistent=%s, headless=%s",
+                len(_pages_at_close), self.use_persistent_context, self._headless,
+            )
             _context = self._context
             self._context = None
+            _t0 = _time.monotonic()
             try:
                 await asyncio.wait_for(
                     _context.close(),
                     timeout=self._CONTEXT_CLOSE_TIMEOUT,
                 )
+                logger.debug("[close] context.close() completed in %.2fs", _time.monotonic() - _t0)
             except asyncio.TimeoutError:
+                logger.warning(
+                    "[close] context.close() TIMED OUT after %.2fs (limit=%.1fs)",
+                    _time.monotonic() - _t0, self._CONTEXT_CLOSE_TIMEOUT,
+                )
                 errors.append(
                     f"context.close: timeout after {self._CONTEXT_CLOSE_TIMEOUT:.1f}s"
                 )
@@ -1473,6 +1569,7 @@ class Browser:
                     self._playwright = None
                     self._browser = None  # browser dies with driver
                     await self._force_kill_playwright_driver(_playwright)
+                    logger.debug("[close] force-killed playwright driver after context.close timeout")
             except Exception as e:
                 errors.append(f"context.close: {e}")
             except BaseException as e:

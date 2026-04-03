@@ -681,7 +681,10 @@ async def _handle_connection(
             return
 
         if command == "close":
-            # Pre-allocate session dir + artifact paths; respond immediately
+            # Close the browser synchronously so Chrome's SingletonLock on
+            # user_data_dir is released before responding to the client.
+            # This ensures a subsequent ``open`` command can start a new
+            # browser immediately without hitting a profile lock error.
             try:
                 artifacts = browser.inspect_pending_close_artifacts()
             except Exception as exc:
@@ -689,14 +692,31 @@ async def _handle_connection(
                 artifacts = {"session_dir": None, "trace": [], "video": []}
             session_dir = artifacts.get("session_dir") or "(unknown)"
 
-            lines = ["Browser closing in background."]
+            _close_timed_out = False
+            _close_exc: Optional[Exception] = None
+            try:
+                close_result = await asyncio.wait_for(
+                    browser.close(), timeout=_DAEMON_STOP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                _close_timed_out = True
+                close_result = f"Browser close timed out after {_DAEMON_STOP_TIMEOUT:.0f}s"
+                logger.error("[daemon] browser.close() timed out during close command")
+            except Exception as exc:
+                _close_exc = exc
+                close_result = f"Browser close failed: {exc}"
+                logger.exception("[daemon] browser.close() failed during close command")
+
+            _write_close_report(browser, timed_out=_close_timed_out, stop_exc=_close_exc)
+
+            lines = [close_result]
             if artifacts["trace"]:
-                lines.append("Trace (generating in background, check later):")
+                lines.append("Trace:")
                 lines.extend(f"  {p}" for p in artifacts["trace"])
             if artifacts["video"]:
-                lines.append("Video (generating in background, check later):")
+                lines.append("Video:")
                 lines.extend(f"  {p}" for p in artifacts["video"])
-            lines.append(f"Close report (generating in background, check later): {session_dir}/close-report.json")
+            lines.append(f"Close report: {session_dir}/close-report.json")
 
             resp = _response(success=True, result="\n".join(lines))
             writer.write((json.dumps(resp) + "\n").encode())
@@ -793,31 +813,34 @@ async def run_daemon() -> None:
         await stop_event.wait()
 
     logger.info("[daemon] shutting down")
-    _stop_timed_out = False
-    _stop_exc: Optional[Exception] = None
-    try:
-        await asyncio.wait_for(browser.close(), timeout=_DAEMON_STOP_TIMEOUT)
-    except asyncio.TimeoutError:
-        _stop_timed_out = True
-        logger.error("[daemon] browser.close() timed out after %.0fs", _DAEMON_STOP_TIMEOUT)
-    except Exception as exc:
-        _stop_exc = exc
-        logger.exception("[daemon] browser.close() failed during shutdown")
+    # browser.close() is normally called in the close command handler before
+    # responding to the client (so SingletonLock is released immediately).
+    # Only call it here if it wasn't already done (e.g. daemon stopped by
+    # SIGTERM/SIGINT instead of the close command).
+    if browser._playwright is not None:
+        _stop_timed_out = False
+        _stop_exc: Optional[Exception] = None
+        try:
+            await asyncio.wait_for(browser.close(), timeout=_DAEMON_STOP_TIMEOUT)
+        except asyncio.TimeoutError:
+            _stop_timed_out = True
+            logger.error("[daemon] browser.close() timed out after %.0fs", _DAEMON_STOP_TIMEOUT)
+        except Exception as exc:
+            _stop_exc = exc
+            logger.exception("[daemon] browser.close() failed during shutdown")
 
-    _write_close_report(browser, timed_out=_stop_timed_out, stop_exc=_stop_exc)
+        _write_close_report(browser, timed_out=_stop_timed_out, stop_exc=_stop_exc)
 
     # Only clean up the socket and run-info if this daemon is still the owner.
-    # Primary race: `close` responds immediately and a new daemon can start
-    # (write_run_info + bind socket) before browser.close() finishes here.
-    # If we blindly call cleanup/remove_run_info we would delete the new
-    # daemon's socket file and run-info, causing the next command to spawn
-    # yet another daemon (with no page) and return NO_BROWSER_SESSION.
+    # The close command now calls browser.close() synchronously before
+    # responding, so the primary race (new daemon starts while old Chrome is
+    # still running) is mitigated.  However, the guard is still needed for
+    # edge cases: SIGTERM-based shutdown, daemon stop timeout, or a new
+    # daemon that was spawned for a different reason during shutdown.
     #
     # Residual micro-race: there is a tiny window between read_run_info() and
     # transport.cleanup() where a new daemon could start and write its run-info.
-    # This window is measured in microseconds (vs. the primary race which spans
-    # the entire browser.close() call — often seconds).  Eliminating it would
-    # require OS-level atomic file locking; the practical risk is negligible.
+    # This window is measured in microseconds; the practical risk is negligible.
     current_info = read_run_info()
     if current_info is None or current_info.get("pid") == os.getpid():
         transport.cleanup()

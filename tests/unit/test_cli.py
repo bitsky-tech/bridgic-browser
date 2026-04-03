@@ -1356,6 +1356,8 @@ class TestDaemonConnection:
 
     async def test_close_command_sets_stop_event(self):
         browser = make_browser()
+        browser.close = AsyncMock(return_value="Browser closed successfully")
+        browser._playwright = None  # mark as closed after close()
         stop = asyncio.Event()
         req = json.dumps({"command": "close", "args": {}}).encode() + b"\n"
         reader = make_reader(req)
@@ -1364,6 +1366,7 @@ class TestDaemonConnection:
         await _handle_connection(browser, reader, writer, stop)
 
         assert stop.is_set()
+        browser.close.assert_awaited_once()
         written = b"".join(call.args[0] for call in writer.write.call_args_list)
         resp = json.loads(written.decode().strip())
         assert resp["status"] == "ok"
@@ -1371,8 +1374,10 @@ class TestDaemonConnection:
         assert resp["error_code"] is None
 
     async def test_close_command_includes_report_path(self):
-        """close responds immediately with report path and sets stop_event."""
+        """close calls browser.close() synchronously and includes report path."""
         browser = make_browser()
+        browser.close = AsyncMock(return_value="Browser closed successfully")
+        browser._playwright = None
         browser.inspect_pending_close_artifacts = MagicMock(return_value={
             "session_dir": "/tmp/close-20240101-120000-abcd",
             "trace": [],
@@ -1386,12 +1391,12 @@ class TestDaemonConnection:
         await _handle_connection(browser, reader, writer, stop)
 
         assert stop.is_set()
+        browser.close.assert_awaited_once()
         written = b"".join(call.args[0] for call in writer.write.call_args_list)
         resp = json.loads(written.decode().strip())
         assert resp["status"] == "ok"
         assert resp["success"] is True
         assert "close-report.json" in resp["result"]
-        assert "Background" in resp["result"] or "background" in resp["result"]
 
     async def test_writer_always_closed(self):
         """writer.close() must be called even when an exception occurs."""
