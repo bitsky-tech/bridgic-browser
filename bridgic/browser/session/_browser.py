@@ -1089,9 +1089,9 @@ class Browser:
     _TRACE_STOP_TIMEOUT = 10.0
     _VIDEO_PATH_TIMEOUT = 10.0
     _VIDEO_SAVE_AS_TIMEOUT = 120.0  # save_as copies a file; large recordings need more time
-    _CONTEXT_CLOSE_TIMEOUT = 15.0
-    _BROWSER_CLOSE_TIMEOUT = 15.0
-    _PLAYWRIGHT_STOP_TIMEOUT = 15.0
+    _CONTEXT_CLOSE_TIMEOUT = 5.0
+    _BROWSER_CLOSE_TIMEOUT = 5.0
+    _PLAYWRIGHT_STOP_TIMEOUT = 5.0
 
     @staticmethod
     async def _force_kill_playwright_driver(pw: Any) -> None:
