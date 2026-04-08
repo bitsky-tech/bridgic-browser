@@ -72,12 +72,12 @@ When connecting via CDP, bridgic borrows the browser's existing default context 
 
 If the remote Chrome was not started with stealth flags, bridgic's JS patches can cover some fingerprints (navigator, webdriver, plugins) but cannot modify signals that require launch arguments (e.g., Blink feature disabling).
 
-### Video recording is restricted to bridgic-owned tabs
+### Video recording covers all tabs in the context
 
-bridgic records video via Chrome's CDP `Page.startScreencast` (piped to ffmpeg), **not** Playwright's `record_video` context option — so video recording works on borrowed contexts. There are two CDP-mode constraints worth knowing:
+bridgic records video via Chrome's CDP `Page.startScreencast` (piped to ffmpeg), **not** Playwright's `record_video` context option — so video recording works on borrowed contexts.
 
-- **Only bridgic's own tabs are recorded.** `start_video()` skips every page in the borrowed context that bridgic did not create itself, and the future-page listener applies the same filter. The user's banking, email, or chat tabs are never captured. Pop-ups (`target=_blank`) spawned by pages bridgic was driving are also untracked, and therefore not recorded either.
-- **Recording stops cleanly without touching user tabs.** `stop_video()` only finalizes the screencast sessions for bridgic-owned pages, so no user page is closed or refreshed.
+- **All pages are recorded.** `start_video()` starts a screencast session for every open page in the borrowed context, including the user's pre-existing tabs and any pages opened after recording starts. Each page is saved to its own `.webm` file.
+- **Recording stops cleanly without touching user tabs.** `stop_video()` finalizes every screencast session and saves the files; no page is closed or navigated.
 
 **Tracing is not affected** — `tracing.stop()` works at any time without closing pages or contexts.
 
@@ -93,7 +93,7 @@ bridgic records video via Chrome's CDP `Page.startScreencast` (piped to ffmpeg),
 | `context.close()` | Yes | **Skipped** |
 | `browser.close()` | Kills process | **Disconnects only** |
 | Save tracing artifacts | Yes | Yes |
-| Save video artifacts | Yes | Yes (bridgic-owned tabs only) |
+| Save video artifacts | Yes | Yes (all tabs in context) |
 
 After `close()`, the remote Chrome continues running with all of the **user's** tabs intact; only the tabs bridgic explicitly created are gone.
 
