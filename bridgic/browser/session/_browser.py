@@ -2075,12 +2075,19 @@ class Browser:
 
     async def get_all_page_descs(self) -> List[PageDesc]:
         pages = self.get_pages()
-        page_descs = []
-        for page in pages:
-            page_desc = await self.get_page_desc(page)
-            if page_desc:
-                page_descs.append(page_desc)
-        return page_descs
+        if not pages:
+            return []
+
+        async def _safe_desc(page: Page) -> Optional[PageDesc]:
+            try:
+                page_id = generate_page_id(page)
+                title = await page.title()
+                return PageDesc(url=page.url, title=title, page_id=page_id)
+            except Exception:
+                return None
+
+        results = await asyncio.gather(*(_safe_desc(p) for p in pages))
+        return [d for d in results if d is not None]
 
     def get_pages(self) -> List[Page]:
         """Return all pages in the current browser context.
