@@ -8,7 +8,7 @@ import sys
 import tempfile
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Union, NoReturn
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Set, Union, NoReturn
 
 if TYPE_CHECKING:
     try:
@@ -33,6 +33,7 @@ from ._snapshot import EnhancedSnapshot, SnapshotGenerator, SnapshotOptions
 from ._browser_model import FullPageInfo, PageDesc, PageInfo, PageSizeInfo
 from ._stealth import StealthConfig, StealthArgsBuilder
 from ._download import DownloadManager, DownloadedFile
+from . import _video_recorder as _video_recorder_mod
 from ..utils import find_page_by_id, generate_page_id, model_to_llm_string
 from ..errors import (
     BridgicBrowserError,
@@ -45,6 +46,267 @@ from ..errors import (
 logger = logging.getLogger(__name__)
 
 _DEFAULT_SNAPSHOT_LIMIT = 10000
+
+
+# Chromium-based browser profile directories per platform.
+# Used by find_cdp_url(mode="scan") to auto-discover a running browser.
+# Source: https://chromium.googlesource.com/chromium/src/+/main/docs/user_data_dir.md
+_CDP_SCAN_DIRS: Dict[str, List[tuple]] = {
+    "darwin": [
+        # (browser_label, profile_base_path)
+        ("Chrome",        "~/Library/Application Support/Google/Chrome"),
+        ("Chrome Canary", "~/Library/Application Support/Google/Chrome Canary"),
+        ("Chromium",      "~/Library/Application Support/Chromium"),
+        ("Brave",         "~/Library/Application Support/BraveSoftware/Brave-Browser"),
+    ],
+    "linux": [
+        ("Chrome",        "~/.config/google-chrome"),
+        ("Chrome Canary", "~/.config/google-chrome-unstable"),
+        ("Chromium",      "~/.config/chromium"),
+        ("Brave",         "~/.config/BraveSoftware/Brave-Browser"),
+    ],
+    "win32": [
+        ("Chrome",        r"%LOCALAPPDATA%\Google\Chrome\User Data"),
+        ("Chrome Canary", r"%LOCALAPPDATA%\Google\Chrome SxS\User Data"),
+        ("Chromium",      r"%LOCALAPPDATA%\Chromium\User Data"),
+        ("Brave",         r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data"),
+    ],
+}
+
+
+def _read_devtools_active_port(base: str) -> Optional[str]:
+    """Return the ws:// URL from a DevToolsActivePort file, or None if absent/invalid."""
+    port_file = os.path.join(base, "DevToolsActivePort")
+    try:
+        with open(port_file) as f:
+            lines = f.read().strip().splitlines()
+        if len(lines) >= 2:
+            return f"ws://localhost:{lines[0]}{lines[1]}"
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def find_cdp_url(
+    mode: str = "port",
+    port: int = 9222,
+    host: str = "localhost",
+    user_data_dir: Optional[str] = None,
+    channel: str = "stable",
+    ws_endpoint: Optional[str] = None,
+) -> str:
+    """Resolve a Chrome CDP WebSocket URL.
+
+    Parameters
+    ----------
+    mode:
+        - ``"port"`` *(recommended)*: HTTP GET ``/json/version`` on ``host:port``.
+          Works for both local and remote Chrome, regardless of install path.
+          Chrome must be started with ``--remote-debugging-port=PORT``.
+        - ``"file"``: Read ``DevToolsActivePort`` from the Chrome profile directory.
+          Use ``user_data_dir`` to specify the exact profile path; falling back to
+          the ``channel`` guess is unreliable with custom installs or multiple instances.
+        - ``"scan"``: Auto-discover a running Chromium-based browser by scanning all
+          known profile directories on the current machine (Chrome, Chrome Canary,
+          Chromium, Brave). Returns the first active one found.
+          Raises ``RuntimeError`` with instructions if none are running with CDP enabled.
+        - ``"service"``: Return ``ws_endpoint`` directly (cloud providers such as
+          Browserless or Steel that give you a ``wss://`` URL).
+    port:
+        Debugging port (``"port"`` / ``"file"`` modes). Default 9222.
+    host:
+        Server address (``"port"`` mode). Default ``"localhost"``.
+    user_data_dir:
+        Explicit Chrome profile directory (``"file"`` mode).
+    channel:
+        Chrome channel for built-in path lookup when ``user_data_dir`` is not given
+        (``"file"`` mode). Values: ``"stable"``, ``"beta"``, ``"canary"``.
+    ws_endpoint:
+        Full ``ws://`` or ``wss://`` address (``"service"`` mode).
+    """
+    import urllib.error
+    import urllib.request
+
+    if mode == "service":
+        if not ws_endpoint:
+            raise ValueError("ws_endpoint is required when mode='service'")
+        return ws_endpoint
+
+    if mode == "port":
+        # Bracket IPv6 hosts so the URL stays parseable
+        # (e.g. ``::1`` → ``[::1]``).  Plain IPv4 / hostnames pass through
+        # unchanged.
+        host_in_url = f"[{host}]" if host and ":" in host else host
+        url = f"http://{host_in_url}:{port}/json/version"
+        try:
+            # Bypass system HTTP proxy for loopback hosts. macOS reads system
+            # network preferences (proxy_bypass_macosx_sysconf) and may NOT
+            # bypass localhost even though it should — when a system proxy is
+            # active, probes return misleading "HTTP 502 Bad Gateway" instead
+            # of the real "Connection refused" / "Connection timed out".
+            # Remote hosts (cloud browser services, SSH-tunneled CDP, etc.)
+            # MUST keep proxy support, so this branch is loopback-only.
+            host_lower = (host or "").lower().strip()
+            is_loopback = host_lower in ("localhost", "127.0.0.1", "::1")
+            if is_loopback:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({})
+                )
+                resp = opener.open(url, timeout=5)
+            else:
+                resp = urllib.request.urlopen(url, timeout=5)
+            data = json.loads(resp.read())
+            ws_url: str = data["webSocketDebuggerUrl"]
+        except urllib.error.URLError as exc:
+            # URLError is the parent of HTTPError; catches connection refused,
+            # timeouts, DNS failures, and HTTP error responses alike. OSError
+            # subclasses (e.g. raw socket errors) also flow through URLError
+            # in practice via urlopen, so this single clause is sufficient.
+            raise ConnectionError(
+                f"Cannot reach Chrome debugging interface at {url}: {exc}\n"
+                f"Make sure Chrome was started with --remote-debugging-port={port}"
+            ) from exc
+        except (KeyError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Failed to parse /json/version response: {exc}") from exc
+        # Chrome always reports localhost in the URL; replace with the actual
+        # host when the user passed a remote address. Compare against the
+        # *normalized* host_lower so callers passing "LOCALHOST" or other
+        # mixed-case loopback variants still get a clean lowercase URL
+        # rather than ws://LOCALHOST:9222/... For IPv6 hosts we substitute
+        # the bracketed form so the resulting URL is parseable.
+        if host_lower != "localhost":
+            ws_url = ws_url.replace("localhost", host_in_url, 1)
+        return ws_url
+
+    if mode == "scan":
+        platform = sys.platform
+        candidates = _CDP_SCAN_DIRS.get(platform, [])
+        if not candidates:
+            raise RuntimeError(f"Auto-scan is not supported on platform: {platform}")
+        for label, raw_path in candidates:
+            base = os.path.expandvars(os.path.expanduser(raw_path))
+            ws_url = _read_devtools_active_port(base)
+            if ws_url:
+                logger.info("find_cdp_url(scan): found active CDP port via %s (%s)", label, base)
+                return ws_url
+        # Nothing found — build a helpful error with instructions
+        _browsers = ", ".join(label for label, _ in candidates)
+        raise RuntimeError(
+            "No locally running browser with remote debugging enabled was found.\n"
+            f"Scanned profiles for: {_browsers}.\n\n"
+            "To enable remote debugging, start your browser with:\n"
+            "  --remote-debugging-port=9222\n\n"
+            "Examples:\n"
+            '  # macOS Chrome\n'
+            '  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\\n'
+            '      --remote-debugging-port=9222 --user-data-dir=/tmp/cdp-profile\n\n'
+            '  # Or connect to a cloud browser service:\n'
+            '  bridgic-browser open <url> --cdp "wss://<service>/chromium/playwright?token=..."'
+        )
+
+    if mode != "file":
+        raise ValueError(
+            f"Unknown mode {mode!r}. Valid modes: 'port', 'file', 'scan', 'service'."
+        )
+
+    if user_data_dir:
+        base = os.path.expanduser(str(user_data_dir))
+    else:
+        _dirs: Dict[str, Dict[str, str]] = {
+            "darwin": {
+                "stable": "~/Library/Application Support/Google/Chrome",
+                "beta":   "~/Library/Application Support/Google/Chrome Beta",
+                "canary": "~/Library/Application Support/Google/Chrome Canary",
+            },
+            "linux": {
+                "stable": "~/.config/google-chrome",
+                "beta":   "~/.config/google-chrome-beta",
+                "canary": "~/.config/google-chrome-unstable",
+            },
+            "win32": {
+                "stable": r"%LOCALAPPDATA%\Google\Chrome\User Data",
+                "beta":   r"%LOCALAPPDATA%\Google\Chrome Beta\User Data",
+                "canary": r"%LOCALAPPDATA%\Google\Chrome SxS\User Data",
+            },
+        }
+        if sys.platform not in _dirs:
+            raise RuntimeError(f"Unsupported platform for mode='file': {sys.platform}")
+        _platform_dirs = _dirs[sys.platform]
+        if channel not in _platform_dirs:
+            raise ValueError(
+                f"Unknown channel '{channel}' for platform '{sys.platform}'. "
+                f"Valid options: {list(_platform_dirs)}"
+            )
+        base = os.path.expandvars(os.path.expanduser(_platform_dirs[channel]))
+
+    port_file = os.path.join(base, "DevToolsActivePort")
+    if not os.path.exists(port_file):
+        extra = "" if user_data_dir else "\nOr specify user_data_dir explicitly instead of relying on channel path."
+        raise FileNotFoundError(
+            f"DevToolsActivePort not found: {port_file}\n"
+            f"Make sure Chrome has remote debugging enabled." + extra
+        )
+    with open(port_file) as f:
+        lines = f.read().strip().splitlines()
+    if len(lines) < 2:
+        raise ValueError(
+            f"DevToolsActivePort file is malformed (expected 2 lines, got {len(lines)}): {port_file}"
+        )
+    return f"ws://localhost:{lines[0]}{lines[1]}"
+
+
+def resolve_cdp_input(value: str) -> str:
+    """Resolve a user-supplied CDP value to a WebSocket URL.
+
+    Parameters
+    ----------
+    value:
+        Accepted formats:
+
+        - ``"9222"``                  — local Chrome on port 9222; queries /json/version
+        - ``"ws://..."`` / ``"wss://..."``  — used as-is (raw CDP or Playwright WS protocol)
+        - ``"http://host:port"``       — HTTP discovery; queries /json/version on that host
+        - ``"auto"`` / ``"scan"``      — auto-scan known Chrome/Chromium/Brave profile dirs (+ Canary variants)
+
+    Returns
+    -------
+    str
+        A ``ws://`` or ``wss://`` WebSocket URL ready to pass to ``Browser(cdp_url=...)``.
+
+    Raises
+    ------
+    ValueError
+        Input format is not recognised.
+    RuntimeError
+        ``auto``/``scan`` mode: no running browser with CDP found.
+    ConnectionError
+        Port/HTTP mode: cannot reach Chrome at the specified address.
+    """
+    v = value.strip()
+    # Auto-scan all known local Chrome/Chromium/Brave profile directories
+    # (matches _CDP_SCAN_DIRS, including Canary variants)
+    if v.lower() in ("auto", "scan"):
+        return find_cdp_url(mode="scan")
+    # Direct WebSocket URL — pass through unchanged
+    if v.startswith("ws://") or v.startswith("wss://"):
+        return v
+    # HTTP discovery endpoint — extract host/port and query /json/version
+    if v.startswith("http://") or v.startswith("https://"):
+        parsed = urlparse(v)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 9222
+        return find_cdp_url(mode="port", host=host, port=port)
+    # Bare port number — localhost auto-discover via /json/version
+    if v.isdigit():
+        return find_cdp_url(mode="port", host="localhost", port=int(v))
+    raise ValueError(
+        f"Invalid --cdp value: {v!r}.\n"
+        "Accepted formats:\n"
+        "  9222              — local Chrome on port 9222\n"
+        "  ws://host:port/…  — WebSocket URL (raw CDP or Playwright WS protocol)\n"
+        "  http://host:port  — HTTP discovery endpoint\n"
+        "  auto              — auto-scan local Chrome/Chromium/Brave profiles (+ Canary variants)"
+    )
 
 _LAUNCH_DEBUG_LOG = str(BRIDGIC_TMP_DIR / "launch-debug.json")
 
@@ -399,7 +661,7 @@ class Browser:
         - device_scale_factor, is_mobile, has_touch: Device emulation
         - reduced_motion, forced_colors, contrast: Accessibility
         - accept_downloads: Auto-accept downloads
-        - record_har_*, record_video_*: Recording options
+        - record_har_*: HAR recording options
         - base_url, strict_selectors, service_workers: Navigation/selector options
         - client_certificates: TLS client authentication
 
@@ -452,6 +714,8 @@ class Browser:
         clear_user_data: Optional[bool] = None,
         # === Stealth mode (enabled by default for best anti-detection) ===
         stealth: Union[bool, StealthConfig, None] = None,
+        # === CDP connection (connect to an existing Chrome instance) ===
+        cdp_url: Optional[str] = None,
         # === Browser launch parameters (commonly used) ===
         channel: Optional[str] = None,
         executable_path: Optional[Union[str, Path]] = None,
@@ -480,6 +744,25 @@ class Browser:
         # Resolve parameters: explicit (non-None) > config > default.
         # Always pop named-param keys from _cfg so they don't leak into
         # _extra_kwargs (which would corrupt get_config() and Playwright options).
+        cdp_url = cdp_url if cdp_url is not None else _cfg.pop('cdp_url', None)
+        # Normalize cdp_url for *all* sources (config file, explicit ctor arg).
+        # The CLI client and the daemon already run resolve_cdp_input() before
+        # they pass us a value, but a config file like {"cdp_url": "9222"} or
+        # {"cdp_url": "auto"} would otherwise reach Playwright's
+        # connect_over_cdp() unchanged and crash deep in the driver. ws://
+        # and wss:// inputs short-circuit (no extra work, no I/O).
+        if cdp_url is not None and not (
+            isinstance(cdp_url, str)
+            and (cdp_url.startswith("ws://") or cdp_url.startswith("wss://"))
+        ):
+            try:
+                cdp_url = resolve_cdp_input(str(cdp_url))
+            except (RuntimeError, ValueError, ConnectionError) as exc:
+                raise InvalidInputError(
+                    f"Failed to resolve cdp_url={cdp_url!r}: {exc}",
+                    code="INVALID_CDP_URL",
+                    details={"cdp_url": cdp_url, "source": "config_or_argument"},
+                ) from exc
         headless = headless if headless is not None else _cfg.pop('headless', True)
         stealth = stealth if stealth is not None else _cfg.pop('stealth', True)
         viewport = viewport if viewport is not None else _cfg.pop('viewport', None)
@@ -503,11 +786,11 @@ class Browser:
         color_scheme = color_scheme if color_scheme is not None else _cfg.pop('color_scheme', None)
         # Remove any named-param keys that were skipped above (explicit value won)
         for _named_key in (
-            'headless', 'stealth', 'viewport', 'user_data_dir', 'clear_user_data', 'channel',
-            'executable_path', 'proxy', 'timeout', 'slow_mo', 'args',
-            'ignore_default_args', 'downloads_path', 'devtools', 'user_agent',
-            'locale', 'timezone_id', 'ignore_https_errors', 'extra_http_headers',
-            'offline', 'color_scheme',
+            'cdp_url', 'headless', 'stealth', 'viewport', 'user_data_dir',
+            'clear_user_data', 'channel', 'executable_path', 'proxy', 'timeout',
+            'slow_mo', 'args', 'ignore_default_args', 'downloads_path', 'devtools',
+            'user_agent', 'locale', 'timezone_id', 'ignore_https_errors',
+            'extra_http_headers', 'offline', 'color_scheme',
         ):
             _cfg.pop(_named_key, None)
 
@@ -540,7 +823,7 @@ class Browser:
         # Stealth configuration
         self._stealth_config: Optional[StealthConfig] = None
         self._stealth_builder: Optional[StealthArgsBuilder] = None
-        self._temp_video_dir: Optional[str] = None  # For auto-created video dir
+
         self._preallocated_trace_path: Optional[str] = None
         self._close_session_dir: Optional[str] = None
 
@@ -559,6 +842,17 @@ class Browser:
 
         if self._stealth_config and self._stealth_config.enabled:
             self._stealth_builder = StealthArgsBuilder(self._stealth_config)
+
+        # CDP connection URL (if set, connect_over_cdp() is used instead of launch)
+        self._cdp_url = cdp_url
+        # Whether bridgic created the CDP context (vs borrowing an existing one).
+        # When True, close() will close the context; when False it only disconnects.
+        self._cdp_context_owned = False
+        # Pages bridgic explicitly created inside the (possibly borrowed) CDP
+        # context.  close() uses this to clean up bridgic's own tabs without
+        # touching the user's existing tabs.  Unused in non-CDP modes (kept
+        # empty as a defensive default).
+        self._cdp_owned_pages: Set[Any] = set()
 
         # Browser launch parameters
         self._channel = channel
@@ -612,10 +906,15 @@ class Browser:
         # Context-scoped state (keyed by _get_context_key)
         self._tracing_state: Dict[str, bool] = {}
         self._video_state: Dict[str, bool] = {}
-        # Deferred video save requests from stop_video(): context_key → target filename.
-        # None means save to the Playwright temp path (stop_video called without filename).
-        # Key absent means stop_video was not called for this context.
-        self._pending_video_save_path: Dict[str, Optional[str]] = {}
+        # Multi-page CDP screencast video recording state.
+        # Mirrors Playwright CLI behaviour (packages/playwright-core/src/tools/
+        # backend/context.ts — ``startVideoRecording`` / ``stopVideoRecording``):
+        # one ``start_video`` call records EVERY page in the context, including
+        # pages opened after start, each to its own .webm file.
+        self._video_recorders: Dict[Any, "_video_recorder_mod.VideoRecorder"] = {}
+        # When a recording session is active, holds {"width", "height",
+        # "context", "page_listener"}.  None means no active session.
+        self._video_session: Optional[Dict[str, Any]] = None
 
     # ==================== Properties ====================
 
@@ -624,9 +923,14 @@ class Browser:
         """Whether to use persistent context mode (unrelated to headless/headed mode).
 
         Priority (highest to lowest):
+        - cdp_url is set        → always False (connect to existing browser)
         - clear_user_data=True  → always False (fresh launch+new_context, user_data_dir ignored)
         - clear_user_data=False → always True (persistent; user_data_dir if set, else default dir)
         """
+        # CDP mode: connect to existing browser, never use persistent context
+        if self._cdp_url is not None:
+            return False
+
         return not self._clear_user_data
 
     @property
@@ -683,6 +987,47 @@ class Browser:
         """Browser distribution channel."""
         return self._channel
 
+    @property
+    def last_close_artifacts(self) -> Dict[str, List[str]]:
+        """Trace and video paths produced by the most recent ``close()`` call.
+
+        Returns
+        -------
+        Dict[str, List[str]]
+            ``{"trace": [...], "video": [...]}``. The lists are empty
+            when ``close()`` ran but produced no artifacts, and also
+            when ``close()`` has never been called on this instance.
+
+        Notes
+        -----
+        Returns a fresh shallow copy on every access — mutating the
+        returned dict (or its inner lists) does not affect the
+        browser's internal state, and a subsequent ``close()`` will
+        not clobber the copy you already hold.
+        """
+        src = self._last_shutdown_artifacts or {}
+        return {
+            "trace": list(src.get("trace", [])),
+            "video": list(src.get("video", [])),
+        }
+
+    @property
+    def last_close_errors(self) -> List[str]:
+        """Warnings/errors collected during the most recent ``close()`` call.
+
+        Returns
+        -------
+        List[str]
+            One entry per cleanup step that raised. Empty when
+            ``close()`` succeeded cleanly or has never been called.
+
+        Notes
+        -----
+        Returns a fresh copy on every access; mutating it does not
+        affect the browser's internal state.
+        """
+        return list(self._last_shutdown_errors or [])
+
     def get_config(self) -> Dict[str, Any]:
         """Get all current browser configuration.
 
@@ -714,6 +1059,7 @@ class Browser:
             "extra_http_headers": self._extra_http_headers,
             "offline": self._offline,
             "color_scheme": self._color_scheme,
+            "cdp_url": self._cdp_url,
             "use_persistent_context": self.use_persistent_context,
             **self._extra_kwargs,
         }
@@ -839,9 +1185,13 @@ class Browser:
             options["devtools"] = self._devtools
         if self._proxy is not None:
             options["proxy"] = self._proxy
-        # NOTE: Don't pass downloads_path to Playwright - DownloadManager handles it
-        # Passing downloads_path to Playwright causes files to be saved with hash names
-        # Our DownloadManager uses download.save_as() to save with correct filenames
+        # NOTE: We intentionally do NOT pass downloads_path to Playwright.
+        # Playwright uses CDP `Browser.setDownloadBehavior(allowAndName)` to
+        # intercept all downloads, which breaks Chrome's native download UI
+        # (e.g. "Show in Folder" does nothing).  This is a known Chromium bug:
+        # https://issues.chromium.org/issues/324282051
+        # Instead, DownloadManager uses download.save_as() to copy files with
+        # correct filenames to the user's downloads_path.
         if self._slow_mo is not None:
             options["slow_mo"] = self._slow_mo
 
@@ -911,20 +1261,11 @@ class Browser:
             "accept_downloads", "base_url", "strict_selectors", "service_workers",
             "record_har_path", "record_har_omit_content", "record_har_url_filter",
             "record_har_mode", "record_har_content",
-            "record_video_dir", "record_video_size",
             "client_certificates"
         }
         for key in context_keys:
             if key in self._extra_kwargs:
                 options[key] = self._extra_kwargs[key]
-
-        # Auto-create a default video dir so video recording is always available
-        if "record_video_dir" not in options:
-            if not self._temp_video_dir:
-                self._temp_video_dir = str(BRIDGIC_TMP_DIR)
-                os.makedirs(self._temp_video_dir, exist_ok=True)
-                logger.info(f"Using default video dir: {self._temp_video_dir}")
-            options["record_video_dir"] = self._temp_video_dir
 
         return options
 
@@ -978,7 +1319,63 @@ class Browser:
         try:
             self._playwright = await async_playwright().start()
 
-            if self.use_persistent_context:
+            if self._cdp_url:
+                # Mode 0: Connect to an already-running Chrome via raw CDP.
+                # Stealth launch args and extensions cannot be applied to an existing
+                # browser process, so they are skipped here.  The JS init script is
+                # still registered so that new pages opened in this session receive it.
+                logger.info("Using CDP connect mode (url=%s)", self._cdp_url)
+                self._browser = await self._playwright.chromium.connect_over_cdp(self._cdp_url)
+                # Playwright invariant for connect_over_cdp() (verified
+                # against playwright-core 1.57):
+                #   chromium.ts _connectOverCDPImpl always passes
+                #   persistent={noDefaultViewport: true}, so
+                #   crBrowser.ts:_connect skips the early `if (!options.persistent)`
+                #   branch and creates `_defaultContext`. The Node-side
+                #   browserDispatcher then dispatches it as a `context`
+                #   event, which the Python client appends to
+                #   `Browser._contexts`.
+                # Net effect: ``self._browser.contexts`` is never empty
+                # in current Playwright versions. The else branch below
+                # is a defensive fallback in case this invariant ever
+                # changes upstream.
+                if self._browser.contexts:
+                    self._context = self._browser.contexts[0]
+                    self._cdp_context_owned = False
+                else:
+                    self._context = await self._browser.new_context(**self._get_context_options())
+                    self._cdp_context_owned = True
+
+                # Inject JS stealth patches only in headless mode.  Headed mode
+                # skips the script to avoid breaking Cloudflare Turnstile (same
+                # rationale as the non-CDP code path below).
+                if self._stealth_builder and self._headless:
+                    init_script = self._stealth_builder.get_init_script(locale=self._locale)
+                    if init_script:
+                        await self._context.add_init_script(init_script)
+
+                # Always create a new bridgic-owned tab.  We never reuse a
+                # borrowed user tab — the very next navigate_to() would
+                # otherwise overwrite whatever the user was looking at.
+                # In owned-context mode the new context is empty anyway, so
+                # this is a no-op cost.
+                existing_count = len(self._context.pages)
+                self._page = await self._context.new_page()
+                self._cdp_owned_pages.add(self._page)
+                logger.info(
+                    "[CDP] connected; created new bridgic tab "
+                    "(borrowed_context=%s, preserved_existing_tabs=%d)",
+                    not self._cdp_context_owned,
+                    existing_count,
+                )
+
+                if self._download_manager:
+                    self._download_manager.attach_to_context(self._context)
+
+                logger.info("Playwright started (mode=cdp, stealth_js=%s)", self.stealth_enabled)
+                return
+
+            elif self.use_persistent_context:
                 # Mode 1: Persistent context (clear_user_data=False)
                 logger.info("Using persistent context mode")
                 persistent_options = self._get_persistent_context_options()
@@ -1063,8 +1460,6 @@ class Browser:
     # shutdown so that a hung beforeunload handler cannot block forever.
     _PAGE_CLOSE_TIMEOUT = 5.0
     _TRACE_STOP_TIMEOUT = 10.0
-    _VIDEO_PATH_TIMEOUT = 10.0
-    _VIDEO_SAVE_AS_TIMEOUT = 120.0  # save_as copies a file; large recordings need more time
     _CONTEXT_CLOSE_TIMEOUT = 15.0
     _BROWSER_CLOSE_TIMEOUT = 15.0
     _PLAYWRIGHT_STOP_TIMEOUT = 15.0
@@ -1193,21 +1588,21 @@ class Browser:
         Returns
         -------
         Dict with keys:
-          session_dir : str         — unique per-close directory under BRIDGIC_TMP_DIR
+          session_dir : str         — unique per-close directory under
+                                      BRIDGIC_TMP_DIR, or "" when no
+                                      artifact will be produced
           trace       : List[str]   — pre-created trace path (if tracing is active)
           video       : List[str]   — pre-allocated video paths in session dir
+
+        Notes
+        -----
+        We deliberately skip creating the session directory when no
+        tracing/video session is active. Otherwise every SDK ``close()``
+        call would leak an empty ``close-<ts>-<rand>`` directory under
+        ``BRIDGIC_TMP_DIR``, which previously accumulated indefinitely.
         """
-        import random
-        from datetime import datetime
-
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        session_name = f"close-{ts}-{random.randint(0, 0xffff):04x}"
-        session_dir = Path(str(BRIDGIC_TMP_DIR)) / session_name
-        session_dir.mkdir(parents=True, exist_ok=True)
-        self._close_session_dir = str(session_dir)
-
         artifacts: Dict[str, Any] = {
-            "session_dir": str(session_dir),
+            "session_dir": "",
             "trace": [],
             "video": [],
         }
@@ -1217,33 +1612,37 @@ class Browser:
 
         context_key = _get_context_key(self._context)
 
+        tracing_active = bool(self._tracing_state.get(context_key))
+        video_count = len(self._video_recorders)
+        if not tracing_active and video_count == 0:
+            # Nothing to write — don't create a directory.
+            return artifacts
+
+        import random
+        from datetime import datetime
+
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        session_name = f"close-{ts}-{random.randint(0, 0xffff):04x}"
+        session_dir = Path(str(BRIDGIC_TMP_DIR)) / session_name
+        session_dir.mkdir(parents=True, exist_ok=True)
+        self._close_session_dir = str(session_dir)
+        artifacts["session_dir"] = str(session_dir)
+
         # Pre-allocate trace path inside session dir
-        if self._tracing_state.get(context_key):
+        if tracing_active:
             trace_path = str(session_dir / "trace.zip")
             Path(trace_path).touch()          # create empty file; tracing.stop() will overwrite
             self._preallocated_trace_path = trace_path
             artifacts["trace"].append(trace_path)
 
-        # Determine video artifact info
-        _absent: Any = object()
-        pending_raw = self._pending_video_save_path.get(context_key, _absent)
-        has_pending = pending_raw is not _absent
-
-        if self._video_state.get(context_key) or has_pending:
-            if has_pending and pending_raw:
-                artifacts["video"].append(os.path.abspath(str(pending_raw)))
+        # Pre-allocate one video path per active recorder.  Multi-page
+        # recording produces N files: video.webm, video-1.webm, ...
+        for i in range(video_count):
+            if i == 0:
+                video_path = str(session_dir / "video.webm")
             else:
-                # Pre-allocate video paths inside session dir so all artifacts
-                # are grouped together instead of scattered in tmp/ with hashes.
-                pages_with_video = [
-                    p for p in list(self._context.pages)
-                    if getattr(p, "video", None) is not None
-                ]
-                need_suffix = len(pages_with_video) > 1
-                for i in range(len(pages_with_video)):
-                    suffix = f"_{i + 1}" if need_suffix else ""
-                    video_path = str(session_dir / f"video{suffix}.webm")
-                    artifacts["video"].append(video_path)
+                video_path = str(session_dir / f"video-{i}.webm")
+            artifacts["video"].append(video_path)
 
         return artifacts
 
@@ -1255,6 +1654,11 @@ class Browser:
         dialog handlers) — no need to call ``stop_*`` / ``remove_*`` methods
         beforehand. Active tracing/video sessions are auto-finalized and their
         paths included in the result.
+
+        **CDP mode**: only disconnects the Playwright session from the remote
+        browser — pages, tabs, and borrowed contexts are left intact.  A
+        context created by bridgic (when ``connect_over_cdp`` returned no
+        existing contexts) is closed normally.
 
         Safe to call even when the browser was never started — returns
         ``"Browser closed."`` immediately without raising.
@@ -1283,6 +1687,10 @@ class Browser:
         # the very end.  This ensures no Playwright/Chromium process is left orphaned
         # just because one step was interrupted.
         _pending_cancel: Optional[BaseException] = None
+        _is_cdp = self._cdp_url is not None
+        # True when we are a guest on someone else's browser — must not
+        # close pages, navigate, or destroy the borrowed context.
+        _cdp_borrowed = _is_cdp and not self._cdp_context_owned
 
         # Auto-stop active tracing before context/page teardown so trace data is saved.
         if self._context:
@@ -1334,101 +1742,60 @@ class Browser:
                 finally:
                     self._tracing_state[context_key] = False
 
+            # Stop every active CDP screencast recorder (one per page).
+            # Mirrors Playwright CLI's context.ts ``dispose()`` →
+            # ``stopVideoRecording()``: when the context closes, every
+            # per-page recorder is finalized.
+            #
+            # Why we snapshot the dict before awaiting:
+            #   stop_video() and close() can race in the daemon flow. We
+            #   clear the dict first so the other path observes "no work
+            #   left" and skips the duplicate stop() call.
+            if self._video_recorders or self._video_session is not None:
+                # Detach the context "page" listener so new pages aren't
+                # auto-started during shutdown.
+                if self._video_session:
+                    _listener = self._video_session.get("page_listener")
+                    if _listener is not None:
+                        try:
+                            self._context.remove_listener("page", _listener)
+                        except Exception:
+                            pass
+                _recorders = list(self._video_recorders.items())
+                self._video_recorders.clear()
+                self._video_session = None
+                for _idx, (_page_ref, _recorder) in enumerate(_recorders):
+                    try:
+                        rec_path = await asyncio.wait_for(
+                            _recorder.stop(), timeout=10.0
+                        )
+                        # Move the video file into the close-session dir,
+                        # next to the trace.
+                        if self._close_session_dir:
+                            if _idx == 0:
+                                dest_name = "video.webm"
+                            else:
+                                dest_name = f"video-{_idx}.webm"
+                            dest = os.path.join(self._close_session_dir, dest_name)
+                            self._move_video_local(Path(rec_path), dest)
+                            shutdown_artifacts["video"].append(dest)
+                        else:
+                            shutdown_artifacts["video"].append(rec_path)
+                    except asyncio.TimeoutError:
+                        errors.append("video_recorder.stop: timeout after 10.0s")
+                    except Exception as e:
+                        errors.append(f"video_recorder.stop: {e}")
+                    except BaseException as e:
+                        errors.append(f"video_recorder.stop: {e}")
+                        if _pending_cancel is None:
+                            _pending_cancel = e
+                self._video_state.pop(context_key, None)
+
             # Always clear page-scoped listeners/caches for every context page.
             for page in list(self._context.pages):
                 self._clear_page_scoped_state(page, errors)
-
-            # Navigate all pages to about:blank before video finalization to
-            # terminate service workers and ongoing network activity.  This
-            # prevents context.close() from hanging later.
-            #
-            # Must run BEFORE video finalization because _finalize_video()
-            # calls page.close() for each page — after that the page list is
-            # empty and about:blank would be a no-op.
-            for _nav_page in list(self._context.pages):
-                try:
-                    await asyncio.wait_for(
-                        _nav_page.goto("about:blank", wait_until="commit"),
-                        timeout=self._PAGE_CLOSE_TIMEOUT,
-                    )
-                except Exception as exc:
-                    logger.debug("close: about:blank navigation failed: %s", exc)
-                except BaseException as e:
-                    if _pending_cancel is None:
-                        _pending_cancel = e
-
-            # Save videos when: (a) video_start() was called and never stopped, or
-            # (b) stop_video() deferred the save to close time.
-            # Use a sentinel because pop() returns None both for "absent" and "stored None".
-            _absent: Any = object()
-            pending_save_raw = self._pending_video_save_path.pop(context_key, _absent)
-            has_pending_save = pending_save_raw is not _absent
-            pending_filename: Optional[str] = pending_save_raw if has_pending_save else None  # type: ignore[assignment]
-
-            if self._video_state.get(context_key) or has_pending_save:
-                pages_with_video = [
-                    (p, p.video)
-                    for p in list(self._context.pages)
-                    if getattr(p, "video", None) is not None
-                ]
-
-                need_suffix = len(pages_with_video) > 1
-                dest_dir: Optional[str] = None
-                dest_stem: Optional[str] = None
-                dest_ext = ".webm"
-                if pending_filename:
-                    dest_dir = os.path.dirname(pending_filename)
-                    dest_stem = os.path.splitext(os.path.basename(pending_filename))[0]
-                elif self._close_session_dir:
-                    # No explicit filename — save into session dir so all
-                    # close artifacts are grouped together.
-                    dest_dir = self._close_session_dir
-                    dest_stem = "video"
-
-                async def _finalize_video(page_: Any, video_: Any, idx: int) -> Optional[str]:
-                    await asyncio.wait_for(page_.close(), timeout=self._PAGE_CLOSE_TIMEOUT)
-                    if dest_dir is not None and dest_stem is not None:
-                        suffix = f"_{idx}" if need_suffix else ""
-                        dest = os.path.join(dest_dir, f"{dest_stem}{suffix}{dest_ext}")
-                        await asyncio.wait_for(
-                            video_.save_as(dest),
-                            timeout=self._VIDEO_SAVE_AS_TIMEOUT,
-                        )
-                        return dest
-                    vp = await asyncio.wait_for(
-                        video_.path(),
-                        timeout=self._VIDEO_PATH_TIMEOUT,
-                    )
-                    return os.path.abspath(str(vp))
-
-                results = await asyncio.gather(
-                    *(_finalize_video(p, v, i + 1) for i, (p, v) in enumerate(pages_with_video)),
-                    return_exceptions=True,
-                )
-                for r in results:
-                    if isinstance(r, BaseException):
-                        errors.append(f"video.finalize: {r}")
-                    elif r is not None:
-                        shutdown_artifacts["video"].append(r)
-
-                self._video_state[context_key] = False
-                # We may have closed the current page above.
-                self._page = None
         else:
             self._clear_page_scoped_state(self._page, errors)
-
-        # Close page (with timeout to guard against hung beforeunload handlers)
-        if self._page:
-            _page = self._page
-            self._page = None
-            try:
-                await asyncio.wait_for(
-                    _page.close(), timeout=self._PAGE_CLOSE_TIMEOUT,
-                )
-            except BaseException as e:
-                errors.append(f"page.close: {e}")
-                if not isinstance(e, Exception) and _pending_cancel is None:
-                    _pending_cancel = e
 
         # Detach download manager before context closes to remove handlers
         if self._download_manager and self._context:
@@ -1437,24 +1804,69 @@ class Browser:
             except Exception as e:
                 errors.append(f"download_manager.detach: {e}")
 
-        # Close all remaining pages in context before closing context.
-        # This avoids context.close() hanging on beforeunload handlers of extra
-        # tabs the user may have opened manually (or pages we didn't track).
+        # Close every page in parallel (replaces the old serial
+        # about:blank → close walk).
+        #
+        # Why we no longer navigate to about:blank first:
+        #   The previous code navigated each page to about:blank to stop
+        #   service workers, then closed it. Playwright CLI does not do
+        #   this — it just calls close() directly. ``run_before_unload=
+        #   False`` already aborts in-flight activity, and parallel close
+        #   is much faster than serial about:blank + close.
+        #
+        # Why asyncio.gather:
+        #   Tab closes are independent; serializing them would compound
+        #   the per-page timeout. Reference: Playwright's
+        #   browserContext.ts ``close()`` also closes pages in parallel.
+        #
+        # CDP borrowed context: only close pages bridgic created itself
+        # (``_cdp_owned_pages``); never touch the user's existing tabs.
+        self._page = None
         if self._context:
-            for extra_page in list(self._context.pages):
-                try:
-                    await asyncio.wait_for(
-                        extra_page.close(run_before_unload=False),
-                        timeout=self._PAGE_CLOSE_TIMEOUT,
+            if _cdp_borrowed:
+                # Borrowed CDP context: only close pages bridgic created.
+                # Skip pages already closed by the user (via Chrome UI).
+                owned = [
+                    p for p in self._cdp_owned_pages
+                    if not p.is_closed()
+                ]
+                if owned:
+                    page_results = await asyncio.gather(
+                        *(asyncio.wait_for(
+                            p.close(run_before_unload=False),
+                            timeout=self._PAGE_CLOSE_TIMEOUT,
+                        ) for p in owned),
+                        return_exceptions=True,
                     )
-                except BaseException as e:
-                    if not isinstance(e, Exception) and _pending_cancel is None:
-                        _pending_cancel = e
-                    # best-effort; context.close() will handle remaining pages
+                    for r in page_results:
+                        if isinstance(r, BaseException):
+                            if not isinstance(r, Exception) and _pending_cancel is None:
+                                _pending_cancel = r
+                            elif isinstance(r, Exception):
+                                errors.append(f"cdp_owned_page.close: {r}")
+            else:
+                # Launch / persistent / owned-CDP-context: close all pages.
+                all_pages = list(self._context.pages)
+                if all_pages:
+                    page_results = await asyncio.gather(
+                        *(asyncio.wait_for(
+                            p.close(run_before_unload=False),
+                            timeout=self._PAGE_CLOSE_TIMEOUT,
+                        ) for p in all_pages),
+                        return_exceptions=True,
+                    )
+                    for r in page_results:
+                        if isinstance(r, BaseException):
+                            if not isinstance(r, Exception) and _pending_cancel is None:
+                                _pending_cancel = r
+                            elif isinstance(r, Exception):
+                                errors.append(f"page.close: {r}")
 
         # Close context
         # NOTE: In persistent context mode, closing context will auto close browser
-        if self._context:
+        # CDP mode: only close the context if bridgic created it; borrowed contexts
+        # belong to the remote browser and must not be destroyed.
+        if self._context and not _cdp_borrowed:
             _context = self._context
             self._context = None
             try:
@@ -1479,9 +1891,15 @@ class Browser:
                 errors.append(f"context.close: {e}")
                 if _pending_cancel is None:
                     _pending_cancel = e
+        elif self._context:
+            # CDP borrowed context: release reference without closing
+            self._context = None
 
-        # Close browser (only needed in normal launch mode, not persistent context)
-        # In persistent context mode, browser is None or already closed
+        # Close browser.
+        # - Normal launch mode: closes browser process.
+        # - Persistent context mode: browser is None or already closed via context.
+        # - CDP mode: close() disconnects the Playwright session without killing the
+        #   remote Chrome process (the process continues running after disconnect).
         if self._browser:
             _browser = self._browser
             self._browser = None
@@ -1543,7 +1961,7 @@ class Browser:
         self._dialog_handlers.clear()
         self._tracing_state.clear()
         self._video_state.clear()
-        self._pending_video_save_path.clear()
+        self._cdp_owned_pages.clear()
 
         trace_paths = shutdown_artifacts.get("trace", [])
         video_paths = shutdown_artifacts.get("video", [])
@@ -1651,6 +2069,8 @@ class Browser:
                 # All tabs were closed (e.g. via close_tab); _context is still alive.
                 logger.info("No page is open, creating a new page in existing context")
                 self._page = await self._context.new_page()
+                if self._cdp_url:
+                    self._cdp_owned_pages.add(self._page)
 
             kwargs: Dict[str, Any] = {"wait_until": wait_until}
             if timeout is not None:
@@ -1684,6 +2104,8 @@ class Browser:
                 code="NO_BROWSER_CONTEXT",
             )
         self._page = await self._context.new_page()
+        if self._cdp_url:
+            self._cdp_owned_pages.add(self._page)
         if url:
             await self.navigate_to(url, wait_until=wait_until, timeout=timeout)
         await self._page.bring_to_front()
@@ -1714,8 +2136,26 @@ class Browser:
         return page_descs
 
     def get_pages(self) -> List[Page]:
+        """Return the pages bridgic considers part of its session.
+
+        Launch / persistent / CDP-with-owned-context modes: every page in
+        the context belongs to bridgic, so we return them all.
+
+        CDP borrowed-context mode: bridgic is a guest on the user's real
+        Chrome session.  We must only expose tabs bridgic explicitly
+        created (tracked in ``_cdp_owned_pages``); the user's tabs and
+        any pop-ups they spawn are off-limits — they should not appear
+        in ``get_tabs``, be selectable via ``switch_tab``, become the
+        fallback "current page" after ``close_tab``, or be visible to
+        any of the page-iterating tools.  This invariant is documented
+        in ``docs/CDP_MODE.md``.
+        """
         if not self._context:
             return []
+        if self._cdp_url and not self._cdp_context_owned:
+            # Preserve the underlying tab order so indices stay stable.
+            owned = self._cdp_owned_pages
+            return [p for p in self._context.pages if p in owned]
         return self._context.pages
 
     async def switch_to_page(self, page_id: str) -> tuple[bool, str]:
@@ -1776,11 +2216,42 @@ class Browser:
         if not page:
             logger.warning("Page is None, can't close")
             return False, "Page is None, can't close"
-        await page.close()
 
-        # If the closed page is the current page, switch to another
+        # If the page being closed is currently recording, stop its
+        # recorder first and remove it from the registry. Why: a
+        # VideoRecorder's CDP session is bound to a specific page; once
+        # the page is closed the CDP session is dead and any later
+        # stop()/detach() call would block waiting on a 10 s timeout.
+        # Recorders for other pages stay active — same multi-page
+        # semantics as Playwright CLI.
+        if page in self._video_recorders:
+            _recorder = self._video_recorders.pop(page)
+            try:
+                await asyncio.wait_for(_recorder.stop(), timeout=10.0)
+                logger.debug("[_close_page] auto-stopped video recorder for closing page")
+            except Exception as e:
+                logger.debug("[_close_page] video recorder stop error: %s", e)
+
+        try:
+            await page.close()
+        finally:
+            # Drop our ownership reference now that the close attempt is
+            # done. Without this discard, every CDP-mode new-tab +
+            # close-tab cycle would leak a Page object (frames,
+            # listeners, cached resources) for the lifetime of the
+            # daemon. We discard inside `finally` so a raised
+            # page.close() can't leave a stale reference behind.
+            # discard() is a no-op in launch / persistent /
+            # owned-CDP-context modes where _cdp_owned_pages stays empty.
+            self._cdp_owned_pages.discard(page)
+
+        # If the closed page is the current page, switch to another.
+        # Use the bridgic-visible page list (get_pages) so that in CDP
+        # borrowed mode we never silently land on a user tab — operating
+        # on the user's banking / email page after a close_tab would be
+        # a serious privacy violation.
         if self._page == page:
-            pages = self._context.pages
+            pages = self.get_pages()
             self._page = pages[0] if pages else None
             # Clear snapshot cache
             self._last_snapshot = None
@@ -6450,90 +6921,363 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.error(f"[stop_tracing] {error_msg}")
             _raise_operation_error(error_msg)
 
+    @staticmethod
+    def _allocate_video_temp_path() -> str:
+        """Generate a unique temp .webm path for one page's recording.
+
+        Uses ``tempfile.mkstemp`` (O_EXCL) so the path is guaranteed
+        unique even when many recorders are allocated within the same
+        second — a previous timestamp+random scheme had a non-zero
+        collision risk under burst multi-page start_video() calls.
+        We immediately remove the empty file because ffmpeg insists on
+        creating the output itself.
+        """
+        os.makedirs(BRIDGIC_TMP_DIR, exist_ok=True)
+        fd, path = tempfile.mkstemp(
+            prefix="video_", suffix=".webm", dir=str(BRIDGIC_TMP_DIR)
+        )
+        os.close(fd)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return path
+
+    async def _start_page_video_recorder(self, page: Page) -> None:
+        """Start a VideoRecorder for one page within the active session.
+
+        Idempotent — a no-op if the session is inactive or the page is
+        already being recorded.  Mirrors Playwright CLI's
+        ``Context._startPageVideo`` (``tools/backend/context.ts``).
+
+        In CDP borrowed-context mode, skip pages bridgic does not own
+        (the user's existing tabs and any pop-ups they spawn).  Recording
+        a user's banking / email tab without consent would be a serious
+        privacy violation, and contradicts the tab-ownership invariant
+        documented in ``docs/CDP_MODE.md``.
+        """
+        if self._video_session is None:
+            return
+        if page in self._video_recorders:
+            return
+        if page.is_closed():
+            return
+        # CDP borrowed context: only record bridgic-owned tabs.
+        if self._cdp_url and not self._cdp_context_owned and page not in self._cdp_owned_pages:
+            return
+
+        output_path = self._allocate_video_temp_path()
+        w = int(self._video_session["width"])
+        h = int(self._video_session["height"])
+        recorder = _video_recorder_mod.VideoRecorder(
+            page.context, page, output_path, (w, h),
+        )
+        try:
+            await recorder.start()
+        except Exception as e:
+            logger.warning(
+                "[start_video] failed to start recorder on page %s: %s", page, e,
+            )
+            return
+        self._video_recorders[page] = recorder
+        logger.info("[start_video] recording page → %s", output_path)
+
     async def start_video(
         self,
         width: Optional[int] = None,
         height: Optional[int] = None,
     ) -> str:
-        """Mark the current page's video recording session as active.
+        """Start video recording on ALL pages in the context.
 
-        Video recording is always running — Playwright starts recording as soon
-        as a page is created (using the ``record_video_dir`` set at browser
-        creation, which defaults to ``~/.bridgic/bridgic-browser/tmp``).  This method simply
-        marks the session as "started" so that :meth:`stop_video` can later
-        register where to save the file.
-
-        Use ``stop_video(filename)`` to designate a save path; the actual file
-        is written when the browser closes.
+        Mirrors the Playwright CLI behaviour
+        (``packages/playwright-core/src/tools/backend/context.ts`` —
+        ``startVideoRecording``): a single call records every page in the
+        browser context, and any page opened afterwards is auto-recorded
+        to its own .webm file.  Uses CDP ``Page.startScreencast`` to
+        capture frames and pipes them to ffmpeg for VP8/WebM encoding —
+        no Playwright RPC streaming needed.
 
         Parameters
         ----------
         width : Optional[int], optional
-            Accepted for API compatibility but **not used** — video resolution
-            is determined by ``record_video_size`` passed at ``Browser()``
-            creation time, not here.
+            Video width in pixels. Defaults to the current viewport width
+            (rounded down to an even number). Pass an explicit value to
+            override — e.g. to downscale a 4K viewport.
         height : Optional[int], optional
-            Accepted for API compatibility but **not used** — see ``width``.
+            Video height in pixels. Defaults to the current viewport height
+            (rounded down to an even number).
 
         Returns
         -------
         str
-            "Video recording started".
-
-        Raises
-        ------
-        StateError
-            If no active page is available, or if no video is attached to the
-            current page (should not occur under normal operation).
-        OperationError
-            If an unexpected error occurs.
+            "Video recording started" (plus the number of pages being
+            recorded).
         """
+        logger.info(f"[start_video] start width={width} height={height}")
+
+        # Validation runs BEFORE any state mutation so that "already active" /
+        # "no active page" errors cannot trigger the rollback path below — that
+        # path would otherwise tear down the *previous* successful session.
+        page = await self.get_current_page()
+        if page is None:
+            _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
+
+        context = page.context
+        context_key = _get_context_key(context)
+
+        if self._video_session is not None or self._video_state.get(context_key):
+            _raise_state_error("Video recording already active", code="VIDEO_ALREADY_ACTIVE")
+
+        # Compute the recording size.
+        #
+        # NOTE: this intentionally diverges from Playwright's screencast.ts
+        # ``startScreencast()`` (lines 90-98), which caps the longest side at
+        # 800 px to keep encoder cost low. That cap is the dominant source of
+        # blur for bridgic recordings: with a typical 1280×800 viewport, Chrome
+        # downsamples to 800×500 *inside the browser* before frames ever reach
+        # ffmpeg, so no encoder tuning can recover the lost detail. Bridgic
+        # videos are usually replayed by humans inspecting an LLM session where
+        # legibility wins over a few extra MB of CPU and disk.
+        #
+        # Default policy: record at the page's actual CSS pixel dimensions.
+        # We query ``window.innerWidth/innerHeight`` directly instead of
+        # trusting ``page.viewport_size``:
+        #
+        #   - launch mode with explicit viewport: both agree
+        #   - launch mode without an explicit viewport: both agree
+        #   - CDP attach mode: ``page.viewport_size`` is ``None`` because
+        #     bridgic never called ``setViewportSize`` on the foreign Chrome.
+        #     Falling back to a hard-coded ``800×600`` is almost always wrong:
+        #     the real window is wider (typically 16:9), so Chrome downsamples
+        #     to fit within 800×600 and ffmpeg's ``pad`` filter adds a gray
+        #     strip at the bottom to make up the difference. Querying
+        #     ``window.innerWidth/innerHeight`` returns the true visible area
+        #     for any of the three modes.
+        # ``& ~1``: round down to an even number — VP8 requires even
+        # width and height.
+        viewport_width = 1280
+        viewport_height = 720
         try:
-            logger.info(f"[start_video] start width={width} height={height}")
-
-            page = await self.get_current_page()
-            if page is None:
-                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
-
-            context = page.context
-            context_key = _get_context_key(context)
-
-            if page.video:
-                self._video_state[context_key] = True
-                result = "Video recording started"
-                logger.info(f"[start_video] done {result}")
-                return result
+            dims = await page.evaluate(
+                "() => ({w: window.innerWidth, h: window.innerHeight})"
+            )
+            qw = int(dims.get("w") or 0)
+            qh = int(dims.get("h") or 0)
+            if qw > 0 and qh > 0:
+                viewport_width = qw
+                viewport_height = qh
             else:
-                _raise_state_error("No video recording available for this page", code="NO_ACTIVE_RECORDING")
-        except BridgicBrowserError:
-            raise
+                raise ValueError(f"non-positive dimensions: {dims}")
+        except Exception as exc:
+            # Fall back to viewport_size, then the hard default above. Logged
+            # but non-fatal so a hardened CSP page can still record.
+            logger.warning(
+                "[start_video] could not query window dimensions (%s); "
+                "falling back to page.viewport_size", exc,
+            )
+            vp = page.viewport_size
+            if vp:
+                viewport_width = int(vp["width"]) or viewport_width
+                viewport_height = int(vp["height"]) or viewport_height
+
+        w = (width or viewport_width) & ~1
+        h = (height or viewport_height) & ~1
+
+        # Build the session record up front so _start_page_video_recorder
+        # picks up the parameters. From this point on, any failure must
+        # roll back the partially-set-up session state.
+        self._video_session = {
+            "width": w,
+            "height": h,
+            "context": context,
+            "page_listener": None,
+        }
+        self._video_recorders = {}
+        self._video_state[context_key] = True
+
+        try:
+            # Start a recorder on every existing page.
+            # Mirrors Playwright CLI's context.ts ``startVideoRecording``:
+            #   for (const page of browserContext.pages())
+            #     await this._startPageVideo(page);
+            #
+            # CDP borrowed context: restrict to bridgic-owned pages so we
+            # never record the user's existing tabs.
+            # _start_page_video_recorder double-checks this, but
+            # filtering up front makes intent obvious and avoids spurious
+            # "page start failed" log lines.
+            if self._cdp_url and not self._cdp_context_owned:
+                existing_pages = [
+                    p for p in self._cdp_owned_pages if not p.is_closed()
+                ]
+            else:
+                existing_pages = [p for p in context.pages if not p.is_closed()]
+            for p in existing_pages:
+                try:
+                    await self._start_page_video_recorder(p)
+                except Exception as e:
+                    logger.warning("[start_video] page start failed: %s", e)
+
+            # Subscribe to future pages so newly opened tabs are also
+            # recorded. Mirrors Playwright CLI's context.ts
+            # ``_onPageCreated`` → ``_startPageVideo``. Playwright
+            # Python's context.on("page") calls the handler synchronously
+            # with the new Page, so async work has to be scheduled as a
+            # task.
+            def _on_page_created(new_page: Page) -> None:
+                try:
+                    asyncio.get_running_loop().create_task(
+                        self._start_page_video_recorder(new_page),
+                    )
+                except RuntimeError:
+                    logger.warning(
+                        "[start_video] no running loop to record new page",
+                    )
+
+            context.on("page", _on_page_created)
+            self._video_session["page_listener"] = _on_page_created
+
+            count = len(self._video_recorders)
+            result = f"Video recording started ({count} page{'s' if count != 1 else ''})"
+            logger.info("[start_video] %s", result)
+            return result
         except Exception as e:
+            # Rollback the session state we set up above so future
+            # start_video() calls are not blocked by a phantom session.
+            self._video_session = None
+            for _rec in list(self._video_recorders.values()):
+                try:
+                    await _rec.stop()
+                except Exception:
+                    pass
+            self._video_recorders.clear()
+            self._video_state.pop(context_key, None)
+            if isinstance(e, BridgicBrowserError):
+                raise
             error_msg = f"Failed to start video: {str(e)}"
             logger.error(f"[start_video] {error_msg}")
             _raise_operation_error(error_msg)
 
-    async def stop_video(self, filename: Optional[str] = None) -> str:
-        """Stop video recording.
+    @staticmethod
+    def _resolve_video_dest(filename: str) -> str:
+        """Resolve a user-supplied filename to an absolute path.
 
-        Marks the current recording session as stopped and registers the
-        destination path.  The actual video files are written by Playwright
-        when pages close, so saving is deferred to ``browser_close()`` /
-        ``close_tab()`` — no pages are touched here.
+        Three input shapes are accepted:
+          "demo.webm"   → cwd/demo.webm
+          "./videos/"   → ./videos/video_<timestamp>.webm  (auto-named)
+          "demo"        → cwd/demo.webm  (".webm" suffix auto-added)
+        """
+        if filename.endswith(os.sep) or filename.endswith("/") or os.path.isdir(filename):
+            import time as _time
+            dest_dir = os.path.abspath(filename)
+            resolved = os.path.join(dest_dir, f"video_{_time.strftime('%Y%m%d_%H%M%S')}.webm")
+        else:
+            if not filename.lower().endswith(".webm"):
+                filename = f"{filename}.webm"
+            resolved = os.path.abspath(filename)
+        dest_dir = os.path.dirname(resolved)
+        if dest_dir:
+            os.makedirs(dest_dir, exist_ok=True)
+        return resolved
+
+    @staticmethod
+    def _move_video_local(src: Path, dest: str) -> str:
+        """Move a video file locally (rename, falling back to copy).
+
+        Why we do not use Playwright's ``video.save_as()``:
+          save_as() streams the file across the Node RPC bridge in 1 MB
+          base64 chunks. Large recordings can take tens of seconds or
+          even time out. A local ``os.rename`` is O(1); even when we
+          fall back to copy2 (cross-device move), it is orders of
+          magnitude faster than the RPC stream.
+        """
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        try:
+            os.rename(str(src), dest)
+        except OSError:
+            import shutil
+            shutil.copy2(str(src), dest)
+            try:
+                src.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return os.path.abspath(dest)
+
+    @staticmethod
+    def _resolve_multi_video_dests(
+        filename: Optional[str], count: int,
+    ) -> Optional[List[str]]:
+        """Build N destination paths for ``count`` recorded video files.
+
+        Parameters
+        ----------
+        filename : Optional[str]
+            User-supplied destination.  ``None`` leaves files in temp dir.
+            A directory (``./videos/`` or existing dir) → each file keeps
+            its auto-generated basename inside that dir.
+            A file path (``./out.webm``) → first file uses the exact path,
+            subsequent files get ``-1``, ``-2``, … suffix inserted before
+            the extension.
+        count : int
+            Number of recorded videos.
+
+        Returns
+        -------
+        Optional[List[str]]
+            ``None`` when ``filename`` is ``None`` (keep temp paths),
+            otherwise a list of ``count`` destination paths.
+        """
+        if filename is None:
+            return None
+        if count == 0:
+            return []
+        is_dir = (
+            filename.endswith(os.sep)
+            or filename.endswith("/")
+            or os.path.isdir(filename)
+        )
+        if is_dir:
+            import time as _time
+            dest_dir = os.path.abspath(filename)
+            os.makedirs(dest_dir, exist_ok=True)
+            ts = _time.strftime("%Y%m%d_%H%M%S")
+            out: List[str] = []
+            for i in range(count):
+                name = f"video_{ts}.webm" if i == 0 else f"video_{ts}-{i}.webm"
+                out.append(os.path.join(dest_dir, name))
+            return out
+        # Single-file target: use as base name; append -N for extras.
+        base = filename if filename.lower().endswith(".webm") else f"{filename}.webm"
+        base_abs = os.path.abspath(base)
+        dest_dir = os.path.dirname(base_abs)
+        if dest_dir:
+            os.makedirs(dest_dir, exist_ok=True)
+        stem, ext = os.path.splitext(base_abs)
+        return [base_abs if i == 0 else f"{stem}-{i}{ext}" for i in range(count)]
+
+    async def stop_video(self, filename: Optional[str] = None) -> str:
+        """Stop video recording on all pages and save the files.
+
+        Files are saved immediately — no need to wait for browser close.
+        Mirrors Playwright CLI context.ts ``stopVideoRecording``: returns
+        one .webm file per page that was being recorded.
 
         Parameters
         ----------
         filename : Optional[str], optional
-            Destination path for the video file(s).  Accepts a file path
+            Destination for the video files.  Accepts a file path
             (``./videos/demo.webm``) or a directory (``./videos/``).
             The ``.webm`` extension is added automatically when missing.
-            If not provided, Playwright writes files to the temporary
-            recording directory automatically on page close.
+            When multiple pages are recorded and ``filename`` is a single
+            file path, the first file uses the given name and subsequent
+            files get a ``-1``, ``-2``, … suffix inserted before the
+            extension.  If not provided, the files stay in the temporary
+            directory.
 
         Returns
         -------
         str
-            Confirmation that recording was stopped and where files will be
-            saved (``Video will be saved to: <path> on browser close``).
+            Confirmation with the saved file path(s).
         """
         try:
             logger.info(f"[stop_video] start filename={filename}")
@@ -6542,46 +7286,71 @@ Before you return the element ref, reason about the state and elements for a sen
                 _raise_state_error("No context is open", code="NO_CONTEXT")
             context_key = _get_context_key(self._context)
 
-            if not self._video_state.get(context_key):
-                _raise_state_error("No active video recording. Use video-start first.", code="NO_ACTIVE_RECORDING")
+            if self._video_session is None and not self._video_recorders:
+                _raise_state_error(
+                    "No active video recording. Use video-start first.",
+                    code="NO_ACTIVE_RECORDING",
+                )
 
-            # Resolve destination path now (before any context changes) and
-            # create the directory so the user gets an early error if the path
-            # is invalid.  Actual file writing is deferred to browser close.
-            resolved: Optional[str] = None
-            if filename:
-                if filename.endswith(os.sep) or filename.endswith("/") or os.path.isdir(filename):
-                    import time as _time
-                    dest_dir = os.path.abspath(filename)
-                    resolved = os.path.join(dest_dir, f"video_{_time.strftime('%Y%m%d_%H%M%S')}.webm")
-                else:
-                    if not filename.lower().endswith(".webm"):
-                        filename = f"{filename}.webm"
-                    resolved = os.path.abspath(filename)
-                dest_dir = os.path.dirname(resolved)
-                if dest_dir:
-                    os.makedirs(dest_dir, exist_ok=True)
+            # Detach page-creation listener so stopping recording in
+            # parallel with a tab open doesn't race into a new recorder.
+            if self._video_session is not None:
+                listener = self._video_session.get("page_listener")
+                if listener is not None:
+                    try:
+                        self._context.remove_listener("page", listener)
+                    except Exception:
+                        pass
 
-            # Defer the actual save; no pages are closed or navigated here.
-            self._pending_video_save_path[context_key] = resolved
+            # Snap the recorder dict to a local list first so a concurrent
+            # close() won't also try to stop them.
+            recorders = list(self._video_recorders.items())
+            self._video_recorders = {}
+            self._video_session = None
             self._video_state[context_key] = False
 
-            if resolved:
-                dest_dir_display = os.path.dirname(resolved)
-                stem_display = os.path.splitext(os.path.basename(resolved))[0]
-                result = (
-                    f"Video recording stopped. "
-                    f"Files will be saved to {dest_dir_display}/ "
-                    f"as {stem_display}.webm (single tab) or "
-                    f"{stem_display}_1.webm, {stem_display}_2.webm, ... (multiple tabs) "
-                    f"when browser closes."
-                )
+            if not recorders:
+                return "Video recording stopped (no pages were recorded)"
+
+            # Stop every recorder; preserve order of pages.
+            async def _stop_one(
+                rec: "_video_recorder_mod.VideoRecorder",
+            ) -> Optional[str]:
+                try:
+                    return await rec.stop()
+                except Exception as exc:
+                    logger.warning("[stop_video] recorder stop failed: %s", exc)
+                    return None
+
+            temp_paths: List[Optional[str]] = []
+            for _page_ref, _rec in recorders:
+                temp_paths.append(await _stop_one(_rec))
+            good_paths = [p for p in temp_paths if p]
+
+            if not good_paths:
+                return "Video recording stopped (no files were produced)"
+
+            dests = self._resolve_multi_video_dests(filename, len(good_paths))
+            if dests is None:
+                saved = list(good_paths)
             else:
-                result = (
-                    "Video recording stopped. "
-                    "Files will be auto-saved to the recording directory when browser closes."
-                )
-            logger.info(f"[stop_video] done (deferred) {result}")
+                saved = []
+                for src, dest in zip(good_paths, dests):
+                    try:
+                        self._move_video_local(Path(src), dest)
+                        saved.append(dest)
+                    except Exception as move_err:
+                        logger.error(
+                            "[stop_video] move failed, file stays at: %s (%s)",
+                            src, move_err,
+                        )
+                        saved.append(src)
+
+            if len(saved) == 1:
+                result = f"Video saved to: {saved[0]}"
+            else:
+                result = "Video files saved:\n" + "\n".join(saved)
+            logger.info(f"[stop_video] done: {result}")
             return result
         except BridgicBrowserError:
             raise

@@ -10,9 +10,10 @@ Use this guide when the output should be Python automation code (`bridgic.browse
 4. [Snapshot and Ref Rules](#snapshot-and-ref-rules)
 5. [Frequent SDK Methods](#frequent-sdk-methods)
 6. [Tool Set Builder (for Agent Integration)](#tool-set-builder-for-agent-integration)
-7. [Non-Obvious SDK Behavior](#non-obvious-sdk-behavior)
-8. [SDK Error Handling](#sdk-error-handling)
-9. [When to Load Other References](#when-to-load-other-references)
+7. [CDP Mode (Connect to Existing Browser)](#cdp-mode-connect-to-existing-browser)
+8. [Non-Obvious SDK Behavior](#non-obvious-sdk-behavior)
+9. [SDK Error Handling](#sdk-error-handling)
+10. [When to Load Other References](#when-to-load-other-references)
 
 ## Installation and Imports
 
@@ -122,6 +123,29 @@ builder1 = BrowserToolSetBuilder.for_categories(
 builder2 = BrowserToolSetBuilder.for_tool_names(browser, "verify_url")
 tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 ```
+
+## CDP Mode (Connect to Existing Browser)
+
+To connect to an already-running Chrome instead of launching a new one, pass `cdp_url`:
+
+```python
+browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/...")
+```
+
+Use `resolve_cdp_input()` to convert user-friendly formats (port, URL, `"auto"`) into a WebSocket URL:
+
+```python
+from bridgic.browser import resolve_cdp_input
+
+ws_url = resolve_cdp_input("9222")       # queries localhost:9222/json/version
+ws_url = resolve_cdp_input("auto")       # scans local Chrome/Brave/Edge profiles
+browser = Browser(cdp_url=ws_url)
+```
+
+Notes:
+- Stealth launch args are **not** applied (the Chrome process is already running), but the JS init script is still registered for new pages.
+- `close()` disconnects from the remote browser but does **not** terminate the Chrome process.
+- The daemon auto-reconnects once if the CDP session drops (useful for cloud browser session timeouts).
 
 ## Non-Obvious SDK Behavior
 

@@ -6,7 +6,7 @@ Short reference for the main session and download APIs. For tool lists and selec
 
 | Method / property | Description |
 |------------------|-------------|
-| `Browser(...)` | Constructor. Key args: `headless`, `viewport`, `user_data_dir`, `clear_user_data`, `stealth`, `channel`, `proxy`, `downloads_path`, etc. |
+| `Browser(...)` | Constructor. Key args: `headless`, `viewport`, `user_data_dir`, `clear_user_data`, `stealth`, `cdp_url`, `channel`, `proxy`, `downloads_path`, etc. When `cdp_url` is set, connects to an existing Chrome via CDP (`connect_over_cdp`) instead of launching a new browser. |
 | `await browser._start()` | Launch browser and create context. Called automatically by `navigate_to` / `search` (lazy start); call directly only when you need explicit startup before any navigation. |
 | `await browser.close()` | Stop the browser, auto-cleans active capture listeners. No-op if never started. |
 | `await browser.navigate_to(url, wait_until="domcontentloaded", timeout=None)` | Navigate to URL with optional auto-prefix when missing protocol. `wait_until`: `"domcontentloaded"` (default), `"load"`, `"networkidle"`, or `"commit"`. `timeout` in seconds. |
@@ -26,6 +26,8 @@ Short reference for the main session and download APIs. For tool lists and selec
 | `browser.stealth_enabled` | `bool` — whether stealth mode is active. |
 | `browser.stealth_config` | `StealthConfig` or `None` — current stealth configuration. |
 | `browser.use_persistent_context` | `bool` — `True` when using `launch_persistent_context` (`clear_user_data=False`); `False` when using ephemeral `launch`+`new_context` (`clear_user_data=True`). |
+| `browser.last_close_artifacts` | `dict` — trace and video paths produced by the most recent `close()` call. Shape: `{"trace": [str, ...], "video": [str, ...]}`. Empty lists before the first close, or when no tracing/video was active. Returns a fresh shallow copy on every access — mutating it does not affect the browser's internal state. |
+| `browser.last_close_errors` | `list[str]` — warnings/errors collected during the most recent `close()` call (e.g. trace-stop timeouts, video-finalize failures). Empty list before the first close, or on a clean shutdown. Returns a fresh copy on every access. |
 
 ## DownloadManager
 

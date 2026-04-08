@@ -16,8 +16,10 @@ import json
 import logging
 import os
 import stat
+import tempfile
 from types import SimpleNamespace
-from typing import Any
+from pathlib import Path
+from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -32,6 +34,10 @@ from bridgic.browser.errors import (
 )
 from bridgic.browser.cli._commands import _strip_ref, cli, SectionedGroup
 from bridgic.browser.cli._daemon import (
+    _BROWSER_CLOSED_HINT,
+    _browser_closed_hint,
+    _cdp_reconnect,
+    _resolve_default_downloads_dir,
     _dispatch,
     _handle_connection,
     _handle_open,
@@ -234,6 +240,7 @@ def make_browser() -> MagicMock:
         "trace": [],
         "video": [],
     })
+    b._cdp_url = None  # explicit None so _dispatch treats as local-launch mode
     return b
 
 
@@ -417,15 +424,73 @@ class TestCliCommandRouting:
 
     def test_open(self):
         _, sc = invoke(["open", "https://example.com"])
-        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=False, clear_user_data=False)
+        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=False, clear_user_data=False, cdp_url=None)
 
     def test_open_headed(self):
         _, sc = invoke(["open", "--headed", "https://example.com"])
-        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=True, clear_user_data=False)
+        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=True, clear_user_data=False, cdp_url=None)
 
     def test_open_clear_user_data(self):
         _, sc = invoke(["open", "--clear-user-data", "https://example.com"])
-        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=False, clear_user_data=True)
+        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=False, clear_user_data=True, cdp_url=None)
+
+    def test_open_cdp_ws_url_passthrough(self):
+        """--cdp ws://... passes through without resolution."""
+        with patch("bridgic.browser.session._browser.find_cdp_url") as mock_find:
+            _, sc = invoke(["open", "--cdp", "ws://localhost:9222/devtools/browser/abc", "https://example.com"])
+        mock_find.assert_not_called()
+        sc.assert_called_once_with(
+            "open", {"url": "https://example.com"},
+            headed=False, clear_user_data=False, cdp_url="ws://localhost:9222/devtools/browser/abc",
+        )
+
+    def test_open_cdp_port_number(self):
+        """--cdp 9222 calls find_cdp_url(mode='port', host='localhost', port=9222)."""
+        with patch("bridgic.browser.session._browser.find_cdp_url", return_value="ws://localhost:9222/devtools/browser/xyz") as mock_find:
+            _, sc = invoke(["open", "--cdp", "9222", "https://example.com"])
+        mock_find.assert_called_once_with(mode="port", host="localhost", port=9222)
+        sc.assert_called_once_with(
+            "open", {"url": "https://example.com"},
+            headed=False, clear_user_data=False, cdp_url="ws://localhost:9222/devtools/browser/xyz",
+        )
+
+    def test_open_cdp_http_url(self):
+        """--cdp http://host:port calls find_cdp_url(mode='port', host=..., port=...)."""
+        with patch("bridgic.browser.session._browser.find_cdp_url", return_value="ws://1.2.3.4:9222/devtools/browser/xyz") as mock_find:
+            _, sc = invoke(["open", "--cdp", "http://1.2.3.4:9222", "https://example.com"])
+        mock_find.assert_called_once_with(mode="port", host="1.2.3.4", port=9222)
+        sc.assert_called_once_with(
+            "open", {"url": "https://example.com"},
+            headed=False, clear_user_data=False, cdp_url="ws://1.2.3.4:9222/devtools/browser/xyz",
+        )
+
+    def test_open_cdp_auto(self):
+        """--cdp auto calls find_cdp_url(mode='scan')."""
+        with patch("bridgic.browser.session._browser.find_cdp_url", return_value="ws://localhost:57234/devtools/browser/auto") as mock_find:
+            _, sc = invoke(["open", "--cdp", "auto", "https://example.com"])
+        mock_find.assert_called_once_with(mode="scan")
+        sc.assert_called_once_with(
+            "open", {"url": "https://example.com"},
+            headed=False, clear_user_data=False, cdp_url="ws://localhost:57234/devtools/browser/auto",
+        )
+
+    def test_open_cdp_wss_url_passthrough(self):
+        """--cdp wss://... passes through unchanged (cloud services like Browserless, Steel.dev)."""
+        wss_url = "wss://production.browserless.io/chromium/playwright?token=abc123"
+        with patch("bridgic.browser.session._browser.find_cdp_url") as mock_find:
+            _, sc = invoke(["open", "--cdp", wss_url, "https://example.com"])
+        mock_find.assert_not_called()
+        sc.assert_called_once_with(
+            "open", {"url": "https://example.com"},
+            headed=False, clear_user_data=False, cdp_url=wss_url,
+        )
+
+    def test_open_cdp_invalid_format_shows_error(self):
+        """--cdp with unrecognized format prints an error and does NOT call send_command."""
+        result, sc = invoke(["open", "--cdp", "not-a-valid-cdp", "https://example.com"])
+        sc.assert_not_called()
+        assert result.exit_code == 1  # _err() calls sys.exit(1)
+        assert "Invalid --cdp value" in result.output
 
     def test_back(self):
         _, sc = invoke(["back"])
@@ -2239,3 +2304,599 @@ class TestTransport:
         result = t.inject_auth(req)
         assert result == req
         assert "_token" not in result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# resolve_cdp_input unit tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestResolveCdpInput:
+    """Direct unit tests for resolve_cdp_input() — all branches."""
+
+    def test_port_number_calls_find_cdp_url(self, monkeypatch):
+        monkeypatch.setattr(
+            "bridgic.browser.session._browser.find_cdp_url",
+            lambda mode, host, port: f"ws://{host}:{port}/fake",
+        )
+        from bridgic.browser.session._browser import resolve_cdp_input
+        assert resolve_cdp_input("9222") == "ws://localhost:9222/fake"
+
+    def test_ws_passthrough(self):
+        from bridgic.browser.session._browser import resolve_cdp_input
+        url = "ws://localhost:9222/devtools/browser/abc123"
+        assert resolve_cdp_input(url) == url
+
+    def test_wss_passthrough(self):
+        from bridgic.browser.session._browser import resolve_cdp_input
+        url = "wss://production.browserless.io/chromium/playwright?token=xyz"
+        assert resolve_cdp_input(url) == url
+
+    def test_http_url_calls_find_cdp_url(self, monkeypatch):
+        monkeypatch.setattr(
+            "bridgic.browser.session._browser.find_cdp_url",
+            lambda mode, host, port: f"ws://{host}:{port}/fake",
+        )
+        from bridgic.browser.session._browser import resolve_cdp_input
+        assert resolve_cdp_input("http://remote.host:9222") == "ws://remote.host:9222/fake"
+
+    def test_auto_calls_scan(self, monkeypatch):
+        monkeypatch.setattr(
+            "bridgic.browser.session._browser.find_cdp_url",
+            lambda mode: "ws://localhost:54321/fake",
+        )
+        from bridgic.browser.session._browser import resolve_cdp_input
+        assert resolve_cdp_input("auto") == "ws://localhost:54321/fake"
+
+    def test_scan_alias_calls_scan(self, monkeypatch):
+        monkeypatch.setattr(
+            "bridgic.browser.session._browser.find_cdp_url",
+            lambda mode: "ws://localhost:54321/fake",
+        )
+        from bridgic.browser.session._browser import resolve_cdp_input
+        assert resolve_cdp_input("scan") == "ws://localhost:54321/fake"
+
+    def test_invalid_raises_value_error(self):
+        from bridgic.browser.session._browser import resolve_cdp_input
+        with pytest.raises(ValueError, match="Invalid --cdp value"):
+            resolve_cdp_input("not-a-valid-input")
+
+    def test_whitespace_stripped(self, monkeypatch):
+        monkeypatch.setattr(
+            "bridgic.browser.session._browser.find_cdp_url",
+            lambda mode, host, port: f"ws://{host}:{port}/fake",
+        )
+        from bridgic.browser.session._browser import resolve_cdp_input
+        assert resolve_cdp_input("  9222  ") == "ws://localhost:9222/fake"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# find_cdp_url() unit tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestFindCdpUrl:
+    """Direct unit tests for find_cdp_url() — all branches, all mocked."""
+
+    def test_service_mode_returns_ws_endpoint(self):
+        from bridgic.browser import find_cdp_url
+        url = "wss://my-cloud-service.io/browser?token=abc"
+        assert find_cdp_url(mode="service", ws_endpoint=url) == url
+
+    def test_service_mode_no_endpoint_raises_value_error(self):
+        from bridgic.browser import find_cdp_url
+        with pytest.raises(ValueError, match="ws_endpoint is required"):
+            find_cdp_url(mode="service")
+
+    def _make_loopback_opener_patch(self, mock_resp):
+        """Return a patch context manager for urllib.request.build_opener that
+        returns an opener whose .open() returns mock_resp. Used for loopback
+        host tests because find_cdp_url() bypasses the system proxy via
+        ProxyHandler({}) on loopback hosts."""
+        opener = MagicMock()
+        opener.open = MagicMock(return_value=mock_resp)
+        return patch("urllib.request.build_opener", return_value=opener), opener
+
+    def test_port_mode_returns_ws_url(self):
+        from bridgic.browser import find_cdp_url
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"webSocketDebuggerUrl": "ws://localhost:9222/devtools/browser/abc"}'
+        patch_ctx, _ = self._make_loopback_opener_patch(mock_resp)
+        with patch_ctx:
+            url = find_cdp_url(mode="port", port=9222)
+        assert url == "ws://localhost:9222/devtools/browser/abc"
+
+    def test_port_remote_host_replaces_localhost(self):
+        from bridgic.browser import find_cdp_url
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"webSocketDebuggerUrl": "ws://localhost:9222/devtools/browser/abc"}'
+        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
+            url = find_cdp_url(mode="port", host="192.168.1.100", port=9222)
+        assert url == "ws://192.168.1.100:9222/devtools/browser/abc"
+        mock_open.assert_called_once_with("http://192.168.1.100:9222/json/version", timeout=5)
+
+    def test_port_localhost_uppercase_keeps_localhost(self):
+        """host='LOCALHOST' must be normalized to lowercase 'localhost' so the
+        ws_url is not rewritten with a misleading uppercase host. Regression
+        guard for L2."""
+        from bridgic.browser import find_cdp_url
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"webSocketDebuggerUrl": "ws://localhost:9222/devtools/browser/abc"}'
+        patch_ctx, _ = self._make_loopback_opener_patch(mock_resp)
+        with patch_ctx:
+            url = find_cdp_url(mode="port", host="LOCALHOST", port=9222)
+        # Must NOT contain uppercase LOCALHOST in the result.
+        assert url == "ws://localhost:9222/devtools/browser/abc"
+
+    def test_port_chrome_not_running_raises_connection_error(self):
+        import urllib.error
+        from bridgic.browser import find_cdp_url
+        # Loopback path: patch build_opener so .open() raises URLError.
+        opener = MagicMock()
+        opener.open = MagicMock(side_effect=urllib.error.URLError("Connection refused"))
+        with patch("urllib.request.build_opener", return_value=opener):
+            with pytest.raises(ConnectionError, match="--remote-debugging-port=9222"):
+                find_cdp_url(mode="port", port=9222)
+
+    def test_port_invalid_json_raises_value_error(self):
+        from bridgic.browser import find_cdp_url
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'hey'
+        patch_ctx, _ = self._make_loopback_opener_patch(mock_resp)
+        with patch_ctx:
+            with pytest.raises(ValueError, match="Failed to parse /json/version response"):
+                find_cdp_url(mode="port", port=9222)
+
+    def test_port_missing_key_raises_value_error(self):
+        from bridgic.browser import find_cdp_url
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"Browser": "Chrome/124"}'
+        patch_ctx, _ = self._make_loopback_opener_patch(mock_resp)
+        with patch_ctx:
+            with pytest.raises(ValueError, match="Failed to parse /json/version response"):
+                find_cdp_url(mode="port", port=9222)
+
+    def test_port_urlopen_uses_timeout_5(self):
+        from bridgic.browser import find_cdp_url
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"webSocketDebuggerUrl": "ws://localhost:9222/fake"}'
+        # Loopback path uses build_opener(...).open(url, timeout=5).
+        patch_ctx, opener = self._make_loopback_opener_patch(mock_resp)
+        with patch_ctx:
+            find_cdp_url(mode="port", port=9222)
+        _, kwargs = opener.open.call_args
+        assert kwargs.get("timeout") == 5
+
+    def test_scan_mode_returns_url_from_file(self):
+        from bridgic.browser import find_cdp_url
+        fake_url = "ws://localhost:9222/devtools/browser/chrome-uuid"
+        with patch("bridgic.browser.session._browser._read_devtools_active_port", return_value=fake_url):
+            url = find_cdp_url(mode="scan")
+        assert url == fake_url
+
+    def test_scan_mode_returns_first_active(self):
+        from bridgic.browser import find_cdp_url
+        chrome_url = "ws://localhost:9222/devtools/browser/chrome-uuid"
+
+        def fake_read(base):
+            if "Chrome" in base and "Canary" not in base and "Beta" not in base:
+                return chrome_url
+            return None
+
+        with patch("bridgic.browser.session._browser._read_devtools_active_port", side_effect=fake_read):
+            result = find_cdp_url(mode="scan")
+        assert result == chrome_url
+
+    def test_scan_mode_no_profiles_raises_runtime_error(self):
+        from bridgic.browser import find_cdp_url
+        with patch("bridgic.browser.session._browser._read_devtools_active_port", return_value=None):
+            with pytest.raises(RuntimeError, match="--remote-debugging-port=9222"):
+                find_cdp_url(mode="scan")
+
+    def test_scan_mode_unsupported_platform_raises_runtime_error(self):
+        from bridgic.browser import find_cdp_url
+        with patch("sys.platform", "freebsd"):
+            with pytest.raises(RuntimeError, match="not supported on platform"):
+                find_cdp_url(mode="scan")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _read_devtools_active_port() unit tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestReadDevToolsActivePort:
+    """Unit tests for _read_devtools_active_port() using tempfile."""
+
+    def _fn(self):
+        from bridgic.browser.session._browser import _read_devtools_active_port
+        return _read_devtools_active_port
+
+    def test_valid_file_returns_ws_url(self):
+        fn = self._fn()
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "DevToolsActivePort"), "w").write("9222\n/devtools/browser/abc123\n")
+            result = fn(d)
+        assert result == "ws://localhost:9222/devtools/browser/abc123"
+
+    def test_missing_file_returns_none(self):
+        fn = self._fn()
+        result = fn("/tmp/nonexistent-bridgic-profile-xyz-abc")
+        assert result is None
+
+    def test_single_line_file_returns_none(self):
+        fn = self._fn()
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "DevToolsActivePort"), "w") as f:
+                f.write("9222\n")
+            result = fn(d)
+        assert result is None
+
+    def test_no_read_permission_returns_none(self):
+        fn = self._fn()
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "DevToolsActivePort")
+            with open(p, "w") as f:
+                f.write("9222\n/devtools/browser/abc\n")
+            os.chmod(p, 0o000)
+            try:
+                result = fn(d)
+            finally:
+                os.chmod(p, 0o644)
+        assert result is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _browser_closed_hint() unit tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBrowserClosedHint:
+    """Unit tests for _browser_closed_hint()."""
+
+    def test_no_cdp_returns_default_hint(self):
+        assert _browser_closed_hint(None) == _BROWSER_CLOSED_HINT
+        assert _browser_closed_hint() == _BROWSER_CLOSED_HINT
+
+    @pytest.mark.parametrize("host,url_host", [
+        ("localhost", "localhost"),
+        ("127.0.0.1", "127.0.0.1"),
+        ("::1", "[::1]"),
+    ])
+    def test_local_host_shows_port_only(self, host, url_host):
+        url = f"ws://{url_host}:9222/devtools/browser/some-uuid"
+        msg = _browser_closed_hint(url)
+        assert "9222" in msg
+        assert "some-uuid" not in msg
+        assert "Local Chrome" in msg
+        assert "bridgic-browser close" in msg
+
+    def test_remote_host_exposes_full_url(self):
+        url = "wss://my-cloud.io/browser?token=secret123"
+        msg = _browser_closed_hint(url)
+        assert url in msg
+        assert "Remote browser session" in msg
+        assert "bridgic-browser close" in msg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# find_cdp_url() — invalid mode
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestFindCdpUrlInvalidMode:
+    def test_invalid_mode_raises_value_error(self):
+        from bridgic.browser import find_cdp_url
+        with pytest.raises(ValueError, match="Unknown mode"):
+            find_cdp_url(mode="bogus")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _cdp_reconnect() unit tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCdpReconnect:
+    """Unit tests for _cdp_reconnect() using AsyncMock."""
+
+    async def test_close_and_start_succeed_returns_true(self):
+        browser = MagicMock()
+        browser.close = AsyncMock()
+        browser._start = AsyncMock()
+        result = await _cdp_reconnect(browser)
+        assert result is True
+        browser.close.assert_awaited_once()
+        browser._start.assert_awaited_once()
+
+    async def test_close_raises_ignored_start_called_returns_true(self):
+        browser = MagicMock()
+        browser.close = AsyncMock(side_effect=RuntimeError("already closed"))
+        browser._start = AsyncMock()
+        result = await _cdp_reconnect(browser)
+        assert result is True
+        browser._start.assert_awaited_once()
+
+    async def test_start_fails_returns_false(self):
+        browser = MagicMock()
+        browser.close = AsyncMock()
+        browser._start = AsyncMock(side_effect=ConnectionError("Chrome not found"))
+        result = await _cdp_reconnect(browser)
+        assert result is False
+
+    async def test_close_and_start_both_fail_returns_false(self):
+        browser = MagicMock()
+        browser.close = AsyncMock(side_effect=RuntimeError("gone"))
+        browser._start = AsyncMock(side_effect=ConnectionError("still gone"))
+        result = await _cdp_reconnect(browser)
+        assert result is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _dispatch() CDP reconnect logic
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDispatchCdpReconnect:
+    """Tests for _dispatch() CDP reconnect retry logic."""
+
+    def _make_cdp_browser(self, cdp_url="ws://cloud.io/browser/abc"):
+        b = make_browser()
+        b._cdp_url = cdp_url
+        return b
+
+    async def test_cdp_browser_closed_reconnect_success_retry_success(self):
+        browser = self._make_cdp_browser()
+        call_count = 0
+
+        async def navigate(url):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("browser has been closed")
+            return "Navigated"
+
+        browser.navigate_to = navigate
+        with patch("bridgic.browser.cli._daemon._cdp_reconnect", new=AsyncMock(return_value=True)):
+            resp = await _dispatch(browser, "open", {"url": "x"})
+
+        assert resp["success"] is True
+        assert resp["result"] == "Navigated"
+        assert call_count == 2
+
+    async def test_cdp_browser_closed_reconnect_success_retry_fails(self):
+        browser = self._make_cdp_browser()
+        browser.navigate_to = AsyncMock(
+            side_effect=RuntimeError("browser has been closed")
+        )
+        with patch("bridgic.browser.cli._daemon._cdp_reconnect", new=AsyncMock(return_value=True)):
+            resp = await _dispatch(browser, "open", {"url": "x"})
+
+        assert resp["success"] is False
+        assert resp["error_code"] == "BROWSER_CLOSED"
+        assert browser.navigate_to.await_count == 2
+
+    async def test_cdp_browser_closed_reconnect_fails(self):
+        browser = self._make_cdp_browser()
+        browser.navigate_to = AsyncMock(
+            side_effect=RuntimeError("browser has been closed")
+        )
+        with patch("bridgic.browser.cli._daemon._cdp_reconnect", new=AsyncMock(return_value=False)):
+            resp = await _dispatch(browser, "open", {"url": "x"})
+
+        assert resp["success"] is False
+        assert resp["error_code"] == "BROWSER_CLOSED"
+        browser.navigate_to.assert_awaited_once()
+
+    async def test_cdp_close_command_no_reconnect(self):
+        browser = self._make_cdp_browser()
+        browser.inspect_pending_close_artifacts = MagicMock(return_value={
+            "session_dir": "/tmp/close-test", "trace": [], "video": [],
+        })
+        mock_reconnect = AsyncMock(return_value=True)
+        with patch("bridgic.browser.cli._daemon._cdp_reconnect", new=mock_reconnect):
+            with patch("bridgic.browser.cli._daemon._HANDLERS", {
+                "close": AsyncMock(side_effect=RuntimeError("browser has been closed"))
+            }):
+                resp = await _dispatch(browser, "close", {})
+        mock_reconnect.assert_not_called()
+        assert resp["error_code"] == "BROWSER_CLOSED"
+
+    async def test_non_cdp_browser_closed_no_reconnect(self):
+        browser = make_browser()  # _cdp_url = None
+        browser.navigate_to = AsyncMock(
+            side_effect=RuntimeError("browser has been closed")
+        )
+        mock_reconnect = AsyncMock(return_value=True)
+        with patch("bridgic.browser.cli._daemon._cdp_reconnect", new=mock_reconnect):
+            resp = await _dispatch(browser, "open", {"url": "x"})
+        mock_reconnect.assert_not_called()
+        assert resp["error_code"] == "BROWSER_CLOSED"
+        browser.navigate_to.assert_awaited_once()
+
+    async def test_cdp_non_browser_closed_error_no_reconnect(self):
+        browser = self._make_cdp_browser()
+        browser.navigate_to = AsyncMock(
+            side_effect=OperationError(code="ELEMENT_NOT_FOUND", message="element not found")
+        )
+        mock_reconnect = AsyncMock(return_value=True)
+        with patch("bridgic.browser.cli._daemon._cdp_reconnect", new=mock_reconnect):
+            resp = await _dispatch(browser, "open", {"url": "x"})
+        mock_reconnect.assert_not_called()
+        assert resp["error_code"] == "ELEMENT_NOT_FOUND"
+        browser.navigate_to.assert_awaited_once()
+
+    async def test_cdp_plain_exception_with_closed_message_triggers_reconnect(self):
+        browser = self._make_cdp_browser()
+        call_count = 0
+
+        async def navigate(url):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("Target page, context or browser has been closed")
+            return "Navigated"
+
+        browser.navigate_to = navigate
+        with patch("bridgic.browser.cli._daemon._cdp_reconnect", new=AsyncMock(return_value=True)):
+            resp = await _dispatch(browser, "open", {"url": "x"})
+
+        assert resp["success"] is True
+        assert call_count == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _spawn_daemon() env var passing
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSpawnDaemonEnv:
+    """Unit tests for _spawn_daemon() environment variable propagation."""
+
+    def _fake_popen_factory(self, captured_env: dict):
+        """Return a fake Popen that records the env and signals READY."""
+        def fake_popen(cmd, **kwargs):
+            captured_env.update(kwargs.get("env", {}))
+            m = MagicMock()
+            m.stdout = MagicMock()
+            lines = [b"BRIDGIC_DAEMON_READY\n"]
+            m.stdout.__iter__ = lambda self: iter(lines)
+            m.stdout.close = MagicMock()
+            return m
+        return fake_popen
+
+    def _run_spawn(self, captured_env, **kwargs):
+        from bridgic.browser.cli._client import _spawn_daemon
+        fake_popen = self._fake_popen_factory(captured_env)
+        with patch("subprocess.Popen", side_effect=fake_popen):
+            _spawn_daemon(**kwargs)
+
+    def test_cdp_url_sets_env_var(self):
+        captured_env: dict = {}
+        self._run_spawn(captured_env, cdp_url="ws://localhost:9222/devtools/browser/abc")
+        assert captured_env.get("BRIDGIC_CDP") == "ws://localhost:9222/devtools/browser/abc"
+
+    def test_no_cdp_url_env_var_absent(self):
+        captured_env: dict = {}
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BRIDGIC_CDP", None)
+            self._run_spawn(captured_env)
+        assert "BRIDGIC_CDP" not in captured_env
+
+    def test_headed_and_cdp_url_both_set(self):
+        captured_env: dict = {}
+        self._run_spawn(
+            captured_env,
+            headed=True,
+            cdp_url="ws://localhost:9222/devtools/browser/abc",
+        )
+        assert captured_env.get("BRIDGIC_HEADLESS") is None or "BRIDGIC_BROWSER_JSON" in captured_env
+        assert captured_env.get("BRIDGIC_CDP") == "ws://localhost:9222/devtools/browser/abc"
+
+
+# ---------------------------------------------------------------------------
+# TestDaemonDownloadsPath — default downloads_path injection in run_daemon()
+# ---------------------------------------------------------------------------
+
+
+class TestDaemonDownloadsPath:
+    """Verify that run_daemon() auto-injects downloads_path when not configured."""
+
+    @pytest.mark.asyncio
+    async def test_daemon_injects_default_downloads_path(self):
+        """When no config sets downloads_path, daemon injects a default."""
+        captured_kwargs: Dict[str, Any] = {}
+
+        def fake_browser(**kw: Any) -> MagicMock:
+            captured_kwargs.update(kw)
+            b = MagicMock()
+            b.get_config.return_value = kw
+            return b
+
+        with (
+            patch("bridgic.browser.cli._daemon._load_config_sources", return_value={}),
+            patch("bridgic.browser.cli._daemon._resolve_default_downloads_dir", return_value=Path.home() / "Downloads"),
+            patch("bridgic.browser.session._browser.Browser", side_effect=fake_browser),
+            patch("bridgic.browser.cli._daemon.get_transport") as mock_transport,
+            patch("bridgic.browser.cli._daemon.write_run_info"),
+            patch("bridgic.browser.cli._daemon.asyncio.Event") as mock_event,
+        ):
+            mock_event.return_value.wait = AsyncMock()
+            mock_server = AsyncMock()
+            mock_transport.return_value.start_server = AsyncMock(return_value=mock_server)
+            mock_transport.return_value.build_run_info.return_value = {}
+            mock_transport.return_value.verify_auth = None
+            mock_event.return_value.is_set.return_value = True
+
+            with patch("bridgic.browser.cli._daemon.logger"):
+                from bridgic.browser.cli._daemon import run_daemon
+
+                with patch("sys.stdout"):
+                    try:
+                        await run_daemon()
+                    except Exception:
+                        pass
+
+            assert "downloads_path" in captured_kwargs
+            assert captured_kwargs["downloads_path"] == str(Path.home() / "Downloads")
+
+    @pytest.mark.asyncio
+    async def test_daemon_respects_config_downloads_path(self):
+        """When config already sets downloads_path, daemon does not override."""
+        captured_kwargs: Dict[str, Any] = {}
+
+        def fake_browser(**kw: Any) -> MagicMock:
+            captured_kwargs.update(kw)
+            b = MagicMock()
+            b.get_config.return_value = kw
+            return b
+
+        with (
+            patch("bridgic.browser.cli._daemon._load_config_sources", return_value={"downloads_path": "/custom/path"}),
+            patch("bridgic.browser.session._browser.Browser", side_effect=fake_browser),
+            patch("bridgic.browser.cli._daemon.get_transport") as mock_transport,
+            patch("bridgic.browser.cli._daemon.write_run_info"),
+            patch("bridgic.browser.cli._daemon.asyncio.Event") as mock_event,
+        ):
+            mock_event.return_value.wait = AsyncMock()
+            mock_server = AsyncMock()
+            mock_transport.return_value.start_server = AsyncMock(return_value=mock_server)
+            mock_transport.return_value.build_run_info.return_value = {}
+            mock_transport.return_value.verify_auth = None
+            mock_event.return_value.is_set.return_value = True
+
+            with patch("bridgic.browser.cli._daemon.logger"):
+                from bridgic.browser.cli._daemon import run_daemon
+
+                with patch("sys.stdout"):
+                    try:
+                        await run_daemon()
+                    except Exception:
+                        pass
+
+            # Should NOT have downloads_path injected (config already has it)
+            assert captured_kwargs.get("downloads_path") is None
+
+    def test_resolve_default_downloads_dir_prefers_user_downloads(self, tmp_path: Path):
+        """When ~/Downloads is writable, it is preferred."""
+        fake_home = tmp_path / "home"
+        fake_downloads = fake_home / "Downloads"
+        fake_downloads.mkdir(parents=True)
+
+        with patch("bridgic.browser.cli._daemon.Path.home", return_value=fake_home):
+            result = _resolve_default_downloads_dir()
+
+        assert result == fake_downloads
+
+    def test_resolve_default_downloads_dir_fallback(self, tmp_path: Path):
+        """When ~/Downloads is not writable, falls back to app-managed dir."""
+        fake_home = tmp_path / "home"
+        fake_downloads = fake_home / "Downloads"
+        fake_downloads.mkdir(parents=True)
+        # Make ~/Downloads read-only so probe.touch() fails
+        fake_downloads.chmod(0o444)
+
+        fallback_dir = tmp_path / "fallback"
+
+        with (
+            patch("bridgic.browser.cli._daemon.Path.home", return_value=fake_home),
+            patch("bridgic.browser.cli._daemon.BRIDGIC_DOWNLOADS_DIR", fallback_dir),
+        ):
+            result = _resolve_default_downloads_dir()
+
+        assert result == fallback_dir
+        assert fallback_dir.exists()
+
+        # Restore permissions for cleanup
+        fake_downloads.chmod(0o755)

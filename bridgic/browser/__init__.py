@@ -3,7 +3,7 @@
 from importlib.metadata import version
 
 from .utils._logging import configure_logging
-from .session._browser import Browser
+from .session._browser import Browser, find_cdp_url, resolve_cdp_input
 from .session._snapshot import EnhancedSnapshot, RefData, SnapshotGenerator, SnapshotOptions
 from .session._browser_model import PageDesc, PageInfo, PageSizeInfo, FullPageInfo
 from .session._stealth import StealthConfig, StealthArgsBuilder, create_stealth_config
@@ -27,6 +27,8 @@ __all__ = [
     "configure_logging",
     # Browser session
     "Browser",
+    "find_cdp_url",
+    "resolve_cdp_input",
     # Snapshot types
     "EnhancedSnapshot",
     "RefData",

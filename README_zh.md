@@ -201,6 +201,50 @@ BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open 
 BRIDGIC_BROWSER_JSON='{"clear_user_data":true}' bridgic-browser open URL
 ```
 
+#### CDP 模式（连接已有浏览器）
+
+`bridgic-browser` 可以通过 [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) 连接到已经运行的 Chrome/Chromium 实例，而非启动新浏览器。
+
+首先启动 Chrome 并开启远程调试端口：
+
+```bash
+# macOS
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+    --remote-debugging-port=9222 --user-data-dir=/tmp/cdp-profile
+
+# Linux
+google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/cdp-profile
+```
+
+然后使用 `--cdp` 连接：
+
+```bash
+bridgic-browser open https://example.com --cdp 9222
+bridgic-browser open https://example.com --cdp ws://localhost:9222/devtools/browser/...
+bridgic-browser open https://example.com --cdp wss://cloud.example.com/chromium?token=...
+bridgic-browser open https://example.com --cdp auto
+```
+
+| 格式 | 说明 |
+|--------|-------------|
+| `9222` | 端口号 -- 向 `localhost:9222/json/version` 查询 WebSocket URL |
+| `ws://...` / `wss://...` | 直接 WebSocket URL（原始 CDP 或 Playwright WS 协议），原样传递 |
+| `http://host:port` | HTTP 发现端点 -- 向该主机的 `/json/version` 查询 |
+| `auto` | 自动扫描本地 Chrome/Chromium/Brave/Edge/Arc 配置目录（含 Canary 变体），查找活跃的 `DevToolsActivePort` 文件 |
+
+**关闭行为：** `bridgic-browser close` 会断开与远程浏览器的连接，但**不会**终止 Chrome 进程。浏览器继续运行，可以重新连接。
+
+**使用场景：**
+- 复用已有 Chrome 会话及其登录状态和扩展
+- 连接云端浏览器服务（Browserless、Steel.dev 等）
+- 自动化开放 CDP 端口的 Electron 应用
+
+SDK 等效用法：
+
+```python
+browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/...")
+```
+
 #### 命令列表
 
 | 类别 | 命令 |
@@ -479,6 +523,7 @@ browser = Browser(
 | `user_data_dir` | str/Path | None | 持久化 profile 自定义路径（`clear_user_data=True` 时忽略） |
 | `clear_user_data` | bool | False | True 时使用临时会话（无 profile）；False 时使用持久化 profile |
 | `stealth` | bool/StealthConfig | True | 隐身模式配置 |
+| `cdp_url` | str | None | 通过 CDP 连接已有 Chrome 的 WebSocket URL（跳过启动） |
 | `channel` | str | None | 浏览器通道（chrome、msedge 等） |
 | `proxy` | dict | None | 代理设置 |
 | `downloads_path` | str/Path | None | 下载目录 |
@@ -578,3 +623,4 @@ MIT 许可证
 - [浏览器工具指南](docs/BROWSER_TOOLS_GUIDE.md) — 工具选择、ref 与坐标、等待策略、常见模式。
 - [快照与页面状态](docs/SNAPSHOT_AND_STATE.md) — SnapshotOptions、EnhancedSnapshot、get_snapshot_text、get_element_by_ref。
 - [API 摘要](docs/API.md) — Session 与 DownloadManager API 说明。
+- [已知限制](docs/KNOWN_LIMITATIONS.md) — 已知问题与上游 bug（如 Chrome「在文件夹中打开」不可用）。

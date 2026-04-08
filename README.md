@@ -202,6 +202,50 @@ BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open 
 BRIDGIC_BROWSER_JSON='{"clear_user_data":true}' bridgic-browser open URL
 ```
 
+#### CDP Mode (Connect to Existing Browser)
+
+Instead of launching a new browser, `bridgic-browser` can connect to an already-running Chrome/Chromium instance via the [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/).
+
+Start Chrome with remote debugging enabled:
+
+```bash
+# macOS
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+    --remote-debugging-port=9222 --user-data-dir=/tmp/cdp-profile
+
+# Linux
+google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/cdp-profile
+```
+
+Then connect with `--cdp`:
+
+```bash
+bridgic-browser open https://example.com --cdp 9222
+bridgic-browser open https://example.com --cdp ws://localhost:9222/devtools/browser/...
+bridgic-browser open https://example.com --cdp wss://cloud.example.com/chromium?token=...
+bridgic-browser open https://example.com --cdp auto
+```
+
+| Format | Description |
+|--------|-------------|
+| `9222` | Bare port number -- queries `localhost:9222/json/version` to discover the WebSocket URL |
+| `ws://...` / `wss://...` | Direct WebSocket URL (raw CDP or Playwright WS protocol), passed through as-is |
+| `http://host:port` | HTTP discovery endpoint -- queries `/json/version` on that host |
+| `auto` | Auto-scan local Chrome/Chromium/Brave/Edge/Arc profile directories (+ Canary variants) for an active `DevToolsActivePort` file |
+
+**Closing behavior:** `bridgic-browser close` disconnects from the remote browser but does **not** terminate the Chrome process. The browser keeps running and can be reconnected.
+
+**Use cases:**
+- Reuse an existing Chrome session with its login state and extensions
+- Connect to cloud browser services (Browserless, Steel.dev, etc.)
+- Automate Electron apps that expose a CDP port
+
+SDK equivalent:
+
+```python
+browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/...")
+```
+
 #### Command List
 
 | Category | Commands |
@@ -480,6 +524,7 @@ browser = Browser(
 | `user_data_dir` | str/Path | None | Custom path for persistent profile (ignored when `clear_user_data=True`) |
 | `clear_user_data` | bool | False | If True, use ephemeral session (no profile); if False, use persistent profile |
 | `stealth` | bool/StealthConfig | True | Stealth mode configuration |
+| `cdp_url` | str | None | WebSocket URL to connect to an existing Chrome via CDP (skips launch) |
 | `channel` | str | None | Browser channel (chrome, msedge, etc.) |
 | `proxy` | dict | None | Proxy settings |
 | `downloads_path` | str/Path | None | Download directory |
@@ -579,3 +624,4 @@ MIT License
 - [Browser Tools Guide](docs/BROWSER_TOOLS_GUIDE.md) – Tool selection, ref vs coordinate, wait strategies, patterns.
 - [Snapshot and Page State](docs/SNAPSHOT_AND_STATE.md) – SnapshotOptions, EnhancedSnapshot, get_snapshot_text, get_element_by_ref.
 - [API Summary](docs/API.md) – Session and DownloadManager API reference.
+- [Known Limitations](docs/KNOWN_LIMITATIONS.md) – Known issues and upstream bugs (e.g. Chrome "Show in Folder" not working).

@@ -398,7 +398,6 @@ class TestTabManagementTools:
     @pytest.mark.asyncio
     async def test_new_tab(self, mock_browser):
         """Test new_tab with no URL opens a blank page."""
-
         mock_browser._new_page.return_value = MagicMock()
 
         result = await Browser.new_tab(mock_browser)
@@ -409,7 +408,6 @@ class TestTabManagementTools:
     @pytest.mark.asyncio
     async def test_new_tab_with_url(self, mock_browser):
         """Test new_tab with URL."""
-
         mock_browser._new_page.return_value = MagicMock()
 
         result = await Browser.new_tab(mock_browser, "https://example.com")
@@ -1514,18 +1512,135 @@ class TestDevTools:
 
     @pytest.mark.asyncio
     async def test_start_video(self, mock_browser):
-        """Test starting video recording."""
+        """Test starting video recording — multi-page: all existing
+        pages in the context get a per-page recorder, and context.on('page')
+        is subscribed so future pages auto-record too.
+        """
+        import types
 
-        result = await Browser.start_video(mock_browser)
+        page = mock_browser._page
+        page.viewport_size = {"width": 800, "height": 600}
+        page.is_closed = MagicMock(return_value=False)
+        mock_context = page.context
+        mock_context.pages = [page]
+        mock_context.on = MagicMock()
+        mock_browser._video_state = {}
+        mock_browser._video_recorders = {}
+        mock_browser._video_session = None
+        # Bind the real helper so start_video can drive _start_page_video_recorder.
+        mock_browser._start_page_video_recorder = types.MethodType(
+            Browser._start_page_video_recorder, mock_browser,
+        )
 
-        assert result == "Video recording started"
+        mock_recorder = MagicMock()
+        mock_recorder.start = AsyncMock()
+        with patch("bridgic.browser.session._browser._video_recorder_mod.VideoRecorder", return_value=mock_recorder):
+            result = await Browser.start_video(mock_browser)
+
+        assert "Video recording started" in result
+        assert "1 page" in result
+        assert mock_browser._video_recorders[page] is mock_recorder
+        assert mock_browser._video_session is not None
+        # context.on('page', handler) must be registered for auto-recording
+        # of newly opened tabs.
+        assert mock_context.on.called
+        assert mock_context.on.call_args.args[0] == "page"
 
     @pytest.mark.asyncio
     async def test_stop_video(self, mock_browser):
-        """Test stopping video recording."""
+        """Test stopping video recording when no session is active."""
+        mock_browser._video_recorders = {}
+        mock_browser._video_session = None
+        mock_browser._video_state = {}
         with pytest.raises(StateError) as exc_info:
             await Browser.stop_video(mock_browser)
         assert exc_info.value.code == "NO_ACTIVE_RECORDING"
+
+    @pytest.mark.asyncio
+    async def test_start_video_records_all_pages(self, mock_browser):
+        """start_video should record every existing page, not just current."""
+        import types
+
+        page1 = mock_browser._page
+        page1.viewport_size = {"width": 800, "height": 600}
+        page1.is_closed = MagicMock(return_value=False)
+
+        page2 = MagicMock()
+        page2.viewport_size = {"width": 800, "height": 600}
+        page2.is_closed = MagicMock(return_value=False)
+        page2.context = page1.context
+
+        mock_context = page1.context
+        mock_context.pages = [page1, page2]
+        mock_context.on = MagicMock()
+        mock_browser._video_state = {}
+        mock_browser._video_recorders = {}
+        mock_browser._video_session = None
+        mock_browser._start_page_video_recorder = types.MethodType(
+            Browser._start_page_video_recorder, mock_browser,
+        )
+
+        created_recorders = []
+
+        def _factory(context, page, output_path, size):
+            rec = MagicMock()
+            rec.start = AsyncMock()
+            rec.output_path = output_path
+            created_recorders.append(rec)
+            return rec
+
+        with patch(
+            "bridgic.browser.session._browser._video_recorder_mod.VideoRecorder",
+            side_effect=_factory,
+        ):
+            result = await Browser.start_video(mock_browser)
+
+        assert "2 pages" in result
+        assert len(mock_browser._video_recorders) == 2
+        assert page1 in mock_browser._video_recorders
+        assert page2 in mock_browser._video_recorders
+        assert len(created_recorders) == 2
+        for rec in created_recorders:
+            rec.start.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_video_returns_multiple_paths(self, mock_browser, tmp_path):
+        """stop_video should stop all page recorders and return all paths."""
+        from bridgic.browser.session import _browser as browser_module
+
+        mock_browser._context.remove_listener = MagicMock()
+        context_key = browser_module._get_context_key(mock_browser._context)
+        mock_browser._video_state = {context_key: True}
+        # Bind real static helpers — otherwise `self._resolve_multi_video_dests`
+        # on a MagicMock returns another MagicMock (truthy) and the code
+        # takes the wrong branch.
+        mock_browser._resolve_multi_video_dests = Browser._resolve_multi_video_dests
+        mock_browser._move_video_local = Browser._move_video_local
+
+        page1 = MagicMock()
+        page2 = MagicMock()
+        rec1 = MagicMock()
+        rec1.stop = AsyncMock(return_value=str(tmp_path / "a.webm"))
+        rec2 = MagicMock()
+        rec2.stop = AsyncMock(return_value=str(tmp_path / "b.webm"))
+        (tmp_path / "a.webm").write_bytes(b"")
+        (tmp_path / "b.webm").write_bytes(b"")
+
+        mock_browser._video_recorders = {page1: rec1, page2: rec2}
+        mock_browser._video_session = {
+            "width": 800, "height": 600, "context": mock_browser._context,
+            "page_listener": lambda *_: None,
+        }
+
+        result = await Browser.stop_video(mock_browser)
+
+        rec1.stop.assert_awaited_once()
+        rec2.stop.assert_awaited_once()
+        assert "Video files saved" in result
+        assert str(tmp_path / "a.webm") in result
+        assert str(tmp_path / "b.webm") in result
+        assert mock_browser._video_recorders == {}
+        assert mock_browser._video_session is None
 
 # ==================== State Tools Tests ====================
 

@@ -58,7 +58,11 @@ def _load_config_sources() -> Dict[str, Any]:
     user_cfg = BRIDGIC_BROWSER_HOME / _CONFIG_FILENAME
     if user_cfg.is_file():
         try:
-            cfg.update(json.loads(user_cfg.read_text(encoding="utf-8")))
+            parsed = json.loads(user_cfg.read_text(encoding="utf-8"))
+            if not isinstance(parsed, dict):
+                logger.warning("user config %s: expected JSON object, got %s", user_cfg, type(parsed).__name__)
+            else:
+                cfg.update(parsed)
         except Exception:
             logger.warning("failed to parse user config %s", user_cfg, exc_info=True)
 
@@ -66,7 +70,11 @@ def _load_config_sources() -> Dict[str, Any]:
     local_cfg = Path(_CONFIG_FILENAME)
     if local_cfg.is_file():
         try:
-            cfg.update(json.loads(local_cfg.read_text(encoding="utf-8")))
+            parsed = json.loads(local_cfg.read_text(encoding="utf-8"))
+            if not isinstance(parsed, dict):
+                logger.warning("local config %s: expected JSON object, got %s", local_cfg, type(parsed).__name__)
+            else:
+                cfg.update(parsed)
         except Exception:
             logger.warning("failed to parse local config %s", local_cfg, exc_info=True)
 
@@ -74,7 +82,11 @@ def _load_config_sources() -> Dict[str, Any]:
     raw = os.environ.get(_ENV_VAR)
     if raw:
         try:
-            cfg.update(json.loads(raw))
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                logger.warning("%s: expected JSON object, got %s", _ENV_VAR, type(parsed).__name__)
+            else:
+                cfg.update(parsed)
         except Exception:
             logger.warning("failed to parse %s: %s", _ENV_VAR, raw, exc_info=True)
 

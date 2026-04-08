@@ -124,10 +124,26 @@ def cli() -> None:
               help="Launch the browser in headed (visible) mode.")
 @click.option("--clear-user-data", is_flag=True, default=False,
               help="Start with a fresh browser profile (no persistent user data). Ignored if a session is already running.")
-def cmd_open(url: str, headed: bool, clear_user_data: bool) -> None:
+@click.option(
+    "--cdp", default=None, metavar="PORT_OR_URL",
+    help=(
+        "Connect to a running browser instead of launching a new one. "
+        "Accepts: port number (9222), ws:// or wss:// URL, http://host:port, "
+        "or 'auto' to scan local Chrome/Chromium/Brave (+ Canary variants) profiles."
+    ),
+)
+def cmd_open(url: str, headed: bool, clear_user_data: bool, cdp: str | None) -> None:
     """Navigate to URL (starts a browser session if needed)."""
+    cdp_url: str | None = None
+    if cdp:
+        from bridgic.browser.session._browser import resolve_cdp_input
+        try:
+            cdp_url = resolve_cdp_input(cdp)
+        except Exception as exc:
+            _err(exc)
+            return
     try:
-        _ok(send_command("open", {"url": url}, headed=headed, clear_user_data=clear_user_data))
+        _ok(send_command("open", {"url": url}, headed=headed, clear_user_data=clear_user_data, cdp_url=cdp_url))
     except Exception as exc:
         _err(exc)
 
@@ -934,7 +950,12 @@ def cmd_trace_chunk(title: str) -> None:
 @click.option("--width", default=None, type=int, help="Video width in pixels.")
 @click.option("--height", default=None, type=int, help="Video height in pixels.")
 def cmd_video_start(width: int | None, height: int | None) -> None:
-    """Start video recording."""
+    """Start video recording on ALL pages in the context.
+
+    Mirrors the Playwright CLI: one start call records every tab,
+    including tabs opened afterwards. Each page gets its own .webm file
+    returned by ``video-stop``.
+    """
     try:
         _ok(send_command("video_start", {"width": width, "height": height}, start_if_needed=False))
     except Exception as exc:
@@ -944,7 +965,15 @@ def cmd_video_start(width: int | None, height: int | None) -> None:
 @cli.command("video-stop", context_settings=CONTEXT_SETTINGS)
 @click.argument("path", required=False, default=None)
 def cmd_video_stop(path: str | None) -> None:
-    """Stop video recording and save to PATH (optional)."""
+    """Stop video recording and save files.
+
+    PATH is optional. When omitted, recorded files stay in the temp dir.
+    When given:
+      * a directory → each recording is saved inside it
+      * a file path → first recording uses that exact path; extra
+        recordings from additional tabs get a ``-1``, ``-2`` … suffix
+        inserted before the ``.webm`` extension.
+    """
     try:
         abs_path = os.path.abspath(path) if path else None
         _ok(send_command("video_stop", {"path": abs_path}, start_if_needed=False))

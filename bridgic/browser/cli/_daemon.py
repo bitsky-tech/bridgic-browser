@@ -20,8 +20,10 @@ import signal
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
+from urllib.parse import urlparse
 
-from .._constants import BRIDGIC_BROWSER_HOME
+from .._config import _load_config_sources
+from .._constants import BRIDGIC_BROWSER_HOME, BRIDGIC_DOWNLOADS_DIR
 from ..errors import BridgicBrowserError, InvalidInputError
 from ._transport import (
     get_transport,
@@ -56,6 +58,26 @@ _BROWSER_CLOSED_PATTERNS = (
 def _is_browser_closed_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
     return any(pat in msg for pat in _BROWSER_CLOSED_PATTERNS)
+
+
+def _browser_closed_hint(cdp_url: Optional[str] = None) -> str:
+    """Return a BROWSER_CLOSED hint message tailored to the connection mode."""
+    if cdp_url:
+        # For local Chrome (localhost/127.0.0.1), show port number instead of the full ws:// URL
+        # because the browser UUID in the URL changes on every Chrome restart.
+        _parsed = urlparse(cdp_url)
+        _host = (_parsed.hostname or "").lower()
+        if _host in ("localhost", "127.0.0.1", "::1"):
+            _cdp_hint = str(_parsed.port or 9222)
+            _msg = "Local Chrome closed or crashed."
+        else:
+            _cdp_hint = cdp_url
+            _msg = "Remote browser session closed (the cloud/remote browser disconnected or timed out)."
+        return (
+            f"{_msg} "
+            f"Run: bridgic-browser close && bridgic-browser open <url> --cdp '{_cdp_hint}'"
+        )
+    return _BROWSER_CLOSED_HINT
 
 
 def _response(
@@ -452,8 +474,11 @@ async def _handle_video_stop(browser: "Browser", args: Dict[str, Any]) -> str:
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
-async def _handle_close(browser: "Browser", _args: Dict[str, Any]) -> str:
-    return await browser.close()
+# Note: there is no `_handle_close` here. The connection handler intercepts
+# the `close` command directly (see the `if command == "close"` branch
+# below) so it can pre-allocate the close-session directory and respond to
+# the client *before* the actual browser teardown runs in the background.
+# Adding a `_HANDLERS["close"]` entry would be dead code.
 
 
 async def _handle_resize(browser: "Browser", args: Dict[str, Any]) -> str:
@@ -541,9 +566,29 @@ _HANDLERS = {
     "video_start": _handle_video_start,
     "video_stop": _handle_video_stop,
     # Lifecycle
-    "close": _handle_close,
+    # ("close" is intercepted in the connection handler — see comment above
+    # the lifecycle section.)
     "resize": _handle_resize,
 }
+
+
+async def _cdp_reconnect(browser: "Browser") -> bool:
+    """Stop and restart *browser* to re-establish a dropped CDP/PW-WS connection.
+
+    Returns True if the reconnect succeeded, False otherwise.
+    After a successful reconnect the browser is at about:blank (new session).
+    """
+    try:
+        await browser.close()
+    except Exception as exc:
+        logger.debug("[daemon] cdp_reconnect: close() error (ignored): %s", exc)
+    try:
+        await browser._start()
+        logger.info("[daemon] cdp_reconnect: reconnected successfully")
+        return True
+    except Exception as exc:
+        logger.error("[daemon] cdp_reconnect: _start() failed: %s", exc)
+        return False
 
 
 async def _dispatch(browser: "Browser", command: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -554,39 +599,72 @@ async def _dispatch(browser: "Browser", command: str, args: Dict[str, Any]) -> D
             result=f"Unknown command: {command!r}",
             error_code="UNKNOWN_COMMAND",
         )
-    try:
-        result = await handler(browser, args)
-        return _response(
-            success=True,
-            result=str(result),
-        )
-    except BridgicBrowserError as exc:
-        if _is_browser_closed_error(exc):
+
+    cdp_url: Optional[str] = getattr(browser, "_cdp_url", None)
+    # In CDP mode, attempt one automatic reconnect when the remote session drops.
+    # This helps with cloud-browser session timeouts (Browserless, Steel.dev, etc.).
+    # We do NOT reconnect for `close` (shutdown intent) or if there is no CDP URL.
+    _max_attempts = 2 if (cdp_url and command != "close") else 1
+
+    for _attempt in range(_max_attempts):
+        try:
+            result = await handler(browser, args)
+            return _response(
+                success=True,
+                result=str(result),
+            )
+        except BridgicBrowserError as exc:
+            if _is_browser_closed_error(exc):
+                if _attempt == 0 and _max_attempts > 1:
+                    logger.warning(
+                        "[daemon] CDP session closed during %r, attempting one-shot reconnect",
+                        command,
+                    )
+                    if await _cdp_reconnect(browser):
+                        continue  # retry the command with the refreshed connection
+                return _response(
+                    success=False,
+                    result=_browser_closed_hint(cdp_url),
+                    error_code="BROWSER_CLOSED",
+                )
             return _response(
                 success=False,
-                result=_BROWSER_CLOSED_HINT,
-                error_code="BROWSER_CLOSED",
+                result=exc.message,
+                error_code=exc.code,
+                data=exc.details,
+                meta={"retryable": exc.retryable},
             )
-        return _response(
-            success=False,
-            result=exc.message,
-            error_code=exc.code,
-            data=exc.details,
-            meta={"retryable": exc.retryable},
-        )
-    except Exception as exc:
-        if _is_browser_closed_error(exc):
+        except Exception as exc:
+            if _is_browser_closed_error(exc):
+                if _attempt == 0 and _max_attempts > 1:
+                    logger.warning(
+                        "[daemon] CDP session closed during %r, attempting one-shot reconnect",
+                        command,
+                    )
+                    if await _cdp_reconnect(browser):
+                        continue  # retry
+                return _response(
+                    success=False,
+                    result=_browser_closed_hint(cdp_url),
+                    error_code="BROWSER_CLOSED",
+                )
+            logger.exception("[daemon] command=%s error", command)
             return _response(
                 success=False,
-                result=_BROWSER_CLOSED_HINT,
-                error_code="BROWSER_CLOSED",
+                result=str(exc),
+                error_code="HANDLER_EXCEPTION",
             )
-        logger.exception("[daemon] command=%s error", command)
-        return _response(
-            success=False,
-            result=str(exc),
-            error_code="HANDLER_EXCEPTION",
-        )
+    # Unreachable: every iteration of the loop above always returns. The body
+    # only `continue`s on a successful reconnect, and the *retried* iteration
+    # itself either returns success or returns one of the BROWSER_CLOSED /
+    # HANDLER_EXCEPTION responses. Kept as a defensive safety net so that if
+    # a future edit accidentally adds a code path that exits the loop without
+    # returning, the daemon still answers the client with a clean error.
+    return _response(
+        success=False,
+        result=_browser_closed_hint(cdp_url),
+        error_code="BROWSER_CLOSED",
+    )
 
 
 _READ_TIMEOUT = 60.0  # seconds to wait for a command line from the client
@@ -686,8 +764,8 @@ async def _handle_connection(
                 artifacts = browser.inspect_pending_close_artifacts()
             except Exception as exc:
                 logger.warning(f"[close] inspect_pending_close_artifacts failed: {exc}")
-                artifacts = {"session_dir": None, "trace": [], "video": []}
-            session_dir = artifacts.get("session_dir") or "(unknown)"
+                artifacts = {"session_dir": "", "trace": [], "video": []}
+            session_dir = artifacts.get("session_dir") or ""
 
             lines = ["Browser closing in background."]
             if artifacts["trace"]:
@@ -696,7 +774,14 @@ async def _handle_connection(
             if artifacts["video"]:
                 lines.append("Video (generating in background, check later):")
                 lines.extend(f"  {p}" for p in artifacts["video"])
-            lines.append(f"Close report (generating in background, check later): {session_dir}/close-report.json")
+            # The close-report is only written when there is at least one
+            # artifact (otherwise we would leak an empty session dir per
+            # close call). Only advertise the path when it actually exists.
+            if session_dir:
+                lines.append(
+                    f"Close report (generating in background, check later): "
+                    f"{session_dir}/close-report.json"
+                )
 
             resp = _response(success=True, result="\n".join(lines))
             writer.write((json.dumps(resp) + "\n").encode())
@@ -763,11 +848,65 @@ def _write_close_report(
         logger.warning("[daemon] failed to write close-report.json: %s", exc)
 
 
+def _resolve_default_downloads_dir() -> Path:
+    """Pick the best default downloads directory for the daemon.
+
+    Strategy: prefer ~/Downloads (user-familiar), fall back to
+    ~/.bridgic/bridgic-browser/downloads/ if ~/Downloads is not
+    writable or cannot be created.
+    """
+    user_downloads = Path.home() / "Downloads"
+    try:
+        user_downloads.mkdir(parents=True, exist_ok=True)
+        # Verify writable by testing with a temp file
+        probe = user_downloads / ".bridgic_probe"
+        probe.touch()
+        probe.unlink()
+        return user_downloads
+    except OSError:
+        pass
+
+    BRIDGIC_DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "[daemon] ~/Downloads not writable, using fallback: %s",
+        BRIDGIC_DOWNLOADS_DIR,
+    )
+    return BRIDGIC_DOWNLOADS_DIR
+
+
 async def run_daemon() -> None:
-    from bridgic.browser.session._browser import Browser
+    from bridgic.browser.session._browser import Browser, resolve_cdp_input
+
+    # Resolve CDP connection if requested via env var.
+    # BRIDGIC_CDP accepts port/url/auto from the user shell, or an already-
+    # resolved ws:// URL injected by _spawn_daemon() when the CLI client has
+    # pre-resolved the --cdp flag. Both paths go through resolve_cdp_input(),
+    # which is a no-op on ws:///wss:// inputs.
+    _cdp_input: Optional[str] = os.environ.get("BRIDGIC_CDP")
+    cdp_url: Optional[str] = None
+    if _cdp_input:
+        try:
+            cdp_url = resolve_cdp_input(_cdp_input)
+        except (RuntimeError, ValueError, ConnectionError) as exc:
+            raise RuntimeError(
+                f"Failed to establish CDP connection: {exc}\n"
+                "Check that the browser is running with --remote-debugging-port "
+                "or that the CDP URL / port is correct."
+            ) from exc
 
     # Browser.__init__ auto-loads config from files and env vars.
-    browser = Browser()
+    kwargs: Dict[str, Any] = {}
+    if cdp_url:
+        kwargs["cdp_url"] = cdp_url
+
+    # Auto-enable downloads in daemon mode.
+    # SDK users are unaffected (they control downloads_path explicitly).
+    if "downloads_path" not in kwargs:
+        _cfg_check = _load_config_sources()
+        if "downloads_path" not in _cfg_check:
+            kwargs["downloads_path"] = str(_resolve_default_downloads_dir())
+
+    browser = Browser(**kwargs)
     logger.info("[daemon] browser ready (lazy start, config=%s)", {k: v for k, v in browser.get_config().items() if k != "proxy"})
 
     stop_event = asyncio.Event()

@@ -78,7 +78,7 @@ CLI_ALL_COMMANDS: list[str] = [
 
 # command_name -> (ToolCategory, one-line description)
 CLI_COMMAND_META: dict[str, tuple[ToolCategory, str]] = {
-    "open": (ToolCategory.NAVIGATION, "Navigate to URL (starts a browser session if needed) [--headed] [--clear-user-data]"),
+    "open": (ToolCategory.NAVIGATION, "Navigate to URL (starts a browser session if needed) [--headed] [--clear-user-data] [--cdp PORT_OR_URL]"),
     "back": (ToolCategory.NAVIGATION, "Go back to the previous page"),
     "forward": (ToolCategory.NAVIGATION, "Go forward to the next page"),
     "reload": (ToolCategory.NAVIGATION, "Reload the current page"),
