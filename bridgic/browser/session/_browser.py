@@ -7095,17 +7095,9 @@ Before you return the element ref, reason about the state and elements for a sen
             #   for (const page of browserContext.pages())
             #     await this._startPageVideo(page);
             #
-            # CDP borrowed context: restrict to bridgic-owned pages so we
-            # never record the user's existing tabs.
-            # _start_page_video_recorder double-checks this, but
-            # filtering up front makes intent obvious and avoids spurious
-            # "page start failed" log lines.
-            if self._cdp_url and not self._cdp_context_owned:
-                existing_pages = [
-                    p for p in self._cdp_owned_pages if not p.is_closed()
-                ]
-            else:
-                existing_pages = [p for p in context.pages if not p.is_closed()]
+            # CDP borrowed context: all pages in the context are recorded,
+            # including the user's pre-existing tabs.
+            existing_pages = [p for p in context.pages if not p.is_closed()]
             for p in existing_pages:
                 try:
                     await self._start_page_video_recorder(p)
