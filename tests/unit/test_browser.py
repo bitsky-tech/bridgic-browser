@@ -1613,12 +1613,11 @@ class TestBrowserStartCdp:
         mock_ctx.new_page.assert_awaited_once()
         assert browser._page is mock_pg
         assert browser._page is not page2  # CRITICAL: never hijack user's tab
-        assert browser._page in browser._cdp_owned_pages
 
     @pytest.mark.asyncio
     async def test_cdp_new_page_called_unconditionally(self):
         """Even when the borrowed context has no pages, _start() still calls
-        new_page() and tracks the result in _cdp_owned_pages."""
+        new_page() to create a tab for bridgic to drive."""
         mock_pw, _, mock_ctx, mock_pg = self._make_cdp_mocks(pages=[])
         browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/abc", stealth=False)
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
@@ -1626,7 +1625,6 @@ class TestBrowserStartCdp:
             await browser._start()
         mock_ctx.new_page.assert_awaited_once()
         assert browser._page is mock_pg
-        assert browser._page in browser._cdp_owned_pages
 
     @pytest.mark.asyncio
     async def test_download_manager_attached(self, tmp_path):
@@ -1713,10 +1711,8 @@ class TestBrowserCloseCdp:
 
     @pytest.mark.asyncio
     async def test_cdp_close_does_not_close_borrowed_pages(self):
-        """close() in CDP borrowed context must NOT close any user tabs.
-        It MUST close the bridgic-owned page (the one new_page() returned)."""
-        # Set up two distinct pages: a borrowed user tab and the bridgic-owned
-        # page that mock_ctx.new_page() returns.
+        """close() in CDP borrowed context must NOT close any pages — bridgic
+        just disconnects and leaves the remote browser intact."""
         borrowed_pg = MagicMock()
         borrowed_pg.close = AsyncMock()
         borrowed_pg.goto = AsyncMock()
@@ -1728,16 +1724,13 @@ class TestBrowserCloseCdp:
         bridgic_pg.is_closed = MagicMock(return_value=False)
         browser = await self._start_cdp_browser(mock_pw)
 
-        # After _start: bridgic should have created its own page; borrowed page untouched.
         assert browser._page is bridgic_pg
-        assert bridgic_pg in browser._cdp_owned_pages
 
         await browser.close()
 
-        # User's borrowed tab MUST NOT be closed.
+        # No page is closed — bridgic only disconnects.
         borrowed_pg.close.assert_not_called()
-        # bridgic's owned page MUST be closed.
-        bridgic_pg.close.assert_awaited_once()
+        bridgic_pg.close.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_cdp_close_does_not_close_borrowed_context(self):
@@ -1751,8 +1744,9 @@ class TestBrowserCloseCdp:
         mock_ctx.close.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_cdp_close_closes_owned_context(self):
-        """close() in CDP mode SHOULD close a context that bridgic created."""
+    async def test_cdp_close_does_not_close_owned_context(self):
+        """close() in CDP mode must NOT call context.close() even when bridgic
+        created the context — the remote browser manages its own lifecycle."""
         mock_pw, mock_cdp_browser, mock_ctx, _ = self._make_cdp_mocks(contexts_count=0)
         mock_cdp_browser.contexts = []
         browser = await self._start_cdp_browser(mock_pw)
@@ -1760,7 +1754,7 @@ class TestBrowserCloseCdp:
         assert browser._cdp_context_owned is True
         await browser.close()
 
-        mock_ctx.close.assert_awaited_once()
+        mock_ctx.close.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_cdp_close_does_not_navigate_about_blank(self):
@@ -1807,8 +1801,7 @@ class TestBrowserCloseCdp:
 
     @pytest.mark.asyncio
     async def test_cdp_close_multiple_borrowed_pages_not_closed(self):
-        """close() in CDP borrowed mode must leave all user tabs alone but
-        still close the bridgic-owned page."""
+        """close() in CDP borrowed mode must not close or navigate any page."""
         page1 = MagicMock()
         page1.close = AsyncMock()
         page1.goto = AsyncMock()
@@ -1827,19 +1820,18 @@ class TestBrowserCloseCdp:
 
         await browser.close()
 
-        # User tabs MUST NOT be closed or navigated.
+        # No page is closed or navigated — bridgic only disconnects.
         page1.close.assert_not_called()
         page2.close.assert_not_called()
         page1.goto.assert_not_called()
         page2.goto.assert_not_called()
-        # bridgic's owned page MUST be closed.
-        bridgic_pg.close.assert_awaited_once()
+        bridgic_pg.close.assert_not_called()
 
-    # --- Owned CDP context: pages and context ARE cleaned up ---
+    # --- Owned CDP context: still just disconnect, no page/context cleanup ---
 
     @pytest.mark.asyncio
-    async def test_cdp_owned_context_closes_page(self):
-        """Owned CDP context: page.close() IS called (bridgic created it)."""
+    async def test_cdp_owned_context_does_not_close_pages(self):
+        """Owned CDP context: page.close() is NOT called — bridgic only disconnects."""
         mock_pw, mock_cdp_browser, mock_ctx, mock_pg = self._make_cdp_mocks(contexts_count=0)
         mock_cdp_browser.contexts = []
         browser = await self._start_cdp_browser(mock_pw)
@@ -1847,308 +1839,18 @@ class TestBrowserCloseCdp:
         assert browser._cdp_context_owned is True
         await browser.close()
 
-        # page.close() is called (either directly or via extra-pages loop)
-        assert mock_pg.close.await_count >= 1
+        mock_pg.close.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_cdp_owned_context_closes_pages(self):
-        """Owned CDP context: pages are closed in parallel before context close."""
+    async def test_cdp_owned_context_does_not_close_context(self):
+        """Owned CDP context: context.close() is NOT called — bridgic only disconnects."""
         mock_pw, mock_cdp_browser, mock_ctx, mock_pg = self._make_cdp_mocks(contexts_count=0)
         mock_cdp_browser.contexts = []
         browser = await self._start_cdp_browser(mock_pw)
 
         await browser.close()
 
-        # Pages are closed via parallel asyncio.gather with run_before_unload=False
-        mock_pg.close.assert_awaited()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Browser._cdp_owned_pages — bridgic-owned page tracking in CDP mode
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestBrowserCdpOwnedPages:
-    """Tests for the _cdp_owned_pages tracking set used to clean up only
-    bridgic-created tabs in CDP borrowed-context mode."""
-
-    def _make_cdp_mocks(self, pages=None, contexts_count=1, new_page_factory=None):
-        """Return (mock_pw, mock_cdp_browser, mock_ctx, mock_page) tuple."""
-        mock_pg = MagicMock()
-        mock_pg.bring_to_front = AsyncMock()
-        mock_pg.close = AsyncMock()
-        mock_pg.goto = AsyncMock()
-        mock_pg.video = None
-        mock_pg.is_closed = MagicMock(return_value=False)
-
-        mock_ctx = MagicMock()
-        mock_ctx.add_init_script = AsyncMock()
-        if new_page_factory is not None:
-            mock_ctx.new_page = AsyncMock(side_effect=new_page_factory)
-        else:
-            mock_ctx.new_page = AsyncMock(return_value=mock_pg)
-        mock_ctx.pages = pages if pages is not None else [mock_pg]
-        mock_ctx.close = AsyncMock()
-        mock_ctx.tracing = MagicMock()
-        mock_ctx.tracing.stop = AsyncMock()
-
-        mock_cdp_browser = MagicMock()
-        mock_cdp_browser.contexts = [mock_ctx] * contexts_count
-        mock_cdp_browser.new_context = AsyncMock(return_value=mock_ctx)
-        mock_cdp_browser.close = AsyncMock()
-
-        mock_pw = MagicMock()
-        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=mock_cdp_browser)
-        mock_pw.stop = AsyncMock()
-
-        return mock_pw, mock_cdp_browser, mock_ctx, mock_pg
-
-    async def _start_cdp_browser(self, mock_pw, **kwargs):
-        browser = Browser(
-            cdp_url="ws://localhost:9222/devtools/browser/abc",
-            stealth=False,
-            **kwargs,
-        )
-        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
-            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
-            await browser._start()
-        return browser
-
-    @staticmethod
-    def _make_page(name="page"):
-        p = MagicMock(name=name)
-        p.bring_to_front = AsyncMock()
-        p.close = AsyncMock()
-        p.goto = AsyncMock()
-        p.video = None
-        p.is_closed = MagicMock(return_value=False)
-        return p
-
-    @pytest.mark.asyncio
-    async def test_cdp_owned_page_added_on_start(self):
-        """After _start() in CDP mode, _cdp_owned_pages contains exactly the
-        bridgic-owned page."""
-        mock_pw, _, _, mock_pg = self._make_cdp_mocks(pages=[self._make_page("user")])
-        browser = await self._start_cdp_browser(mock_pw)
-
-        assert len(browser._cdp_owned_pages) == 1
-        assert browser._page in browser._cdp_owned_pages
-        assert browser._page is mock_pg
-
-    @pytest.mark.asyncio
-    async def test_cdp_borrowed_close_keeps_borrowed_pages_closes_owned(self):
-        """Two borrowed user tabs survive close(); the bridgic-owned page is closed."""
-        u1 = self._make_page("u1")
-        u2 = self._make_page("u2")
-        mock_pw, _, _, bridgic_pg = self._make_cdp_mocks(pages=[u1, u2])
-        browser = await self._start_cdp_browser(mock_pw)
-
-        await browser.close()
-
-        u1.close.assert_not_called()
-        u2.close.assert_not_called()
-        bridgic_pg.close.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_cdp_owned_page_already_closed_handled(self):
-        """If the bridgic-owned page was already closed (user closed via Chrome
-        UI), close() must NOT call page.close() on it and must not raise."""
-        mock_pw, _, _, bridgic_pg = self._make_cdp_mocks(pages=[self._make_page("u")])
-        browser = await self._start_cdp_browser(mock_pw)
-
-        # Simulate user closing the bridgic tab manually before close().
-        bridgic_pg.is_closed = MagicMock(return_value=True)
-
-        await browser.close()
-
-        bridgic_pg.close.assert_not_called()
-        assert browser._cdp_owned_pages == set()
-
-    @pytest.mark.asyncio
-    async def test_cdp_owned_page_close_failure_recorded(self):
-        """If a bridgic-owned page raises during close(), the error is recorded
-        in _last_shutdown_errors and close() still completes."""
-        mock_pw, _, _, bridgic_pg = self._make_cdp_mocks(pages=[self._make_page("u")])
-        bridgic_pg.close = AsyncMock(side_effect=RuntimeError("boom"))
-        browser = await self._start_cdp_browser(mock_pw)
-
-        await browser.close()
-
-        # close() must complete and record the failure
-        assert any("boom" in e for e in browser._last_shutdown_errors), (
-            f"expected error to mention 'boom', got: {browser._last_shutdown_errors}"
-        )
-        # downstream cleanup still ran
-        assert browser._page is None
-        assert browser._context is None
-
-    @pytest.mark.asyncio
-    async def test_cdp_new_page_helper_tracks_owned(self):
-        """In CDP mode, calling _new_page() also adds the new page to
-        _cdp_owned_pages so the CLI's `new-tab` command stays trackable."""
-        first = MagicMock(name="first")
-        first.bring_to_front = AsyncMock()
-        first.close = AsyncMock()
-        first.goto = AsyncMock()
-        first.video = None
-        first.is_closed = MagicMock(return_value=False)
-
-        second = MagicMock(name="second")
-        second.bring_to_front = AsyncMock()
-        second.close = AsyncMock()
-        second.goto = AsyncMock()
-        second.video = None
-        second.is_closed = MagicMock(return_value=False)
-
-        call_count = {"n": 0}
-
-        async def _factory():
-            call_count["n"] += 1
-            return first if call_count["n"] == 1 else second
-
-        mock_pw, _, _, _ = self._make_cdp_mocks(
-            pages=[self._make_page("u")], new_page_factory=_factory
-        )
-        browser = await self._start_cdp_browser(mock_pw)
-
-        # _start() consumed first via new_page()
-        assert browser._page is first
-        assert first in browser._cdp_owned_pages
-        assert len(browser._cdp_owned_pages) == 1
-
-        # second invocation via _new_page() should track the new page too
-        result = await browser._new_page()
-        assert result is second
-        assert second in browser._cdp_owned_pages
-        assert len(browser._cdp_owned_pages) == 2
-
-    @pytest.mark.asyncio
-    async def test_navigate_to_recovery_tracks_owned_in_cdp(self):
-        """In CDP mode, navigate_to() recovery (when self._page is None) must
-        track the recovery-created page in _cdp_owned_pages."""
-        first = self._make_page("first")
-        recovery = self._make_page("recovery")
-
-        call_count = {"n": 0}
-
-        async def _factory():
-            call_count["n"] += 1
-            return first if call_count["n"] == 1 else recovery
-
-        mock_pw, _, _, _ = self._make_cdp_mocks(
-            pages=[self._make_page("u")], new_page_factory=_factory
-        )
-        browser = await self._start_cdp_browser(mock_pw)
-
-        assert browser._page is first
-        assert first in browser._cdp_owned_pages
-
-        # Simulate "all tabs closed" — navigate_to() will create a new page.
-        browser._page = None
-        await browser.navigate_to("about:blank")
-
-        assert browser._page is recovery
-        assert recovery in browser._cdp_owned_pages
-        assert len(browser._cdp_owned_pages) == 2
-
-    @pytest.mark.asyncio
-    async def test_owned_pages_cleared_after_close(self):
-        """_cdp_owned_pages must be reset to an empty set after close()."""
-        mock_pw, _, _, _ = self._make_cdp_mocks(pages=[self._make_page("u")])
-        browser = await self._start_cdp_browser(mock_pw)
-
-        assert len(browser._cdp_owned_pages) == 1
-        await browser.close()
-
-        assert browser._cdp_owned_pages == set()
-
-    @pytest.mark.asyncio
-    async def test_close_page_discards_from_cdp_owned_pages(self):
-        """_close_page() must remove the closed page from _cdp_owned_pages.
-
-        Regression guard for M1: long-running CDP daemon would otherwise leak
-        Page references for every new-tab + close-tab cycle, holding onto
-        frames, listeners, and cached resources.
-        """
-        first = self._make_page("first")
-        second = self._make_page("second")
-        # _close_page() awaits title() on the new active page after switching.
-        second.title = AsyncMock(return_value="second-title")
-        second.url = "https://second.example/"
-
-        call_count = {"n": 0}
-
-        async def _factory():
-            call_count["n"] += 1
-            return first if call_count["n"] == 1 else second
-
-        mock_pw, _, mock_ctx, _ = self._make_cdp_mocks(
-            pages=[self._make_page("u")], new_page_factory=_factory
-        )
-        browser = await self._start_cdp_browser(mock_pw)
-
-        # _start() consumed first via new_page() and added it to the owned set.
-        assert first in browser._cdp_owned_pages
-        assert browser._page is first
-
-        # Open a second bridgic-owned tab; ownership grows to 2.
-        second_returned = await browser._new_page()
-        assert second_returned is second
-        assert second in browser._cdp_owned_pages
-        assert len(browser._cdp_owned_pages) == 2
-
-        # After _close_page(first), the post-close switch reads
-        # self._context.pages[0] — make that be `second` so title() works.
-        mock_ctx.pages = [second]
-
-        await browser._close_page(first)
-
-        # first must vanish from the owned set; second must remain.
-        assert first not in browser._cdp_owned_pages
-        assert second in browser._cdp_owned_pages
-        assert len(browser._cdp_owned_pages) == 1
-
-    @pytest.mark.asyncio
-    async def test_cdp_owned_pages_unused_in_launch_mode(self):
-        """Launch mode (no cdp_url) must NOT touch _cdp_owned_pages — the
-        tracking logic is CDP-specific and must not leak elsewhere."""
-        mock_pg = MagicMock()
-        mock_pg.bring_to_front = AsyncMock()
-        mock_pg.close = AsyncMock()
-        mock_pg.video = None
-        mock_pg.is_closed = MagicMock(return_value=False)
-
-        new_pg = MagicMock()
-        new_pg.bring_to_front = AsyncMock()
-        new_pg.close = AsyncMock()
-        new_pg.video = None
-        new_pg.is_closed = MagicMock(return_value=False)
-
-        mock_ctx = MagicMock()
-        mock_ctx.add_init_script = AsyncMock()
-        mock_ctx.new_page = AsyncMock(return_value=new_pg)
-        mock_ctx.pages = [mock_pg]
-        mock_ctx.close = AsyncMock()
-        mock_ctx.tracing = MagicMock()
-        mock_ctx.tracing.stop = AsyncMock()
-
-        mock_browser = MagicMock()
-        mock_browser.new_context = AsyncMock(return_value=mock_ctx)
-        mock_browser.close = AsyncMock()
-
-        mock_pw = MagicMock()
-        mock_pw.chromium.launch_persistent_context = AsyncMock(return_value=mock_ctx)
-        mock_pw.chromium.launch = AsyncMock(return_value=mock_browser)
-        mock_pw.stop = AsyncMock()
-
-        browser = Browser(stealth=False, clear_user_data=True)
-        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
-            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
-            await browser._start()
-            # Launch mode: no tracking
-            assert browser._cdp_owned_pages == set()
-            await browser._new_page()
-            # _new_page should NOT add to the set in launch mode
-            assert browser._cdp_owned_pages == set()
+        mock_ctx.close.assert_not_called()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
