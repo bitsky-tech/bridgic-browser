@@ -20,9 +20,11 @@ bridgic-browser open https://example.com --cdp "ws://localhost:9222/..."
 
 ## Tab ownership in CDP mode
 
-After connecting via CDP, bridgic **always opens its own brand-new tab** in the borrowed browser context. **Your existing tabs are never navigated, refreshed, or closed.** When `close()` runs (or the daemon shuts down), bridgic only closes the tabs it created itself.
+After connecting via CDP, bridgic **always opens its own brand-new tab** in the borrowed browser context. **Your existing tabs are never navigated, refreshed, or closed.**
 
-Each call to `bridgic-browser new-tab` creates an additional bridgic-owned tab; all of them are tracked and cleaned up on shutdown. Tabs you opened manually in Chrome — or pop-ups (`target=_blank` etc.) spawned by pages bridgic was driving — are **not** tracked and will not be touched by bridgic.
+All tabs in the context — including the ones you had open before bridgic connected, and any pop-up tabs (`target=_blank`, `window.open()`) spawned by pages bridgic is driving — are fully visible via `get_tabs` / `switch_tab` / `close_tab`.
+
+When `close()` runs (or the daemon shuts down), bridgic **only disconnects** — no tabs are closed. The remote Chrome continues running exactly as the user left it.
 
 When bridgic connects, the daemon log records which Chrome instance was joined and how many user tabs were preserved:
 
@@ -83,19 +85,18 @@ bridgic records video via Chrome's CDP `Page.startScreencast` (piped to ffmpeg),
 
 ### `close()` only disconnects
 
-`close()` in CDP mode preserves the remote browser state — only bridgic's own tabs are cleaned up:
+`close()` in CDP mode is a pure disconnect — no pages or contexts are touched:
 
-| Operation | Launch mode | CDP (borrowed context) |
-|-----------|------------|----------------------|
+| Operation | Launch mode | CDP mode |
+|-----------|------------|---------|
 | Navigate pages to about:blank | Yes | **Skipped** |
-| `page.close()` on user tabs | Yes | **Skipped** |
-| `page.close()` on bridgic-owned tabs | Yes | Yes |
+| `page.close()` | Yes | **Skipped** |
 | `context.close()` | Yes | **Skipped** |
 | `browser.close()` | Kills process | **Disconnects only** |
 | Save tracing artifacts | Yes | Yes |
 | Save video artifacts | Yes | Yes (all tabs in context) |
 
-After `close()`, the remote Chrome continues running with all of the **user's** tabs intact; only the tabs bridgic explicitly created are gone.
+After `close()`, the remote Chrome continues running with all tabs intact.
 
 ### Connection drops
 
