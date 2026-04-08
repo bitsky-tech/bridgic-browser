@@ -89,7 +89,6 @@ def _make_browser_with_mock_page() -> tuple:
     # this file simulate launch-mode (non-CDP), so both default to "not CDP".
     browser._cdp_url = None
     browser._cdp_context_owned = False
-    browser._cdp_owned_pages = set()
     browser._context = MagicMock()
     browser._page = MagicMock()
     # get_current_page() returns self._page
@@ -246,19 +245,16 @@ async def test_start_video_already_active_does_not_destroy_existing_session():
 
 
 # ---------------------------------------------------------------------------
-# CDP borrowed-context isolation: bridgic must never expose, record, or
-# auto-switch to user-owned tabs in CDP borrowed mode.  These tests cover
-# the regression set R2-A / R2-B / R2-C found in the second-round CR.
+# CDP borrowed-context behaviour: get_pages returns all tabs, start_video
+# records all tabs, _close_page switches to the next available tab.
 # ---------------------------------------------------------------------------
 
 def _make_borrowed_cdp_browser_with_pages(owned_page, user_page):
     """Build a Browser configured as if it had connected to a user's Chrome
-    via CDP, with one bridgic-owned tab and one user-owned tab in the
-    same context."""
+    via CDP, with two tabs in the same context."""
     browser = _make_browser_with_mock_page()
     browser._cdp_url = "ws://localhost:9222/devtools/browser/abc"
     browser._cdp_context_owned = False  # borrowed
-    browser._cdp_owned_pages = {owned_page}
     fake_context = MagicMock()
     # Order matters — get_pages preserves the underlying tab order
     fake_context.pages = [user_page, owned_page]
@@ -267,23 +263,10 @@ def _make_borrowed_cdp_browser_with_pages(owned_page, user_page):
     return browser
 
 
-def test_get_pages_filters_user_tabs_in_cdp_borrowed_mode():
-    """get_pages must hide user-owned tabs when bridgic borrowed the context."""
-    owned = MagicMock(name="bridgic_tab")
-    user = MagicMock(name="user_tab")
-    browser = _make_borrowed_cdp_browser_with_pages(owned, user)
-
-    visible = browser.get_pages()
-    assert visible == [owned]
-    assert user not in visible
-
-
-def test_get_pages_returns_all_pages_when_context_owned():
-    """When bridgic owns the context (launch / persistent / owned-CDP),
-    every page in the context should be visible."""
+def test_get_pages_returns_all_context_pages():
+    """get_pages() must return every page in the context regardless of how
+    the browser was started (launch, persistent, or CDP)."""
     browser = _make_browser_with_mock_page()
-    browser._cdp_url = None  # launch mode
-    browser._cdp_context_owned = False
     p1 = MagicMock(name="p1")
     p2 = MagicMock(name="p2")
     browser._context.pages = [p1, p2]
@@ -292,22 +275,21 @@ def test_get_pages_returns_all_pages_when_context_owned():
 
 
 @pytest.mark.asyncio
-async def test_close_page_does_not_switch_to_user_tab_in_cdp_borrowed_mode():
-    """Closing the last bridgic tab must NOT silently land self._page on
-    a user-owned tab — that would route subsequent commands into the
-    user's banking / email page.
-    """
+async def test_close_page_switches_to_remaining_tab_in_cdp_borrowed_mode():
+    """After closing the active tab in CDP mode, self._page must be set to
+    the next available page in the context (there is no ownership filter)."""
     owned = MagicMock(name="bridgic_tab")
     owned.close = AsyncMock()
     owned.title = AsyncMock(return_value="bridgic")
     user = MagicMock(name="user_tab")
+    user.is_closed = MagicMock(return_value=False)
+    user.title = AsyncMock(return_value="user-tab-title")
     browser = _make_borrowed_cdp_browser_with_pages(owned, user)
 
     success, _msg = await browser._close_page(owned)
     assert success
-    # No bridgic-owned pages remain → self._page must be None,
-    # NOT the user's still-open tab.
-    assert browser._page is None
+    # A remaining page exists → self._page switches to it.
+    assert browser._page is user
 
 
 @pytest.mark.asyncio
@@ -324,7 +306,6 @@ async def test_start_video_records_all_tabs_in_cdp_borrowed_mode():
     browser = _make_browser_with_mock_page()
     browser._cdp_url = "ws://localhost:9222/devtools/browser/abc"
     browser._cdp_context_owned = False
-    browser._cdp_owned_pages = {owned}
 
     fake_context = MagicMock()
     fake_context.pages = [owned, user]
