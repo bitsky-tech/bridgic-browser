@@ -1349,9 +1349,9 @@ class Browser:
                     if init_script:
                         await self._context.add_init_script(init_script)
 
-                # Always create a new bridgic-owned tab.  We never reuse a
-                # borrowed user tab — the very next navigate_to() would
-                # otherwise overwrite whatever the user was looking at.
+                # Always create a new tab for bridgic to drive.  We never
+                # reuse an existing user tab — the very next navigate_to()
+                # would otherwise overwrite whatever the user was looking at.
                 # In owned-context mode the new context is empty anyway, so
                 # this is a no-op cost.
                 existing_count = len(self._context.pages)
@@ -1650,9 +1650,7 @@ class Browser:
         paths included in the result.
 
         **CDP mode**: only disconnects the Playwright session from the remote
-        browser — pages, tabs, and borrowed contexts are left intact.  A
-        context created by bridgic (when ``connect_over_cdp`` returned no
-        existing contexts) is closed normally.
+        browser — pages, tabs, and contexts are left intact.
 
         Safe to call even when the browser was never started — returns
         ``"Browser closed."`` immediately without raising.
@@ -1682,7 +1680,6 @@ class Browser:
         # just because one step was interrupted.
         _pending_cancel: Optional[BaseException] = None
         _is_cdp = self._cdp_url is not None
-        _cdp_borrowed = _is_cdp and not self._cdp_context_owned
 
         # Auto-stop active tracing before context/page teardown so trace data is saved.
         if self._context:
@@ -6874,8 +6871,7 @@ Before you return the element ref, reason about the state and elements for a sen
         already being recorded.  Mirrors Playwright CLI's
         ``Context._startPageVideo`` (``tools/backend/context.ts``).
 
-        In CDP borrowed-context mode ALL pages in the context are recorded,
-        including the user's pre-existing tabs.
+        In CDP mode all pages in the context are recorded.
         """
         if self._video_session is None:
             return
