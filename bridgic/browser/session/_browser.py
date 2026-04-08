@@ -6950,20 +6950,14 @@ Before you return the element ref, reason about the state and elements for a sen
         already being recorded.  Mirrors Playwright CLI's
         ``Context._startPageVideo`` (``tools/backend/context.ts``).
 
-        In CDP borrowed-context mode, skip pages bridgic does not own
-        (the user's existing tabs and any pop-ups they spawn).  Recording
-        a user's banking / email tab without consent would be a serious
-        privacy violation, and contradicts the tab-ownership invariant
-        documented in ``docs/CDP_MODE.md``.
+        In CDP borrowed-context mode ALL pages in the context are recorded,
+        including the user's pre-existing tabs.
         """
         if self._video_session is None:
             return
         if page in self._video_recorders:
             return
         if page.is_closed():
-            return
-        # CDP borrowed context: only record bridgic-owned tabs.
-        if self._cdp_url and not self._cdp_context_owned and page not in self._cdp_owned_pages:
             return
 
         output_path = self._allocate_video_temp_path()
