@@ -8,7 +8,7 @@ import sys
 import tempfile
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Set, Union, NoReturn
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Union, NoReturn
 
 if TYPE_CHECKING:
     try:
@@ -848,11 +848,6 @@ class Browser:
         # Whether bridgic created the CDP context (vs borrowing an existing one).
         # When True, close() will close the context; when False it only disconnects.
         self._cdp_context_owned = False
-        # Pages bridgic explicitly created inside the (possibly borrowed) CDP
-        # context.  close() uses this to clean up bridgic's own tabs without
-        # touching the user's existing tabs.  Unused in non-CDP modes (kept
-        # empty as a defensive default).
-        self._cdp_owned_pages: Set[Any] = set()
 
         # Browser launch parameters
         self._channel = channel
@@ -1361,7 +1356,6 @@ class Browser:
                 # this is a no-op cost.
                 existing_count = len(self._context.pages)
                 self._page = await self._context.new_page()
-                self._cdp_owned_pages.add(self._page)
                 logger.info(
                     "[CDP] connected; created new bridgic tab "
                     "(borrowed_context=%s, preserved_existing_tabs=%d)",
@@ -1688,8 +1682,6 @@ class Browser:
         # just because one step was interrupted.
         _pending_cancel: Optional[BaseException] = None
         _is_cdp = self._cdp_url is not None
-        # True when we are a guest on someone else's browser — must not
-        # close pages, navigate, or destroy the borrowed context.
         _cdp_borrowed = _is_cdp and not self._cdp_context_owned
 
         # Auto-stop active tracing before context/page teardown so trace data is saved.
@@ -1804,69 +1796,32 @@ class Browser:
             except Exception as e:
                 errors.append(f"download_manager.detach: {e}")
 
-        # Close every page in parallel (replaces the old serial
-        # about:blank → close walk).
-        #
-        # Why we no longer navigate to about:blank first:
-        #   The previous code navigated each page to about:blank to stop
-        #   service workers, then closed it. Playwright CLI does not do
-        #   this — it just calls close() directly. ``run_before_unload=
-        #   False`` already aborts in-flight activity, and parallel close
-        #   is much faster than serial about:blank + close.
-        #
-        # Why asyncio.gather:
-        #   Tab closes are independent; serializing them would compound
-        #   the per-page timeout. Reference: Playwright's
-        #   browserContext.ts ``close()`` also closes pages in parallel.
-        #
-        # CDP borrowed context: only close pages bridgic created itself
-        # (``_cdp_owned_pages``); never touch the user's existing tabs.
+        # Close every page in parallel.
+        # CDP mode: skip page cleanup entirely — just disconnect.
+        #   The remote browser manages its own tab lifecycle.
+        # Launch / persistent: close all pages explicitly before context close.
         self._page = None
-        if self._context:
-            if _cdp_borrowed:
-                # Borrowed CDP context: only close pages bridgic created.
-                # Skip pages already closed by the user (via Chrome UI).
-                owned = [
-                    p for p in self._cdp_owned_pages
-                    if not p.is_closed()
-                ]
-                if owned:
-                    page_results = await asyncio.gather(
-                        *(asyncio.wait_for(
-                            p.close(run_before_unload=False),
-                            timeout=self._PAGE_CLOSE_TIMEOUT,
-                        ) for p in owned),
-                        return_exceptions=True,
-                    )
-                    for r in page_results:
-                        if isinstance(r, BaseException):
-                            if not isinstance(r, Exception) and _pending_cancel is None:
-                                _pending_cancel = r
-                            elif isinstance(r, Exception):
-                                errors.append(f"cdp_owned_page.close: {r}")
-            else:
-                # Launch / persistent / owned-CDP-context: close all pages.
-                all_pages = list(self._context.pages)
-                if all_pages:
-                    page_results = await asyncio.gather(
-                        *(asyncio.wait_for(
-                            p.close(run_before_unload=False),
-                            timeout=self._PAGE_CLOSE_TIMEOUT,
-                        ) for p in all_pages),
-                        return_exceptions=True,
-                    )
-                    for r in page_results:
-                        if isinstance(r, BaseException):
-                            if not isinstance(r, Exception) and _pending_cancel is None:
-                                _pending_cancel = r
-                            elif isinstance(r, Exception):
-                                errors.append(f"page.close: {r}")
+        if self._context and not _is_cdp:
+            all_pages = list(self._context.pages)
+            if all_pages:
+                page_results = await asyncio.gather(
+                    *(asyncio.wait_for(
+                        p.close(run_before_unload=False),
+                        timeout=self._PAGE_CLOSE_TIMEOUT,
+                    ) for p in all_pages),
+                    return_exceptions=True,
+                )
+                for r in page_results:
+                    if isinstance(r, BaseException):
+                        if not isinstance(r, Exception) and _pending_cancel is None:
+                            _pending_cancel = r
+                        elif isinstance(r, Exception):
+                            errors.append(f"page.close: {r}")
 
-        # Close context
-        # NOTE: In persistent context mode, closing context will auto close browser
-        # CDP mode: only close the context if bridgic created it; borrowed contexts
-        # belong to the remote browser and must not be destroyed.
-        if self._context and not _cdp_borrowed:
+        # Close context.
+        # NOTE: In persistent context mode, closing context will auto close browser.
+        # CDP mode: skip context.close() — just release the reference and disconnect.
+        if self._context and not _is_cdp:
             _context = self._context
             self._context = None
             try:
@@ -1892,7 +1847,7 @@ class Browser:
                 if _pending_cancel is None:
                     _pending_cancel = e
         elif self._context:
-            # CDP borrowed context: release reference without closing
+            # CDP mode: release reference without closing (disconnect only)
             self._context = None
 
         # Close browser.
@@ -1961,7 +1916,6 @@ class Browser:
         self._dialog_handlers.clear()
         self._tracing_state.clear()
         self._video_state.clear()
-        self._cdp_owned_pages.clear()
 
         trace_paths = shutdown_artifacts.get("trace", [])
         video_paths = shutdown_artifacts.get("video", [])
@@ -2069,8 +2023,6 @@ class Browser:
                 # All tabs were closed (e.g. via close_tab); _context is still alive.
                 logger.info("No page is open, creating a new page in existing context")
                 self._page = await self._context.new_page()
-                if self._cdp_url:
-                    self._cdp_owned_pages.add(self._page)
 
             kwargs: Dict[str, Any] = {"wait_until": wait_until}
             if timeout is not None:
@@ -2104,8 +2056,6 @@ class Browser:
                 code="NO_BROWSER_CONTEXT",
             )
         self._page = await self._context.new_page()
-        if self._cdp_url:
-            self._cdp_owned_pages.add(self._page)
         if url:
             await self.navigate_to(url, wait_until=wait_until, timeout=timeout)
         await self._page.bring_to_front()
@@ -2136,26 +2086,15 @@ class Browser:
         return page_descs
 
     def get_pages(self) -> List[Page]:
-        """Return the pages bridgic considers part of its session.
+        """Return all pages in the current browser context.
 
-        Launch / persistent / CDP-with-owned-context modes: every page in
-        the context belongs to bridgic, so we return them all.
-
-        CDP borrowed-context mode: bridgic is a guest on the user's real
-        Chrome session.  We must only expose tabs bridgic explicitly
-        created (tracked in ``_cdp_owned_pages``); the user's tabs and
-        any pop-ups they spawn are off-limits — they should not appear
-        in ``get_tabs``, be selectable via ``switch_tab``, become the
-        fallback "current page" after ``close_tab``, or be visible to
-        any of the page-iterating tools.  This invariant is documented
-        in ``docs/CDP_MODE.md``.
+        In CDP mode bridgic operates as a guest on the remote browser, so all
+        tabs — including pre-existing user tabs and pop-ups spawned by pages
+        bridgic was driving — are part of the session and are reachable via
+        ``get_tabs`` / ``switch_tab``.
         """
         if not self._context:
             return []
-        if self._cdp_url and not self._cdp_context_owned:
-            # Preserve the underlying tab order so indices stay stable.
-            owned = self._cdp_owned_pages
-            return [p for p in self._context.pages if p in owned]
         return self._context.pages
 
     async def switch_to_page(self, page_id: str) -> tuple[bool, str]:
@@ -2232,24 +2171,9 @@ class Browser:
             except Exception as e:
                 logger.debug("[_close_page] video recorder stop error: %s", e)
 
-        try:
-            await page.close()
-        finally:
-            # Drop our ownership reference now that the close attempt is
-            # done. Without this discard, every CDP-mode new-tab +
-            # close-tab cycle would leak a Page object (frames,
-            # listeners, cached resources) for the lifetime of the
-            # daemon. We discard inside `finally` so a raised
-            # page.close() can't leave a stale reference behind.
-            # discard() is a no-op in launch / persistent /
-            # owned-CDP-context modes where _cdp_owned_pages stays empty.
-            self._cdp_owned_pages.discard(page)
+        await page.close()
 
         # If the closed page is the current page, switch to another.
-        # Use the bridgic-visible page list (get_pages) so that in CDP
-        # borrowed mode we never silently land on a user tab — operating
-        # on the user's banking / email page after a close_tab would be
-        # a serious privacy violation.
         if self._page == page:
             pages = self.get_pages()
             self._page = pages[0] if pages else None

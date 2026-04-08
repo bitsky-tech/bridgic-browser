@@ -45,6 +45,7 @@ docs/site/
 docs/debug.log
 docs/docs/reference
 docs/mkdocs.yml
+docs/superpowers/
 
 # Cursor/Editor
 .cursor/
