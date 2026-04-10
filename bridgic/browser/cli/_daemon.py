@@ -871,11 +871,8 @@ def _resolve_default_downloads_dir() -> Path:
     user_downloads = Path.home() / "Downloads"
     try:
         user_downloads.mkdir(parents=True, exist_ok=True)
-        # Verify writable by testing with a temp file
-        probe = user_downloads / ".bridgic_probe"
-        probe.touch()
-        probe.unlink()
-        return user_downloads
+        if os.access(str(user_downloads), os.W_OK):
+            return user_downloads
     except OSError:
         pass
 

@@ -389,7 +389,7 @@ def test_cli_screenshot_on_preopened_tab(session):
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         path = f.name
     try:
-        out = _ok(f"{CLI} screenshot {path}", timeout=15)
+        out = _ok(f'{CLI} screenshot "{path}"', timeout=15)
         print(f"\n[screenshot]: {out}")
         assert os.path.exists(path), "Screenshot file not created"
         size = os.path.getsize(path)

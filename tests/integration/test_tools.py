@@ -107,7 +107,7 @@ async def browser():
         stealth=False,
         viewport={"width": 1280, "height": 720},
     )
-    test_url = f"file://{TEST_PAGE_PATH.absolute()}"
+    test_url = TEST_PAGE_PATH.absolute().as_uri()
     await browser_instance.navigate_to(test_url)
     await asyncio.sleep(0.3)
     yield browser_instance
@@ -128,13 +128,13 @@ class TestNavigationTools:
 
     @pytest.mark.asyncio
     async def test_navigate_to(self, browser):
-        test_url = f"file://{TEST_PAGE_PATH.absolute()}"
+        test_url = TEST_PAGE_PATH.absolute().as_uri()
         result = await browser.navigate_to(test_url)
         assert "Navigated to" in result
 
     @pytest.mark.asyncio
     async def test_go_back_and_forward(self, browser):
-        test_url = f"file://{TEST_PAGE_PATH.absolute()}"
+        test_url = TEST_PAGE_PATH.absolute().as_uri()
         page = await browser.get_current_page()
         await page.click("#link-form")
         await asyncio.sleep(0.2)
@@ -199,7 +199,7 @@ class TestPageTools:
         assert result.startswith("Created new blank tab")
         assert re.search(r"\bpage_\d+\b", result), result
 
-        test_url = f"file://{TEST_PAGE_PATH.absolute()}"
+        test_url = TEST_PAGE_PATH.absolute().as_uri()
         await browser.navigate_to(test_url)
 
         result_str = await browser.get_tabs()
@@ -566,7 +566,7 @@ class TestNetworkTools:
         assert result is not None
 
         # Trigger a navigation (which creates network requests)
-        test_url = f"file://{TEST_PAGE_PATH.absolute()}"
+        test_url = TEST_PAGE_PATH.absolute().as_uri()
         await browser.navigate_to(test_url)
 
         reqs = await browser.get_network_requests(include_static=True)
@@ -698,7 +698,7 @@ class TestVerificationTools:
 
     @pytest.mark.asyncio
     async def test_verify_url(self, browser):
-        test_url = f"file://{TEST_PAGE_PATH.absolute()}"
+        test_url = TEST_PAGE_PATH.absolute().as_uri()
         result = await browser.verify_url(test_url, exact=True)
         assert "PASS" in result
 

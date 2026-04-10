@@ -181,10 +181,10 @@ def find_cdp_url(
         return ws_url
 
     if mode == "scan":
-        platform = sys.platform
-        candidates = _CDP_SCAN_DIRS.get(platform, [])
+        _platform = sys.platform
+        candidates = _CDP_SCAN_DIRS.get(_platform, [])
         if not candidates:
-            raise RuntimeError(f"Auto-scan is not supported on platform: {platform}")
+            raise RuntimeError(f"Auto-scan is not supported on platform: {_platform}")
         for label, raw_path in candidates:
             base = os.path.expandvars(os.path.expanduser(raw_path))
             ws_url = _read_devtools_active_port(base)
@@ -2453,6 +2453,9 @@ class Browser:
         if not self._page:
             logger.warning("No page is open")
             return None
+        if not self._context:
+            logger.warning("No context is open")
+            return None
         try:
             # Use CDP Page.getLayoutMetrics directly — avoids page.evaluate() which hangs
             # indefinitely on pre-existing tabs in CDP borrowed mode (Playwright misses the
@@ -3130,9 +3133,12 @@ Before you return the element ref, reason about the state and elements for a sen
             snapshot, page_title = await asyncio.gather(
                 self.get_snapshot(interactive=interactive, full_page=full_page),
                 _get_title(),
+                return_exceptions=True,
             )
-            if snapshot is None:
+            if isinstance(snapshot, BaseException) or snapshot is None:
                 _raise_operation_error("Failed to get snapshot")
+            if isinstance(page_title, BaseException):
+                page_title = ""
             page_url = _page.url if _page else ""
             header = f"[Page: {page_url} | {page_title}]\n"
             full_text = snapshot.tree
@@ -4661,7 +4667,7 @@ Before you return the element ref, reason about the state and elements for a sen
                 # tabs where _mainContext() hangs.
                 try:
                     result = await asyncio.wait_for(locator.evaluate(code), timeout=5.0)
-                except (asyncio.TimeoutError, Exception) as native_err:
+                except Exception as native_err:
                     if isinstance(native_err, asyncio.TimeoutError):
                         logger.debug(
                             f'[evaluate_javascript_on_ref] native evaluate timed out '

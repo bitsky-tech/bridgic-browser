@@ -82,12 +82,14 @@ def _find_ffmpeg() -> str:
         elif system == "Linux":
             browsers_path = os.path.expanduser("~/.cache/ms-playwright")
         else:
-            browsers_path = os.path.join(
-                os.environ.get("LOCALAPPDATA", ""), "ms-playwright"
-            )
+            _local_app = os.environ.get("LOCALAPPDATA", "")
+            if _local_app:
+                browsers_path = os.path.join(_local_app, "ms-playwright")
+            else:
+                browsers_path = ""
 
     bp = Path(browsers_path)
-    if bp.is_dir():
+    if browsers_path and bp.is_dir():
         suffix_map = {"Darwin": "mac", "Linux": "linux", "Windows": "win64.exe"}
         suffix = suffix_map.get(platform.system(), "linux")
         # Pick the highest numeric revision (e.g. ffmpeg-1011 > ffmpeg-999).
@@ -223,6 +225,7 @@ class VideoRecorder:
         self._is_stopped = False
         self._write_lock = asyncio.Lock()                              # serializes writes to ffmpeg's stdin
         self._flush_pending = False                                    # dedup flag: avoid scheduling a flush task per frame
+        self._ffmpeg_write_warned = False                               # one-shot dedup for ffmpeg write errors
 
     # ------------------------------------------------------------------
     # Public API
@@ -396,8 +399,8 @@ class VideoRecorder:
 
         self._is_stopped = True
 
-        logger.debug("[VideoRecorder] prepare_stop step6: detach CDP %s", self._output_path)
-        # Step 6 (moved here from old stop()): detach the CDP session
+        logger.debug("[VideoRecorder] prepare_stop step4: detach CDP %s", self._output_path)
+        # Step 4 (moved here from old stop()): detach the CDP session
         # early so Chrome resources are released before finalize().
         if self._cdp_session:
             try:
@@ -660,7 +663,7 @@ class VideoRecorder:
             self._ffmpeg.stdin.write(frame)
             await self._ffmpeg.stdin.drain()
         except Exception as e:
-            if not getattr(self, "_ffmpeg_write_warned", False):
+            if not self._ffmpeg_write_warned:
                 logger.warning("[VideoRecorder] ffmpeg write error: %s", e)
                 self._ffmpeg_write_warned = True
             else:
