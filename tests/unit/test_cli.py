@@ -783,7 +783,7 @@ class TestCliCommandRouting:
         abs_path = "/tmp/my_screenshot.png"
         _, sc = invoke(["screenshot", abs_path])
         sc.assert_called_once_with(
-            "screenshot", {"path": abs_path, "full_page": False}, start_if_needed=False
+            "screenshot", {"path": os.path.abspath(abs_path), "full_page": False}, start_if_needed=False
         )
 
     def test_pdf_absolutizes_relative_path(self, tmp_path, monkeypatch):
@@ -1009,8 +1009,9 @@ class TestCliCommandRouting:
         sc.assert_called_once_with("video_stop", {"path": None}, start_if_needed=False)
 
     def test_video_stop_with_absolute_path(self):
-        _, sc = invoke(["video-stop", "/tmp/video.webm"])
-        sc.assert_called_once_with("video_stop", {"path": "/tmp/video.webm"}, start_if_needed=False)
+        abs_path = "/tmp/video.webm"
+        _, sc = invoke(["video-stop", abs_path])
+        sc.assert_called_once_with("video_stop", {"path": os.path.abspath(abs_path)}, start_if_needed=False)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -1184,6 +1185,7 @@ class TestDaemonSocketSecurity:
             path = _default_socket_path()
         assert path == str(fake_browser_home / "run" / "bridgic-browser.sock")
 
+    @pytest.mark.skipif(not hasattr(os, "getuid"), reason="os.getuid unavailable on Windows")
     def test_safe_remove_socket_removes_owned_socket(self):
         mock_path = MagicMock()
         mock_path.exists.return_value = True
@@ -1198,6 +1200,7 @@ class TestDaemonSocketSecurity:
 
         mock_path.unlink.assert_called_once()
 
+    @pytest.mark.skipif(not hasattr(os, "getuid"), reason="os.getuid unavailable on Windows")
     def test_safe_remove_socket_rejects_non_socket_path(self):
         mock_path = MagicMock()
         mock_path.exists.return_value = True
@@ -1247,6 +1250,7 @@ class TestDaemonSocketSecurity:
 
         mock_path.unlink.assert_not_called()
 
+    @pytest.mark.skipif(not hasattr(os, "getuid"), reason="os.getuid unavailable on Windows")
     def test_safe_remove_socket_noop_when_unlink_races_with_delete(self):
         mock_path = MagicMock()
         mock_path.stat.return_value = SimpleNamespace(
@@ -2250,6 +2254,7 @@ class TestTransport:
         assert t._port == 12345
         assert t._token == "abc123"
 
+    @pytest.mark.skipif(not hasattr(__import__("socket"), "AF_UNIX"), reason="AF_UNIX unavailable on Windows")
     def test_unix_transport_probe_returns_false_when_no_socket(self, tmp_path):
         sock_path = str(tmp_path / "no.sock")
         t = UnixTransport(sock_path)
@@ -2541,6 +2546,10 @@ class TestReadDevToolsActivePort:
             result = fn(d)
         assert result is None
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="os.chmod(0o000) does not restrict read access on Windows",
+    )
     def test_no_read_permission_returns_none(self):
         fn = self._fn()
         with tempfile.TemporaryDirectory() as d:
@@ -2893,6 +2902,9 @@ class TestDaemonDownloadsPath:
 
     def test_resolve_default_downloads_dir_fallback(self, tmp_path: Path):
         """When ~/Downloads is not writable, falls back to app-managed dir."""
+        if os.name == "nt":
+            pytest.skip("chmod does not restrict write access on Windows")
+
         fake_home = tmp_path / "home"
         fake_downloads = fake_home / "Downloads"
         fake_downloads.mkdir(parents=True)
