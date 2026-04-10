@@ -580,6 +580,11 @@ async def _cdp_reconnect(browser: "Browser") -> bool:
 
     Returns True if the reconnect succeeded, False otherwise.
     After a successful reconnect the browser is at about:blank (new session).
+
+    Implementation note: calls ``browser._start()`` (private) because there
+    is no public ``reconnect()`` API. This is intentional — reconnect is a
+    daemon-only concern.  If ``_start()``'s preconditions change, this
+    function must be updated accordingly.
     """
     try:
         await browser.close()
@@ -671,6 +676,11 @@ async def _dispatch(browser: "Browser", command: str, args: Dict[str, Any]) -> D
 
 
 _READ_TIMEOUT = 60.0  # seconds to wait for a command line from the client
+# Global safety-net timeout for browser.close(). The large value (300s)
+# accommodates worst-case video finalization (ffmpeg encoding). In practice
+# individual cleanup steps have their own shorter timeouts (video finalize
+# 30s, context close 15s, etc.), so the full 300s is never reached during
+# normal operation.
 try:
     _DAEMON_STOP_TIMEOUT = float(os.environ.get("BRIDGIC_DAEMON_STOP_TIMEOUT", "300"))
 except (ValueError, TypeError):

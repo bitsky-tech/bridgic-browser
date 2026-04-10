@@ -506,19 +506,19 @@ class TestCliCommandRouting:
 
     def test_search_default_engine(self):
         _, sc = invoke(["search", "python async"])
-        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=False, clear_user_data=False)
+        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=False, clear_user_data=False, cdp_url=None)
 
     def test_search_custom_engine(self):
         _, sc = invoke(["search", "query", "--engine", "google"])
-        sc.assert_called_once_with("search", {"query": "query", "engine": "google"}, headed=False, clear_user_data=False)
+        sc.assert_called_once_with("search", {"query": "query", "engine": "google"}, headed=False, clear_user_data=False, cdp_url=None)
 
     def test_search_headed(self):
         _, sc = invoke(["search", "--headed", "python async"])
-        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=True, clear_user_data=False)
+        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=True, clear_user_data=False, cdp_url=None)
 
     def test_search_clear_user_data(self):
         _, sc = invoke(["search", "--clear-user-data", "python async"])
-        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=False, clear_user_data=True)
+        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=False, clear_user_data=True, cdp_url=None)
 
     def test_info(self):
         _, sc = invoke(["info"])

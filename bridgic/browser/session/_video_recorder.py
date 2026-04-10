@@ -44,6 +44,7 @@ import platform
 import re
 import shutil
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
@@ -219,7 +220,7 @@ class VideoRecorder:
         self._first_frame_ts: float = 0.0                              # timestamp of the first frame; used to compute frame numbers
         self._last_frame: Optional[Tuple[bytes, float, int]] = None    # (jpeg_bytes, timestamp, frame_number)
         self._last_write_time: float = 0.0                             # monotonic time of the last write_frame() call
-        self._frame_queue: List[bytes] = []                            # frames waiting to be written to ffmpeg's stdin
+        self._frame_queue: deque[bytes] = deque()                        # frames waiting to be written to ffmpeg's stdin
         self._is_stopped = False
         self._write_lock = asyncio.Lock()                              # serializes writes to ffmpeg's stdin
         self._flush_pending = False                                    # dedup flag: avoid scheduling a flush task per frame
@@ -376,6 +377,13 @@ class VideoRecorder:
         # sentinel that tells _write_frame to advance the frame counter
         # without replacing the cached JPEG bytes.
         # Reference: videoRecorder.ts lines 140-144.
+        #
+        # Note: _last_write_time is monotonic while _last_frame[1] is
+        # wall-clock (Chrome's metadata.timestamp). Mixing clocks is safe
+        # here because add_time is a *duration* (not an absolute
+        # timestamp) — both clocks advance at the same rate, so the
+        # delta is valid.  monotonic is preferred for the duration to
+        # avoid NTP jump artifacts.
         add_time = max(time.monotonic() - self._last_write_time, 1.0)
         self._write_frame(b"", self._last_frame[1] + add_time)  # type: ignore[index]
 
@@ -442,6 +450,25 @@ class VideoRecorder:
         """
         await self.prepare_stop()
         return await self.finalize()
+
+    async def detach_screencast(self) -> None:
+        """Stop the CDP screencast and detach the session without stopping ffmpeg.
+
+        Used when the last recorded page is about to close — the CDP session
+        is bound to that page and will die with it, but ffmpeg must stay alive
+        for a later ``finalize()`` call.  Idempotent: safe to call when the
+        session is already detached.
+        """
+        if self._cdp_session:
+            try:
+                await self._cdp_session.send("Page.stopScreencast")
+            except Exception:
+                pass
+            try:
+                await self._cdp_session.detach()
+            except Exception:
+                pass
+            self._cdp_session = None
 
     async def switch_page(self, new_page: Any) -> None:
         """Switch screencast source to a different page. ffmpeg stays alive."""
@@ -603,7 +630,7 @@ class VideoRecorder:
         """Drain the frame queue into ffmpeg's stdin under a write lock."""
         async with self._write_lock:
             while self._frame_queue:
-                frame_data = self._frame_queue.pop(0)
+                frame_data = self._frame_queue.popleft()
                 await self._send_frame(frame_data)
 
     async def _flush_and_reset(self) -> None:

@@ -173,7 +173,8 @@ class TestVideoRecorder:
         mock_proc.stdin = mock_stdin
         rec._ffmpeg = mock_proc
 
-        rec._frame_queue = [b"a", b"b", b"c"]
+        from collections import deque
+        rec._frame_queue = deque([b"a", b"b", b"c"])
         await rec._flush_queue()
 
         assert mock_stdin.write.call_count == 3

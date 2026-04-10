@@ -186,10 +186,26 @@ def cmd_reload() -> None:
               help="Launch the browser in headed (visible) mode.")
 @click.option("--clear-user-data", is_flag=True, default=False,
               help="Start with a fresh browser profile (no persistent user data). Ignored if a session is already running.")
-def cmd_search(query: str, engine: str, headed: bool, clear_user_data: bool) -> None:
+@click.option(
+    "--cdp", default=None, metavar="PORT_OR_URL",
+    help=(
+        "Connect to a running browser instead of launching a new one. "
+        "Accepts: port number (9222), ws:// or wss:// URL, http://host:port, "
+        "or 'auto' to scan local Chrome/Chromium/Brave (+ Canary variants) profiles."
+    ),
+)
+def cmd_search(query: str, engine: str, headed: bool, clear_user_data: bool, cdp: str | None) -> None:
     """Search the web using a search engine (starts a browser session if needed)."""
+    cdp_url: str | None = None
+    if cdp:
+        from bridgic.browser.session._browser import resolve_cdp_input
+        try:
+            cdp_url = resolve_cdp_input(cdp)
+        except Exception as exc:
+            _err(exc)
+            return
     try:
-        _ok(send_command("search", {"query": query, "engine": engine}, headed=headed, clear_user_data=clear_user_data))
+        _ok(send_command("search", {"query": query, "engine": engine}, headed=headed, clear_user_data=clear_user_data, cdp_url=cdp_url))
     except Exception as exc:
         _err(exc)
 

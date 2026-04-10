@@ -6,7 +6,7 @@ import os
 import signal
 import sys
 import tempfile
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Union, NoReturn
 
@@ -169,13 +169,15 @@ def find_cdp_url(
         except (KeyError, json.JSONDecodeError) as exc:
             raise ValueError(f"Failed to parse /json/version response: {exc}") from exc
         # Chrome always reports localhost in the URL; replace with the actual
-        # host when the user passed a remote address. Compare against the
-        # *normalized* host_lower so callers passing "LOCALHOST" or other
-        # mixed-case loopback variants still get a clean lowercase URL
-        # rather than ws://LOCALHOST:9222/... For IPv6 hosts we substitute
-        # the bracketed form so the resulting URL is parseable.
+        # host when the user passed a remote address. Use urlparse to
+        # precisely swap only the hostname component (a naive string replace
+        # could match "localhost" inside a path or query parameter).
         if host_lower != "localhost":
-            ws_url = ws_url.replace("localhost", host_in_url, 1)
+            _parsed_ws = urlparse(ws_url)
+            # Rebuild netloc: bracketed IPv6 host + original port
+            _ws_port = _parsed_ws.port or port
+            _new_netloc = f"{host_in_url}:{_ws_port}"
+            ws_url = urlunparse(_parsed_ws._replace(netloc=_new_netloc))
         return ws_url
 
     if mode == "scan":
@@ -508,7 +510,9 @@ async def _is_native_checkbox_or_radio(locator) -> bool:
     Uses ``get_attribute("type")`` instead of ``evaluate()`` to avoid
     Playwright's ``_mainContext()`` hang on pre-existing CDP tabs.
     Only ``<input type=checkbox|radio>`` elements carry those type values, so
-    the tagName check is redundant.
+    the tagName check is redundant.  A custom element with an explicit
+    ``type="checkbox"`` attribute would be misidentified, but this is
+    vanishingly rare in practice.
     """
     try:
         input_type = (await locator.get_attribute("type") or "").strip().lower()
@@ -543,6 +547,10 @@ async def _cdp_evaluate_on_element(cdp_context, page, locator, code: str) -> Any
     Resolves the element via bounding-box coordinates + ``document.elementFromPoint``
     so it bypasses Playwright's ``_mainContext()`` which hangs on pre-existing
     CDP-borrowed tabs.  Raises on any failure (caller must handle).
+
+    Note: assumes no concurrent scroll between ``bounding_box()`` and the CDP
+    ``Runtime.evaluate`` call — if the page scrolls in between, the coordinates
+    may resolve to a different element.
     """
     bbox = await locator.bounding_box()
     if bbox is None:
@@ -1790,9 +1798,10 @@ class Browser:
         errors: List[str] = []
         shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
         context_key: Optional[str] = None
-        # Recorders whose prepare_stop() has run but finalize() is deferred
+        # Recorder whose prepare_stop() has run but finalize() is deferred
         # until after Chrome exits (two-phase video shutdown).
-        _deferred_recorders: list = []
+        # Currently only one single-stream recorder is supported.
+        _deferred_recorder: Optional[Any] = None
         # Deferred re-raise: if CancelledError / KeyboardInterrupt arrives during any
         # cleanup await we record it here, finish ALL cleanup steps, then re-raise at
         # the very end.  This ensures no Playwright/Chromium process is left orphaned
@@ -1905,7 +1914,7 @@ class Browser:
                             _pending_cancel = _pr
 
                     # Stash for Phase 2 (runs after Chrome exits).
-                    _deferred_recorders = [("single", _recorder)]
+                    _deferred_recorder = _recorder
 
             logger.debug("[close] Phase 1 done, clearing page state")
             # Always clear page-scoped listeners/caches for every context page.
@@ -2020,15 +2029,14 @@ class Browser:
                 if _pending_cancel is None:
                     _pending_cancel = e
 
-        # Phase 2: finalize() deferred video recorders.
+        # Phase 2: finalize() the deferred video recorder.
         # Chrome is dead, user_data_dir is released.  Now flush the ffmpeg
-        # frame queues with a semaphore to bound CPU usage.
-        if _deferred_recorders:
+        # frame queue.
+        if _deferred_recorder is not None:
             logger.info("[close] Phase 2: finalize single recorder")
-            _, _rec_to_finalize = _deferred_recorders[0]
             try:
                 rec_path: str = await asyncio.wait_for(
-                    _rec_to_finalize.finalize(),
+                    _deferred_recorder.finalize(),
                     timeout=self._VIDEO_FINALIZE_TIMEOUT,
                 )
                 if self._close_session_dir:
@@ -2423,16 +2431,7 @@ class Browser:
                     logger.debug("[_close_page] video switch error: %s", e)
             else:
                 # Last page — stop screencast but keep ffmpeg alive for finalize.
-                if self._video_recorder._cdp_session:
-                    try:
-                        await self._video_recorder._cdp_session.send("Page.stopScreencast")
-                    except Exception:
-                        pass
-                    try:
-                        await self._video_recorder._cdp_session.detach()
-                    except Exception:
-                        pass
-                    self._video_recorder._cdp_session = None
+                await self._video_recorder.detach_screencast()
 
         await page.close()
 
@@ -2474,7 +2473,6 @@ class Browser:
 
             layout = metrics.get("cssLayoutViewport", {})
             content = metrics.get("cssContentSize", {})
-            visual = metrics.get("cssVisualViewport", {})
 
             viewport_width = layout.get("clientWidth", 0)
             viewport_height = layout.get("clientHeight", 0)
@@ -7487,6 +7485,11 @@ Before you return the element ref, reason about the state and elements for a sen
                     await _session.detach()
                 except Exception:
                     pass
+            # Use cssVisualViewport (not cssLayoutViewport) because it
+            # represents the actual visible pixel area after pinch-zoom,
+            # matching what Chrome's screencast captures.
+            # get_page_size_info() uses cssLayoutViewport for scroll
+            # reporting — different purpose, both choices are intentional.
             _vp = _metrics.get("cssVisualViewport", {})
             qw = int(_vp.get("clientWidth") or 0)
             qh = int(_vp.get("clientHeight") or 0)
