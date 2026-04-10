@@ -246,3 +246,84 @@ class TestVideoRecorder:
         assert captured.get("stderr") == asyncio.subprocess.DEVNULL
         # stdin must remain PIPE — bridgic feeds JPEG bytes into it.
         assert captured.get("stdin") == asyncio.subprocess.PIPE
+
+
+# ---------------------------------------------------------------------------
+# switch_page()
+# ---------------------------------------------------------------------------
+
+class TestSwitchPage:
+    """Tests for VideoRecorder.switch_page() — hot-swap screencast source."""
+
+    def _make_recorder(self, tmp_path: Path) -> VideoRecorder:
+        ctx = MagicMock()
+        page = MagicMock()
+        output = str(tmp_path / "test.webm")
+        return VideoRecorder(ctx, page, output, (800, 600))
+
+    @pytest.mark.asyncio
+    async def test_noop_when_stopped(self, tmp_path: Path) -> None:
+        rec = self._make_recorder(tmp_path)
+        rec._is_stopped = True
+        old_page = rec._page
+        new_page = MagicMock()
+        await rec.switch_page(new_page)
+        assert rec._page is old_page  # unchanged
+
+    @pytest.mark.asyncio
+    async def test_noop_same_page(self, tmp_path: Path) -> None:
+        rec = self._make_recorder(tmp_path)
+        old_page = rec._page
+        rec._context.new_cdp_session = AsyncMock()
+        await rec.switch_page(old_page)
+        # No CDP calls should have been made
+        rec._context.new_cdp_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_tears_down_old_sets_up_new(self, tmp_path: Path) -> None:
+        rec = self._make_recorder(tmp_path)
+        old_cdp = MagicMock()
+        old_cdp.send = AsyncMock()
+        old_cdp.remove_listener = MagicMock()
+        old_cdp.detach = AsyncMock()
+        rec._cdp_session = old_cdp
+
+        new_page = MagicMock()
+        new_cdp = MagicMock()
+        new_cdp.on = MagicMock()
+        new_cdp.send = AsyncMock()
+        rec._context.new_cdp_session = AsyncMock(return_value=new_cdp)
+
+        await rec.switch_page(new_page)
+
+        # Old CDP torn down
+        old_cdp.send.assert_awaited_once_with("Page.stopScreencast")
+        old_cdp.remove_listener.assert_called_once()
+        old_cdp.detach.assert_awaited_once()
+
+        # New CDP set up
+        rec._context.new_cdp_session.assert_awaited_once_with(new_page)
+        new_cdp.on.assert_called_once()
+        new_cdp.send.assert_awaited_once()
+        assert rec._page is new_page
+        assert rec._cdp_session is new_cdp
+
+    @pytest.mark.asyncio
+    async def test_survives_cdp_failure(self, tmp_path: Path) -> None:
+        """If CDP setup fails on the new page, recorder degrades gracefully."""
+        rec = self._make_recorder(tmp_path)
+        rec._cdp_session = None  # no old session
+
+        new_page = MagicMock()
+        rec._context.new_cdp_session = AsyncMock(
+            side_effect=RuntimeError("CDP unavailable"),
+        )
+
+        await rec.switch_page(new_page)  # must not raise
+
+        assert rec._page is new_page
+        assert rec._cdp_session is None  # degraded
+
+    def test_current_page_property(self, tmp_path: Path) -> None:
+        rec = self._make_recorder(tmp_path)
+        assert rec.current_page is rec._page

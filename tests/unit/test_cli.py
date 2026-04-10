@@ -721,11 +721,19 @@ class TestCliCommandRouting:
 
     def test_wait_text_appear(self):
         _, sc = invoke(["wait", "Done"])
-        sc.assert_called_once_with("wait", {"text": "Done"}, start_if_needed=False)
+        sc.assert_called_once_with("wait", {"text": "Done", "timeout": 30.0}, start_if_needed=False)
+
+    def test_wait_text_appear_custom_timeout(self):
+        _, sc = invoke(["wait", "--timeout", "5", "Done"])
+        sc.assert_called_once_with("wait", {"text": "Done", "timeout": 5.0}, start_if_needed=False)
 
     def test_wait_text_gone(self):
         _, sc = invoke(["wait", "--gone", "Loading"])
-        sc.assert_called_once_with("wait", {"text_gone": "Loading"}, start_if_needed=False)
+        sc.assert_called_once_with("wait", {"text_gone": "Loading", "timeout": 30.0}, start_if_needed=False)
+
+    def test_wait_text_gone_custom_timeout(self):
+        _, sc = invoke(["wait", "--gone", "--timeout", "10", "Spinner"])
+        sc.assert_called_once_with("wait", {"text_gone": "Spinner", "timeout": 10.0}, start_if_needed=False)
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
 

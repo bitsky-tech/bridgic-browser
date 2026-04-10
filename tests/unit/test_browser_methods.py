@@ -82,7 +82,7 @@ def _make_browser_with_mock_page() -> tuple:
     browser._dialog_handlers = {}
     browser._tracing_state = {}
     browser._video_state = {}
-    browser._video_recorders = {}
+    browser._video_recorder = None
     browser._video_session = None
     # CDP-mode attributes — required by start_video / get_pages / _close_page
     # which inspect them to decide whether to filter out user tabs.  Tests in
@@ -130,9 +130,8 @@ async def test_stop_tracing_guard():
 
 @pytest.mark.asyncio
 async def test_start_video_uses_window_inner_dimensions_not_viewport_size():
-    """Regression: start_video() must derive its recording size from
-    ``window.innerWidth/innerHeight`` (queried via JS), NOT from
-    ``page.viewport_size``.
+    """Regression: start_video() must derive its recording size from CDP
+    Page.getLayoutMetrics, NOT from ``page.viewport_size``.
 
     In CDP attach mode bridgic never calls ``setViewportSize`` on the
     foreign Chrome, so ``page.viewport_size`` returns ``None`` and the
@@ -141,7 +140,7 @@ async def test_start_video_uses_window_inner_dimensions_not_viewport_size():
     within 800×600, which:
       1. blurred the page (37% downscale)
       2. left a gray strip at the bottom from ffmpeg's pad filter
-    Querying the page directly avoids both.
+    Querying via CDP avoids both.
     """
     browser = _make_browser_with_mock_page()
 
@@ -154,18 +153,28 @@ async def test_start_video_uses_window_inner_dimensions_not_viewport_size():
     # Simulate CDP attach mode: viewport_size is None.
     fake_page.viewport_size = None
     fake_page.is_closed = MagicMock(return_value=False)
-    # window.innerWidth/innerHeight reports the real window — 16:9, much
-    # larger than the old 800×600 fallback.
-    fake_page.evaluate = AsyncMock(return_value={"w": 1366, "h": 768})
     browser.get_current_page = AsyncMock(return_value=fake_page)
+
+    # Mock CDPSession on the browser's context so Page.getLayoutMetrics returns real dims.
+    fake_cdp_session = MagicMock()
+    fake_cdp_session.send = AsyncMock(return_value={
+        "cssLayoutViewport": {"clientWidth": 1366, "clientHeight": 768, "pageX": 0, "pageY": 0},
+        "cssContentSize": {"width": 1366, "height": 768},
+        "cssVisualViewport": {"clientWidth": 1366, "clientHeight": 768},
+    })
+    fake_cdp_session.detach = AsyncMock()
+    browser._context.new_cdp_session = AsyncMock(return_value=fake_cdp_session)
+
+    # Mock the recorder startup — this test only verifies dimension computation.
+    async def _fake_start(page):
+        browser._video_recorder = MagicMock()
+    browser._start_single_video_recorder = _fake_start  # type: ignore[method-assign]
 
     await browser.start_video()
 
-    # JS query was performed.
-    fake_page.evaluate.assert_awaited_once()
-    call_arg = fake_page.evaluate.await_args.args[0]
-    assert "innerWidth" in call_arg
-    assert "innerHeight" in call_arg
+    # CDP session was used to query dimensions.
+    browser._context.new_cdp_session.assert_awaited_once()
+    fake_cdp_session.send.assert_awaited_once_with("Page.getLayoutMetrics")
 
     # Recording size matches the queried dimensions, NOT the 800×600
     # fallback. (& ~1 rounds to even, both are already even here.)
@@ -181,9 +190,8 @@ async def test_start_video_uses_window_inner_dimensions_not_viewport_size():
 
 @pytest.mark.asyncio
 async def test_start_video_falls_back_to_viewport_size_when_evaluate_fails():
-    """If ``page.evaluate`` raises (hardened CSP, page closed mid-call,
-    etc.), start_video() should fall back to ``page.viewport_size``
-    instead of crashing."""
+    """If CDP session send raises (e.g. session unavailable), start_video()
+    should fall back to ``page.viewport_size`` instead of crashing."""
     browser = _make_browser_with_mock_page()
 
     fake_context = MagicMock()
@@ -194,8 +202,18 @@ async def test_start_video_falls_back_to_viewport_size_when_evaluate_fails():
     fake_page.context = fake_context
     fake_page.viewport_size = {"width": 1280, "height": 800}
     fake_page.is_closed = MagicMock(return_value=False)
-    fake_page.evaluate = AsyncMock(side_effect=RuntimeError("CSP blocked"))
     browser.get_current_page = AsyncMock(return_value=fake_page)
+
+    # Make CDP session fail so it falls back to viewport_size.
+    fake_cdp_session = MagicMock()
+    fake_cdp_session.send = AsyncMock(side_effect=RuntimeError("CDP unavailable"))
+    fake_cdp_session.detach = AsyncMock()
+    browser._context.new_cdp_session = AsyncMock(return_value=fake_cdp_session)
+
+    # Mock the recorder startup — this test only verifies dimension fallback.
+    async def _fake_start(page):
+        browser._video_recorder = MagicMock()
+    browser._start_single_video_recorder = _fake_start  # type: ignore[method-assign]
 
     await browser.start_video()
 
@@ -205,6 +223,7 @@ async def test_start_video_falls_back_to_viewport_size_when_evaluate_fails():
     assert session["height"] == 800
 
     browser._video_session = None
+    browser._video_recorder = None
     browser._video_state.clear()
 
 
@@ -229,6 +248,11 @@ async def test_start_video_already_active_does_not_destroy_existing_session():
     fake_page.viewport_size = {"width": 800, "height": 600}
     fake_page.is_closed = MagicMock(return_value=False)
     browser.get_current_page = AsyncMock(return_value=fake_page)
+
+    # Mock recorder startup so first call succeeds.
+    async def _fake_start(page):
+        browser._video_recorder = MagicMock()
+    browser._start_single_video_recorder = _fake_start  # type: ignore[method-assign]
 
     # First call: sets up a session.
     await browser.start_video()
@@ -293,10 +317,9 @@ async def test_close_page_switches_to_remaining_tab_in_cdp_borrowed_mode():
 
 
 @pytest.mark.asyncio
-async def test_start_video_records_all_tabs_in_cdp_borrowed_mode():
-    """start_video() MUST install a recorder on every page (including the
-    user's existing tabs) when bridgic is a guest on a borrowed CDP context.
-    """
+async def test_start_video_records_only_active_tab_in_cdp_borrowed_mode():
+    """start_video() in single-stream mode MUST start only one recorder on the
+    active page, even in CDP borrowed mode with multiple tabs."""
     owned = MagicMock(name="bridgic_tab")
     owned.is_closed = MagicMock(return_value=False)
 
@@ -316,21 +339,30 @@ async def test_start_video_records_all_tabs_in_cdp_borrowed_mode():
     fake_context.on = MagicMock()
     browser._context = fake_context
 
-    started: list = []
+    started_page = None
 
     async def _fake_starter(page):
-        started.append(page)
+        nonlocal started_page
+        started_page = page
 
-    browser._start_page_video_recorder = _fake_starter  # type: ignore[method-assign]
+    browser._start_single_video_recorder = _fake_starter  # type: ignore[method-assign]
     browser.get_current_page = AsyncMock(return_value=owned)
     owned.evaluate = AsyncMock(return_value={"w": 1280, "h": 720})
 
+    # Make _start_single_video_recorder set _video_recorder so the post-check passes.
+    async def _fake_starter_with_recorder(page):
+        nonlocal started_page
+        started_page = page
+        browser._video_recorder = MagicMock()  # simulate recorder created
+
+    browser._start_single_video_recorder = _fake_starter_with_recorder  # type: ignore[method-assign]
+
     await browser.start_video()
 
-    # Both bridgic-owned tab AND the user's pre-existing tab must be recorded.
-    assert owned in started
-    assert user in started
+    # Only the active (owned) tab should have been started.
+    assert started_page is owned
 
-    # Cleanup: avoid leaking the fake session into other tests.
+    # Cleanup.
     browser._video_session = None
+    browser._video_recorder = None
     browser._video_state.clear()

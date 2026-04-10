@@ -59,6 +59,7 @@ def mock_browser():
     browser._new_page = AsyncMock()
     browser.get_snapshot = AsyncMock()
     browser.get_element_by_ref = AsyncMock()
+    browser._get_page_title = AsyncMock(return_value="Test Page")
 
     # Browser tool methods (all async)
     browser.search = AsyncMock(return_value="Searched on Duckduckgo for 'test query'")
@@ -685,7 +686,9 @@ class TestElementInteractionTools:
         mock_locator.check = AsyncMock()
         mock_locator.bounding_box = AsyncMock(return_value=None)
         mock_locator.is_visible = AsyncMock(return_value=True)
-        mock_locator.evaluate = AsyncMock(side_effect=["input", False, True])
+        # is_checked: False before (proceed), True after (confirmed)
+        mock_locator.is_checked = AsyncMock(side_effect=[False, True])
+        # get_attribute("type") → "checkbox" → is_native; get_attribute("aria-checked") unused
         mock_locator.get_attribute = AsyncMock(return_value="checkbox")
         mock_browser.get_element_by_ref.return_value = mock_locator
 
@@ -702,7 +705,8 @@ class TestElementInteractionTools:
         mock_locator.uncheck = AsyncMock()
         mock_locator.bounding_box = AsyncMock(return_value=None)
         mock_locator.is_visible = AsyncMock(return_value=True)
-        mock_locator.evaluate = AsyncMock(side_effect=["input", True, False])
+        # is_checked: True before (proceed), False after (confirmed)
+        mock_locator.is_checked = AsyncMock(side_effect=[True, False])
         mock_locator.get_attribute = AsyncMock(return_value="checkbox")
         mock_browser.get_element_by_ref.return_value = mock_locator
 
@@ -722,7 +726,10 @@ class TestElementInteractionTools:
         mock_locator.uncheck = AsyncMock()
         mock_locator.bounding_box = AsyncMock(return_value={"x": 10, "y": 20, "width": 100, "height": 40})
         mock_locator.is_visible = AsyncMock(return_value=True)
-        mock_locator.evaluate = AsyncMock(side_effect=["input", True, True, False])
+        # is_checked: True before (proceed), False after (confirmed)
+        mock_locator.is_checked = AsyncMock(side_effect=[True, False])
+        # locator.evaluate used only by _check_element_covered → return True (element is covered)
+        mock_locator.evaluate = AsyncMock(return_value=True)
         mock_locator.get_attribute = AsyncMock(return_value="checkbox")
         mock_browser.get_element_by_ref.return_value = mock_locator
 
@@ -742,7 +749,9 @@ class TestElementInteractionTools:
         mock_locator.dispatch_event = AsyncMock()
         mock_locator.bounding_box = AsyncMock(return_value=None)
         mock_locator.is_visible = AsyncMock(return_value=True)
-        mock_locator.evaluate = AsyncMock(side_effect=["div", False, True])
+        # is_checked: False before (proceed), True after (confirmed)
+        mock_locator.is_checked = AsyncMock(side_effect=[False, True])
+        # get_attribute("type") → None → is_native=False (custom element)
         mock_locator.get_attribute = AsyncMock(return_value=None)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
@@ -762,7 +771,8 @@ class TestElementInteractionTools:
         mock_locator.dispatch_event = AsyncMock()
         mock_locator.bounding_box = AsyncMock(return_value=None)
         mock_locator.is_visible = AsyncMock(return_value=True)
-        mock_locator.evaluate = AsyncMock(side_effect=["div", True, False])
+        # is_checked: True before (proceed), False after (confirmed)
+        mock_locator.is_checked = AsyncMock(side_effect=[True, False])
         mock_locator.get_attribute = AsyncMock(return_value=None)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
@@ -781,8 +791,8 @@ class TestElementInteractionTools:
         mock_locator.dispatch_event = AsyncMock()
         mock_locator.bounding_box = AsyncMock(return_value=None)
         mock_locator.is_visible = AsyncMock(return_value=True)
-        # tag=input? no, custom div; initially unchecked -> still unchecked after click
-        mock_locator.evaluate = AsyncMock(side_effect=["div", False, False])
+        # is_native=False (custom div); initially unchecked → still unchecked after click
+        mock_locator.is_checked = AsyncMock(side_effect=[False, False])
         mock_locator.get_attribute = AsyncMock(return_value=None)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
@@ -800,8 +810,8 @@ class TestElementInteractionTools:
         mock_locator.dispatch_event = AsyncMock()
         mock_locator.bounding_box = AsyncMock(return_value=None)
         mock_locator.is_visible = AsyncMock(return_value=True)
-        # custom div; initially checked -> still checked after click
-        mock_locator.evaluate = AsyncMock(side_effect=["div", True, True])
+        # custom div; initially checked → still checked after click
+        mock_locator.is_checked = AsyncMock(side_effect=[True, True])
         mock_locator.get_attribute = AsyncMock(return_value=None)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
@@ -1512,9 +1522,9 @@ class TestDevTools:
 
     @pytest.mark.asyncio
     async def test_start_video(self, mock_browser):
-        """Test starting video recording — multi-page: all existing
-        pages in the context get a per-page recorder, and context.on('page')
-        is subscribed so future pages auto-record too.
+        """Test starting video recording — single-stream: one recorder on
+        the active page, and context.on('page') is subscribed so new pages
+        auto-switch the screencast source.
         """
         import types
 
@@ -1525,11 +1535,10 @@ class TestDevTools:
         mock_context.pages = [page]
         mock_context.on = MagicMock()
         mock_browser._video_state = {}
-        mock_browser._video_recorders = {}
+        mock_browser._video_recorder = None
         mock_browser._video_session = None
-        # Bind the real helper so start_video can drive _start_page_video_recorder.
-        mock_browser._start_page_video_recorder = types.MethodType(
-            Browser._start_page_video_recorder, mock_browser,
+        mock_browser._start_single_video_recorder = types.MethodType(
+            Browser._start_single_video_recorder, mock_browser,
         )
 
         mock_recorder = MagicMock()
@@ -1538,18 +1547,17 @@ class TestDevTools:
             result = await Browser.start_video(mock_browser)
 
         assert "Video recording started" in result
-        assert "1 page" in result
-        assert mock_browser._video_recorders[page] is mock_recorder
+        assert "active tab" in result
+        assert mock_browser._video_recorder is mock_recorder
         assert mock_browser._video_session is not None
-        # context.on('page', handler) must be registered for auto-recording
-        # of newly opened tabs.
+        # context.on('page', handler) must be registered for auto-switching.
         assert mock_context.on.called
         assert mock_context.on.call_args.args[0] == "page"
 
     @pytest.mark.asyncio
     async def test_stop_video(self, mock_browser):
         """Test stopping video recording when no session is active."""
-        mock_browser._video_recorders = {}
+        mock_browser._video_recorder = None
         mock_browser._video_session = None
         mock_browser._video_state = {}
         with pytest.raises(StateError) as exc_info:
@@ -1557,8 +1565,8 @@ class TestDevTools:
         assert exc_info.value.code == "NO_ACTIVE_RECORDING"
 
     @pytest.mark.asyncio
-    async def test_start_video_records_all_pages(self, mock_browser):
-        """start_video should record every existing page, not just current."""
+    async def test_start_video_single_stream_only_records_active_page(self, mock_browser):
+        """start_video in single-stream mode records only the active page."""
         import types
 
         page1 = mock_browser._page
@@ -1574,59 +1582,43 @@ class TestDevTools:
         mock_context.pages = [page1, page2]
         mock_context.on = MagicMock()
         mock_browser._video_state = {}
-        mock_browser._video_recorders = {}
+        mock_browser._video_recorder = None
         mock_browser._video_session = None
-        mock_browser._start_page_video_recorder = types.MethodType(
-            Browser._start_page_video_recorder, mock_browser,
+        mock_browser._start_single_video_recorder = types.MethodType(
+            Browser._start_single_video_recorder, mock_browser,
         )
 
-        created_recorders = []
-
-        def _factory(context, page, output_path, size):
-            rec = MagicMock()
-            rec.start = AsyncMock()
-            rec.output_path = output_path
-            created_recorders.append(rec)
-            return rec
-
+        mock_recorder = MagicMock()
+        mock_recorder.start = AsyncMock()
         with patch(
             "bridgic.browser.session._browser._video_recorder_mod.VideoRecorder",
-            side_effect=_factory,
+            return_value=mock_recorder,
         ):
             result = await Browser.start_video(mock_browser)
 
-        assert "2 pages" in result
-        assert len(mock_browser._video_recorders) == 2
-        assert page1 in mock_browser._video_recorders
-        assert page2 in mock_browser._video_recorders
-        assert len(created_recorders) == 2
-        for rec in created_recorders:
-            rec.start.assert_awaited_once()
+        assert "active tab" in result
+        # Only one recorder for the active page (page1), not both.
+        assert mock_browser._video_recorder is mock_recorder
+        mock_recorder.start.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_stop_video_returns_multiple_paths(self, mock_browser, tmp_path):
-        """stop_video should stop all page recorders and return all paths."""
+    async def test_stop_video_returns_single_path(self, mock_browser, tmp_path):
+        """stop_video should stop the single recorder and return its path."""
         from bridgic.browser.session import _browser as browser_module
 
         mock_browser._context.remove_listener = MagicMock()
         context_key = browser_module._get_context_key(mock_browser._context)
         mock_browser._video_state = {context_key: True}
-        # Bind real static helpers — otherwise `self._resolve_multi_video_dests`
-        # on a MagicMock returns another MagicMock (truthy) and the code
-        # takes the wrong branch.
-        mock_browser._resolve_multi_video_dests = Browser._resolve_multi_video_dests
+        mock_browser._resolve_video_dest = Browser._resolve_video_dest
         mock_browser._move_video_local = Browser._move_video_local
 
-        page1 = MagicMock()
-        page2 = MagicMock()
-        rec1 = MagicMock()
-        rec1.stop = AsyncMock(return_value=str(tmp_path / "a.webm"))
-        rec2 = MagicMock()
-        rec2.stop = AsyncMock(return_value=str(tmp_path / "b.webm"))
-        (tmp_path / "a.webm").write_bytes(b"")
-        (tmp_path / "b.webm").write_bytes(b"")
+        video_path = str(tmp_path / "video.webm")
+        (tmp_path / "video.webm").write_bytes(b"")
 
-        mock_browser._video_recorders = {page1: rec1, page2: rec2}
+        rec = MagicMock()
+        rec.stop = AsyncMock(return_value=video_path)
+
+        mock_browser._video_recorder = rec
         mock_browser._video_session = {
             "width": 800, "height": 600, "context": mock_browser._context,
             "page_listener": lambda *_: None,
@@ -1634,13 +1626,35 @@ class TestDevTools:
 
         result = await Browser.stop_video(mock_browser)
 
-        rec1.stop.assert_awaited_once()
-        rec2.stop.assert_awaited_once()
-        assert "Video files saved" in result
-        assert str(tmp_path / "a.webm") in result
-        assert str(tmp_path / "b.webm") in result
-        assert mock_browser._video_recorders == {}
+        rec.stop.assert_awaited_once()
+        assert "Video saved to" in result
+        assert video_path in result
+        assert mock_browser._video_recorder is None
         assert mock_browser._video_session is None
+
+    @pytest.mark.asyncio
+    async def test_stop_video_handles_recorder_failure(self, mock_browser):
+        """stop_video() should handle recorder stop failure gracefully."""
+        from bridgic.browser.session import _browser as browser_module
+
+        mock_browser._context.remove_listener = MagicMock()
+        context_key = browser_module._get_context_key(mock_browser._context)
+        mock_browser._video_state = {context_key: True}
+
+        rec = MagicMock()
+        rec.stop = AsyncMock(side_effect=RuntimeError("encoder crashed"))
+
+        mock_browser._video_recorder = rec
+        mock_browser._video_session = {
+            "width": 800, "height": 600, "context": mock_browser._context,
+            "page_listener": lambda *_: None,
+        }
+
+        result = await Browser.stop_video(mock_browser)
+
+        assert "incomplete" in result
+        assert mock_browser._video_recorder is None
+
 
 # ==================== State Tools Tests ====================
 
@@ -1721,7 +1735,7 @@ class TestStateTools:
         mock_browser.get_snapshot.return_value = None
         with pytest.raises(OperationError) as exc_info:
             await Browser.get_snapshot_text(mock_browser)
-        assert "Failed to get interface information" in exc_info.value.message
+        assert "Failed to get snapshot" in exc_info.value.message
 
 # ==================== BrowserToolSetBuilder Tests ====================
 

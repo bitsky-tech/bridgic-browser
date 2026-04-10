@@ -265,11 +265,14 @@ async def _handle_mouse_up(browser: "Browser", args: Dict[str, Any]) -> str:
 # ── Wait ──────────────────────────────────────────────────────────────────────
 
 async def _handle_wait(browser: "Browser", args: Dict[str, Any]) -> str:
-    return await browser.wait_for(
-        time_seconds=args.get("seconds"),
-        text=args.get("text"),
-        text_gone=args.get("text_gone"),
-    )
+    kwargs: dict = {
+        "time_seconds": args.get("seconds"),
+        "text": args.get("text"),
+        "text_gone": args.get("text_gone"),
+    }
+    if "timeout" in args:
+        kwargs["timeout"] = float(args["timeout"])
+    return await browser.wait_for(**kwargs)
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
@@ -669,9 +672,9 @@ async def _dispatch(browser: "Browser", command: str, args: Dict[str, Any]) -> D
 
 _READ_TIMEOUT = 60.0  # seconds to wait for a command line from the client
 try:
-    _DAEMON_STOP_TIMEOUT = float(os.environ.get("BRIDGIC_DAEMON_STOP_TIMEOUT", "45"))
+    _DAEMON_STOP_TIMEOUT = float(os.environ.get("BRIDGIC_DAEMON_STOP_TIMEOUT", "300"))
 except (ValueError, TypeError):
-    _DAEMON_STOP_TIMEOUT = 45.0
+    _DAEMON_STOP_TIMEOUT = 300.0
 
 
 def _setup_signal_handlers(stop_event: asyncio.Event) -> None:

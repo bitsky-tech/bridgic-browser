@@ -340,23 +340,29 @@ class VideoRecorder:
             self._width, self._height, self._output_path,
         )
 
-    async def stop(self) -> str:
-        """Stop recording and return the output path.
+    async def prepare_stop(self) -> None:
+        """Phase 1: stop screencast, pad frames, detach CDP session.
 
-        On return the file is fully written. The shutdown sequence mirrors
-        ``stop()`` in Playwright's videoRecorder.ts (lines 130-155).
+        Fast (~milliseconds).  Must be called while Chrome is still alive
+        so that ``Page.stopScreencast`` can reach Chrome.  After this
+        method returns, the CDP session is detached and Chrome resources
+        are released — ``finalize()`` can run even after Chrome exits.
+
+        Idempotent: calling twice is safe (second call is a no-op).
         """
         if self._is_stopped:
-            return self._output_path
+            return
 
+        logger.debug("[VideoRecorder] prepare_stop step1: stopScreencast %s", self._output_path)
         # Step 1: tell Chrome to stop pushing frames.
         # Reference: CDP Page.stopScreencast.
         if self._cdp_session:
             try:
                 await self._cdp_session.send("Page.stopScreencast")
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.debug("[VideoRecorder] stopScreencast err: %s(%s)", type(_e).__name__, _e)
 
+        logger.debug("[VideoRecorder] prepare_stop step2: ensure frame %s", self._output_path)
         # Step 2: make sure at least one frame has been written. ffmpeg
         # refuses to produce a valid container with an empty input stream.
         # Reference: videoRecorder.ts lines 136-138.
@@ -364,6 +370,7 @@ class VideoRecorder:
             white = _create_white_jpeg(self._width, self._height)
             self._write_frame(white, time.monotonic())
 
+        logger.debug("[VideoRecorder] prepare_stop step3: pad tail %s", self._output_path)
         # Step 3: pad the tail with ≥1 second of the last frame so the
         # output never ends abruptly. Sending an empty frame (b"") is the
         # sentinel that tells _write_frame to advance the frame counter
@@ -373,6 +380,36 @@ class VideoRecorder:
         self._write_frame(b"", self._last_frame[1] + add_time)  # type: ignore[index]
 
         self._is_stopped = True
+
+        logger.debug("[VideoRecorder] prepare_stop step6: detach CDP %s", self._output_path)
+        # Step 6 (moved here from old stop()): detach the CDP session
+        # early so Chrome resources are released before finalize().
+        if self._cdp_session:
+            try:
+                await self._cdp_session.detach()
+            except Exception:
+                pass
+            self._cdp_session = None
+
+        logger.debug("[VideoRecorder] prepare_stop done: %s", self._output_path)
+
+    async def finalize(self) -> str:
+        """Phase 2: flush frames to ffmpeg, close stdin, wait for exit.
+
+        Returns the output file path.  Chrome can be dead — this method
+        only needs the ffmpeg subprocess.  If ``prepare_stop()`` was not
+        called beforehand, it is called automatically as a safety fallback.
+        """
+        if not self._is_stopped:
+            try:
+                await asyncio.wait_for(self.prepare_stop(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[VideoRecorder] finalize: prepare_stop fallback timed out, "
+                    "force-marking stopped: %s", self._output_path,
+                )
+                self._is_stopped = True
+                self._cdp_session = None
 
         # Step 4: drain any frames still queued for ffmpeg's stdin.
         await self._flush_queue()
@@ -385,21 +422,71 @@ class VideoRecorder:
             except Exception:
                 pass
             try:
-                await asyncio.wait_for(self._ffmpeg.wait(), timeout=10.0)
+                await asyncio.wait_for(self._ffmpeg.wait(), timeout=15.0)
             except asyncio.TimeoutError:
                 self._ffmpeg.kill()
                 logger.warning("[VideoRecorder] ffmpeg killed after timeout")
 
-        # Step 6: detach the CDP session.
+        logger.debug("[VideoRecorder] finalize done → %s", self._output_path)
+        return self._output_path
+
+    async def stop(self) -> str:
+        """Full stop (convenience): ``prepare_stop()`` + ``finalize()``.
+
+        On return the file is fully written. The shutdown sequence mirrors
+        ``stop()`` in Playwright's videoRecorder.ts (lines 130-155).
+
+        For the two-phase flow used by ``Browser.close()`` — where Chrome
+        must exit between the two phases — call ``prepare_stop()`` and
+        ``finalize()`` separately instead.
+        """
+        await self.prepare_stop()
+        return await self.finalize()
+
+    async def switch_page(self, new_page: Any) -> None:
+        """Switch screencast source to a different page. ffmpeg stays alive."""
+        if self._is_stopped:
+            return
+        if new_page == self._page:
+            return
+
+        # Tear down old screencast
         if self._cdp_session:
+            try:
+                await self._cdp_session.send("Page.stopScreencast")
+            except Exception:
+                pass
+            try:
+                self._cdp_session.remove_listener(
+                    "Page.screencastFrame", self._on_screencast_frame,
+                )
+            except Exception:
+                pass
             try:
                 await self._cdp_session.detach()
             except Exception:
                 pass
+
+        # Set up new screencast on the new page
+        self._page = new_page
+        try:
+            self._cdp_session = await self._context.new_cdp_session(new_page)
+            self._cdp_session.on("Page.screencastFrame", self._on_screencast_frame)
+            await self._cdp_session.send("Page.startScreencast", {
+                "format": "jpeg",
+                "quality": 95,
+                "maxWidth": self._width,
+                "maxHeight": self._height,
+            })
+            logger.debug("[VideoRecorder] switched screencast to new page")
+        except Exception as e:
+            logger.warning("[VideoRecorder] switch_page CDP setup failed: %s", e)
             self._cdp_session = None
 
-        logger.debug("[VideoRecorder] stopped → %s", self._output_path)
-        return self._output_path
+    @property
+    def current_page(self) -> Any:
+        """The page currently being recorded."""
+        return self._page
 
     @property
     def output_path(self) -> str:

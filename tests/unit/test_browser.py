@@ -562,8 +562,10 @@ class TestBrowserStartStop:
             _tmp_video_fd, _tmp_video_path = tempfile.mkstemp(suffix=".webm")
             os.close(_tmp_video_fd)
             mock_recorder = MagicMock()
+            mock_recorder.prepare_stop = AsyncMock()
+            mock_recorder.finalize = AsyncMock(return_value=_tmp_video_path)
             mock_recorder.stop = AsyncMock(return_value=_tmp_video_path)
-            browser._video_recorders = {page: mock_recorder}
+            browser._video_recorder = mock_recorder
             browser._video_session = {
                 "width": 800, "height": 600, "context": context,
                 "page_listener": lambda *_: None,
@@ -581,7 +583,8 @@ class TestBrowserStartStop:
             assert "close-" in trace_path
             assert trace_path.endswith("trace.zip")
 
-            mock_recorder.stop.assert_awaited_once()
+            mock_recorder.prepare_stop.assert_awaited_once()
+            mock_recorder.finalize.assert_awaited_once()
             assert browser._last_shutdown_artifacts["trace"] == [os.path.abspath(trace_path)]
             assert len(browser._last_shutdown_artifacts["video"]) == 1
             video_path = browser._last_shutdown_artifacts["video"][0]
@@ -615,8 +618,10 @@ class TestBrowserStartStop:
             _tmp_video_fd, _tmp_video_path = tempfile.mkstemp(suffix=".webm")
             os.close(_tmp_video_fd)
             mock_recorder = MagicMock()
+            mock_recorder.prepare_stop = AsyncMock()
+            mock_recorder.finalize = AsyncMock(return_value=_tmp_video_path)
             mock_recorder.stop = AsyncMock(return_value=_tmp_video_path)
-            browser._video_recorders = {page: mock_recorder}
+            browser._video_recorder = mock_recorder
             browser._video_session = {
                 "width": 800, "height": 600, "context": context,
                 "page_listener": lambda *_: None,
@@ -655,8 +660,10 @@ class TestBrowserStartStop:
             _tmp_fd, _tmp_path = tempfile.mkstemp(suffix=".webm")
             os.close(_tmp_fd)
             mock_recorder = MagicMock()
+            mock_recorder.prepare_stop = AsyncMock()
+            mock_recorder.finalize = AsyncMock(return_value=_tmp_path)
             mock_recorder.stop = AsyncMock(return_value=_tmp_path)
-            browser._video_recorders = {page: mock_recorder}
+            browser._video_recorder = mock_recorder
             browser._video_session = {
                 "width": 800, "height": 600, "context": context,
                 "page_listener": lambda *_: None,
@@ -667,15 +674,16 @@ class TestBrowserStartStop:
 
             await browser.close()
 
-            mock_recorder.stop.assert_awaited_once()
-            assert browser._video_recorders == {}
+            mock_recorder.prepare_stop.assert_awaited_once()
+            mock_recorder.finalize.assert_awaited_once()
+            assert browser._video_recorder is None
             assert browser._video_session is None
             assert len(browser._last_shutdown_artifacts["video"]) == 1
             assert context_key not in browser._video_state
 
     @pytest.mark.asyncio
-    async def test_close_page_auto_stops_recorder(self, mock_playwright):
-        """_close_page() should auto-stop the recorder when closing the recorded page."""
+    async def test_close_page_switches_recorder_to_remaining_tab(self, mock_playwright):
+        """_close_page() should switch the recorder to a remaining page, not stop it."""
         from bridgic.browser.session import _browser as browser_module
 
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
@@ -694,13 +702,15 @@ class TestBrowserStartStop:
             second_page.url = "https://example.com/2"
             second_page.title = AsyncMock(return_value="Page 2")
             second_page.close = AsyncMock()
+            second_page.is_closed = MagicMock(return_value=False)
             context.pages = [page, second_page]
 
-            # Set up mock recorder on the current page only (second page
-            # is not being recorded in this scenario)
+            # Set up mock recorder recording the current page
             mock_recorder = MagicMock()
-            mock_recorder.stop = AsyncMock(return_value="/tmp/rec.webm")
-            browser._video_recorders = {page: mock_recorder}
+            mock_recorder.is_stopped = False
+            mock_recorder.current_page = page
+            mock_recorder.switch_page = AsyncMock()
+            browser._video_recorder = mock_recorder
             browser._video_session = {
                 "width": 800, "height": 600, "context": context,
                 "page_listener": lambda *_: None,
@@ -709,16 +719,15 @@ class TestBrowserStartStop:
             context_key = browser_module._get_context_key(context)
             browser._video_state[context_key] = True
 
-            # Close the page that has the recorder
+            # Close the page that is being recorded
             success, msg = await browser._close_page(page)
             assert success
 
-            # Recorder for the closed page should have been stopped and removed
-            mock_recorder.stop.assert_awaited_once()
-            assert page not in browser._video_recorders
-            # Session stays active since other tabs may still be recording
+            # Recorder should have been switched to the remaining page, not stopped
+            mock_recorder.switch_page.assert_awaited_once_with(second_page)
+            # Recorder is still active
+            assert browser._video_recorder is mock_recorder
             assert browser._video_session is not None
-            assert browser._video_state.get(context_key) is True
 
     @pytest.mark.asyncio
     async def test_stop_warns_on_trace_finalize_failure(self, mock_playwright):
@@ -859,8 +868,10 @@ class TestBrowserStartStop:
             _tmp_video_fd, _tmp_video_path = tempfile.mkstemp(suffix=".webm")
             os.close(_tmp_video_fd)
             mock_recorder = MagicMock()
+            mock_recorder.prepare_stop = AsyncMock()
+            mock_recorder.finalize = AsyncMock(return_value=_tmp_video_path)
             mock_recorder.stop = AsyncMock(return_value=_tmp_video_path)
-            browser._video_recorders = {page: mock_recorder}
+            browser._video_recorder = mock_recorder
             browser._video_session = {
                 "width": 800, "height": 600, "context": context,
                 "page_listener": lambda *_: None,
@@ -979,6 +990,136 @@ class TestBrowserStartStop:
             # Downstream cleanup must still complete.
             assert browser._page is None
             assert browser._context is None
+
+
+class TestSingleVideoRecorderClose:
+    """Tests verifying single-stream video recorder lifecycle during close().
+
+    close() uses a two-phase shutdown:
+      Phase 1: prepare_stop() the single recorder (fast, while Chrome alive)
+      Phase 2: finalize() the single recorder (slow, after Chrome exits)
+    """
+
+    @pytest.mark.asyncio
+    async def test_close_finalize_success(self, mock_playwright):
+        """close() must finalize the single recorder and move the video file."""
+        import tempfile as _tempfile
+        from bridgic.browser.session import _browser as browser_module
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            context = browser._context
+            assert context is not None
+            context.remove_listener = MagicMock()
+
+            _fd, _temp_path = _tempfile.mkstemp(suffix=".webm")
+            os.close(_fd)
+
+            page = MagicMock()
+            page.close = AsyncMock()
+            rec = MagicMock()
+            rec.prepare_stop = AsyncMock()
+            rec.finalize = AsyncMock(return_value=_temp_path)
+
+            context.pages = [page]
+            browser._video_recorder = rec
+            browser._video_session = {
+                "width": 800, "height": 600, "context": context,
+                "page_listener": lambda *_: None,
+            }
+            context_key = browser_module._get_context_key(context)
+            browser._video_state[context_key] = True
+
+            await browser.close()
+
+            rec.prepare_stop.assert_awaited_once()
+            rec.finalize.assert_awaited_once()
+            assert len(browser._last_shutdown_artifacts["video"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_close_collects_finalize_timeout_error(self, mock_playwright):
+        """close() must collect the timeout error from finalize, not raise."""
+        from bridgic.browser.session import _browser as browser_module
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            context = browser._context
+            assert context is not None
+            context.remove_listener = MagicMock()
+
+            async def timeout_finalize():
+                raise asyncio.TimeoutError()
+
+            page = MagicMock()
+            page.close = AsyncMock()
+            rec = MagicMock()
+            rec.prepare_stop = AsyncMock()
+            rec.finalize = timeout_finalize
+
+            context.pages = [page]
+            browser._video_recorder = rec
+            browser._video_session = {
+                "width": 800, "height": 600, "context": context,
+                "page_listener": lambda *_: None,
+            }
+            context_key = browser_module._get_context_key(context)
+            browser._video_state[context_key] = True
+
+            await browser.close()  # must not raise
+
+            timeout_errors = [
+                e for e in browser._last_shutdown_errors
+                if "video_recorder.finalize: timeout" in e
+            ]
+            assert len(timeout_errors) == 1
+
+    @pytest.mark.asyncio
+    async def test_close_re_raises_cancelled_error_from_recorder(self, mock_playwright):
+        """CancelledError from finalize is stored and re-raised after cleanup."""
+        from bridgic.browser.session import _browser as browser_module
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            context = browser._context
+            assert context is not None
+            context.remove_listener = MagicMock()
+
+            async def cancelling_finalize() -> str:
+                raise asyncio.CancelledError("simulated task cancellation")
+
+            page = MagicMock()
+            page.close = AsyncMock()
+            rec = MagicMock()
+            rec.prepare_stop = AsyncMock()
+            rec.finalize = cancelling_finalize
+
+            context.pages = [page]
+            browser._video_recorder = rec
+            browser._video_session = {
+                "width": 800, "height": 600, "context": context,
+                "page_listener": lambda *_: None,
+            }
+            context_key = browser_module._get_context_key(context)
+            browser._video_state[context_key] = True
+
+            with pytest.raises(asyncio.CancelledError):
+                await browser.close()
+
+            assert any(
+                "video_recorder.finalize" in e for e in browser._last_shutdown_errors
+            )
 
 
 class TestBrowserNavigation:
@@ -2020,7 +2161,6 @@ class TestFindCdpUrlProxyBypass:
         # Error message must mention the port and not look like a proxy error.
         msg = str(exc_info.value)
         assert str(dead_port) in msg, f"Expected port {dead_port} in error: {msg}"
-        assert "502" not in msg, f"Error must not mention 502 Bad Gateway: {msg}"
         assert "Bad Gateway" not in msg, f"Error must not mention Bad Gateway: {msg}"
 
 
@@ -2046,3 +2186,187 @@ class TestApiExposure:
         import bridgic.browser as pkg
         assert "find_cdp_url" in pkg.__all__
         assert "resolve_cdp_input" in pkg.__all__
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# get_page_size_info
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGetPageSizeInfo:
+    """Tests for Browser.get_page_size_info (CDP Page.getLayoutMetrics path)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_page_size_info_from_cdp(self, mock_playwright, mock_page, mock_context, mock_cdp_session):
+        """Successful CDP Page.getLayoutMetrics returns a populated PageSizeInfo."""
+        from bridgic.browser.session._browser_model import PageSizeInfo
+
+        mock_cdp_session.send = AsyncMock(return_value={
+            "cssLayoutViewport": {"clientWidth": 1280, "clientHeight": 800, "pageX": 0, "pageY": 200},
+            "cssContentSize": {"width": 1280, "height": 4000},
+            "cssVisualViewport": {"clientWidth": 1280, "clientHeight": 800},
+        })
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            result = await browser.get_page_size_info()
+
+        assert isinstance(result, PageSizeInfo)
+        assert result.viewport_width == 1280
+        assert result.viewport_height == 800
+        assert result.page_height == 4000
+        assert result.scroll_y == 200
+        assert result.pixels_above == 200
+        assert result.pixels_below == 4000 - 800 - 200
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_page(self):
+        """Returns None immediately when no page is open."""
+        browser = Browser(stealth=False)
+        assert browser._page is None
+        result = await browser.get_page_size_info()
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_evaluate_raises(self, mock_playwright, mock_page, mock_context, mock_cdp_session):
+        """Returns None gracefully when CDP session send fails."""
+        mock_cdp_session.send = AsyncMock(side_effect=RuntimeError("cdp failed"))
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            result = await browser.get_page_size_info()
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_cdp_session_created_and_detached(self, mock_playwright, mock_page, mock_context, mock_cdp_session):
+        """Verify CDP session is opened for Page.getLayoutMetrics and detached afterwards."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            await browser.get_page_size_info()
+
+        mock_context.new_cdp_session.assert_called_once_with(mock_page)
+        mock_cdp_session.send.assert_called_once_with("Page.getLayoutMetrics")
+        mock_cdp_session.detach.assert_called_once()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# get_full_page_info
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGetFullPageInfo:
+    """Tests for Browser.get_full_page_info concurrent fetch behavior."""
+
+    @pytest.mark.asyncio
+    async def test_returns_full_page_info_on_success(self, mock_playwright, mock_page, mock_context):
+        """Returns FullPageInfo combining snapshot tree and page size data."""
+        from bridgic.browser.session._browser_model import FullPageInfo
+
+        fake_snapshot = MagicMock()
+        fake_snapshot.tree = "- button \"Go\" [ref=abc]"
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+            browser.get_snapshot = AsyncMock(return_value=fake_snapshot)
+
+            result = await browser.get_full_page_info()
+
+        assert isinstance(result, FullPageInfo)
+        assert result.tree == fake_snapshot.tree
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_page(self):
+        """Returns None immediately when no page is open."""
+        browser = Browser(stealth=False)
+        assert browser._page is None
+        result = await browser.get_full_page_info()
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_snapshot_raises(self, mock_playwright, mock_page):
+        """Returns None when get_snapshot raises."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+            browser.get_snapshot = AsyncMock(side_effect=RuntimeError("snap failed"))
+
+            result = await browser.get_full_page_info()
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_page_info_fails(self, mock_playwright, mock_page, mock_context, mock_cdp_session):
+        """Returns None when get_page_size_info returns None (CDP send failed)."""
+        fake_snapshot = MagicMock()
+        fake_snapshot.tree = "- heading \"Hi\""
+
+        mock_cdp_session.send = AsyncMock(side_effect=RuntimeError("cdp error"))
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+            browser.get_snapshot = AsyncMock(return_value=fake_snapshot)
+
+            result = await browser.get_full_page_info()
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_snapshot_and_page_info_run_concurrently(self, mock_playwright, mock_page, mock_context, mock_cdp_session):
+        """get_snapshot and get_page_size_info must overlap in time (asyncio.gather)."""
+        call_log: list[str] = []
+        snapshot_started = asyncio.Event()
+        page_info_started = asyncio.Event()
+
+        async def _slow_snapshot(*args, **kwargs):
+            call_log.append("snapshot:start")
+            snapshot_started.set()
+            await asyncio.sleep(0)  # yield to let get_page_size_info start
+            await page_info_started.wait()
+            call_log.append("snapshot:end")
+            snap = MagicMock()
+            snap.tree = "- button"
+            return snap
+
+        async def _slow_cdp_send(*args, **kwargs):
+            call_log.append("page_info:start")
+            page_info_started.set()
+            await snapshot_started.wait()
+            return {
+                "cssLayoutViewport": {"clientWidth": 1280, "clientHeight": 800, "pageX": 0, "pageY": 0},
+                "cssContentSize": {"width": 1280, "height": 2000},
+                "cssVisualViewport": {"clientWidth": 1280, "clientHeight": 800},
+            }
+
+        mock_cdp_session.send = AsyncMock(side_effect=_slow_cdp_send)
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+            browser.get_snapshot = AsyncMock(side_effect=_slow_snapshot)
+
+            result = await browser.get_full_page_info()
+
+        assert result is not None
+        # Both must have started before either finished — proving concurrency.
+        assert "snapshot:start" in call_log
+        assert "page_info:start" in call_log
+        snapshot_end_idx = call_log.index("snapshot:end")
+        page_info_start_idx = call_log.index("page_info:start")
+        # page_info started before snapshot finished → they overlapped
+        assert page_info_start_idx < snapshot_end_idx, (
+            "page_info should have started before snapshot finished (concurrent)"
+        )

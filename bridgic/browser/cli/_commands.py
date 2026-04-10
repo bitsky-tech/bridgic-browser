@@ -366,7 +366,12 @@ def cmd_upload(ref: str, path: str) -> None:
 @click.option("--submit", is_flag=True, default=False,
               help="Press Enter after filling the last field.")
 def cmd_fill_form(fields_json: str, submit: bool) -> None:
-    """Fill multiple form fields all at once. FIELDS_JSON is a JSON array like '[{"ref":"8d4a07a9","value":"hi"}]'."""
+    """Fill multiple form fields all at once.
+
+    FIELDS_JSON is a JSON array of {"ref": "REF", "value": "TEXT"} objects.
+    Example: '[{"ref":"8d4a07a9","value":"Alice"},{"ref":"9e5f18b0","value":"secret"}]'
+    Get refs from the 'snapshot' command.
+    """
     try:
         _ok(send_command("fill_form", {"fields": fields_json, "submit": submit}, start_if_needed=False))
     except Exception as exc:
@@ -378,7 +383,10 @@ def cmd_fill_form(fields_json: str, submit: bool) -> None:
 @cli.command("press", context_settings=CONTEXT_SETTINGS)
 @click.argument("key")
 def cmd_press(key: str) -> None:
-    """Press a keyboard key or combination (Enter, Control+A, Shift+Tab…)."""
+    """Press a keyboard key or combination (Enter, Control+A, Shift+Tab…).
+
+    On macOS use Meta for the Command key (e.g. Meta+A for select-all, Meta+C for copy).
+    """
     try:
         _ok(send_command("press", {"key": key}, start_if_needed=False))
     except Exception as exc:
@@ -477,7 +485,10 @@ def cmd_mouse_drag(x1: float, y1: float, x2: float, y2: float) -> None:
               type=click.Choice(["left", "right", "middle"], case_sensitive=False),
               help="Mouse button to press (default: left).")
 def cmd_mouse_down(button: str) -> None:
-    """Press and hold a mouse button."""
+    """Press and hold a mouse button at the current cursor position.
+
+    Call mouse-move first to position the cursor before pressing.
+    """
     try:
         _ok(send_command("mouse_down", {"button": button}, start_if_needed=False))
     except Exception as exc:
@@ -489,7 +500,10 @@ def cmd_mouse_down(button: str) -> None:
               type=click.Choice(["left", "right", "middle"], case_sensitive=False),
               help="Mouse button to release (default: left).")
 def cmd_mouse_up(button: str) -> None:
-    """Release a held mouse button."""
+    """Release a held mouse button at the current cursor position.
+
+    Call mouse-move first to position the cursor before releasing.
+    """
     try:
         _ok(send_command("mouse_up", {"button": button}, start_if_needed=False))
     except Exception as exc:
@@ -502,28 +516,33 @@ def cmd_mouse_up(button: str) -> None:
 @click.argument("seconds_or_text")
 @click.option("--gone", is_flag=True, default=False,
               help="Wait for SECONDS_OR_TEXT to disappear instead of appear.")
-def cmd_wait(seconds_or_text: str, gone: bool) -> None:
+@click.option("--timeout", "timeout_seconds", default=30.0, show_default=True, type=float,
+              help="Max seconds to wait for text to appear/disappear (ignored for numeric waits).")
+def cmd_wait(seconds_or_text: str, gone: bool, timeout_seconds: float) -> None:
     """Wait for N seconds (float) or until TEXT appears/disappears.
 
     \b
     SECONDS_OR_TEXT:
       If a number  → wait exactly that many seconds (e.g. 2, 0.5). Max 60.
                      NOTE: unit is SECONDS, not milliseconds.
-                     --gone is ignored when a number is given.
+                     --gone and --timeout are ignored when a number is given.
       If text      → wait until that text appears on the page.
                      Add --gone to wait until it disappears instead.
+                     Use --timeout to set a custom wait limit (default: 30s).
 
     \b
     Examples:
-        bridgic-browser wait 2                 # wait for 2 seconds
-        bridgic-browser wait 0.5               # wait for 0.5 senond
-        bridgic-browser wait "Submit"          # wait for text to appear
-        bridgic-browser wait --gone "Loading"  # wait for text to disappear
+        bridgic-browser wait 2                          # wait for 2 seconds
+        bridgic-browser wait 0.5                        # wait for 0.5 second
+        bridgic-browser wait "Submit"                   # wait for text to appear (30s limit)
+        bridgic-browser wait --timeout 5 "Submit"       # wait up to 5 seconds
+        bridgic-browser wait --gone "Loading"           # wait for text to disappear
+        bridgic-browser wait --gone --timeout 10 "Spinner"  # disappear within 10s
     """
     value = seconds_or_text
     try:
         # Try to parse as a number for time-based wait.
-        # --gone is irrelevant for numeric waits (no text to watch for).
+        # --gone and --timeout are irrelevant for numeric waits.
         try:
             seconds = float(value)
         except ValueError:
@@ -532,9 +551,9 @@ def cmd_wait(seconds_or_text: str, gone: bool) -> None:
         if seconds is not None:
             _ok(send_command("wait", {"seconds": seconds}, start_if_needed=False))
         elif gone:
-            _ok(send_command("wait", {"text_gone": value}, start_if_needed=False))
+            _ok(send_command("wait", {"text_gone": value, "timeout": timeout_seconds}, start_if_needed=False))
         else:
-            _ok(send_command("wait", {"text": value}, start_if_needed=False))
+            _ok(send_command("wait", {"text": value, "timeout": timeout_seconds}, start_if_needed=False))
     except Exception as exc:
         _err(exc)
 
