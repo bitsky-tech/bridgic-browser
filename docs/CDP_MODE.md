@@ -8,10 +8,11 @@ from bridgic.browser import Browser
 # SDK
 browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/abc")
 
-# CLI
+# CLI (both open and search support --cdp)
 bridgic-browser open https://example.com --cdp 9222
 bridgic-browser open https://example.com --cdp auto
 bridgic-browser open https://example.com --cdp "ws://localhost:9222/..."
+bridgic-browser search "query" --cdp 9222
 ```
 
 ## How it works
@@ -74,12 +75,13 @@ When connecting via CDP, bridgic borrows the browser's existing default context 
 
 If the remote Chrome was not started with stealth flags, bridgic's JS patches can cover some fingerprints (navigator, webdriver, plugins) but cannot modify signals that require launch arguments (e.g., Blink feature disabling).
 
-### Video recording covers all tabs in the context
+### Video recording (single-stream, active tab)
 
 bridgic records video via Chrome's CDP `Page.startScreencast` (piped to ffmpeg), **not** Playwright's `record_video` context option — so video recording works on borrowed contexts.
 
-- **All pages are recorded.** `start_video()` starts a screencast session for every open page in the borrowed context, including the user's pre-existing tabs and any pages opened after recording starts. Each page is saved to its own `.webm` file.
-- **Recording stops cleanly without touching user tabs.** `stop_video()` finalizes every screencast session and saves the files; no page is closed or navigated.
+- **Only the active tab is recorded.** `start_video()` starts a single screencast session on the currently active page. When you switch tabs (via `switch_tab`, `new_tab`, etc.), the CDP screencast source is hot-swapped to the new page — ffmpeg stays alive and the output is a single continuous `.webm` file.
+- **`stop_video()` saves the file immediately.** The `.webm` is written as soon as the recorder stops; no page close is needed.
+- **Recording stops cleanly without touching user tabs.** No page is closed or navigated.
 
 **Tracing is not affected** — `tracing.stop()` works at any time without closing pages or contexts.
 
@@ -94,7 +96,7 @@ bridgic records video via Chrome's CDP `Page.startScreencast` (piped to ffmpeg),
 | `context.close()` | Yes | **Skipped** |
 | `browser.close()` | Kills process | **Disconnects only** |
 | Save tracing artifacts | Yes | Yes |
-| Save video artifacts | Yes | Yes (all tabs in context) |
+| Save video artifacts | Yes | Yes (active tab recording) |
 
 After `close()`, the remote Chrome continues running with all tabs intact.
 

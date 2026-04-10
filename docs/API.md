@@ -7,6 +7,8 @@ Short reference for the main session and download APIs. For tool lists and selec
 | Method / property | Description |
 |------------------|-------------|
 | `Browser(...)` | Constructor. Key args: `headless`, `viewport`, `user_data_dir`, `clear_user_data`, `stealth`, `cdp_url`, `channel`, `proxy`, `downloads_path`, etc. When `cdp_url` is set, connects to an existing Chrome via CDP (`connect_over_cdp`) instead of launching a new browser. |
+| `find_cdp_url(mode, port, host, ...)` | Resolve a Chrome CDP WebSocket URL. `mode`: `"port"` (HTTP `/json/version`), `"file"` (read `DevToolsActivePort`), `"scan"` (auto-discover running Chrome/Chromium/Brave), `"service"` (return `ws_endpoint` as-is). Returns `ws://` URL. |
+| `resolve_cdp_input(value)` | Normalize user-supplied CDP input to a `ws://` URL. Accepts: bare port (`"9222"`), `ws://`/`wss://` URL, `http://host:port`, or `"auto"`/`"scan"`. |
 | `await browser._start()` | Launch browser and create context. Called automatically by `navigate_to` / `search` (lazy start); call directly only when you need explicit startup before any navigation. |
 | `await browser.close()` | Stop the browser, auto-cleans active capture listeners. No-op if never started. |
 | `await browser.navigate_to(url, wait_until="domcontentloaded", timeout=None)` | Navigate to URL with optional auto-prefix when missing protocol. `wait_until`: `"domcontentloaded"` (default), `"load"`, `"networkidle"`, or `"commit"`. `timeout` in seconds. |

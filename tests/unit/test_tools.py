@@ -102,7 +102,7 @@ def mock_browser():
     browser.key_down = AsyncMock(return_value="Key down")
     browser.key_up = AsyncMock(return_value="Key up")
     browser.fill_form = AsyncMock(return_value="Filled form")
-    browser.insert_text = AsyncMock(return_value="Inserted text")
+
     browser.take_screenshot = AsyncMock(return_value=b"fake_screenshot_data")
     browser.save_pdf = AsyncMock(return_value=b"fake_pdf_data")
     browser.start_console_capture = AsyncMock(return_value="Console capture started")
@@ -150,7 +150,6 @@ def mock_browser():
     mock_page.keyboard.press = AsyncMock()
     mock_page.keyboard.down = AsyncMock()
     mock_page.keyboard.up = AsyncMock()
-    mock_page.keyboard.insert_text = AsyncMock()
 
     # Mock other page methods
     mock_page.go_back = AsyncMock()
@@ -1066,15 +1065,6 @@ class TestKeyboardTools:
         assert "1/2" in result
         assert "Failed" in result
 
-    @pytest.mark.asyncio
-    async def test_insert_text(self, mock_browser):
-        """Test inserting text at cursor position."""
-
-        result = await Browser.insert_text(mock_browser, "Hello World")
-
-        mock_page = mock_browser.get_current_page.return_value
-        mock_page.keyboard.insert_text.assert_called_once_with("Hello World")
-        assert "11" in result
 
 # ==================== Screenshot Tools Tests ====================
 

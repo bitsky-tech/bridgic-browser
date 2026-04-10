@@ -985,11 +985,11 @@ def cmd_trace_chunk(title: str) -> None:
 @click.option("--width", default=None, type=int, help="Video width in pixels.")
 @click.option("--height", default=None, type=int, help="Video height in pixels.")
 def cmd_video_start(width: int | None, height: int | None) -> None:
-    """Start video recording on ALL pages in the context.
+    """Start single-stream video recording on the active tab.
 
-    Mirrors the Playwright CLI: one start call records every tab,
-    including tabs opened afterwards. Each page gets its own .webm file
-    returned by ``video-stop``.
+    Only one recorder is created. When the active tab changes, bridgic
+    hot-switches the CDP screencast source and keeps writing to the same
+    continuous ``.webm`` file.
     """
     try:
         _ok(send_command("video_start", {"width": width, "height": height}, start_if_needed=False))
@@ -1000,14 +1000,12 @@ def cmd_video_start(width: int | None, height: int | None) -> None:
 @cli.command("video-stop", context_settings=CONTEXT_SETTINGS)
 @click.argument("path", required=False, default=None)
 def cmd_video_stop(path: str | None) -> None:
-    """Stop video recording and save files.
+    """Stop video recording and save one ``.webm`` file.
 
-    PATH is optional. When omitted, recorded files stay in the temp dir.
-    When given:
-      * a directory → each recording is saved inside it
-      * a file path → first recording uses that exact path; extra
-        recordings from additional tabs get a ``-1``, ``-2`` … suffix
-        inserted before the ``.webm`` extension.
+    PATH is optional. When omitted, the recorded file stays in the temp
+    dir. When given, PATH may be either:
+      * a directory → bridgic auto-generates a single filename inside it
+      * a file path → bridgic saves exactly one recording to that path
     """
     try:
         abs_path = os.path.abspath(path) if path else None

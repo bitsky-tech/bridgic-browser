@@ -458,7 +458,7 @@ class TestMouseTools:
 # ==================== 6. Keyboard Tools (5 tools) ====================
 
 class TestKeyboardTools:
-    """Tests: type_text, key_down, key_up, fill_form, insert_text"""
+    """Tests: type_text, key_down, key_up, fill_form"""
 
     @pytest.mark.asyncio
     async def test_type_text(self, browser_with_complete_snapshot):
@@ -483,20 +483,6 @@ class TestKeyboardTools:
         assert result_down is not None
         result_up = await browser.key_up("Shift")
         assert result_up is not None
-
-    @pytest.mark.asyncio
-    async def test_insert_text(self, browser_with_complete_snapshot):
-        """insert_text inserts text at cursor position."""
-        browser, _, refs = browser_with_complete_snapshot
-        tb_ref = find_ref_by_type_and_name(refs, "textbox", "Email")
-        assert tb_ref is not None
-        await browser.focus_element_by_ref(tb_ref)
-        result = await browser.insert_text("test@example.com")
-        assert result is not None
-
-        page = await browser.get_current_page()
-        value = await page.evaluate("document.getElementById('email').value")
-        assert "test@example.com" in value
 
     @pytest.mark.asyncio
     async def test_fill_form(self, browser_with_complete_snapshot):

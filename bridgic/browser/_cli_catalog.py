@@ -144,8 +144,8 @@ CLI_COMMAND_META: dict[str, tuple[ToolCategory, str]] = {
     "trace-start": (ToolCategory.DEVELOPER, "Start browser tracing [--no-screenshots] [--no-snapshots]"),
     "trace-stop": (ToolCategory.DEVELOPER, "Stop tracing and save to PATH (.zip)"),
     "trace-chunk": (ToolCategory.DEVELOPER, "Add a named chunk marker to the current trace"),
-    "video-start": (ToolCategory.DEVELOPER, "Start video recording [--width W] [--height H]"),
-    "video-stop": (ToolCategory.DEVELOPER, "Stop video recording [PATH]"),
+    "video-start": (ToolCategory.DEVELOPER, "Start single-stream video recording on the active tab [--width W] [--height H]"),
+    "video-stop": (ToolCategory.DEVELOPER, "Stop video recording and save one .webm [PATH]"),
     "close": (ToolCategory.LIFECYCLE, "Close the browser session"),
     "resize": (ToolCategory.LIFECYCLE, "Resize the browser viewport to WIDTH x HEIGHT"),
 }

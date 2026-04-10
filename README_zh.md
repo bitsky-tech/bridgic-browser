@@ -230,7 +230,7 @@ bridgic-browser open https://example.com --cdp auto
 | `9222` | 端口号 -- 向 `localhost:9222/json/version` 查询 WebSocket URL |
 | `ws://...` / `wss://...` | 直接 WebSocket URL（原始 CDP 或 Playwright WS 协议），原样传递 |
 | `http://host:port` | HTTP 发现端点 -- 向该主机的 `/json/version` 查询 |
-| `auto` | 自动扫描本地 Chrome/Chromium/Brave/Edge/Arc 配置目录（含 Canary 变体），查找活跃的 `DevToolsActivePort` 文件 |
+| `auto` | 自动扫描本地 Chrome/Chromium/Brave 配置目录（含 Canary 变体），查找活跃的 `DevToolsActivePort` 文件 |
 
 **关闭行为：** `bridgic-browser close` 会断开与远程浏览器的连接，但**不会**终止 Chrome 进程。浏览器继续运行，可以重新连接。
 

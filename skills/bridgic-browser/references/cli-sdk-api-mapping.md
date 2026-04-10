@@ -195,7 +195,7 @@ These CLI behaviors have no direct SDK equivalent or work differently:
 | `scroll` argument style | `--dy`/`--dx` flag options (not positional) to allow negative values | `mouse_wheel(delta_x=X, delta_y=Y)` keyword args |
 | `fill-form` input format | JSON string on command line | Python list of dicts |
 | `take_screenshot` return value | CLI always writes to a file path | SDK: `filename=None` returns base64 data URL; `filename="path.png"` writes file |
-| Video file write timing | `video-stop` registers path; file is written when daemon/browser closes | Same for SDK: `.webm` is written when page closes via `close()` or `close_tab()` |
+| Video file write timing | `video-stop` stops the recorder and saves the `.webm` file immediately | Same for SDK: `stop_video()` saves the file immediately — no page close needed |
 
 ## Practical Rule for Mixed Tasks
 

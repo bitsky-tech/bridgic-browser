@@ -231,7 +231,7 @@ bridgic-browser open https://example.com --cdp auto
 | `9222` | Bare port number -- queries `localhost:9222/json/version` to discover the WebSocket URL |
 | `ws://...` / `wss://...` | Direct WebSocket URL (raw CDP or Playwright WS protocol), passed through as-is |
 | `http://host:port` | HTTP discovery endpoint -- queries `/json/version` on that host |
-| `auto` | Auto-scan local Chrome/Chromium/Brave/Edge/Arc profile directories (+ Canary variants) for an active `DevToolsActivePort` file |
+| `auto` | Auto-scan local Chrome/Chromium/Brave profile directories (+ Canary variants) for an active `DevToolsActivePort` file |
 
 **Closing behavior:** `bridgic-browser close` disconnects from the remote browser but does **not** terminate the Chrome process. The browser keeps running and can be reconnected.
 

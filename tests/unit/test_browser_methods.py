@@ -19,7 +19,7 @@ EXPECTED_METHODS = [
     "check_checkbox_or_radio_by_ref", "uncheck_checkbox_by_ref", "double_click_element_by_ref",
     "scroll_element_into_view_by_ref",
     "mouse_move", "mouse_click", "mouse_drag", "mouse_down", "mouse_up", "mouse_wheel",
-    "type_text", "key_down", "key_up", "fill_form", "insert_text",
+    "type_text", "key_down", "key_up", "fill_form",
     "take_screenshot", "save_pdf",
     "start_console_capture", "stop_console_capture", "get_console_messages",
     "start_network_capture", "stop_network_capture", "get_network_requests",
@@ -139,7 +139,7 @@ async def test_start_video_uses_window_inner_dimensions_not_viewport_size():
     the real (e.g. 16:9) window aspect ratio and downsampled to fit
     within 800×600, which:
       1. blurred the page (37% downscale)
-      2. left a gray strip at the bottom from ffmpeg's pad filter
+      2. left a gray strip at the bottom from ffmpeg's pad filter (now fixed: uses scale)
     Querying via CDP avoids both.
     """
     browser = _make_browser_with_mock_page()

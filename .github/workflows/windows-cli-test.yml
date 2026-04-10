@@ -14,13 +14,57 @@ on:
   workflow_dispatch:
 
 jobs:
+  # ── Unit tests (pytest) on Windows ───────────────────────────────────────
+  unit-test-windows:
+    name: Unit Test (Windows, Python ${{ matrix.python-version }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Cache uv dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\uv\cache
+            .venv
+          key: windows-unit-py${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            windows-unit-py${{ matrix.python-version }}-
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Install Playwright browsers
+        run: uv run playwright install chromium
+
+      - name: Run unit tests
+        run: uv run pytest tests/ --tb=short --verbose -m "not integration"
+
+  # ── CLI functional tests on Windows ──────────────────────────────────────
   cli-windows:
     name: CLI Test (Windows, Python ${{ matrix.python-version }})
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - name: Checkout repository
@@ -74,6 +118,49 @@ jobs:
         shell: pwsh
         run: uv run bridgic-browser reload
 
+      # ── Verify ─────────────────────────────────────────────────────────────
+      - name: CLI — verify-url
+        shell: pwsh
+        run: |
+          $out = uv run bridgic-browser verify-url example.com
+          Write-Output $out
+          $outText = ($out | Out-String)
+          if ($outText -notmatch 'PASS') {
+            Write-Error "verify-url did not PASS"
+            exit 1
+          }
+
+      - name: CLI — verify-title
+        shell: pwsh
+        run: |
+          $out = uv run bridgic-browser verify-title Example
+          Write-Output $out
+          $outText = ($out | Out-String)
+          if ($outText -notmatch 'PASS') {
+            Write-Error "verify-title did not PASS"
+            exit 1
+          }
+
+      - name: CLI — verify-text
+        shell: pwsh
+        run: |
+          $out = uv run bridgic-browser verify-text "Example Domain"
+          Write-Output $out
+          $outText = ($out | Out-String)
+          if ($outText -notmatch 'PASS') {
+            Write-Error "verify-text did not PASS"
+            exit 1
+          }
+
+      # ── Wait ───────────────────────────────────────────────────────────────
+      - name: CLI — wait (text appears)
+        shell: pwsh
+        run: uv run bridgic-browser wait "Example Domain"
+
+      - name: CLI — wait (time)
+        shell: pwsh
+        run: uv run bridgic-browser wait 1
+
       # ── Snapshot ───────────────────────────────────────────────────────────
       - name: CLI — snapshot (full page)
         shell: pwsh
@@ -97,6 +184,39 @@ jobs:
         run: uv run bridgic-browser snapshot -F
 
       # ── Element interaction via ref ────────────────────────────────────────
+      - name: CLI — hover first interactive ref
+        shell: pwsh
+        run: |
+          $snap = uv run bridgic-browser snapshot -i
+          $snapText = ($snap | Out-String)
+          $refMatch = [regex]::Match($snapText, '\[ref=([^\]\r\n]+)\]')
+          if ($refMatch.Success) {
+            $ref = $refMatch.Groups[1].Value
+            Write-Output "Hovering ref: $ref"
+            uv run bridgic-browser hover $ref
+          } else {
+            Write-Output "No interactive refs found, skipping hover"
+          }
+
+      - name: CLI — eval-on (ref)
+        shell: pwsh
+        run: |
+          $snap = uv run bridgic-browser snapshot -i
+          $snapText = ($snap | Out-String)
+          $refMatch = [regex]::Match($snapText, '\[ref=([^\]\r\n]+)\]')
+          if ($refMatch.Success) {
+            $ref = $refMatch.Groups[1].Value
+            Write-Output "eval-on ref: $ref"
+            $result = uv run bridgic-browser eval-on $ref "(el) => el.tagName"
+            Write-Output "Tag: $result"
+            if ([string]::IsNullOrWhiteSpace(($result | Out-String))) {
+              Write-Error "eval-on returned empty"
+              exit 1
+            }
+          } else {
+            Write-Output "No interactive refs found, skipping eval-on"
+          }
+
       - name: CLI — click first link ref
         shell: pwsh
         run: |
@@ -112,6 +232,11 @@ jobs:
             Write-Output "No interactive refs found, skipping click"
           }
 
+      # ── Scroll ─────────────────────────────────────────────────────────────
+      - name: CLI — scroll
+        shell: pwsh
+        run: uv run bridgic-browser scroll --dy 300
+
       # ── Navigation history ─────────────────────────────────────────────────
       - name: CLI — back
         shell: pwsh
@@ -121,10 +246,10 @@ jobs:
         shell: pwsh
         run: uv run bridgic-browser forward
 
-      # ── Wait ───────────────────────────────────────────────────────────────
-      - name: CLI — wait (time)
+      # ── Keyboard ───────────────────────────────────────────────────────────
+      - name: CLI — press (keyboard)
         shell: pwsh
-        run: uv run bridgic-browser wait 1
+        run: uv run bridgic-browser press Tab
 
       # ── JavaScript eval ────────────────────────────────────────────────────
       - name: CLI — eval
@@ -163,20 +288,42 @@ jobs:
         shell: pwsh
         run: uv run bridgic-browser tabs
 
-      - name: CLI — new-tab and close-tab
+      - name: CLI — new-tab, switch-tab, close-tab
         shell: pwsh
         run: |
+          # Create a new tab
           $out = uv run bridgic-browser new-tab https://example.com
-          Write-Output $out
-          # page_id is always an integer; allow page_id: 2, page_id=2, or "page_id": 2.
-          $outText = ($out | Out-String)
-          $pidMatch = [regex]::Match($outText, '(?m)\b"?page_id"?\b\s*[:=]\s*(\d+)')
-          if ($pidMatch.Success) {
-            $tabId = $pidMatch.Groups[1].Value
-            Write-Output "Closing tab: $tabId"
-            uv run bridgic-browser close-tab $tabId
+          Write-Output "new-tab: $out"
+
+          # List tabs and extract page_ids
+          $tabsOut = uv run bridgic-browser tabs
+          Write-Output "tabs: $tabsOut"
+          $tabsText = ($tabsOut | Out-String)
+
+          # Extract all page_ids
+          $allPids = [regex]::Matches($tabsText, '\bpage_(\d+)\b')
+          if ($allPids.Count -ge 2) {
+            # Switch to the first tab
+            $firstPid = $allPids[0].Value
+            Write-Output "Switching to: $firstPid"
+            uv run bridgic-browser switch-tab $firstPid
+
+            # Switch back to the second tab
+            $secondPid = $allPids[1].Value
+            Write-Output "Switching to: $secondPid"
+            uv run bridgic-browser switch-tab $secondPid
+
+            # Close the second tab
+            $pidMatch = [regex]::Match(($out | Out-String), '(?m)\b"?page_id"?\b\s*[:=]\s*(\d+)')
+            if ($pidMatch.Success) {
+              $tabId = $pidMatch.Groups[1].Value
+              Write-Output "Closing tab: $tabId"
+              uv run bridgic-browser close-tab $tabId
+            } else {
+              Write-Output "Could not extract page_id from new-tab output, skipping close-tab"
+            }
           } else {
-            Write-Output "Could not extract page_id, skipping close-tab"
+            Write-Output "Less than 2 tabs found, skipping switch-tab"
           }
 
       # ── Storage ────────────────────────────────────────────────────────────
@@ -193,6 +340,62 @@ jobs:
             exit 1
           }
           uv run bridgic-browser storage-load state.json
+
+      # ── Form interaction (httpbin) ─────────────────────────────────────────
+      - name: CLI — open httpbin form
+        shell: pwsh
+        run: uv run bridgic-browser open https://httpbin.org/forms/post
+
+      - name: CLI — fill textbox on httpbin form
+        shell: pwsh
+        run: |
+          $snap = uv run bridgic-browser snapshot -i
+          Write-Output $snap
+          $snapText = ($snap | Out-String)
+          # Find a textbox ref
+          $textboxMatch = [regex]::Match($snapText, '(?i)textbox[^\[]*\[ref=([^\]\r\n]+)\]')
+          if ($textboxMatch.Success) {
+            $ref = $textboxMatch.Groups[1].Value
+            Write-Output "Filling textbox ref: $ref"
+            uv run bridgic-browser fill $ref "CI Test"
+          } else {
+            Write-Error "No textbox found in httpbin interactive snapshot"
+            exit 1
+          }
+
+      - name: CLI — type text (into focused field)
+        shell: pwsh
+        run: uv run bridgic-browser type " appended"
+
+      - name: CLI — focus textbox on httpbin form
+        shell: pwsh
+        run: |
+          $snap = uv run bridgic-browser snapshot -i
+          $snapText = ($snap | Out-String)
+          $textboxMatch = [regex]::Match($snapText, '(?i)textbox[^\[]*\[ref=([^\]\r\n]+)\]')
+          if ($textboxMatch.Success) {
+            $ref = $textboxMatch.Groups[1].Value
+            Write-Output "Focusing ref: $ref"
+            uv run bridgic-browser focus $ref
+          } else {
+            Write-Output "No textbox found, skipping focus"
+          }
+
+      - name: CLI — check and uncheck checkbox on httpbin form
+        shell: pwsh
+        run: |
+          $snap = uv run bridgic-browser snapshot -i
+          $snapText = ($snap | Out-String)
+          $checkMatch = [regex]::Match($snapText, '(?i)checkbox[^\[]*\[ref=([^\]\r\n]+)\]')
+          if ($checkMatch.Success) {
+            $ref = $checkMatch.Groups[1].Value
+            Write-Output "Checking ref: $ref"
+            uv run bridgic-browser check $ref
+            Write-Output "Unchecking ref: $ref"
+            uv run bridgic-browser uncheck $ref
+          } else {
+            Write-Output "No checkbox found in httpbin form, skipping check/uncheck"
+          }
 
       # ── Shutdown ───────────────────────────────────────────────────────────
       - name: CLI — close daemon
@@ -216,3 +419,81 @@ jobs:
             exit 1
           }
           Write-Output "OK: daemon cleaned up correctly (${elapsed}s)"
+
+  # ── Integration tests (pytest) on Windows ─────────────────────────────────
+  integration-test-windows:
+    name: Integration Test (Windows)
+    runs-on: windows-latest
+    needs: unit-test-windows
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Cache uv dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\uv\cache
+            .venv
+          key: windows-integ-py3.11-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            windows-integ-py3.11-
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\ms-playwright
+          key: windows-playwright-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            windows-playwright-
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Install Playwright browsers
+        run: uv run playwright install chromium
+
+      - name: Run integration tests
+        run: uv run pytest tests/ --tb=short --verbose -m integration
+
+  # ── Summary ──────────────────────────────────────────────────────────────
+  windows-test-summary:
+    name: Windows Test Summary
+    runs-on: windows-latest
+    needs: [unit-test-windows, cli-windows, integration-test-windows]
+    if: always()
+
+    steps:
+      - name: Check results
+        shell: pwsh
+        run: |
+          Write-Output "Unit tests:        ${{ needs.unit-test-windows.result }}"
+          Write-Output "CLI tests:         ${{ needs.cli-windows.result }}"
+          Write-Output "Integration tests: ${{ needs.integration-test-windows.result }}"
+
+          if ("${{ needs.unit-test-windows.result }}" -ne "success") {
+            Write-Error "Unit tests failed"
+            exit 1
+          }
+
+          if ("${{ needs.cli-windows.result }}" -ne "success") {
+            Write-Output "WARNING: CLI functional tests failed (non-blocking)"
+          }
+
+          if ("${{ needs.integration-test-windows.result }}" -ne "success") {
+            Write-Output "WARNING: Integration tests failed (non-blocking)"
+          }
+
+          Write-Output "All required Windows tests passed"

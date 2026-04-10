@@ -168,7 +168,7 @@ await browser.type_text("hello world")
 
 | Method | Speed | Events | Use Case |
 |--------|-------|--------|----------|
-| `input_text_by_ref` | Fast | input, change | Standard forms |
+| `input_text_by_ref` | Fast | focus, input, change | Standard forms |
 | `input_text_by_ref(slowly=True)` | Slow | All keyboard | Autocomplete |
 | `type_text` | Medium | All keyboard | At cursor (no ref) |
 

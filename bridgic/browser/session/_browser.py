@@ -1575,7 +1575,7 @@ class Browser:
     # Timeout (seconds) applied to individual page.close() calls during
     # shutdown so that a hung beforeunload handler cannot block forever.
     _PAGE_CLOSE_TIMEOUT = 5.0
-    _TRACE_STOP_TIMEOUT = 10.0
+    _TRACE_STOP_TIMEOUT = 30.0
     _CONTEXT_CLOSE_TIMEOUT = 15.0
     _BROWSER_CLOSE_TIMEOUT = 15.0
     _PLAYWRIGHT_STOP_TIMEOUT = 15.0
@@ -4092,9 +4092,9 @@ Before you return the element ref, reason about the state and elements for a sen
         """Input text into a specific element identified by its snapshot ref.
 
         This is the primary text-input tool for interacting with form fields by
-        ref.  Unlike :meth:`type_text` and :meth:`insert_text` which type into
-        the currently focused element, this method targets the element directly
-        via its ref and handles both visible and hidden (shadow-DOM) inputs.
+        ref.  Unlike :meth:`type_text` which types into the currently focused
+        element, this method targets the element directly via its ref and
+        handles both visible and hidden (shadow-DOM) inputs.
 
         Comparison:
 
@@ -4103,8 +4103,6 @@ Before you return the element ref, reason about the state and elements for a sen
         - :meth:`type_text` — no ref; types into focused element
           character-by-character via ``keyboard.press``; triggers per-character
           ``keydown``/``keyup`` events (needed for autocomplete widgets).
-        - :meth:`insert_text` — no ref; pastes into focused element in one shot
-          without key events; fastest for long strings.
 
         Parameters
         ----------
@@ -5448,8 +5446,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
         Each character fires ``keydown``, ``keypress``, and ``keyup`` events,
         which is required for fields with per-keystroke handlers such as
-        autocomplete widgets.  This is slower than :meth:`insert_text` for
-        long strings.
+        autocomplete widgets.
 
         An element must already be focused before calling this method (e.g.
         via :meth:`focus_element_by_ref` or by clicking a field first).
@@ -5460,8 +5457,6 @@ Before you return the element ref, reason about the state and elements for a sen
           hidden inputs; **preferred** for form filling.
         - ``type_text`` — no ref; requires a pre-focused element; fires per-
           character key events; use when those events are needed.
-        - :meth:`insert_text` — no ref; pastes in one shot without key events;
-          fastest for long strings.
 
         Parameters
         ----------
@@ -5668,57 +5663,6 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to fill form: {str(e)}"
             logger.error(f"[fill_form] {error_msg}")
-            _raise_operation_error(error_msg)
-
-    async def insert_text(self, text: str) -> str:
-        """Insert text at the current cursor position without per-character key events.
-
-        Pastes the text directly into the currently focused element.  Unlike
-        :meth:`type_text`, no ``keydown``/``keyup`` events are fired per character,
-        so it is significantly faster for long strings but will not trigger
-        handlers that listen to individual keystrokes (e.g., autocomplete widgets
-        that react to ``onkeydown``).
-
-        An element must already be focused before calling this method (e.g.
-        via :meth:`focus_element_by_ref`).
-
-        Use :meth:`input_text_by_ref` to target a specific element by ref.
-        Use :meth:`type_text` when per-character key events must fire.
-
-        Parameters
-        ----------
-        text : str
-            Text to insert at the current cursor position.  Requires an element
-            to already be focused (e.g., via :meth:`focus_element_by_ref`).
-
-        Returns
-        -------
-        str
-            "Inserted text (<N> characters)".
-
-        Raises
-        ------
-        StateError
-            If no active page is available.
-        OperationError
-            If insertion fails.
-        """
-        try:
-            logger.info(f"[insert_text] start text_len={len(text)}")
-
-            page = await self.get_current_page()
-            if page is None:
-                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
-
-            await page.keyboard.insert_text(text)
-            result = f"Inserted text ({len(text)} characters)"
-            logger.info(f"[insert_text] done {result}")
-            return result
-        except BridgicBrowserError:
-            raise
-        except Exception as e:
-            error_msg = f"Failed to insert text: {str(e)}"
-            logger.error(f"[insert_text] {error_msg}")
             _raise_operation_error(error_msg)
 
     # ==================== Screenshot and PDF Tools ====================
@@ -7463,8 +7407,8 @@ Before you return the element ref, reason about the state and elements for a sen
         #     bridgic never called ``setViewportSize`` on the foreign Chrome.
         #     Falling back to a hard-coded ``800×600`` is almost always wrong:
         #     the real window is wider (typically 16:9), so Chrome downsamples
-        #     to fit within 800×600 and ffmpeg's ``pad`` filter adds a gray
-        #     strip at the bottom to make up the difference. Querying
+        #     to fit within 800×600 and ffmpeg's ``scale`` filter stretches
+        #     the frame to the target size. Querying
         #     ``window.innerWidth/innerHeight`` returns the true visible area
         #     for any of the three modes.
         # ``& ~1``: round down to an even number — VP8 requires even

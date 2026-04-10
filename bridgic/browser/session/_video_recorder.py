@@ -122,10 +122,9 @@ def _find_ffmpeg() -> str:
 # A baked 1×1 white JPEG. Used in the rare case where no real frame arrived
 # before stop() (e.g. start_video → immediate stop_video). ffmpeg refuses to
 # produce a valid WebM when its input pipe is empty, so we feed it this single
-# byte sequence; the ``pad=W:H:0:0:gray`` filter then expands it to the target
-# resolution by adding gray padding (the original 1×1 white pixel ends up in
-# the top-left corner). The resulting frame is intentionally minimal — the
-# only goal is "produce a playable file", not "produce a meaningful frame".
+# byte sequence; the ``scale=W:H`` filter stretches it to the target resolution.
+# The resulting frame is intentionally minimal — the only goal is "produce a
+# playable file", not "produce a meaningful frame".
 # Playwright's videoRecorder.ts has an analogous fallback in writeFrame().
 _FALLBACK_WHITE_JPEG_1X1 = (
     b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
@@ -145,7 +144,7 @@ def _create_white_jpeg(width: int, height: int) -> bytes:
 
     If Pillow is available we render a true ``width × height`` white JPEG;
     otherwise we return the baked 1×1 fallback above and rely on ffmpeg's
-    ``pad`` filter to expand it. The fallback path is taken in production
+    ``scale`` filter to stretch it. The fallback path is taken in production
     because Pillow is not a project dependency — see the comment on
     ``_FALLBACK_WHITE_JPEG_1X1`` for the implications.
 
@@ -260,8 +259,17 @@ class VideoRecorder:
         #   -speed 2             slower preset (valid 0-5 with deadline=good)
         #   -threads 2           extra worker to keep up with the slower preset
         # Filters:
-        #   pad={w}:{h}:0:0:gray  pad smaller frames with a gray border
-        #   crop={w}:{h}:0:0      crop to exact target size
+        #   scale={w}:{h}  scale frames to exact target dimensions.
+        #
+        #   Why scale instead of pad: Chrome's Page.startScreencast honours
+        #   maxWidth/maxHeight as an *aspect-preserving clamp* — it never
+        #   upsamples.  When the viewport's aspect ratio differs from W:H
+        #   (e.g. viewport 1710×856 vs target 1280×720), Chrome produces
+        #   frames that fit within W×H but are shorter/narrower than the
+        #   target.  ``pad`` would fill the gap with a visible gray border;
+        #   ``scale`` stretches the frame to the exact target size instead.
+        #   The distortion is negligible (typically < 12 %) and eliminates
+        #   the gray bar entirely.
         args = [
             ffmpeg_path,
             "-loglevel", "error",
@@ -281,7 +289,7 @@ class VideoRecorder:
             "-speed", "2",
             "-b:v", "5M",
             "-threads", "2",
-            "-vf", f"pad={w}:{h}:0:0:gray,crop={w}:{h}:0:0",
+            "-vf", f"scale={w}:{h}",
             self._output_path,
         ]
         # stdout/stderr → DEVNULL: ffmpeg launches with `-loglevel error`, so
@@ -322,11 +330,10 @@ class VideoRecorder:
                 "quality": 95,
                 # maxWidth/maxHeight is a *clamp*, not a target: Chrome
                 # downsamples (preserving aspect) to fit within these bounds
-                # but never upsamples. They MUST equal the actual viewport
-                # the caller computed, otherwise an aspect-ratio mismatch
-                # makes Chrome ship a frame smaller than (self._width,
-                # self._height) and ffmpeg's pad filter fills the gap with
-                # gray. See bridgic/browser/session/_browser.py
+                # but never upsamples. When the viewport aspect ratio differs
+                # from W:H, Chrome produces smaller frames and ffmpeg's scale
+                # filter stretches them to the exact target size.
+                # See bridgic/browser/session/_browser.py
                 # ``start_video()`` for the dimension-resolution comment.
                 "maxWidth": self._width,
                 "maxHeight": self._height,

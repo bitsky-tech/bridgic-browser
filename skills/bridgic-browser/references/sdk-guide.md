@@ -138,7 +138,7 @@ Use `resolve_cdp_input()` to convert user-friendly formats (port, URL, `"auto"`)
 from bridgic.browser import resolve_cdp_input
 
 ws_url = resolve_cdp_input("9222")       # queries localhost:9222/json/version
-ws_url = resolve_cdp_input("auto")       # scans local Chrome/Brave/Edge profiles
+ws_url = resolve_cdp_input("auto")       # scans local Chrome/Chromium/Brave profiles
 browser = Browser(cdp_url=ws_url)
 ```
 
@@ -156,7 +156,7 @@ Notes:
 - `take_screenshot(filename=None)` returns base64 data URL string.
 - `take_screenshot(filename="path.png")` writes file and returns a status string.
 - `verify_element_visible` uses `(role, accessible_name)` rather than ref.
-- `start_video` must run before `stop_video`; `stop_video` registers the destination path but does **not** close any pages. The actual `.webm` file is written by Playwright when pages close (via `close()` or `close_tab()`).
+- `start_video` must run before `stop_video`; `stop_video` stops the recorder and saves the `.webm` file immediately — no page close is needed.
 
 ## SDK Error Handling
 

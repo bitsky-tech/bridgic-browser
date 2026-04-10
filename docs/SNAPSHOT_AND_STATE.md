@@ -54,6 +54,7 @@ Stored in `EnhancedSnapshot.refs`. Used internally to build a Playwright locator
 | `text_content`  | str, optional | Text content snippet. |
 | `parent_ref`    | str, optional | Ref of the nearest ancestor element that has a ref. |
 | `frame_path`    | List[int], optional | Per-level local iframe indices for nested iframes. `None` = main frame; `[0]` = 1st top-level iframe; `[0, 0]` = 1st iframe inside the 1st iframe. Used to build the `frame_locator(...).nth(n)` chain in `get_element_by_ref`. |
+| `playwright_ref` | str, optional | Playwright's ephemeral aria-ref ID (e.g. `"e369"`, `"f1e5"`). Valid only for the lifetime of the current snapshot — used by the aria-ref fast path in `get_element_by_ref` for O(1) DOM lookup. |
 
 You normally do not need to use `RefData` directly; `get_element_by_ref(ref)` uses it under the hood.
 

@@ -139,7 +139,7 @@ bridgic-browser open https://example.com --cdp ws://localhost:9222/devtools/brow
 # Connect to cloud service
 bridgic-browser open https://example.com --cdp wss://cloud.example.com/chromium?token=...
 
-# Auto-scan local Chrome/Brave/Edge/Arc profiles
+# Auto-scan local Chrome/Chromium/Brave profiles (+ Canary variants)
 bridgic-browser open https://example.com --cdp auto
 ```
 
@@ -148,7 +148,7 @@ bridgic-browser open https://example.com --cdp auto
 | `9222` | Bare port -- queries `localhost:9222/json/version` |
 | `ws://...` / `wss://...` | Direct WebSocket URL, passed through as-is |
 | `http://host:port` | HTTP discovery endpoint |
-| `auto` | Scan local browser profiles for `DevToolsActivePort` |
+| `auto` | Scan local Chrome/Chromium/Brave profiles (+ Canary) for `DevToolsActivePort` |
 
 `close` disconnects from the remote browser but does **not** kill the Chrome process.
 
@@ -158,7 +158,7 @@ bridgic-browser open https://example.com --cdp auto
 - When `snapshot` output exceeds `-l <limit>`, or `-s <path>` is provided, full content is saved to a file (auto-generated under `~/.bridgic/bridgic-browser/snapshot/` or the specified path).
 - `snapshot -i` returns only clickable/editable elements — use for action selection, not full-page inspection.
 - CLI uses a persistent daemon/browser. State survives across commands until `close`.
-- **`open` and `search` accept `--headed` and `--clear-user-data`** (startup flags only — ignored when a daemon is already running):
+- **`open` and `search` accept `--headed`, `--clear-user-data`, and `--cdp`** (startup flags only — ignored when a daemon is already running):
   - `bridgic-browser open --headed https://example.com` — start in headed mode
   - `bridgic-browser open --clear-user-data https://example.com` — start with ephemeral session (no persistent profile)
   - By default (no `--clear-user-data`), the browser uses a persistent profile saved at `~/.bridgic/bridgic-browser/user_data/`.
