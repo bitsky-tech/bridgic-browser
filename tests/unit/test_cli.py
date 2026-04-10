@@ -2485,7 +2485,11 @@ class TestFindCdpUrl:
         chrome_url = "ws://localhost:9222/devtools/browser/chrome-uuid"
 
         def fake_read(base):
-            if "Chrome" in base and "Canary" not in base and "Beta" not in base:
+            base_lower = base.lower()
+            if ("chrome" in base_lower or "google-chrome" in base_lower) \
+               and "canary" not in base_lower \
+               and "unstable" not in base_lower \
+               and "beta" not in base_lower:
                 return chrome_url
             return None
 
