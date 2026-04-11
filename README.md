@@ -206,7 +206,32 @@ BRIDGIC_BROWSER_JSON='{"clear_user_data":true}' bridgic-browser open URL
 
 Instead of launching a new browser, `bridgic-browser` can connect to an already-running Chrome/Chromium instance via the [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/).
 
-Start Chrome with remote debugging enabled:
+There are two ways to start Chrome with a remote debugging endpoint exposed.
+
+**Option A — Chrome 144+ in-browser UI (no relaunch).** Open `chrome://inspect/#remote-debugging` in your everyday Chrome window and follow the dialog to allow incoming debugging connections. Chrome opens a local endpoint and writes the connection info to a `DevToolsActivePort` file at the root of the user data directory:
+
+| Platform | Path |
+|----------|------|
+| macOS    | `~/Library/Application Support/Google/Chrome/DevToolsActivePort` |
+| Linux    | `~/.config/google-chrome/DevToolsActivePort` |
+| Windows  | `%LOCALAPPDATA%\Google\Chrome\User Data\DevToolsActivePort` |
+
+The file is exactly two lines — port and browser-level WebSocket path:
+
+```
+9222
+/devtools/browser/f8632266-41b6-4eb8-8239-d48a86bb44b1
+```
+
+Because bridgic's `--cdp auto` already scans these standard profile directories for `DevToolsActivePort`, you can connect immediately with no extra arguments:
+
+```bash
+bridgic-browser open https://example.com --cdp auto
+```
+
+While the session is active Chrome shows a *"Chrome is being controlled by automated test software"* banner, and Chrome may prompt you to confirm each new debugging session. Sources: [Chrome DevTools MCP blog post](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session), [chrome-devtools-mcp README](https://github.com/ChromeDevTools/chrome-devtools-mcp/). See [`docs/CDP_MODE.md`](docs/CDP_MODE.md) for more.
+
+**Option B — launch flag (Chrome <144, or a dedicated profile).** Start Chrome with `--remote-debugging-port`:
 
 ```bash
 # macOS

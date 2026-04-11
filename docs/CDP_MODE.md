@@ -15,6 +15,60 @@ bridgic-browser open https://example.com --cdp "ws://localhost:9222/..."
 bridgic-browser search "query" --cdp 9222
 ```
 
+## Starting Chrome with CDP enabled
+
+Before bridgic can connect, the target Chrome must expose a remote debugging endpoint. There are two ways to do this.
+
+### Chrome 144+ — in-browser UI (no relaunch)
+
+Starting in Chrome 144, remote debugging can be enabled from the running browser without restarting it or passing any command-line flags:
+
+1. Open `chrome://inspect/#remote-debugging` in your everyday Chrome window.
+2. Follow the dialog to **allow** incoming debugging connections.
+
+Chrome then opens a local endpoint and writes the connection info to a `DevToolsActivePort` file at the **root of the user data directory** (not inside a profile subfolder like `Default/`):
+
+| Platform | Path |
+|----------|------|
+| macOS    | `~/Library/Application Support/Google/Chrome/DevToolsActivePort` |
+| Linux    | `~/.config/google-chrome/DevToolsActivePort` |
+| Windows  | `%LOCALAPPDATA%\Google\Chrome\User Data\DevToolsActivePort` |
+
+The file is exactly two lines — the port and the browser-level WebSocket path:
+
+```
+9222
+/devtools/browser/f8632266-41b6-4eb8-8239-d48a86bb44b1
+```
+
+Join them as `ws://127.0.0.1:<port><path>` and pass the result to bridgic:
+
+```bash
+bridgic-browser open https://example.com \
+  --cdp "ws://127.0.0.1:9222/devtools/browser/f8632266-41b6-4eb8-8239-d48a86bb44b1"
+```
+
+> `--cdp 9222` and `--cdp auto` also work against this endpoint, since bridgic resolves a bare port to a `ws://` URL by querying `http://127.0.0.1:<port>/json/version`.
+
+While the session is active Chrome shows a *"Chrome is being controlled by automated test software"* banner, and Chrome may prompt you to confirm each new debugging session. This consent gate is the whole point of the Chrome 144+ flow — it lets agents share a real, logged-in profile without anyone passing `--remote-debugging-port` on the command line.
+
+**Sources:**
+- [Let your Coding Agent debug your browser session with Chrome DevTools MCP — Chrome for Developers blog](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session) — describes the Chrome 144 permission dialog and the `chrome://inspect/#remote-debugging` setup step.
+- [ChromeDevTools/chrome-devtools-mcp README](https://github.com/ChromeDevTools/chrome-devtools-mcp/) — documents the `--autoConnect` (Chrome 144+) requirement that the user has enabled remote debugging via `chrome://inspect/#remote-debugging`.
+
+### Legacy — launch flag
+
+For Chrome < 144, or when you want a fresh dedicated profile that won't prompt:
+
+```bash
+# macOS
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir=/tmp/chrome-cdp-profile
+```
+
+Then use `--cdp 9222`, `--cdp auto` (scan), or the explicit `ws://` URL.
+
 ## How it works
 
 `Browser(cdp_url=...)` calls Playwright's `connect_over_cdp()` instead of `launch()`. The existing browser's default context is borrowed — bridgic operates as a guest on someone else's browser, sharing cookies, localStorage, and login state with the user's real Chrome session. (That session sharing is the whole point of CDP mode.)
@@ -79,7 +133,7 @@ If the remote Chrome was not started with stealth flags, bridgic's JS patches ca
 
 bridgic records video via Chrome's CDP `Page.startScreencast` (piped to ffmpeg), **not** Playwright's `record_video` context option — so video recording works on borrowed contexts.
 
-- **Only the active tab is recorded.** `start_video()` starts a single screencast session on the currently active page. When you switch tabs (via `switch_tab`, `new_tab`, etc.), the CDP screencast source is hot-swapped to the new page — ffmpeg stays alive and the output is a single continuous `.webm` file.
+- **Only the active tab is recorded.** `start_video()` starts a single screencast session on the currently active page. When the active tab changes — whether via `switch_tab`, `new_tab`, `navigate_to` (when it creates a new page), or `close_tab` — the CDP screencast source is hot-swapped to the new page. ffmpeg stays alive and the output is a single continuous `.webm` file.
 - **`stop_video()` saves the file immediately.** The `.webm` is written as soon as the recorder stops; no page close is needed.
 - **Recording stops cleanly without touching user tabs.** No page is closed or navigated.
 

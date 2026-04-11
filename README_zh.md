@@ -205,7 +205,32 @@ BRIDGIC_BROWSER_JSON='{"clear_user_data":true}' bridgic-browser open URL
 
 `bridgic-browser` 可以通过 [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) 连接到已经运行的 Chrome/Chromium 实例，而非启动新浏览器。
 
-首先启动 Chrome 并开启远程调试端口：
+开启远程调试端点有两种方式。
+
+**方式一 —— Chrome 144+ 浏览器内 UI 启用（无需重启 Chrome）。** 在你日常使用的 Chrome 中打开 `chrome://inspect/#remote-debugging`，按对话框提示**允许**远程调试连接即可。Chrome 会在本地开启调试端点，并把连接信息写入 user data 目录根部的 `DevToolsActivePort` 文件：
+
+| 平台 | 路径 |
+|------|------|
+| macOS   | `~/Library/Application Support/Google/Chrome/DevToolsActivePort` |
+| Linux   | `~/.config/google-chrome/DevToolsActivePort` |
+| Windows | `%LOCALAPPDATA%\Google\Chrome\User Data\DevToolsActivePort` |
+
+文件总共两行 —— 端口号 + 浏览器级 WebSocket 路径：
+
+```
+9222
+/devtools/browser/f8632266-41b6-4eb8-8239-d48a86bb44b1
+```
+
+由于 bridgic 的 `--cdp auto` 本身就会扫描这些标准 profile 目录里的 `DevToolsActivePort`，你无需任何额外参数即可直接连接：
+
+```bash
+bridgic-browser open https://example.com --cdp auto
+```
+
+会话激活期间 Chrome 会在顶部显示 *"Chrome 正在受到自动测试软件的控制"* 横幅，并可能在每次新建调试会话时再次弹出确认对话框。来源：[Chrome DevTools MCP 博客](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session)、[chrome-devtools-mcp README](https://github.com/ChromeDevTools/chrome-devtools-mcp/)。完整说明见 [`docs/CDP_MODE.md`](docs/CDP_MODE.md)。
+
+**方式二 —— 启动参数（Chrome <144 或需要独立 profile 时）。** 使用 `--remote-debugging-port` 启动 Chrome：
 
 ```bash
 # macOS
