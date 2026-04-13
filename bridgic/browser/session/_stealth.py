@@ -309,6 +309,15 @@ _STEALTH_INIT_SCRIPT_TEMPLATE: str = """
 # "[native code]".
 _ANTI_DEVTOOLS_DETECTOR_SCRIPT: str = """
 (function () {
+  // Only run in the top-level frame.  CAPTCHA providers (Cloudflare
+  // Turnstile, reCAPTCHA, hCaptcha, etc.) use transient iframes for
+  // verification — these iframes may start as about:blank so their
+  // hostname is unknown at init-script time.  Patching Function or
+  // toString inside them causes detectable inconsistencies that fail
+  // the challenge.  devtools-detector runs in the main page context,
+  // so skipping child frames does not weaken the protection.
+  try { if (window !== window.top) return; } catch (_) { return; }
+
   // ── Bootstrap _mkNative (reuse existing or create minimal version) ──
   // In headless mode the main stealth script has already defined _mkNative
   // in an earlier IIFE scope — we cannot reach it, so we always create our
