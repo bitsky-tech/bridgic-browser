@@ -53,7 +53,7 @@ jobs:
 
       - name: Install Playwright browsers
         run: |
-          uv run playwright install chromium
+          uv run playwright install --with-deps chromium
 
       - name: Run tests
         run: |
@@ -86,7 +86,7 @@ jobs:
 
       - name: Install Playwright browsers
         run: |
-          uv run playwright install chromium
+          uv run playwright install --with-deps chromium
 
       - name: Run integration tests
         run: |
