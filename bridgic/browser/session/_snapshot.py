@@ -51,6 +51,7 @@ Usage:
     asyncio.run(main())
 """
 
+import asyncio
 import re
 import math
 import logging
@@ -61,6 +62,321 @@ from dataclasses import dataclass
 from playwright.async_api import FrameLocator as AsyncFrameLocator, Page as AsyncPage, Locator as AsyncLocator
 
 logger = logging.getLogger(__name__)
+
+
+# Chunk size for _batch_get_elements_info; keeps a single page.evaluate() call
+# bounded so the browser JS thread can yield back to the daemon's event loop
+# between chunks. 500 is comfortable for 1000–5000 ref pages.
+_BATCH_INFO_CHUNK_SIZE = 500
+
+
+# JS executed by SnapshotGenerator._batch_get_elements_info. Extracted to a
+# module-level constant so Python can call it multiple times (chunked) with
+# different payloads. The body pre-builds an index of DOM elements keyed by
+# ARIA role — one querySelectorAll per *unique role in the payload* instead of
+# one per ref — and memoizes accessible-name / text-content lookups in
+# WeakMaps. For pages with 1000+ refs this turns an O(N_refs × DOM_size)
+# inner loop into O(unique_roles × DOM_size) + O(N_refs), which is ~10x
+# faster in practice on large pages (e.g. baidu search results).
+_BATCH_INFO_JS = r"""(args) => {
+    const { elements, viewportWidth, viewportHeight, checkViewport } = args;
+
+    const IMPLICIT_ROLE_SELECTORS = {
+        'button': 'button, input[type="button"], input[type="submit"], input[type="reset"], input[type="file"], [role="button"]',
+        'link': 'a[href], area[href], [role="link"]',
+        'textbox': 'input:not([type]), input[type="text"], input[type="email"], input[type="password"], input[type="search"], input[type="url"], input[type="tel"], textarea, [role="textbox"], [contenteditable="true"], [contenteditable=""]',
+        'checkbox': 'input[type="checkbox"], [role="checkbox"]',
+        'radio': 'input[type="radio"], [role="radio"]',
+        'combobox': 'select, [role="combobox"]',
+        'option': 'option, [role="option"]',
+        'heading': 'h1, h2, h3, h4, h5, h6, [role="heading"]',
+        'listitem': 'li, [role="listitem"]',
+        'list': 'ul, ol, [role="list"]',
+        'img': 'img[alt], [role="img"]',
+        'row': 'tr, [role="row"]',
+        'cell': 'td, [role="cell"]',
+        'columnheader': 'th, [role="columnheader"]',
+        'navigation': 'nav, [role="navigation"]',
+        'main': 'main, [role="main"]',
+        'banner': 'header, [role="banner"]',
+        'contentinfo': 'footer, [role="contentinfo"]',
+        'table': 'table, [role="table"]',
+        'menuitem': '[role="menuitem"]',
+        'menuitemcheckbox': '[role="menuitemcheckbox"]',
+        'menuitemradio': '[role="menuitemradio"]',
+        'tab': '[role="tab"]',
+        'tabpanel': '[role="tabpanel"]',
+        'treeitem': '[role="treeitem"]',
+        'switch': '[role="switch"]',
+        'slider': 'input[type="range"], [role="slider"]',
+        'spinbutton': 'input[type="number"], [role="spinbutton"]',
+        'searchbox': 'input[type="search"], [role="searchbox"]',
+        'progressbar': 'progress, [role="progressbar"]',
+        'scrollbar': '[role="scrollbar"]',
+        'separator': 'hr, [role="separator"]',
+        'gridcell': '[role="gridcell"]',
+        'grid': '[role="grid"]',
+        'listbox': '[role="listbox"]',
+        'menu': '[role="menu"]',
+        'menubar': '[role="menubar"]',
+        'radiogroup': '[role="radiogroup"]',
+        'tablist': '[role="tablist"]',
+        'tree': '[role="tree"]',
+        'treegrid': '[role="treegrid"]',
+        'alertdialog': '[role="alertdialog"]',
+        'dialog': 'dialog, [role="dialog"]',
+        'application': '[role="application"]',
+        'search': '[role="search"]',
+        'article': 'article, [role="article"]',
+        'region': 'section[aria-label], section[aria-labelledby], [role="region"]',
+        'rowheader': 'th[scope="row"], [role="rowheader"]',
+        'rowgroup': 'thead, tbody, tfoot, [role="rowgroup"]',
+        'toolbar': '[role="toolbar"]',
+        'status': '[role="status"]',
+        'alert': '[role="alert"]',
+        'log': '[role="log"]',
+        'marquee': '[role="marquee"]',
+        'timer': '[role="timer"]',
+        'tooltip': '[role="tooltip"]',
+        'figure': 'figure, [role="figure"]',
+        'paragraph': 'p, [role="paragraph"]',
+        'blockquote': 'blockquote, [role="blockquote"]',
+        'code': 'code, [role="code"]',
+        'emphasis': 'em, [role="emphasis"]',
+        'strong': 'strong, [role="strong"]',
+        'deletion': 'del, [role="deletion"]',
+        'insertion': 'ins, [role="insertion"]',
+        'subscript': 'sub, [role="subscript"]',
+        'superscript': 'sup, [role="superscript"]',
+        'term': 'dfn, [role="term"]',
+        'definition': 'dd, [role="definition"]',
+        'note': '[role="note"]',
+        'math': 'math, [role="math"]',
+        'time': 'time, [role="time"]',
+        'complementary': 'aside, [role="complementary"]',
+        'form': 'form[aria-label], form[aria-labelledby], [role="form"]',
+        'iframe': 'iframe',
+        'feed': '[role="feed"]',
+        'document': '[role="document"]',
+        'caption': 'caption, figcaption, [role="caption"]',
+        'meter': 'meter, [role="meter"]',
+        'summary': 'summary',
+        'details': 'details',
+        'generic': 'div:not([role]), legend, [role="generic"]',
+        'group': 'fieldset, details, optgroup, [role="group"]',
+        'none': '[role="none"]',
+        'presentation': '[role="presentation"]',
+    };
+
+    // Pre-build role index: one querySelectorAll per *unique* role in the
+    // payload. Avoids re-scanning the DOM for every ref — the dominant cost
+    // on large pages where role='generic' matches thousands of divs.
+    const roleIndex = {};
+    const uniqueRoles = new Set();
+    for (const item of elements) uniqueRoles.add(item.role);
+    for (const role of uniqueRoles) {
+        const selector = IMPLICIT_ROLE_SELECTORS[role] || '[role="' + role + '"]';
+        try {
+            roleIndex[role] = Array.from(document.querySelectorAll(selector));
+        } catch (_e) {
+            roleIndex[role] = [];
+        }
+    }
+
+    // Memoize expensive per-element lookups. WeakMap auto-drops entries when
+    // the element is GC'd — safe within a single evaluate() call.
+    const nameCache = new WeakMap();
+    const textCache = new WeakMap();
+
+    function getAssociatedLabelText(el) {
+        if (!el) return '';
+        if (el.labels && el.labels.length > 0) {
+            const texts = Array.from(el.labels)
+                .map(label => (label.textContent || '').trim())
+                .filter(Boolean);
+            if (texts.length) return texts.join(' ');
+        }
+        if (el.id) {
+            const explicitLabels = Array.from(
+                document.querySelectorAll('label[for="' + el.id + '"]')
+            )
+                .map(label => (label.textContent || '').trim())
+                .filter(Boolean);
+            if (explicitLabels.length) return explicitLabels.join(' ');
+        }
+        return '';
+    }
+
+    function getAccessibleName(el) {
+        const ariaLabel = el.getAttribute('aria-label');
+        if (ariaLabel) return ariaLabel.trim();
+
+        const labelledBy = el.getAttribute('aria-labelledby');
+        if (labelledBy) {
+            const parts = labelledBy.split(/\s+/).map(id => {
+                const ref = document.getElementById(id);
+                return ref ? ref.textContent.trim() : '';
+            }).filter(Boolean);
+            if (parts.length) return parts.join(' ');
+        }
+
+        const associatedLabel = getAssociatedLabelText(el);
+        if (associatedLabel) return associatedLabel;
+
+        const tagName = el.tagName.toUpperCase();
+        if (tagName === 'IMG') {
+            const alt = el.getAttribute('alt');
+            if (alt) return alt.trim();
+        }
+
+        if (tagName === 'INPUT') {
+            const inputType = (el.getAttribute('type') || '').toLowerCase();
+            if (['button', 'submit', 'reset'].includes(inputType)) {
+                const valueAttr = el.getAttribute('value');
+                if (valueAttr) return valueAttr.trim();
+            }
+            if (inputType === 'image') {
+                const alt = el.getAttribute('alt');
+                if (alt) return alt.trim();
+            }
+        }
+
+        const title = el.getAttribute('title');
+        if (title) return title.trim();
+
+        // For inputs: placeholder is a valid accessible name source (W3C accname-1.2).
+        // Do NOT use el.value — it holds user-typed content, not the accessible name,
+        // and would cause findElement to fail after the user fills the field.
+        if (['INPUT', 'TEXTAREA'].includes(tagName)) {
+            if (el.placeholder) return el.placeholder;
+            const ariaPlaceholder = el.getAttribute('aria-placeholder');
+            if (ariaPlaceholder) return ariaPlaceholder.trim();
+        }
+
+        return el.textContent ? el.textContent.trim() : '';
+    }
+
+    function getAccessibleNameCached(el) {
+        const cached = nameCache.get(el);
+        if (cached !== undefined) return cached;
+        const name = getAccessibleName(el) || '';
+        nameCache.set(el, name);
+        return name;
+    }
+
+    function getTextCached(el) {
+        const cached = textCache.get(el);
+        if (cached !== undefined) return cached;
+        const text = el.innerText || el.textContent || '';
+        textCache.set(el, text);
+        return text;
+    }
+
+    function normalizeText(value) {
+        if (!value) return '';
+        return String(value).replace(/\s+/g, ' ').trim();
+    }
+
+    const roleTextMatchRoles = new Set([
+        'listitem', 'row', 'cell', 'gridcell', 'columnheader', 'rowheader'
+    ]);
+
+    function findElement(role, name, nth) {
+        // O(1) lookup from pre-built index; fall back to a one-shot query if
+        // the role wasn't in the initial unique-role set (defensive only).
+        let all = roleIndex[role];
+        if (!all) {
+            const selector = IMPLICIT_ROLE_SELECTORS[role] || '[role="' + role + '"]';
+            try { all = Array.from(document.querySelectorAll(selector)); }
+            catch (_e) { all = []; }
+            roleIndex[role] = all;
+        }
+        if (!name) return all[nth] || null;
+
+        const normalizedName = normalizeText(name);
+        if (!normalizedName) return all[nth] || null;
+
+        let matching = [];
+        if (roleTextMatchRoles.has(role)) {
+            if (role === 'row') {
+                matching = all.filter(el => {
+                    const rowText = normalizeText(getTextCached(el));
+                    if (rowText === normalizedName) return true;
+                    // Row names can map to a single cell/header text. Check descendants.
+                    const descendants = [el, ...Array.from(el.querySelectorAll('*'))];
+                    return descendants.some(node =>
+                        normalizeText(node.innerText || node.textContent || '') === normalizedName
+                    );
+                });
+            } else {
+                matching = all.filter(el =>
+                    normalizeText(getTextCached(el)) === normalizedName
+                );
+            }
+        } else {
+            matching = all.filter(
+                el => normalizeText(getAccessibleNameCached(el)) === normalizedName
+            );
+        }
+
+        return matching[nth] || null;
+    }
+
+    function getElementInfo(el) {
+        if (!el) return null;
+        const computed = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        const tag = el.tagName.toLowerCase();
+
+        const hasEventHandler = !!(
+            el.onclick || el.onmousedown || el.onmouseup ||
+            el.onkeydown || el.onkeyup || el.onkeypress ||
+            el.onmouseenter || el.onmouseleave ||
+            el.ondblclick || el.onfocus || el.onblur
+        );
+
+        let classAndId = '';
+        if (el.className && typeof el.className === 'string') classAndId += el.className + ' ';
+        if (el.id) classAndId += el.id + ' ';
+        let dataAction = null;
+        for (let attr of el.attributes) {
+            if (attr.name.startsWith('data-')) {
+                classAndId += attr.value + ' ';
+                if (attr.name === 'data-action') dataAction = attr.value;
+            }
+        }
+
+        return {
+            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+                    right: rect.right, bottom: rect.bottom },
+            tagName: tag,
+            cursor: computed.cursor,
+            width: el.offsetWidth,
+            height: el.offsetHeight,
+            hasEventHandler: hasEventHandler,
+            tabindex: el.getAttribute('tabindex'),
+            classAndId: classAndId.toLowerCase().trim(),
+            dataAction: dataAction,
+            ariaRequired: el.hasAttribute('aria-required'),
+            ariaAutocomplete: el.getAttribute('aria-autocomplete'),
+            ariaKeyshortcuts: el.getAttribute('aria-keyshortcuts'),
+            ariaHidden: el.getAttribute('aria-hidden') === 'true',
+            ariaDisabled: el.getAttribute('aria-disabled') === 'true',
+            isContentEditable: el.isContentEditable,
+            role: el.getAttribute('role'),
+            isEditable: el.isContentEditable ||
+                (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName.toUpperCase()) && !el.disabled && !el.readOnly),
+            isDisabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true',
+        };
+    }
+
+    const results = {};
+    for (const item of elements) {
+        const el = findElement(item.role, item.name, item.nth);
+        results[item.ref] = getElementInfo(el);
+    }
+    return results;
+}"""
 
 @dataclass
 class RefData:
@@ -679,277 +995,32 @@ class SnapshotGenerator:
         if not batch_elements:
             return visible_refs, interactive_map
 
-        # Single page.evaluate for all remaining elements
+        # Evaluate via the module-level _BATCH_INFO_JS (role-indexed + cached)
+        # and chunk the payload so other daemon commands can be serviced between
+        # JS calls. Each chunk yields the asyncio event loop afterwards.
+        batch_results: Dict[str, Any] = {}
         try:
             start_time = time.time()
-            batch_results = await page.evaluate("""(args) => {
-                const { elements, viewportWidth, viewportHeight, checkViewport } = args;
-
-                const IMPLICIT_ROLE_SELECTORS = {
-                    'button': 'button, input[type="button"], input[type="submit"], input[type="reset"], input[type="file"], [role="button"]',
-                    'link': 'a[href], area[href], [role="link"]',
-                    'textbox': 'input:not([type]), input[type="text"], input[type="email"], input[type="password"], input[type="search"], input[type="url"], input[type="tel"], textarea, [role="textbox"], [contenteditable="true"], [contenteditable=""]',
-                    'checkbox': 'input[type="checkbox"], [role="checkbox"]',
-                    'radio': 'input[type="radio"], [role="radio"]',
-                    'combobox': 'select, [role="combobox"]',
-                    'option': 'option, [role="option"]',
-                    'heading': 'h1, h2, h3, h4, h5, h6, [role="heading"]',
-                    'listitem': 'li, [role="listitem"]',
-                    'list': 'ul, ol, [role="list"]',
-                    'img': 'img[alt], [role="img"]',
-                    'row': 'tr, [role="row"]',
-                    'cell': 'td, [role="cell"]',
-                    'columnheader': 'th, [role="columnheader"]',
-                    'navigation': 'nav, [role="navigation"]',
-                    'main': 'main, [role="main"]',
-                    'banner': 'header, [role="banner"]',
-                    'contentinfo': 'footer, [role="contentinfo"]',
-                    'table': 'table, [role="table"]',
-                    'menuitem': '[role="menuitem"]',
-                    'menuitemcheckbox': '[role="menuitemcheckbox"]',
-                    'menuitemradio': '[role="menuitemradio"]',
-                    'tab': '[role="tab"]',
-                    'tabpanel': '[role="tabpanel"]',
-                    'treeitem': '[role="treeitem"]',
-                    'switch': '[role="switch"]',
-                    'slider': 'input[type="range"], [role="slider"]',
-                    'spinbutton': 'input[type="number"], [role="spinbutton"]',
-                    'searchbox': 'input[type="search"], [role="searchbox"]',
-                    'progressbar': 'progress, [role="progressbar"]',
-                    'scrollbar': '[role="scrollbar"]',
-                    'separator': 'hr, [role="separator"]',
-                    'gridcell': '[role="gridcell"]',
-                    'grid': '[role="grid"]',
-                    'listbox': '[role="listbox"]',
-                    'menu': '[role="menu"]',
-                    'menubar': '[role="menubar"]',
-                    'radiogroup': '[role="radiogroup"]',
-                    'tablist': '[role="tablist"]',
-                    'tree': '[role="tree"]',
-                    'treegrid': '[role="treegrid"]',
-                    'alertdialog': '[role="alertdialog"]',
-                    'dialog': 'dialog, [role="dialog"]',
-                    'application': '[role="application"]',
-                    'search': '[role="search"]',
-                    'article': 'article, [role="article"]',
-                    'region': 'section[aria-label], section[aria-labelledby], [role="region"]',
-                    'rowheader': 'th[scope="row"], [role="rowheader"]',
-                    'rowgroup': 'thead, tbody, tfoot, [role="rowgroup"]',
-                    'toolbar': '[role="toolbar"]',
-                    'status': '[role="status"]',
-                    'alert': '[role="alert"]',
-                    'log': '[role="log"]',
-                    'marquee': '[role="marquee"]',
-                    'timer': '[role="timer"]',
-                    'tooltip': '[role="tooltip"]',
-                    'figure': 'figure, [role="figure"]',
-                    'paragraph': 'p, [role="paragraph"]',
-                    'blockquote': 'blockquote, [role="blockquote"]',
-                    'code': 'code, [role="code"]',
-                    'emphasis': 'em, [role="emphasis"]',
-                    'strong': 'strong, [role="strong"]',
-                    'deletion': 'del, [role="deletion"]',
-                    'insertion': 'ins, [role="insertion"]',
-                    'subscript': 'sub, [role="subscript"]',
-                    'superscript': 'sup, [role="superscript"]',
-                    'term': 'dfn, [role="term"]',
-                    'definition': 'dd, [role="definition"]',
-                    'note': '[role="note"]',
-                    'math': 'math, [role="math"]',
-                    'time': 'time, [role="time"]',
-                    'complementary': 'aside, [role="complementary"]',
-                    'form': 'form[aria-label], form[aria-labelledby], [role="form"]',
-                    'iframe': 'iframe',
-                    'feed': '[role="feed"]',
-                    'document': '[role="document"]',
-                    'caption': 'caption, figcaption, [role="caption"]',
-                    'meter': 'meter, [role="meter"]',
-                    'summary': 'summary',
-                    'details': 'details',
-                    'generic': 'div:not([role]), legend, [role="generic"]',
-                    'group': 'fieldset, details, optgroup, [role="group"]',
-                    'none': '[role="none"]',
-                    'presentation': '[role="presentation"]',
-                };
-
-                function getAssociatedLabelText(el) {
-                    if (!el) return '';
-
-                    // Prefer the browser's label association when available.
-                    if (el.labels && el.labels.length > 0) {
-                        const texts = Array.from(el.labels)
-                            .map(label => (label.textContent || '').trim())
-                            .filter(Boolean);
-                        if (texts.length) return texts.join(' ');
-                    }
-
-                    if (el.id) {
-                        const explicitLabels = Array.from(
-                            document.querySelectorAll('label[for="' + el.id + '"]')
-                        )
-                            .map(label => (label.textContent || '').trim())
-                            .filter(Boolean);
-                        if (explicitLabels.length) return explicitLabels.join(' ');
-                    }
-
-                    return '';
-                }
-
-                function getAccessibleName(el) {
-                    const ariaLabel = el.getAttribute('aria-label');
-                    if (ariaLabel) return ariaLabel.trim();
-
-                    const labelledBy = el.getAttribute('aria-labelledby');
-                    if (labelledBy) {
-                        const parts = labelledBy.split(/\\s+/).map(id => {
-                            const ref = document.getElementById(id);
-                            return ref ? ref.textContent.trim() : '';
-                        }).filter(Boolean);
-                        if (parts.length) return parts.join(' ');
-                    }
-
-                    const associatedLabel = getAssociatedLabelText(el);
-                    if (associatedLabel) return associatedLabel;
-
-                    const tagName = el.tagName.toUpperCase();
-                    if (tagName === 'IMG') {
-                        const alt = el.getAttribute('alt');
-                        if (alt) return alt.trim();
-                    }
-
-                    if (tagName === 'INPUT') {
-                        const inputType = (el.getAttribute('type') || '').toLowerCase();
-                        if (['button', 'submit', 'reset'].includes(inputType)) {
-                            const valueAttr = el.getAttribute('value');
-                            if (valueAttr) return valueAttr.trim();
-                        }
-                        if (inputType === 'image') {
-                            const alt = el.getAttribute('alt');
-                            if (alt) return alt.trim();
-                        }
-                    }
-
-                    const title = el.getAttribute('title');
-                    if (title) return title.trim();
-
-                    // For inputs: placeholder is a valid accessible name source (W3C accname-1.2).
-                    // Do NOT use el.value — it holds user-typed content, not the accessible name,
-                    // and would cause findElement to fail after the user fills the field.
-                    if (['INPUT', 'TEXTAREA'].includes(tagName)) {
-                        if (el.placeholder) return el.placeholder;
-                        const ariaPlaceholder = el.getAttribute('aria-placeholder');
-                        if (ariaPlaceholder) return ariaPlaceholder.trim();
-                    }
-
-                    return el.textContent ? el.textContent.trim() : '';
-                }
-
-                function normalizeText(value) {
-                    if (!value) return '';
-                    return String(value).replace(/\\s+/g, ' ').trim();
-                }
-
-                function findElement(role, name, nth) {
-                    const selector = IMPLICIT_ROLE_SELECTORS[role] || '[role="' + role + '"]';
-                    const all = Array.from(document.querySelectorAll(selector));
-                    if (!name) return all[nth] || null;
-
-                    const normalizedName = normalizeText(name);
-                    if (!normalizedName) return all[nth] || null;
-
-                    const roleTextMatchRoles = new Set([
-                        'listitem', 'row', 'cell', 'gridcell', 'columnheader', 'rowheader'
-                    ]);
-
-                    let matching = [];
-                    if (roleTextMatchRoles.has(role)) {
-                        if (role === 'row') {
-                            matching = all.filter(el => {
-                                const rowText = normalizeText(el.innerText || el.textContent || '');
-                                if (rowText === normalizedName) return true;
-
-                                // Row names can map to a single cell/header text. Check descendants.
-                                const descendants = [el, ...Array.from(el.querySelectorAll('*'))];
-                                return descendants.some(node =>
-                                    normalizeText(node.innerText || node.textContent || '') === normalizedName
-                                );
-                            });
-                        } else {
-                            matching = all.filter(el =>
-                                normalizeText(el.innerText || el.textContent || '') === normalizedName
-                            );
-                        }
-                    } else {
-                        matching = all.filter(
-                            el => normalizeText(getAccessibleName(el)) === normalizedName
-                        );
-                    }
-
-                    return matching[nth] || null;
-                }
-
-                function getElementInfo(el) {
-                    if (!el) return null;
-                    const computed = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    const tag = el.tagName.toLowerCase();
-
-                    const hasEventHandler = !!(
-                        el.onclick || el.onmousedown || el.onmouseup ||
-                        el.onkeydown || el.onkeyup || el.onkeypress ||
-                        el.onmouseenter || el.onmouseleave ||
-                        el.ondblclick || el.onfocus || el.onblur
-                    );
-
-                    let classAndId = '';
-                    if (el.className && typeof el.className === 'string') classAndId += el.className + ' ';
-                    if (el.id) classAndId += el.id + ' ';
-                    let dataAction = null;
-                    for (let attr of el.attributes) {
-                        if (attr.name.startsWith('data-')) {
-                            classAndId += attr.value + ' ';
-                            if (attr.name === 'data-action') dataAction = attr.value;
-                        }
-                    }
-
-                    return {
-                        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height,
-                                right: rect.right, bottom: rect.bottom },
-                        tagName: tag,
-                        cursor: computed.cursor,
-                        width: el.offsetWidth,
-                        height: el.offsetHeight,
-                        hasEventHandler: hasEventHandler,
-                        tabindex: el.getAttribute('tabindex'),
-                        classAndId: classAndId.toLowerCase().trim(),
-                        dataAction: dataAction,
-                        ariaRequired: el.hasAttribute('aria-required'),
-                        ariaAutocomplete: el.getAttribute('aria-autocomplete'),
-                        ariaKeyshortcuts: el.getAttribute('aria-keyshortcuts'),
-                        ariaHidden: el.getAttribute('aria-hidden') === 'true',
-                        ariaDisabled: el.getAttribute('aria-disabled') === 'true',
-                        isContentEditable: el.isContentEditable,
-                        role: el.getAttribute('role'),
-                        isEditable: el.isContentEditable ||
-                            (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName.toUpperCase()) && !el.disabled && !el.readOnly),
-                        isDisabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true',
-                    };
-                }
-
-                const results = {};
-                for (const item of elements) {
-                    const el = findElement(item.role, item.name, item.nth);
-                    results[item.ref] = getElementInfo(el);
-                }
-                return results;
-            }""", {
-                'elements': batch_elements,
-                'viewportWidth': viewport_width,
-                'viewportHeight': viewport_height,
-                'checkViewport': check_viewport,
-            })
+            total = len(batch_elements)
+            for offset in range(0, total, _BATCH_INFO_CHUNK_SIZE):
+                chunk = batch_elements[offset:offset + _BATCH_INFO_CHUNK_SIZE]
+                chunk_result = await page.evaluate(_BATCH_INFO_JS, {
+                    'elements': chunk,
+                    'viewportWidth': viewport_width,
+                    'viewportHeight': viewport_height,
+                    'checkViewport': check_viewport,
+                })
+                if chunk_result:
+                    batch_results.update(chunk_result)
+                # Yield to other daemon commands waiting on the event loop.
+                # Only needed when we still have more chunks to send.
+                if offset + _BATCH_INFO_CHUNK_SIZE < total:
+                    await asyncio.sleep(0)
             end_time = time.time()
-            logger.info(f"_batch_get_elements_info Time taken: {end_time - start_time:.3f}s for {len(batch_elements)} elements")
+            logger.info(
+                f"_batch_get_elements_info Time taken: {end_time - start_time:.3f}s "
+                f"for {total} elements ({(total + _BATCH_INFO_CHUNK_SIZE - 1) // _BATCH_INFO_CHUNK_SIZE} chunks)"
+            )
         except Exception as e:
             logger.debug(f"Batch element info failed: {e}")
             # Fallback: include all elements

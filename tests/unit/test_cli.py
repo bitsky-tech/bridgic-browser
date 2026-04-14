@@ -1136,6 +1136,60 @@ class TestDaemonDispatch:
         assert "bridgic-browser close" in resp["result"]
         assert "bridgic-browser open" in resp["result"]
 
+    async def test_dispatch_emits_cli_cmd_and_cli_resp_logs(self, caplog):
+        """Every _dispatch call emits a matched [CLI-CMD]/[CLI-RESP] pair with timing."""
+        import logging as _logging
+        browser = make_browser()
+        browser.navigate_to = AsyncMock(return_value="Navigated")
+
+        with caplog.at_level(_logging.INFO, logger="bridgic.browser.cli._daemon"):
+            resp = await _dispatch(browser, "open", {"url": "https://example.com"})
+
+        assert resp["success"] is True
+
+        cmd_lines = [r.getMessage() for r in caplog.records if "[CLI-CMD]" in r.getMessage()]
+        resp_lines = [r.getMessage() for r in caplog.records if "[CLI-RESP]" in r.getMessage()]
+
+        assert len(cmd_lines) == 1, f"expected one [CLI-CMD] line, got: {cmd_lines}"
+        assert len(resp_lines) == 1, f"expected one [CLI-RESP] line, got: {resp_lines}"
+        assert "open start args_keys=['url']" in cmd_lines[0]
+        # Must include ok/err verdict AND a duration stamp.
+        assert "open ok" in resp_lines[0]
+        assert "in " in resp_lines[0] and "s" in resp_lines[0]
+
+    async def test_dispatch_logs_err_verdict_on_failure(self, caplog):
+        """[CLI-RESP] uses 'err' when the handler returned a business failure."""
+        import logging as _logging
+        browser = make_browser()
+        browser.navigate_to = AsyncMock(
+            side_effect=OperationError("boom", code="NAVIGATION_FAILED")
+        )
+
+        with caplog.at_level(_logging.INFO, logger="bridgic.browser.cli._daemon"):
+            await _dispatch(browser, "open", {"url": "x"})
+
+        resp_lines = [r.getMessage() for r in caplog.records if "[CLI-RESP]" in r.getMessage()]
+        assert len(resp_lines) == 1
+        assert "open err" in resp_lines[0]
+        # The error_code annotation is part of the observability payload.
+        assert "error_code=NAVIGATION_FAILED" in resp_lines[0]
+
+    async def test_dispatch_slow_command_elevates_to_warning(self, caplog):
+        """Commands running longer than the soft threshold log at WARNING, not INFO."""
+        import logging as _logging
+        from unittest.mock import patch as _patch
+        browser = make_browser()
+        browser.navigate_to = AsyncMock(return_value="Navigated")
+
+        # Make the soft threshold 0 so any measurable duration triggers WARN.
+        with _patch("bridgic.browser.cli._daemon._SLOW_COMMAND_THRESHOLD_S", 0.0), \
+             caplog.at_level(_logging.INFO, logger="bridgic.browser.cli._daemon"):
+            await _dispatch(browser, "open", {"url": "x"})
+
+        resp_records = [r for r in caplog.records if "[CLI-RESP]" in r.getMessage()]
+        assert len(resp_records) == 1
+        assert resp_records[0].levelno == _logging.WARNING
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # _is_browser_closed_error + _handle_snapshot (None guard)

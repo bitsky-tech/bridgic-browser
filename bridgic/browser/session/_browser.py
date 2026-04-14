@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import tempfile
+import time
 from urllib.parse import urlparse, urlunparse
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Union, NoReturn
@@ -26,6 +27,7 @@ from playwright.async_api import (
     Page,
     Locator,
     ProxySettings,
+    TimeoutError as PlaywrightTimeoutError,
 )
 from pydantic import BaseModel
 
@@ -592,6 +594,119 @@ async def _cdp_evaluate_on_element(cdp_context, page, locator, code: str) -> Any
             await session.detach()
         except Exception:
             pass
+
+
+_LAUNCH_RETRY_DELAYS = (0.0, 1.0, 2.5)
+"""Back-off schedule for :func:`_retriable_launch`. Three attempts total."""
+
+_RETRIABLE_LAUNCH_TOKENS = (
+    "has been closed",
+    "singleton lock",
+    "singletonlock",  # Chrome's on-disk file is literally `SingletonLock` (no space)
+    "target closed",
+    "target page, context or browser has been closed",
+    "process unexpectedly closed",
+)
+"""Substrings in Playwright launch errors that indicate a transient failure
+(typically: the previous Chromium process is still releasing the user-data-dir
+singleton lock). Matched case-insensitively against ``str(exc)``."""
+
+
+async def _retriable_launch(launch_callable, *, mode: str):
+    """Call ``launch_callable()`` with exponential back-off.
+
+    Retries on error messages that match :data:`_RETRIABLE_LAUNCH_TOKENS`.
+    Non-transient failures (e.g. bad executable path) raise immediately.
+
+    Parameters
+    ----------
+    launch_callable : Callable[[], Awaitable]
+        Zero-arg thunk that returns a fresh coroutine on each call.
+        Typically a ``lambda: playwright.chromium.launch_persistent_context(**opts)``.
+    mode : str
+        Human-readable label for logs (``"persistent_context"`` / ``"launch"``).
+
+    Returns
+    -------
+    Any
+        Whatever the underlying callable returns on success.
+    """
+    last_exc: Optional[BaseException] = None
+    for attempt, delay in enumerate(_LAUNCH_RETRY_DELAYS):
+        if delay > 0:
+            await asyncio.sleep(delay)
+        try:
+            return await launch_callable()
+        except Exception as e:
+            last_exc = e
+            msg_lower = str(e).lower()
+            retriable = any(tok in msg_lower for tok in _RETRIABLE_LAUNCH_TOKENS)
+            is_last = attempt == len(_LAUNCH_RETRY_DELAYS) - 1
+            will_retry = retriable and not is_last
+            logger.warning(
+                "[_retriable_launch] %s attempt %d/%d failed "
+                "(retriable=%s, will_retry=%s): %s",
+                mode, attempt + 1, len(_LAUNCH_RETRY_DELAYS),
+                retriable, will_retry, e,
+            )
+            if not will_retry:
+                raise
+    # Unreachable — loop always raises or returns.
+    raise last_exc  # type: ignore[misc]
+
+
+_DEFAULT_CLICK_TIMEOUT_MS = 10000
+"""Hard ceiling for locator.click / dblclick / check / uncheck.
+
+Playwright defaults to 30s and retries ``visible, enabled, stable`` up to the
+deadline. On Vue/React SPA pages Chrome can judge a freshly-scrolled element
+as *still* outside viewport (e.g. because a sticky header or transform occupies
+the slot), and the retry loop spins for the full 30s — blocking every other
+CLI command queued on the daemon. Capping at 10s keeps the CLI responsive;
+the dispatch_event fallback below recovers the common case."""
+
+
+async def _locator_action_with_fallback(
+    locator,
+    *,
+    action: str,
+    fallback_event: str = "click",
+    timeout_ms: int = _DEFAULT_CLICK_TIMEOUT_MS,
+) -> None:
+    """Invoke ``locator.<action>`` with a hard timeout and dispatch_event fallback.
+
+    Parameters
+    ----------
+    locator : Locator
+        Playwright locator to act on.
+    action : str
+        Method name on the locator: ``"click"``, ``"dblclick"``, ``"check"``,
+        or ``"uncheck"``.
+    fallback_event : str, default ``"click"``
+        DOM event to dispatch when the primary action times out. For ``check``
+        and ``uncheck`` on custom ARIA widgets, ``"click"`` is the right event;
+        ``dblclick`` uses ``"dblclick"``.
+    timeout_ms : int, default :data:`_DEFAULT_CLICK_TIMEOUT_MS`
+        Explicit timeout passed to Playwright. Shorter than the default 30s
+        so a stuck actionability retry loop cannot freeze the CLI.
+
+    Notes
+    -----
+    ``dispatch_event`` bypasses Playwright's actionability checks and directly
+    fires the DOM event on the element. It is the right fallback when the
+    element is logically interactive but geometrically confusing to
+    Playwright (sticky/transform/absolute positioning, SPA layout quirks).
+    """
+    method = getattr(locator, action)
+    try:
+        await method(timeout=timeout_ms)
+    except PlaywrightTimeoutError as e:
+        logger.warning(
+            "[_locator_action_with_fallback] %s timed out after %dms; "
+            "falling back to dispatch_event(%r). Underlying: %s",
+            action, timeout_ms, fallback_event, e,
+        )
+        await locator.dispatch_event(fallback_event)
 
 
 async def _check_element_covered(locator, cx: float, cy: float, cdp_context=None) -> bool:
@@ -1497,8 +1612,11 @@ class Browser:
                 persistent_options = self._get_persistent_context_options()
                 logger.debug(f"Persistent context options: {persistent_options}")
                 _write_launch_debug_log(persistent_options, mode="persistent_context")
-                self._context = await self._playwright.chromium.launch_persistent_context(
-                    **persistent_options
+                self._context = await _retriable_launch(
+                    lambda: self._playwright.chromium.launch_persistent_context(
+                        **persistent_options
+                    ),
+                    mode="persistent_context",
                 )
                 self._browser = self._context.browser
             else:
@@ -1507,7 +1625,10 @@ class Browser:
                 launch_options = self._get_launch_options()
                 logger.debug(f"Launch options: {launch_options}")
                 _write_launch_debug_log(launch_options, mode="launch")
-                self._browser = await self._playwright.chromium.launch(**launch_options)
+                self._browser = await _retriable_launch(
+                    lambda: self._playwright.chromium.launch(**launch_options),
+                    mode="launch",
+                )
 
                 context_options = self._get_context_options()
                 logger.debug(f"Context options: {context_options}")
@@ -2649,7 +2770,16 @@ class Browser:
         try:
             if not self._page:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
+            _wait_t0 = time.monotonic()
             async with self._snapshot_lock:
+                _wait_elapsed = time.monotonic() - _wait_t0
+                if _wait_elapsed > 0.1:
+                    # Surfaces "command N was stuck behind snapshot of command N-1"
+                    # situations in the log — the typical second-snapshot-back-to-back
+                    # case on a large page.
+                    logger.info(
+                        "[get_snapshot] waited %.3fs for _snapshot_lock", _wait_elapsed
+                    )
                 options = SnapshotOptions(
                     interactive=interactive,
                     full_page=full_page,
@@ -4301,13 +4431,13 @@ Before you return the element ref, reason about the state and elements for a sen
                         else:
                             await locator.dispatch_event("click")
                     else:
-                        await locator.click()
+                        await _locator_action_with_fallback(locator, action="click")
             else:
                 if not is_vis:
                     logger.debug("[click_element_by_ref] bbox=None and is_visible()=False; using dispatch_event click")
                     await locator.dispatch_event("click")
                 else:
-                    await locator.click()
+                    await _locator_action_with_fallback(locator, action="click")
 
             msg = f'Clicked element {ref}'
             logger.info(f'[click_element_by_ref] {msg}')
@@ -4909,15 +5039,15 @@ Before you return the element ref, reason about the state and elements for a sen
                             if page:
                                 await _click_covering_element(page, locator, cx, cy, cdp_context=_cdp_ctx)
                             else:
-                                await locator.check(force=True)
+                                await locator.check(force=True, timeout=_DEFAULT_CLICK_TIMEOUT_MS)
                         else:
-                            await locator.check()
+                            await _locator_action_with_fallback(locator, action="check")
                 else:
                     if not is_vis:
                         logger.debug("[check_checkbox_or_radio_by_ref] native input bbox=None and is_visible()=False; using dispatch_event click")
                         await locator.dispatch_event("click")
                     else:
-                        await locator.check()
+                        await _locator_action_with_fallback(locator, action="check")
             else:
                 _cdp_ctx = self._context if (self._cdp_url and not self._cdp_context_owned) else None
                 page = await self.get_current_page()
@@ -5007,15 +5137,15 @@ Before you return the element ref, reason about the state and elements for a sen
                             if page:
                                 await _click_covering_element(page, locator, cx, cy, cdp_context=_cdp_ctx)
                             else:
-                                await locator.uncheck(force=True)
+                                await locator.uncheck(force=True, timeout=_DEFAULT_CLICK_TIMEOUT_MS)
                         else:
-                            await locator.uncheck()
+                            await _locator_action_with_fallback(locator, action="uncheck")
                 else:
                     if not is_vis:
                         logger.debug("[uncheck_checkbox_by_ref] native input bbox=None and is_visible()=False; using dispatch_event click")
                         await locator.dispatch_event("click")
                     else:
-                        await locator.uncheck()
+                        await _locator_action_with_fallback(locator, action="uncheck")
             else:
                 _cdp_ctx = self._context if (self._cdp_url and not self._cdp_context_owned) else None
                 page = await self.get_current_page()
@@ -5127,15 +5257,19 @@ Before you return the element ref, reason about the state and elements for a sen
                                 except Exception:
                                     await locator.dispatch_event("dblclick")
                         else:
-                            await locator.dblclick(force=True)
+                            await locator.dblclick(force=True, timeout=_DEFAULT_CLICK_TIMEOUT_MS)
                     else:
-                        await locator.dblclick()
+                        await _locator_action_with_fallback(
+                            locator, action="dblclick", fallback_event="dblclick"
+                        )
             else:
                 if not is_vis:
                     logger.debug("[double_click_element_by_ref] bbox=None and is_visible()=False; using dispatch_event dblclick")
                     await locator.dispatch_event("dblclick")
                 else:
-                    await locator.dblclick()
+                    await _locator_action_with_fallback(
+                        locator, action="dblclick", fallback_event="dblclick"
+                    )
 
             msg = f'Double-clicked element {ref}'
             logger.info(f'[double_click_element_by_ref] {msg}')

@@ -2370,3 +2370,217 @@ class TestGetFullPageInfo:
         assert page_info_start_idx < snapshot_end_idx, (
             "page_info should have started before snapshot finished (concurrent)"
         )
+
+
+# ---------------------------------------------------------------------------
+# _locator_action_with_fallback — click timeout + dispatch_event fallback
+# ---------------------------------------------------------------------------
+
+class TestLocatorActionWithFallback:
+    """Tests for :func:`_browser_module._locator_action_with_fallback`.
+
+    This helper caps Playwright's default 30s locator timeout at 10s and
+    dispatches a DOM event as a fallback. It's the core defence against the
+    "click hangs for 30s on SPA elements" pathology observed in prod logs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_primary_action_success_uses_timeout(self):
+        """Happy path: action succeeds; no fallback event dispatched."""
+        locator = MagicMock()
+        locator.click = AsyncMock(return_value=None)
+        locator.dispatch_event = AsyncMock()
+
+        await _browser_module._locator_action_with_fallback(locator, action="click")
+
+        locator.click.assert_awaited_once()
+        # Timeout must be explicitly passed (lower than Playwright's default).
+        assert locator.click.await_args.kwargs.get("timeout") == _browser_module._DEFAULT_CLICK_TIMEOUT_MS
+        locator.dispatch_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_triggers_dispatch_event_fallback(self):
+        """On Playwright TimeoutError, dispatch_event is called with the configured event."""
+        locator = MagicMock()
+        locator.click = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("locator.click: Timeout 10000ms")
+        )
+        locator.dispatch_event = AsyncMock()
+
+        await _browser_module._locator_action_with_fallback(
+            locator, action="click", fallback_event="click"
+        )
+
+        locator.click.assert_awaited_once()
+        locator.dispatch_event.assert_awaited_once_with("click")
+
+    @pytest.mark.asyncio
+    async def test_dblclick_fallback_event(self):
+        """dblclick action pairs with a 'dblclick' DOM fallback by convention."""
+        locator = MagicMock()
+        locator.dblclick = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("timeout")
+        )
+        locator.dispatch_event = AsyncMock()
+
+        await _browser_module._locator_action_with_fallback(
+            locator, action="dblclick", fallback_event="dblclick"
+        )
+
+        locator.dispatch_event.assert_awaited_once_with("dblclick")
+
+    @pytest.mark.asyncio
+    async def test_non_timeout_error_not_swallowed(self):
+        """Errors that aren't PlaywrightTimeoutError bubble up unchanged."""
+        locator = MagicMock()
+        locator.click = AsyncMock(side_effect=RuntimeError("not a timeout"))
+        locator.dispatch_event = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="not a timeout"):
+            await _browser_module._locator_action_with_fallback(locator, action="click")
+
+        locator.dispatch_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_custom_timeout_respected(self):
+        """Caller-supplied timeout overrides the module default."""
+        locator = MagicMock()
+        locator.click = AsyncMock(return_value=None)
+
+        await _browser_module._locator_action_with_fallback(
+            locator, action="click", timeout_ms=5000
+        )
+
+        assert locator.click.await_args.kwargs.get("timeout") == 5000
+
+    @pytest.mark.asyncio
+    async def test_check_action_dispatches_click_on_timeout(self):
+        """`check` action falls back to a 'click' DOM event (same activation semantics)."""
+        locator = MagicMock()
+        locator.check = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("timeout")
+        )
+        locator.dispatch_event = AsyncMock()
+
+        await _browser_module._locator_action_with_fallback(
+            locator, action="check", fallback_event="click"
+        )
+
+        locator.dispatch_event.assert_awaited_once_with("click")
+
+
+# ---------------------------------------------------------------------------
+# _retriable_launch — exponential back-off for transient launch failures
+# ---------------------------------------------------------------------------
+
+class TestRetriableLaunch:
+    """Tests for :func:`_browser_module._retriable_launch`.
+
+    Playwright's :meth:`launch_persistent_context` can fail with
+    ``TargetClosedError`` when the prior Chromium process hasn't released the
+    user-data-dir singleton lock. Without back-off, a user repeatedly running
+    ``navigate_to`` gets 8 rapid-fire failures (per prod log). With the
+    helper, we get 3 attempts max with 0s → 1s → 2.5s spacing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_success_on_first_attempt(self):
+        """Successful launch returns immediately; no retries, no sleeps."""
+        result_obj = object()
+        call_count = 0
+
+        async def launch():
+            nonlocal call_count
+            call_count += 1
+            return result_obj
+
+        with patch("bridgic.browser.session._browser.asyncio.sleep") as mock_sleep:
+            result = await _browser_module._retriable_launch(launch, mode="persistent_context")
+
+        assert result is result_obj
+        assert call_count == 1
+        # First-attempt delay is 0.0 → sleep not called (helper guards >0).
+        mock_sleep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retries_on_target_closed_error(self):
+        """Transient 'target ... has been closed' error retries until success."""
+        attempts = []
+
+        async def launch():
+            attempts.append("tried")
+            if len(attempts) < 2:
+                raise Exception("Target page, context or browser has been closed")
+            return "ok"
+
+        with patch("bridgic.browser.session._browser.asyncio.sleep", new=AsyncMock()):
+            result = await _browser_module._retriable_launch(launch, mode="persistent_context")
+
+        assert result == "ok"
+        assert len(attempts) == 2
+
+    @pytest.mark.asyncio
+    async def test_retries_on_singleton_lock(self):
+        """'SingletonLock' error (profile still held) is retriable."""
+        attempts = []
+
+        async def launch():
+            attempts.append("tried")
+            if len(attempts) < 3:
+                raise Exception("SingletonLock still held by previous process")
+            return "ok"
+
+        with patch("bridgic.browser.session._browser.asyncio.sleep", new=AsyncMock()):
+            result = await _browser_module._retriable_launch(launch, mode="persistent_context")
+
+        assert result == "ok"
+        assert len(attempts) == 3
+
+    @pytest.mark.asyncio
+    async def test_non_retriable_fails_fast(self):
+        """Errors not in _RETRIABLE_LAUNCH_TOKENS raise after the first attempt."""
+        attempts = []
+
+        async def launch():
+            attempts.append("tried")
+            raise Exception("Executable not found at /bad/path")
+
+        with patch("bridgic.browser.session._browser.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(Exception, match="Executable not found"):
+                await _browser_module._retriable_launch(launch, mode="launch")
+
+        assert len(attempts) == 1
+
+    @pytest.mark.asyncio
+    async def test_gives_up_after_max_attempts(self):
+        """Persistent transient errors exhaust all delays and re-raise the last error."""
+        attempts = []
+
+        async def launch():
+            attempts.append("tried")
+            raise Exception("Target closed still")
+
+        with patch("bridgic.browser.session._browser.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(Exception, match="Target closed"):
+                await _browser_module._retriable_launch(launch, mode="persistent_context")
+
+        assert len(attempts) == len(_browser_module._LAUNCH_RETRY_DELAYS)
+
+    @pytest.mark.asyncio
+    async def test_backoff_delays_applied(self):
+        """Each retry waits the corresponding delay before calling the launch callable."""
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(delay):
+            sleep_calls.append(delay)
+
+        async def launch():
+            raise Exception("has been closed")
+
+        with patch("bridgic.browser.session._browser.asyncio.sleep", side_effect=fake_sleep):
+            with pytest.raises(Exception):
+                await _browser_module._retriable_launch(launch, mode="persistent_context")
+
+        # Only non-zero delays get a real sleep call; attempt 1 has delay=0.0.
+        expected = [d for d in _browser_module._LAUNCH_RETRY_DELAYS if d > 0]
+        assert sleep_calls == expected

@@ -18,6 +18,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 from urllib.parse import urlparse
@@ -599,7 +600,41 @@ async def _cdp_reconnect(browser: "Browser") -> bool:
         return False
 
 
+# Commands that exceed this wall-clock duration get a WARN in daemon logs —
+# the CLI's default socket read-timeout is 90s, so anything approaching that
+# is a candidate cause for "CLI froze" user reports. The actual response is
+# unaffected; this is purely observability.
+_SLOW_COMMAND_THRESHOLD_S = 60.0
+
+
 async def _dispatch(browser: "Browser", command: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Wrap :func:`_dispatch_inner` with start/end timing logs.
+
+    Emits matched ``[CLI-CMD] <cmd> start`` and
+    ``[CLI-RESP] <cmd> (ok|err) in X.XXXs`` pairs so every command a client
+    sends is visible in ``daemon.log`` with a duration — the primary
+    affordance for diagnosing "CLI appeared frozen" issues.
+    """
+    t0 = time.monotonic()
+    args_keys = sorted(args.keys()) if args else []
+    logger.info("[CLI-CMD] %s start args_keys=%s", command, args_keys)
+
+    response = await _dispatch_inner(browser, command, args)
+
+    elapsed = time.monotonic() - t0
+    success = bool(response.get("success"))
+    log_fn = logger.warning if elapsed > _SLOW_COMMAND_THRESHOLD_S else logger.info
+    log_fn(
+        "[CLI-RESP] %s %s in %.3fs error_code=%s",
+        command,
+        "ok" if success else "err",
+        elapsed,
+        response.get("error_code"),
+    )
+    return response
+
+
+async def _dispatch_inner(browser: "Browser", command: str, args: Dict[str, Any]) -> Dict[str, Any]:
     handler = _HANDLERS.get(command)
     if handler is None:
         return _response(

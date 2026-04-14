@@ -991,6 +991,190 @@ class TestBatchErrorHandling:
 
 
 # ---------------------------------------------------------------------------
+# 2d. _batch_get_elements_info — chunking + event-loop yielding
+# ---------------------------------------------------------------------------
+
+class TestBatchChunking:
+    """Tests for the chunked page.evaluate() implementation.
+
+    A single call used to process N refs in one JS invocation, which blocks
+    the browser JS thread for multiple seconds on large pages. The chunked
+    implementation splits the batch into `_BATCH_INFO_CHUNK_SIZE` slices and
+    `await asyncio.sleep(0)` between slices so other daemon commands get
+    fair turns on the asyncio loop.
+    """
+
+    @pytest.mark.asyncio
+    async def test_uses_module_level_js_constant(self, gen: SnapshotGenerator) -> None:
+        """The first argument to page.evaluate is the _BATCH_INFO_JS constant."""
+        from bridgic.browser.session._snapshot import _BATCH_INFO_JS
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(return_value={
+            "e1": {
+                "rect": {"x": 10, "y": 10, "right": 100, "bottom": 50},
+                "isEditable": False,
+                "isDisabled": False,
+                "interactive": {"cursor": "pointer"},
+            }
+        })
+        refs_info = {"e1": ("button", "Go", 0)}
+        ref_suffixes = {"e1": "[ref=e1]"}
+
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        assert mock_page.evaluate.call_args is not None
+        call_args = mock_page.evaluate.call_args
+        assert call_args.args[0] is _BATCH_INFO_JS
+
+    @pytest.mark.asyncio
+    async def test_sub_chunk_size_single_evaluate(self, gen: SnapshotGenerator) -> None:
+        """<= CHUNK_SIZE elements => exactly one evaluate call."""
+        from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(return_value={})
+
+        count = _BATCH_INFO_CHUNK_SIZE  # exactly at boundary -> still 1 chunk
+        refs_info = {f"e{i}": ("button", f"B{i}", 0) for i in range(count)}
+        ref_suffixes = {k: "[ref=x]" for k in refs_info}
+
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        assert mock_page.evaluate.call_count == 1
+        chunk_payload = mock_page.evaluate.call_args.args[1]
+        assert len(chunk_payload["elements"]) == count
+
+    @pytest.mark.asyncio
+    async def test_above_chunk_size_splits(self, gen: SnapshotGenerator) -> None:
+        """> CHUNK_SIZE elements => multiple evaluate calls with cumulative size."""
+        from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(return_value={})
+
+        count = _BATCH_INFO_CHUNK_SIZE + 50  # two chunks expected
+        refs_info = {f"e{i}": ("button", f"B{i}", 0) for i in range(count)}
+        ref_suffixes = {k: "[ref=x]" for k in refs_info}
+
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        assert mock_page.evaluate.call_count == 2
+        total = sum(
+            len(call.args[1]["elements"]) for call in mock_page.evaluate.call_args_list
+        )
+        assert total == count
+        # First chunk is exactly CHUNK_SIZE; second holds the remainder.
+        assert len(mock_page.evaluate.call_args_list[0].args[1]["elements"]) == _BATCH_INFO_CHUNK_SIZE
+        assert len(mock_page.evaluate.call_args_list[1].args[1]["elements"]) == 50
+
+    @pytest.mark.asyncio
+    async def test_yields_event_loop_between_chunks(self, gen: SnapshotGenerator) -> None:
+        """`asyncio.sleep(0)` is called between chunks (but not after the last)."""
+        import asyncio as _asyncio
+        from unittest.mock import patch
+        from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(return_value={})
+
+        # 2 chunks => exactly 1 inter-chunk sleep(0)
+        count = _BATCH_INFO_CHUNK_SIZE + 10
+        refs_info = {f"e{i}": ("button", f"B{i}", 0) for i in range(count)}
+        ref_suffixes = {k: "[ref=x]" for k in refs_info}
+
+        original_sleep = _asyncio.sleep
+        sleep_zero_calls = 0
+
+        async def spy_sleep(delay, *args, **kwargs):
+            nonlocal sleep_zero_calls
+            if delay == 0:
+                sleep_zero_calls += 1
+            return await original_sleep(delay, *args, **kwargs)
+
+        with patch("bridgic.browser.session._snapshot.asyncio.sleep", spy_sleep):
+            await gen._batch_get_elements_info(
+                mock_page, refs_info, ref_suffixes,
+                check_viewport=False, viewport_width=1280, viewport_height=720,
+            )
+
+        assert sleep_zero_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_no_sleep_for_single_chunk(self, gen: SnapshotGenerator) -> None:
+        """Single-chunk payloads MUST NOT call asyncio.sleep(0) — keeps hot path clean."""
+        import asyncio as _asyncio
+        from unittest.mock import patch
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(return_value={})
+
+        refs_info = {"e1": ("button", "Go", 0)}
+        ref_suffixes = {"e1": "[ref=e1]"}
+
+        original_sleep = _asyncio.sleep
+        sleep_zero_calls = 0
+
+        async def spy_sleep(delay, *args, **kwargs):
+            nonlocal sleep_zero_calls
+            if delay == 0:
+                sleep_zero_calls += 1
+            return await original_sleep(delay, *args, **kwargs)
+
+        with patch("bridgic.browser.session._snapshot.asyncio.sleep", spy_sleep):
+            await gen._batch_get_elements_info(
+                mock_page, refs_info, ref_suffixes,
+                check_viewport=False, viewport_width=1280, viewport_height=720,
+            )
+
+        assert sleep_zero_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_results_merged_across_chunks(self, gen: SnapshotGenerator) -> None:
+        """Results from multiple chunks are merged into the final output."""
+        from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE
+
+        mock_page = AsyncMock()
+
+        # First chunk returns {e0..e(CHUNK-1)}, second returns {eCHUNK..}
+        def fake_evaluate(_js, payload):
+            chunk_elements = payload["elements"]
+            return {
+                elem["ref"]: {
+                    "rect": {"x": 10, "y": 10, "right": 100, "bottom": 50},
+                    "isEditable": False,
+                    "isDisabled": False,
+                    "interactive": {"cursor": "pointer"},
+                }
+                for elem in chunk_elements
+            }
+
+        mock_page.evaluate = AsyncMock(side_effect=fake_evaluate)
+
+        count = _BATCH_INFO_CHUNK_SIZE + 10
+        refs_info = {f"e{i}": ("button", f"B{i}", 0) for i in range(count)}
+        ref_suffixes = {k: "[ref=x]" for k in refs_info}
+
+        visible, _ = await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        # All refs from both chunks should end up visible.
+        for i in range(count):
+            assert f"e{i}" in visible
+
+
+# ---------------------------------------------------------------------------
 # 3. _process_page_snapshot_for_ai — enhanced tree building
 # ---------------------------------------------------------------------------
 
