@@ -418,27 +418,36 @@ class TestBrowserStartStop:
 
     @pytest.mark.asyncio
     async def test_headed_mode_skips_init_script(self, mock_playwright):
-        """In headed mode (headless=False) add_init_script must NOT be called."""
+        """In headed mode the main stealth init script is skipped, but the
+        anti-devtools-detector script is still injected (safe for headed)."""
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(headless=False)  # headed mode, stealth enabled by default
             await browser._start()
 
-            # Persistent context returns context directly (no new_context call)
-            mock_playwright.chromium.launch_persistent_context.return_value.add_init_script.assert_not_called()
+            ctx = mock_playwright.chromium.launch_persistent_context.return_value
+            # Only the anti-devtools-detector script should be injected (1 call),
+            # NOT the main stealth init script that patches navigator/window.chrome.
+            assert ctx.add_init_script.call_count == 1
+            # Verify it's the anti-devtools-detector script, not the main one
+            script_arg = ctx.add_init_script.call_args_list[0][0][0]
+            assert "console.table" in script_arg
+            assert "navigator.webdriver" not in script_arg
 
     @pytest.mark.asyncio
     async def test_headless_mode_injects_init_script(self, mock_playwright):
-        """In headless mode (headless=True) add_init_script must be called."""
+        """In headless mode both the main stealth script and the
+        anti-devtools-detector script are injected."""
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
             browser = Browser(headless=True)  # headless mode, stealth enabled by default
             await browser._start()
 
-            # Persistent context returns context directly; stealth init script is injected
-            mock_playwright.chromium.launch_persistent_context.return_value.add_init_script.assert_called_once()
+            ctx = mock_playwright.chromium.launch_persistent_context.return_value
+            # Both the main stealth script and anti-devtools-detector script
+            assert ctx.add_init_script.call_count == 2
 
     @pytest.mark.asyncio
     async def test_kill_cleanup(self, mock_playwright, mock_context, mock_page):
