@@ -821,6 +821,38 @@ class SnapshotGenerator:
         'directory',
     }
 
+    # Roles worth checking for viewport position in non-interactive viewport-only mode.
+    # These are structural containers whose off-viewport status causes many children to
+    # be excluded via invisible_depth propagation — so checking just these ~20–100
+    # elements per page is sufficient to prune entire subtrees.
+    #
+    # Leaf roles (heading, link, button, listitem, cell, row …) are intentionally
+    # excluded: (a) they are typically inside one of these containers, so they get
+    # excluded through invisible_depth propagation; (b) including them would negate
+    # the performance benefit.
+    #
+    # Precision trade-off: standalone leaf elements NOT inside any listed container
+    # may be wrongly included when they are near the viewport boundary.  This is
+    # acceptable for snapshot -F use-cases (LLM context, not pixel-perfect selection).
+    VIEWPORT_CONTAINER_ROLES: Set[str] = {
+        # Page landmark containers
+        'main', 'navigation', 'banner', 'contentinfo', 'complementary', 'region',
+        # Section-level containers
+        'article', 'form', 'search',
+        # Data container roots (not individual rows/cells)
+        'list', 'table', 'grid', 'listbox', 'tree', 'treegrid',
+        'rowgroup',            # <thead>/<tbody>/<tfoot> — one check per rowgroup
+        # Interaction containers
+        'tabpanel', 'tablist',
+        'dialog', 'alertdialog',
+        'menu', 'menubar', 'toolbar',
+        'radiogroup', 'feed',
+        # iframes are containers: off-viewport iframes must exclude their subtrees
+        # (the invisible_depth path also preserves the iframe line itself for
+        # frame-path local-index alignment — see _pre_filter_raw_snapshot).
+        'iframe',
+    }
+
     # Namespace salt baked into every fingerprint.
     # Changing this value invalidates all existing refs (intentional for major versions).
     _REF_NAMESPACE = "bridgic-browser-v1"
@@ -1897,13 +1929,98 @@ class SnapshotGenerator:
         viewport_height = viewport['height'] if viewport else None
         check_viewport = not options.full_page and viewport_width is not None
 
-        # Batch check all elements in a single page.evaluate() call
-        visible_refs, interactive_map = await self._batch_get_elements_info(
-            page, refs_info, ref_suffixes,
-            check_viewport=check_viewport,
-            viewport_width=viewport_width,
-            viewport_height=viewport_height,
-        )
+        # Batch check elements for visibility and interactivity.
+        #
+        # Interactive-mode pre-filtering:
+        # In -i mode the caller only needs interactive elements.  The role is
+        # already known from the raw snapshot (zero IPC cost), so we bucket
+        # refs up-front and only run the expensive getBoundingClientRect path
+        # for refs that could plausibly be interactive (INTERACTIVE_ROLES or
+        # [cursor=pointer] suffix signal).
+        #
+        # Non-interactive refs are added directly to visible_refs (assumed
+        # in-viewport) and marked non-interactive.  This is safe because:
+        #   1. _generate_snapshot will filter them via interactive_map anyway.
+        #   2. Adding them to visible_refs prevents invisible_depth propagation
+        #      from incorrectly hiding their interactive children.
+        #
+        # On a 5549-ref page this reduces BoundingClientRect calls from
+        # 5549 → ~834 — a 6.5× speedup (41-50s → ~6-8s in -i mode).
+        if options.interactive:
+            interactive_refs: Dict[str, Tuple[str, Optional[str], int]] = {}
+            non_interactive_refs: Dict[str, Tuple[str, Optional[str], int]] = {}
+            for ref, info in refs_info.items():
+                role = info[0]
+                suffix = ref_suffixes.get(ref, '')
+                if role in self.INTERACTIVE_ROLES or '[cursor=pointer]' in suffix:
+                    interactive_refs[ref] = info
+                else:
+                    non_interactive_refs[ref] = info
+            logger.debug(
+                f"Interactive pre-filter: {len(interactive_refs)} interactive-role refs, "
+                f"{len(non_interactive_refs)} non-interactive skipped"
+            )
+            visible_refs, interactive_map = await self._batch_get_elements_info(
+                page, interactive_refs, ref_suffixes,
+                check_viewport=check_viewport,
+                viewport_width=viewport_width,
+                viewport_height=viewport_height,
+            )
+            # Non-interactive refs: assume in-viewport, mark non-interactive.
+            for ref in non_interactive_refs:
+                visible_refs.add(ref)
+                interactive_map[ref] = False
+        else:
+            # Non-interactive mode.
+            #
+            # Viewport-only path (snapshot -F: full_page=False, interactive=False):
+            # Checking every ref via getBoundingClientRect takes ~43s on large pages
+            # (5549 refs × full getElementInfo JS overhead).  For viewport filtering the
+            # only purpose of the batch is to determine which elements are off-screen
+            # so their subtrees can be excluded via invisible_depth propagation below.
+            #
+            # Key insight: checking STRUCTURAL CONTAINER roles only (~20–100 per page)
+            # is sufficient.  When a container (section, table, list …) is off-viewport,
+            # ALL its descendant refs are excluded by invisible_depth propagation in the
+            # filtering pass — even though those descendants were added to visible_refs
+            # as assumed in-viewport.  Leaf elements (heading, link, button, cell …)
+            # that are NOT inside an off-viewport container are assumed in-viewport; in
+            # the rare case a standalone leaf sits just outside the viewport boundary it
+            # may be wrongly included, which is acceptable for snapshot -F use cases.
+            #
+            # Result: ~43s → ~1–3s for a 5549-ref page.
+            if check_viewport:
+                container_refs: Dict[str, Tuple[str, Optional[str], int]] = {}
+                non_container_refs_keys: Set[str] = set()
+                for ref, info in refs_info.items():
+                    if info[0] in self.VIEWPORT_CONTAINER_ROLES:
+                        container_refs[ref] = info
+                    else:
+                        non_container_refs_keys.add(ref)
+                logger.debug(
+                    "Viewport container-only pre-filter: %d container refs checked, "
+                    "%d leaf refs assumed in-viewport",
+                    len(container_refs), len(non_container_refs_keys),
+                )
+                visible_refs, interactive_map = await self._batch_get_elements_info(
+                    page, container_refs, ref_suffixes,
+                    check_viewport=check_viewport,
+                    viewport_width=viewport_width,
+                    viewport_height=viewport_height,
+                )
+                # Leaf refs: assume in-viewport; invisible_depth propagation in the
+                # filtering pass below correctly excludes children of any off-viewport
+                # container even though these refs are in visible_refs.
+                for ref in non_container_refs_keys:
+                    visible_refs.add(ref)
+                    interactive_map[ref] = False
+            else:
+                visible_refs, interactive_map = await self._batch_get_elements_info(
+                    page, refs_info, ref_suffixes,
+                    check_viewport=check_viewport,
+                    viewport_width=viewport_width,
+                    viewport_height=viewport_height,
+                )
 
         logger.debug(f"Pre-filter: {len(visible_refs)}/{len(refs_info)} refs visible/in-viewport")
         if options.interactive:

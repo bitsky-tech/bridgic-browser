@@ -1127,6 +1127,13 @@ class Browser:
         self._last_snapshot_url: Optional[str] = None
         self._snapshot_generator: Optional[SnapshotGenerator] = None
         self._snapshot_lock = asyncio.Lock()
+        # Background snapshot pre-warm (kicked off after navigate_to).
+        # Uses a dedicated generator so it never races with _snapshot_generator.
+        self._prefetch_snapshot: Optional[EnhancedSnapshot] = None
+        self._prefetch_options: Optional[SnapshotOptions] = None
+        self._prefetch_url: Optional[str] = None
+        self._prefetch_task: Optional[asyncio.Task] = None
+        self._prefetch_generator: Optional[SnapshotGenerator] = None
         # Artifacts auto-saved during shutdown (trace/video)
         self._last_shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
         self._last_shutdown_errors: List[str] = []
@@ -2202,6 +2209,7 @@ class Browser:
         # Clear snapshot cache
         self._last_snapshot = None
         self._last_snapshot_url = None
+        self._cancel_prefetch()
         self._last_shutdown_artifacts = shutdown_artifacts
         self._last_shutdown_errors = list(errors)
 
@@ -2334,14 +2342,28 @@ class Browser:
             if timeout is not None:
                 kwargs["timeout"] = timeout * 1000.0
             await self._page.goto(url, **kwargs)
-            # Update cache
+            # Invalidate snapshot cache and any in-flight pre-warm.
             self._last_snapshot = None
             self._last_snapshot_url = None
+            self._cancel_prefetch()
             page = await self.get_current_page()
             actual_url = page.url if page else url
             result = f"Navigated to: {actual_url}"
-
             logger.info(f"[navigate_to] done {result}")
+
+            # Kick off background snapshot pre-warm so the first snapshot
+            # call after navigation returns instantly (cache hit).
+            if self._page is not None:
+                self._prefetch_options = SnapshotOptions(interactive=True, full_page=True)
+                self._prefetch_url = actual_url
+                try:
+                    self._prefetch_task = asyncio.ensure_future(
+                        self._pre_warm_snapshot(self._page)
+                    )
+                except Exception as _e:
+                    # Non-fatal: pre-warm is best-effort (e.g., no running loop in tests)
+                    logger.debug("[navigate_to] pre-warm scheduling failed: %s", _e)
+
             return result
         except BridgicBrowserError:
             raise
@@ -2520,6 +2542,7 @@ class Browser:
         # Clear snapshot cache after switching pages
         self._last_snapshot = None
         self._last_snapshot_url = None
+        self._cancel_prefetch()
         title = await self._get_page_title(page)
         return True, f"Switched to tab {page_id}: {page.url} (title: {title})"
 
@@ -2582,6 +2605,7 @@ class Browser:
             # Clear snapshot cache
             self._last_snapshot = None
             self._last_snapshot_url = None
+            self._cancel_prefetch()
 
         if self._page:
             now_id = generate_page_id(self._page)
@@ -2806,6 +2830,41 @@ class Browser:
                 if self._snapshot_generator is None:
                     self._snapshot_generator = SnapshotGenerator()
                 current_url = self.get_current_page_url()
+
+                # Check if the background pre-warm already computed this snapshot.
+                if (self._prefetch_snapshot is not None
+                        and self._prefetch_options == options
+                        and self._prefetch_url == current_url):
+                    logger.info("[get_snapshot] pre-warm cache hit — returning instantly")
+                    cached = self._prefetch_snapshot
+                    # One-shot: clear so the next call recomputes fresh.
+                    self._prefetch_snapshot = None
+                    self._last_snapshot = cached
+                    self._last_snapshot_url = current_url
+                    return cached
+
+                # Pre-warm miss (either still running or different options).
+                # If the task is for the same options and URL, wait for it
+                # instead of duplicating the work.
+                prefetch_task = self._prefetch_task
+                if (prefetch_task is not None
+                        and not prefetch_task.done()
+                        and self._prefetch_options == options
+                        and self._prefetch_url == current_url):
+                    logger.info("[get_snapshot] pre-warm in progress — waiting for it")
+                    try:
+                        await prefetch_task
+                        if (self._prefetch_snapshot is not None
+                                and self._prefetch_options == options
+                                and self._prefetch_url == current_url):
+                            cached = self._prefetch_snapshot
+                            self._prefetch_snapshot = None
+                            self._last_snapshot = cached
+                            self._last_snapshot_url = current_url
+                            return cached
+                    except Exception:
+                        pass  # pre-warm failed; fall through to normal computation
+
                 self._last_snapshot = await self._snapshot_generator.get_enhanced_snapshot_async(
                     self._page, options
                 )
@@ -2818,6 +2877,62 @@ class Browser:
             logger.error(f"[get_snapshot] {error_msg}", exc_info=True)
             _raise_operation_error(error_msg)
     
+    def _cancel_prefetch(self) -> None:
+        """Cancel any in-flight pre-warm task and clear prefetch state.
+
+        Must be called whenever navigation or page-switch invalidates the
+        current page's snapshot (i.e. everywhere _last_snapshot is set to None).
+        Uses getattr throughout so it is safe on Browser instances created via
+        Browser.__new__() (test helpers that bypass __init__).
+        """
+        task = getattr(self, '_prefetch_task', None)
+        if task is not None and not task.done():
+            task.cancel()
+        self.__dict__.update(
+            _prefetch_task=None,
+            _prefetch_snapshot=None,
+            _prefetch_options=None,
+            _prefetch_url=None,
+        )
+
+    async def _pre_warm_snapshot(self, page: "AsyncPage") -> None:  # type: ignore[name-defined]
+        """Background task: compute interactive snapshot after navigation.
+
+        Uses a dedicated _prefetch_generator instance so it never conflicts
+        with the user-triggered _snapshot_generator (which is serialised by
+        _snapshot_lock).  Result is written to _prefetch_snapshot; get_snapshot
+        consumes it on a cache hit.
+
+        This is best-effort — any exception or cancellation is silently ignored.
+        """
+        try:
+            # Brief settle: let DOMContentLoaded side-effects stabilize.
+            await asyncio.sleep(0.5)
+
+            options = SnapshotOptions(interactive=True, full_page=True)
+            target_url = page.url
+
+            if self._prefetch_generator is None:
+                self._prefetch_generator = SnapshotGenerator()
+
+            logger.info("[pre_warm] starting snapshot for %s", target_url)
+            snapshot = await self._prefetch_generator.get_enhanced_snapshot_async(
+                page, options
+            )
+
+            # Only cache if the page hasn't changed since we started.
+            if page.url == target_url and self._page is page:
+                self._prefetch_snapshot = snapshot
+                self._prefetch_options = options
+                self._prefetch_url = target_url
+                logger.info("[pre_warm] snapshot ready for %s", target_url)
+            else:
+                logger.debug("[pre_warm] URL changed during pre-warm; discarding result")
+        except asyncio.CancelledError:
+            logger.debug("[pre_warm] cancelled (navigation superseded)")
+        except Exception as e:
+            logger.debug("[pre_warm] failed (best-effort): %s", e)
+
     async def get_element_by_ref(self, ref: str, _fallback_depth: int = 0) -> Optional[Locator]:
         """Resolve a snapshot ref to a Playwright Locator.
 

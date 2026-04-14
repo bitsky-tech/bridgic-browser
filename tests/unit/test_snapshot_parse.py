@@ -2804,6 +2804,388 @@ class TestIframeHandling:
         assert "Above" in filtered
         assert "Below" in filtered
 
+    # ------------------------------------------------------------------
+    # _pre_filter_raw_snapshot: interactive pre-filtering
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_interactive_mode_pre_filters_refs_to_interactive_roles(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """In -i mode, only INTERACTIVE_ROLES refs are sent to _batch_get_elements_info.
+        Non-interactive refs (heading, paragraph, generic, etc.) bypass batch JS."""
+        from bridgic.browser.session._snapshot import (
+            _BATCH_INFO_JS, _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+        evaluate_payloads: list = []
+
+        async def _capture_evaluate(js, payload=None):
+            if js is _BUILD_ROLE_INDEX_JS or js is _CLEANUP_ROLE_INDEX_JS:
+                return None
+            evaluate_payloads.append(payload)
+            # Return info for whichever refs were sent
+            return {
+                elem["ref"]: {
+                    "rect": {"x": 0, "y": 10, "right": 100, "bottom": 50},
+                    "tagName": "button",
+                    "cursor": "pointer",
+                    "isEditable": False, "isDisabled": False, "hasEventHandler": False,
+                    "tabindex": None, "classAndId": "", "dataAction": None,
+                    "ariaRequired": False, "ariaAutocomplete": None,
+                    "ariaKeyshortcuts": None, "ariaHidden": False,
+                    "ariaDisabled": False, "isContentEditable": False, "role": None,
+                }
+                for elem in payload["elements"]
+            }
+
+        raw = (
+            '- button "Go" [ref=e1] [cursor=pointer]\n'
+            '- heading "Title" [ref=e2]\n'
+            '- paragraph [ref=e3]\n'
+            '- link "Home" [ref=e4] [cursor=pointer]\n'
+            '- generic "Box" [ref=e5]\n'
+        )
+        mock_page = AsyncMock()
+        mock_page.viewport_size = {"width": 1280, "height": 720}
+        mock_page.evaluate = AsyncMock(side_effect=_capture_evaluate)
+
+        options = SnapshotOptions(interactive=True, full_page=True)
+        _, imap = await gen._pre_filter_raw_snapshot(raw, mock_page, options)
+
+        # Only one batch call (Phase 2) should have occurred
+        assert len(evaluate_payloads) == 1
+        batched_refs = {elem["ref"] for elem in evaluate_payloads[0]["elements"]}
+        # button and link are INTERACTIVE_ROLES → sent to batch
+        assert "e1" in batched_refs
+        assert "e4" in batched_refs
+        # heading, paragraph, generic are NOT interactive roles → NOT sent to batch
+        assert "e2" not in batched_refs
+        assert "e3" not in batched_refs
+        assert "e5" not in batched_refs
+
+    @pytest.mark.asyncio
+    async def test_non_interactive_refs_assumed_in_viewport_and_marked_false(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Non-interactive refs are added to visible_refs and marked False in interactive_map."""
+        from bridgic.browser.session._snapshot import (
+            _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+
+        async def _evaluate(js, payload=None):
+            if js is _BUILD_ROLE_INDEX_JS or js is _CLEANUP_ROLE_INDEX_JS:
+                return None
+            return {
+                elem["ref"]: {
+                    "rect": {"x": 0, "y": 10, "right": 100, "bottom": 50},
+                    "tagName": "button", "cursor": "pointer",
+                    "isEditable": False, "isDisabled": False, "hasEventHandler": False,
+                    "tabindex": None, "classAndId": "", "dataAction": None,
+                    "ariaRequired": False, "ariaAutocomplete": None,
+                    "ariaKeyshortcuts": None, "ariaHidden": False,
+                    "ariaDisabled": False, "isContentEditable": False, "role": None,
+                }
+                for elem in payload["elements"]
+            }
+
+        raw = (
+            '- button "Go" [ref=e1] [cursor=pointer]\n'
+            '- heading "Title" [ref=e2]\n'
+        )
+        mock_page = AsyncMock()
+        mock_page.viewport_size = {"width": 1280, "height": 720}
+        mock_page.evaluate = AsyncMock(side_effect=_evaluate)
+
+        options = SnapshotOptions(interactive=True, full_page=True)
+        _, imap = await gen._pre_filter_raw_snapshot(raw, mock_page, options)
+
+        # heading (non-interactive) must be in interactive_map and marked False
+        # (it appears in snapshot output as a raw_snapshot key via _extract_original_refs_from_raw)
+        # The stable ref key is hashed, so we check via role lookup on imap values
+        assert False in imap.values(), "At least one ref should be marked non-interactive"
+        # All imap values for non-interactive roles must be False
+        interactive_trues = [v for v in imap.values() if v is True]
+        # Only 'button' ref should be True (cursor=pointer + INTERACTIVE_ROLES)
+        assert len(interactive_trues) >= 1
+
+    @pytest.mark.asyncio
+    async def test_non_interactive_mode_sends_all_refs_to_batch(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Non -i mode: ALL refs (including non-interactive roles) go to batch JS."""
+        from bridgic.browser.session._snapshot import (
+            _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+        evaluate_payloads: list = []
+
+        async def _capture_evaluate(js, payload=None):
+            if js is _BUILD_ROLE_INDEX_JS or js is _CLEANUP_ROLE_INDEX_JS:
+                return None
+            evaluate_payloads.append(payload)
+            return {
+                elem["ref"]: {
+                    "rect": {"x": 0, "y": 10, "right": 100, "bottom": 50},
+                    "tagName": "div", "cursor": "default",
+                    "isEditable": False, "isDisabled": False, "hasEventHandler": False,
+                    "tabindex": None, "classAndId": "", "dataAction": None,
+                    "ariaRequired": False, "ariaAutocomplete": None,
+                    "ariaKeyshortcuts": None, "ariaHidden": False,
+                    "ariaDisabled": False, "isContentEditable": False, "role": None,
+                }
+                for elem in payload["elements"]
+            }
+
+        raw = (
+            '- button "Go" [ref=e1] [cursor=pointer]\n'
+            '- heading "Title" [ref=e2]\n'
+            '- link "Home" [ref=e3] [cursor=pointer]\n'
+        )
+        mock_page = AsyncMock()
+        mock_page.viewport_size = {"width": 1280, "height": 720}
+        mock_page.evaluate = AsyncMock(side_effect=_capture_evaluate)
+
+        options = SnapshotOptions(interactive=False, full_page=True)
+        await gen._pre_filter_raw_snapshot(raw, mock_page, options)
+
+        # full_page=True + interactive=False → early return (no filtering needed)
+        # The evaluate should NOT have been called at all.
+        assert len(evaluate_payloads) == 0, (
+            "full_page=True + interactive=False should early-return without calling evaluate"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cursor_pointer_non_role_element_sent_to_batch_in_interactive_mode(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """[cursor=pointer] on a non-INTERACTIVE_ROLES element (e.g. img) must still
+        go through batch JS in -i mode, not be assumed non-interactive."""
+        from bridgic.browser.session._snapshot import (
+            _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+        evaluate_payloads: list = []
+
+        async def _capture_evaluate(js, payload=None):
+            if js is _BUILD_ROLE_INDEX_JS or js is _CLEANUP_ROLE_INDEX_JS:
+                return None
+            evaluate_payloads.append(payload)
+            return {
+                elem["ref"]: {
+                    "rect": {"x": 0, "y": 10, "right": 100, "bottom": 50},
+                    "tagName": "img", "cursor": "pointer",
+                    "isEditable": False, "isDisabled": False, "hasEventHandler": True,
+                    "tabindex": None, "classAndId": "", "dataAction": None,
+                    "ariaRequired": False, "ariaAutocomplete": None,
+                    "ariaKeyshortcuts": None, "ariaHidden": False,
+                    "ariaDisabled": False, "isContentEditable": False, "role": None,
+                }
+                for elem in payload["elements"]
+            }
+
+        raw = (
+            '- img "Photo" [ref=e1] [cursor=pointer]\n'
+            '- paragraph [ref=e2]\n'
+        )
+        mock_page = AsyncMock()
+        mock_page.viewport_size = {"width": 1280, "height": 720}
+        mock_page.evaluate = AsyncMock(side_effect=_capture_evaluate)
+
+        options = SnapshotOptions(interactive=True, full_page=True)
+        await gen._pre_filter_raw_snapshot(raw, mock_page, options)
+
+        assert len(evaluate_payloads) == 1
+        batched_refs = {elem["ref"] for elem in evaluate_payloads[0]["elements"]}
+        # img with [cursor=pointer] must go through batch
+        assert "e1" in batched_refs
+        # paragraph (no cursor=pointer, not INTERACTIVE_ROLES) must NOT
+        assert "e2" not in batched_refs
+
+
+# ---------------------------------------------------------------------------
+# 7b. Viewport container pre-filter (snapshot -F optimisation)
+# ---------------------------------------------------------------------------
+
+class TestViewportContainerPrefilter:
+    """Tests for the container-only viewport check in non-interactive viewport mode.
+
+    snapshot -F (full_page=False, interactive=False) previously checked every
+    ref via the full JS batch (~43 s on large pages).  The optimisation sends
+    only VIEWPORT_CONTAINER_ROLES to the batch and assumes all other refs are
+    in-viewport, relying on invisible_depth propagation to exclude children of
+    off-viewport containers.
+    """
+
+    # ------------------------------------------------------------------ helpers
+
+    async def _run_pre_filter(
+        self,
+        gen: SnapshotGenerator,
+        raw: str,
+        options: SnapshotOptions,
+        batch_return_factory=None,
+    ):
+        """Run _pre_filter_raw_snapshot with a mock page that captures evaluate calls."""
+        from bridgic.browser.session._snapshot import (
+            _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+        captured_batch_payloads: list = []
+
+        async def _fake_evaluate(js, payload=None):
+            if js is _BUILD_ROLE_INDEX_JS or js is _CLEANUP_ROLE_INDEX_JS:
+                return None
+            captured_batch_payloads.append(payload)
+            if batch_return_factory:
+                return batch_return_factory(payload)
+            # Default: return all elements as in-viewport, non-interactive
+            return {
+                elem["ref"]: {
+                    "rect": {"x": 0, "y": 10, "right": 100, "bottom": 50,
+                             "width": 100, "height": 40},
+                    "tagName": "div", "cursor": "auto",
+                    "isEditable": False, "isDisabled": False,
+                    "hasEventHandler": False, "tabindex": None,
+                    "classAndId": "", "dataAction": None,
+                    "ariaRequired": False, "ariaAutocomplete": None,
+                    "ariaKeyshortcuts": None, "ariaHidden": False,
+                    "ariaDisabled": False, "isContentEditable": False,
+                    "role": None,
+                }
+                for elem in payload["elements"]
+            }
+
+        mock_page = AsyncMock()
+        mock_page.viewport_size = {"width": 1280, "height": 720}
+        mock_page.evaluate = AsyncMock(side_effect=_fake_evaluate)
+
+        filtered, imap = await gen._pre_filter_raw_snapshot(raw, mock_page, options)
+        return filtered, imap, captured_batch_payloads
+
+    # ------------------------------------------------------------------ tests
+
+    async def test_viewport_only_non_interactive_checks_only_container_roles(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """In snapshot -F mode only VIEWPORT_CONTAINER_ROLES are sent to batch JS."""
+        raw = (
+            '- main [ref=eMain]\n'
+            '  - navigation "Primary" [ref=eNav]\n'
+            '    - link "Home" [ref=eLink]\n'
+            '  - list [ref=eList]\n'
+            '    - listitem [ref=eLi1]\n'
+            '    - listitem [ref=eLi2]\n'
+            '  - heading "Title" [ref=eH]\n'
+        )
+        options = SnapshotOptions(interactive=False, full_page=False)
+        _, _, payloads = await self._run_pre_filter(gen, raw, options)
+
+        batched_refs: set = set()
+        for p in payloads:
+            batched_refs.update(elem["ref"] for elem in p["elements"])
+
+        # Container roles must be checked
+        assert "eMain" in batched_refs
+        assert "eNav" in batched_refs
+        assert "eList" in batched_refs
+        # Leaf roles must NOT go to batch
+        assert "eLink" not in batched_refs
+        assert "eLi1" not in batched_refs
+        assert "eLi2" not in batched_refs
+        assert "eH" not in batched_refs
+
+    async def test_leaf_refs_assumed_in_viewport_for_viewport_only_non_interactive(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Leaf refs (heading, link, listitem) are added to visible_refs without JS."""
+        raw = (
+            '- main [ref=eMain]\n'
+            '  - heading "Title" [ref=eH]\n'
+            '  - link "Click" [ref=eLink]\n'
+        )
+        options = SnapshotOptions(interactive=False, full_page=False)
+        filtered, imap, _ = await self._run_pre_filter(gen, raw, options)
+
+        # All refs must survive (all assumed in-viewport)
+        assert "eH" in filtered
+        assert "eLink" in filtered
+
+    async def test_invisible_depth_excludes_leaf_children_of_off_viewport_container(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Children of an off-viewport container are excluded even if assumed in-viewport.
+
+        invisible_depth propagation in the filtering pass ensures that when a
+        VIEWPORT_CONTAINER_ROLES element is found off-viewport its subtree is
+        removed from the snapshot regardless of what visible_refs contains.
+        """
+        raw = (
+            '- main [ref=eMain]\n'
+            '  - list [ref=eList]\n'
+            '    - listitem [ref=eLi1]\n'
+            '    - listitem [ref=eLi2]\n'
+        )
+
+        def _off_viewport_factory(payload):
+            """Return off-viewport rect for any element."""
+            return {
+                elem["ref"]: {
+                    "rect": {"x": 0, "y": 2000, "right": 100, "bottom": 2040,
+                             "width": 100, "height": 40},
+                    "tagName": "ul", "cursor": "auto",
+                    "isEditable": False, "isDisabled": False,
+                    "hasEventHandler": False, "tabindex": None,
+                    "classAndId": "", "dataAction": None,
+                    "ariaRequired": False, "ariaAutocomplete": None,
+                    "ariaKeyshortcuts": None, "ariaHidden": False,
+                    "ariaDisabled": False, "isContentEditable": False,
+                    "role": None,
+                }
+                for elem in payload["elements"]
+            }
+
+        options = SnapshotOptions(interactive=False, full_page=False)
+        filtered, _, _ = await self._run_pre_filter(
+            gen, raw, options, batch_return_factory=_off_viewport_factory
+        )
+
+        # All containers were off-viewport → their leaf children must be excluded
+        assert "eLi1" not in filtered
+        assert "eLi2" not in filtered
+
+    async def test_full_page_non_interactive_hits_early_return_no_batch(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """snapshot (full_page=True, interactive=False) must skip batch entirely."""
+        raw = (
+            '- main [ref=eMain]\n'
+            '  - link "Home" [ref=eLink]\n'
+        )
+        options = SnapshotOptions(interactive=False, full_page=True)
+        _, _, payloads = await self._run_pre_filter(gen, raw, options)
+
+        # Early return at line 1885 — zero batch JS calls
+        assert payloads == []
+
+    async def test_interactive_full_page_bypasses_viewport_container_logic(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """snapshot -i (interactive=True) uses the interactive pre-filter, not container filter."""
+        raw = (
+            '- main [ref=eMain]\n'
+            '  - button "Go" [ref=eBtn]\n'
+            '  - heading "Title" [ref=eH]\n'
+        )
+        options = SnapshotOptions(interactive=True, full_page=True)
+        _, _, payloads = await self._run_pre_filter(gen, raw, options)
+
+        batched_refs: set = set()
+        for p in payloads:
+            batched_refs.update(elem["ref"] for elem in p["elements"])
+
+        # Interactive pre-filter: only button (INTERACTIVE_ROLES) goes to batch
+        assert "eBtn" in batched_refs
+        # main and heading are non-interactive → NOT in batch
+        assert "eMain" not in batched_refs
+        assert "eH" not in batched_refs
+
 
 # ---------------------------------------------------------------------------
 # 8. Stable ref system
