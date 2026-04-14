@@ -70,16 +70,19 @@ logger = logging.getLogger(__name__)
 _BATCH_INFO_CHUNK_SIZE = 500
 
 
-# JS executed by SnapshotGenerator._batch_get_elements_info. Extracted to a
-# module-level constant so Python can call it multiple times (chunked) with
-# different payloads. The body pre-builds an index of DOM elements keyed by
-# ARIA role — one querySelectorAll per *unique role in the payload* instead of
-# one per ref — and memoizes accessible-name / text-content lookups in
-# WeakMaps. For pages with 1000+ refs this turns an O(N_refs × DOM_size)
-# inner loop into O(unique_roles × DOM_size) + O(N_refs), which is ~10x
-# faster in practice on large pages (e.g. baidu search results).
-_BATCH_INFO_JS = r"""(args) => {
-    const { elements, viewportWidth, viewportHeight, checkViewport } = args;
+# Phase 1 of the three-phase evaluate strategy:
+# Called once before the chunk loop. Runs querySelectorAll for every unique
+# ARIA role across ALL chunks and stores the resulting Element arrays in
+# window.__bridgicRoleIndex.  Because window persists between page.evaluate()
+# calls, subsequent Phase-2 chunks read the pre-built index instead of
+# re-scanning the DOM.  Also initialises WeakMap caches and a generation
+# token so stale data from a previous snapshot cannot bleed into a new one.
+#
+# Without this, a 5549-ref page split into 12 chunks would run the expensive
+# `div:not([role])` querySelectorAll 12× instead of once — the observed
+# root cause of 95–123 s runtimes and DAEMON_RESPONSE_TIMEOUT failures.
+_BUILD_ROLE_INDEX_JS = r"""(args) => {
+    if (window.__bridgicRoleGen === args.generation) return null;
 
     const IMPLICIT_ROLE_SELECTORS = {
         'button': 'button, input[type="button"], input[type="submit"], input[type="reset"], input[type="file"], [role="button"]',
@@ -168,25 +171,141 @@ _BATCH_INFO_JS = r"""(args) => {
         'presentation': '[role="presentation"]',
     };
 
-    // Pre-build role index: one querySelectorAll per *unique* role in the
-    // payload. Avoids re-scanning the DOM for every ref — the dominant cost
-    // on large pages where role='generic' matches thousands of divs.
-    const roleIndex = {};
-    const uniqueRoles = new Set();
-    for (const item of elements) uniqueRoles.add(item.role);
-    for (const role of uniqueRoles) {
+    window.__bridgicRoleIndex             = {};
+    window.__bridgicImplicitRoleSelectors = IMPLICIT_ROLE_SELECTORS;
+    window.__bridgicNameCache             = new WeakMap();
+    window.__bridgicTextCache             = new WeakMap();
+    window.__bridgicRoleGen               = args.generation;
+
+    for (const role of args.roles) {
         const selector = IMPLICIT_ROLE_SELECTORS[role] || '[role="' + role + '"]';
         try {
-            roleIndex[role] = Array.from(document.querySelectorAll(selector));
+            window.__bridgicRoleIndex[role] = Array.from(document.querySelectorAll(selector));
         } catch (_e) {
-            roleIndex[role] = [];
+            window.__bridgicRoleIndex[role] = [];
         }
     }
+    return null;
+}"""
 
-    // Memoize expensive per-element lookups. WeakMap auto-drops entries when
-    // the element is GC'd — safe within a single evaluate() call.
-    const nameCache = new WeakMap();
-    const textCache = new WeakMap();
+
+# Phase 3 of the three-phase evaluate strategy:
+# Deletes all window.__bridgic* variables written by _BUILD_ROLE_INDEX_JS.
+# Frees references to potentially thousands of DOM Elements that would
+# otherwise remain reachable through the window object.  Called in a
+# try/except so a closed or navigated page does not raise.
+_CLEANUP_ROLE_INDEX_JS = r"""() => {
+    delete window.__bridgicRoleIndex;
+    delete window.__bridgicImplicitRoleSelectors;
+    delete window.__bridgicNameCache;
+    delete window.__bridgicTextCache;
+    delete window.__bridgicRoleGen;
+}"""
+
+
+# Phase 2 of the three-phase evaluate strategy (called once per chunk):
+# Reads the role index and caches pre-built by _BUILD_ROLE_INDEX_JS from
+# window globals, then resolves each ref to an Element and collects the
+# metadata needed for visibility / interactivity decisions.  Falls back to
+# empty objects / fresh WeakMaps when Phase 1 was skipped or failed — the
+# findElement fallback QSA path still works, just less efficiently.
+_BATCH_INFO_JS = r"""(args) => {
+    const { elements, viewportWidth, viewportHeight, checkViewport } = args;
+
+    const IMPLICIT_ROLE_SELECTORS = window.__bridgicImplicitRoleSelectors || {
+        'button': 'button, input[type="button"], input[type="submit"], input[type="reset"], input[type="file"], [role="button"]',
+        'link': 'a[href], area[href], [role="link"]',
+        'textbox': 'input:not([type]), input[type="text"], input[type="email"], input[type="password"], input[type="search"], input[type="url"], input[type="tel"], textarea, [role="textbox"], [contenteditable="true"], [contenteditable=""]',
+        'checkbox': 'input[type="checkbox"], [role="checkbox"]',
+        'radio': 'input[type="radio"], [role="radio"]',
+        'combobox': 'select, [role="combobox"]',
+        'option': 'option, [role="option"]',
+        'heading': 'h1, h2, h3, h4, h5, h6, [role="heading"]',
+        'listitem': 'li, [role="listitem"]',
+        'list': 'ul, ol, [role="list"]',
+        'img': 'img[alt], [role="img"]',
+        'row': 'tr, [role="row"]',
+        'cell': 'td, [role="cell"]',
+        'columnheader': 'th, [role="columnheader"]',
+        'navigation': 'nav, [role="navigation"]',
+        'main': 'main, [role="main"]',
+        'banner': 'header, [role="banner"]',
+        'contentinfo': 'footer, [role="contentinfo"]',
+        'table': 'table, [role="table"]',
+        'menuitem': '[role="menuitem"]',
+        'menuitemcheckbox': '[role="menuitemcheckbox"]',
+        'menuitemradio': '[role="menuitemradio"]',
+        'tab': '[role="tab"]',
+        'tabpanel': '[role="tabpanel"]',
+        'treeitem': '[role="treeitem"]',
+        'switch': '[role="switch"]',
+        'slider': 'input[type="range"], [role="slider"]',
+        'spinbutton': 'input[type="number"], [role="spinbutton"]',
+        'searchbox': 'input[type="search"], [role="searchbox"]',
+        'progressbar': 'progress, [role="progressbar"]',
+        'scrollbar': '[role="scrollbar"]',
+        'separator': 'hr, [role="separator"]',
+        'gridcell': '[role="gridcell"]',
+        'grid': '[role="grid"]',
+        'listbox': '[role="listbox"]',
+        'menu': '[role="menu"]',
+        'menubar': '[role="menubar"]',
+        'radiogroup': '[role="radiogroup"]',
+        'tablist': '[role="tablist"]',
+        'tree': '[role="tree"]',
+        'treegrid': '[role="treegrid"]',
+        'alertdialog': '[role="alertdialog"]',
+        'dialog': 'dialog, [role="dialog"]',
+        'application': '[role="application"]',
+        'search': '[role="search"]',
+        'article': 'article, [role="article"]',
+        'region': 'section[aria-label], section[aria-labelledby], [role="region"]',
+        'rowheader': 'th[scope="row"], [role="rowheader"]',
+        'rowgroup': 'thead, tbody, tfoot, [role="rowgroup"]',
+        'toolbar': '[role="toolbar"]',
+        'status': '[role="status"]',
+        'alert': '[role="alert"]',
+        'log': '[role="log"]',
+        'marquee': '[role="marquee"]',
+        'timer': '[role="timer"]',
+        'tooltip': '[role="tooltip"]',
+        'figure': 'figure, [role="figure"]',
+        'paragraph': 'p, [role="paragraph"]',
+        'blockquote': 'blockquote, [role="blockquote"]',
+        'code': 'code, [role="code"]',
+        'emphasis': 'em, [role="emphasis"]',
+        'strong': 'strong, [role="strong"]',
+        'deletion': 'del, [role="deletion"]',
+        'insertion': 'ins, [role="insertion"]',
+        'subscript': 'sub, [role="subscript"]',
+        'superscript': 'sup, [role="superscript"]',
+        'term': 'dfn, [role="term"]',
+        'definition': 'dd, [role="definition"]',
+        'note': '[role="note"]',
+        'math': 'math, [role="math"]',
+        'time': 'time, [role="time"]',
+        'complementary': 'aside, [role="complementary"]',
+        'form': 'form[aria-label], form[aria-labelledby], [role="form"]',
+        'iframe': 'iframe',
+        'feed': '[role="feed"]',
+        'document': '[role="document"]',
+        'caption': 'caption, figcaption, [role="caption"]',
+        'meter': 'meter, [role="meter"]',
+        'summary': 'summary',
+        'details': 'details',
+        'generic': 'div:not([role]), legend, [role="generic"]',
+        'group': 'fieldset, details, optgroup, [role="group"]',
+        'none': '[role="none"]',
+        'presentation': '[role="presentation"]',
+    };
+
+    // Read the role index and caches built by _BUILD_ROLE_INDEX_JS (Phase 1).
+    // If Phase 1 was skipped or failed the fallback path in findElement()
+    // issues a one-shot querySelectorAll per missing role and caches it back
+    // into roleIndex for subsequent refs in this chunk.
+    const roleIndex = window.__bridgicRoleIndex  || {};
+    const nameCache = window.__bridgicNameCache  || new WeakMap();
+    const textCache = window.__bridgicTextCache  || new WeakMap();
 
     function getAssociatedLabelText(el) {
         if (!el) return '';
@@ -995,15 +1114,44 @@ class SnapshotGenerator:
         if not batch_elements:
             return visible_refs, interactive_map
 
-        # Evaluate via the module-level _BATCH_INFO_JS (role-indexed + cached)
-        # and chunk the payload so other daemon commands can be serviced between
-        # JS calls. Each chunk yields the asyncio event loop afterwards.
+        # Three-phase evaluate strategy:
+        #
+        # Phase 1 (_BUILD_ROLE_INDEX_JS): called once before the chunk loop.
+        #   Runs querySelectorAll for every unique ARIA role across ALL chunks
+        #   and stores Element arrays in window.__bridgicRoleIndex.  This
+        #   ensures expensive selectors like 'div:not([role])' run exactly
+        #   once regardless of chunk count — the root cause of 95-123 s
+        #   runtimes on 5000+ ref pages was paying that cost once per chunk.
+        #
+        # Phase 2 (_BATCH_INFO_JS): called N times (one per chunk).
+        #   Reads window.__bridgicRoleIndex; no DOM scanning per chunk.
+        #   asyncio.sleep(0) between chunks yields the event loop so other
+        #   daemon commands are not starved.
+        #
+        # Phase 3 (_CLEANUP_ROLE_INDEX_JS): called once in `finally`.
+        #   Removes window.__bridgic* to release Element references and
+        #   prevent cross-snapshot contamination.
         batch_results: Dict[str, Any] = {}
+
+        # Collect all unique roles up-front for Phase 1.
+        all_roles = list({item['role'] for item in batch_elements})
+        generation = f"{id(batch_elements)}-{int(time.time() * 1000)}"
+
+        # Phase 1: build role index in window (one QSA per unique role).
+        try:
+            await page.evaluate(_BUILD_ROLE_INDEX_JS, {
+                'roles': all_roles,
+                'generation': generation,
+            })
+        except Exception as e:
+            logger.debug(f"_build_role_index failed (chunk fallback active): {e}")
+
         try:
             start_time = time.time()
             total = len(batch_elements)
             for offset in range(0, total, _BATCH_INFO_CHUNK_SIZE):
                 chunk = batch_elements[offset:offset + _BATCH_INFO_CHUNK_SIZE]
+                # Phase 2: resolve refs using pre-built window.__bridgicRoleIndex.
                 chunk_result = await page.evaluate(_BATCH_INFO_JS, {
                     'elements': chunk,
                     'viewportWidth': viewport_width,
@@ -1023,11 +1171,18 @@ class SnapshotGenerator:
             )
         except Exception as e:
             logger.debug(f"Batch element info failed: {e}")
-            # Fallback: include all elements
+            # Fallback: include all elements (non-interactive to be safe).
+            # The return below triggers finally (cleanup) before actually returning.
             for item in batch_elements:
                 visible_refs.add(item['ref'])
                 interactive_map[item['ref']] = False
             return visible_refs, interactive_map
+        finally:
+            # Phase 3: release window.__bridgic* references.
+            try:
+                await page.evaluate(_CLEANUP_ROLE_INDEX_JS)
+            except Exception:
+                pass
 
         # Process batch results
         for item in batch_elements:

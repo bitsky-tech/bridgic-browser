@@ -755,7 +755,8 @@ class TestBatchGetElementsInfoRouting:
             check_viewport=False, viewport_width=1280, viewport_height=720,
         )
 
-        mock_page.evaluate.assert_called_once()
+        # Three-phase evaluate: build + 1 chunk + cleanup = 3 total calls.
+        assert mock_page.evaluate.call_count == 3
         assert "e1" in visible
 
     @pytest.mark.asyncio
@@ -779,7 +780,8 @@ class TestBatchGetElementsInfoRouting:
             check_viewport=False, viewport_width=1280, viewport_height=720,
         )
 
-        mock_page.evaluate.assert_called_once()
+        # Three-phase evaluate: build + 1 chunk + cleanup = 3 total calls.
+        assert mock_page.evaluate.call_count == 3
         assert "e1" in visible
 
 
@@ -1004,20 +1006,53 @@ class TestBatchChunking:
     fair turns on the asyncio loop.
     """
 
+    # ------------------------------------------------------------------
+    # Shared helper: dispatch mock evaluate by JS identity
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_dispatch_evaluate(chunk_result_factory=None):
+        """Return an async side_effect that routes calls by JS identity.
+
+        Phase 1 (_BUILD_ROLE_INDEX_JS) and Phase 3 (_CLEANUP_ROLE_INDEX_JS)
+        return None.  Phase 2 (_BATCH_INFO_JS) returns whatever
+        chunk_result_factory(payload) produces (defaults to empty dict).
+        """
+        from bridgic.browser.session._snapshot import (
+            _BATCH_INFO_JS, _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+
+        async def _dispatch(js, payload=None):
+            if js is _BUILD_ROLE_INDEX_JS or js is _CLEANUP_ROLE_INDEX_JS:
+                return None
+            # Phase 2 chunk call
+            if chunk_result_factory is not None:
+                return chunk_result_factory(payload)
+            return {}
+
+        return _dispatch
+
     @pytest.mark.asyncio
-    async def test_uses_module_level_js_constant(self, gen: SnapshotGenerator) -> None:
-        """The first argument to page.evaluate is the _BATCH_INFO_JS constant."""
-        from bridgic.browser.session._snapshot import _BATCH_INFO_JS
+    async def test_uses_module_level_js_constants(self, gen: SnapshotGenerator) -> None:
+        """Phase 1 uses _BUILD_ROLE_INDEX_JS and Phase 2 uses _BATCH_INFO_JS."""
+        from bridgic.browser.session._snapshot import (
+            _BATCH_INFO_JS, _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
 
         mock_page = AsyncMock()
-        mock_page.evaluate = AsyncMock(return_value={
-            "e1": {
-                "rect": {"x": 10, "y": 10, "right": 100, "bottom": 50},
-                "isEditable": False,
-                "isDisabled": False,
-                "interactive": {"cursor": "pointer"},
-            }
-        })
+        mock_page.evaluate = AsyncMock(
+            side_effect=self._make_dispatch_evaluate(
+                chunk_result_factory=lambda p: {
+                    elem["ref"]: {
+                        "rect": {"x": 10, "y": 10, "right": 100, "bottom": 50},
+                        "isEditable": False,
+                        "isDisabled": False,
+                        "cursor": "pointer",
+                    }
+                    for elem in p["elements"]
+                }
+            )
+        )
         refs_info = {"e1": ("button", "Go", 0)}
         ref_suffixes = {"e1": "[ref=e1]"}
 
@@ -1026,17 +1061,19 @@ class TestBatchChunking:
             check_viewport=False, viewport_width=1280, viewport_height=720,
         )
 
-        assert mock_page.evaluate.call_args is not None
-        call_args = mock_page.evaluate.call_args
-        assert call_args.args[0] is _BATCH_INFO_JS
+        calls = mock_page.evaluate.call_args_list
+        assert len(calls) == 3  # build + 1 chunk + cleanup
+        assert calls[0].args[0] is _BUILD_ROLE_INDEX_JS
+        assert calls[1].args[0] is _BATCH_INFO_JS
+        assert calls[2].args[0] is _CLEANUP_ROLE_INDEX_JS
 
     @pytest.mark.asyncio
     async def test_sub_chunk_size_single_evaluate(self, gen: SnapshotGenerator) -> None:
-        """<= CHUNK_SIZE elements => exactly one evaluate call."""
-        from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE
+        """<= CHUNK_SIZE elements => exactly one Phase-2 (chunk) evaluate call."""
+        from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE, _BATCH_INFO_JS
 
         mock_page = AsyncMock()
-        mock_page.evaluate = AsyncMock(return_value={})
+        mock_page.evaluate = AsyncMock(side_effect=self._make_dispatch_evaluate())
 
         count = _BATCH_INFO_CHUNK_SIZE  # exactly at boundary -> still 1 chunk
         refs_info = {f"e{i}": ("button", f"B{i}", 0) for i in range(count)}
@@ -1047,17 +1084,19 @@ class TestBatchChunking:
             check_viewport=False, viewport_width=1280, viewport_height=720,
         )
 
-        assert mock_page.evaluate.call_count == 1
-        chunk_payload = mock_page.evaluate.call_args.args[1]
-        assert len(chunk_payload["elements"]) == count
+        # Total: 1 build + 1 chunk + 1 cleanup = 3
+        assert mock_page.evaluate.call_count == 3
+        phase2_calls = [c for c in mock_page.evaluate.call_args_list if c.args[0] is _BATCH_INFO_JS]
+        assert len(phase2_calls) == 1
+        assert len(phase2_calls[0].args[1]["elements"]) == count
 
     @pytest.mark.asyncio
     async def test_above_chunk_size_splits(self, gen: SnapshotGenerator) -> None:
-        """> CHUNK_SIZE elements => multiple evaluate calls with cumulative size."""
-        from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE
+        """> CHUNK_SIZE elements => two Phase-2 calls with correct sizes."""
+        from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE, _BATCH_INFO_JS
 
         mock_page = AsyncMock()
-        mock_page.evaluate = AsyncMock(return_value={})
+        mock_page.evaluate = AsyncMock(side_effect=self._make_dispatch_evaluate())
 
         count = _BATCH_INFO_CHUNK_SIZE + 50  # two chunks expected
         refs_info = {f"e{i}": ("button", f"B{i}", 0) for i in range(count)}
@@ -1068,14 +1107,14 @@ class TestBatchChunking:
             check_viewport=False, viewport_width=1280, viewport_height=720,
         )
 
-        assert mock_page.evaluate.call_count == 2
-        total = sum(
-            len(call.args[1]["elements"]) for call in mock_page.evaluate.call_args_list
-        )
+        # Total: 1 build + 2 chunks + 1 cleanup = 4
+        assert mock_page.evaluate.call_count == 4
+        phase2_calls = [c for c in mock_page.evaluate.call_args_list if c.args[0] is _BATCH_INFO_JS]
+        assert len(phase2_calls) == 2
+        total = sum(len(c.args[1]["elements"]) for c in phase2_calls)
         assert total == count
-        # First chunk is exactly CHUNK_SIZE; second holds the remainder.
-        assert len(mock_page.evaluate.call_args_list[0].args[1]["elements"]) == _BATCH_INFO_CHUNK_SIZE
-        assert len(mock_page.evaluate.call_args_list[1].args[1]["elements"]) == 50
+        assert len(phase2_calls[0].args[1]["elements"]) == _BATCH_INFO_CHUNK_SIZE
+        assert len(phase2_calls[1].args[1]["elements"]) == 50
 
     @pytest.mark.asyncio
     async def test_yields_event_loop_between_chunks(self, gen: SnapshotGenerator) -> None:
@@ -1085,7 +1124,7 @@ class TestBatchChunking:
         from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE
 
         mock_page = AsyncMock()
-        mock_page.evaluate = AsyncMock(return_value={})
+        mock_page.evaluate = AsyncMock(side_effect=self._make_dispatch_evaluate())
 
         # 2 chunks => exactly 1 inter-chunk sleep(0)
         count = _BATCH_INFO_CHUNK_SIZE + 10
@@ -1116,7 +1155,7 @@ class TestBatchChunking:
         from unittest.mock import patch
 
         mock_page = AsyncMock()
-        mock_page.evaluate = AsyncMock(return_value={})
+        mock_page.evaluate = AsyncMock(side_effect=self._make_dispatch_evaluate())
 
         refs_info = {"e1": ("button", "Go", 0)}
         ref_suffixes = {"e1": "[ref=e1]"}
@@ -1140,25 +1179,24 @@ class TestBatchChunking:
 
     @pytest.mark.asyncio
     async def test_results_merged_across_chunks(self, gen: SnapshotGenerator) -> None:
-        """Results from multiple chunks are merged into the final output."""
+        """Results from multiple Phase-2 chunks are merged into the final output."""
         from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE
 
-        mock_page = AsyncMock()
-
-        # First chunk returns {e0..e(CHUNK-1)}, second returns {eCHUNK..}
-        def fake_evaluate(_js, payload):
-            chunk_elements = payload["elements"]
+        def _chunk_result(payload):
             return {
                 elem["ref"]: {
                     "rect": {"x": 10, "y": 10, "right": 100, "bottom": 50},
                     "isEditable": False,
                     "isDisabled": False,
-                    "interactive": {"cursor": "pointer"},
+                    "cursor": "pointer",
                 }
-                for elem in chunk_elements
+                for elem in payload["elements"]
             }
 
-        mock_page.evaluate = AsyncMock(side_effect=fake_evaluate)
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(
+            side_effect=self._make_dispatch_evaluate(_chunk_result)
+        )
 
         count = _BATCH_INFO_CHUNK_SIZE + 10
         refs_info = {f"e{i}": ("button", f"B{i}", 0) for i in range(count)}
@@ -1172,6 +1210,111 @@ class TestBatchChunking:
         # All refs from both chunks should end up visible.
         for i in range(count):
             assert f"e{i}" in visible
+
+    @pytest.mark.asyncio
+    async def test_role_index_built_once_regardless_of_chunks(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """_BUILD_ROLE_INDEX_JS is called exactly once no matter how many chunks."""
+        from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE, _BUILD_ROLE_INDEX_JS
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=self._make_dispatch_evaluate())
+
+        # 3 chunks
+        count = _BATCH_INFO_CHUNK_SIZE * 2 + 50
+        refs_info = {f"e{i}": ("button", f"B{i}", 0) for i in range(count)}
+        ref_suffixes = {k: "[ref=x]" for k in refs_info}
+
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        build_calls = [
+            c for c in mock_page.evaluate.call_args_list
+            if c.args[0] is _BUILD_ROLE_INDEX_JS
+        ]
+        assert len(build_calls) == 1, "Phase 1 must run exactly once"
+
+    @pytest.mark.asyncio
+    async def test_build_phase_receives_all_unique_roles(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Phase 1 args['roles'] contains all unique roles across all chunks."""
+        from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE, _BUILD_ROLE_INDEX_JS
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=self._make_dispatch_evaluate())
+
+        # Mix button / link / textbox spread across two chunks
+        refs_info = {}
+        for i in range(_BATCH_INFO_CHUNK_SIZE + 10):
+            role = ["button", "link", "textbox"][i % 3]
+            refs_info[f"e{i}"] = (role, f"N{i}", 0)
+        ref_suffixes = {k: "[ref=x]" for k in refs_info}
+
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        build_call = next(
+            c for c in mock_page.evaluate.call_args_list
+            if c.args[0] is _BUILD_ROLE_INDEX_JS
+        )
+        roles_sent = set(build_call.args[1]["roles"])
+        assert roles_sent == {"button", "link", "textbox"}
+
+    @pytest.mark.asyncio
+    async def test_cleanup_is_last_evaluate_call(self, gen: SnapshotGenerator) -> None:
+        """_CLEANUP_ROLE_INDEX_JS is the very last evaluate() call."""
+        from bridgic.browser.session._snapshot import _CLEANUP_ROLE_INDEX_JS
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=self._make_dispatch_evaluate())
+
+        refs_info = {"e1": ("button", "Go", 0)}
+        ref_suffixes = {"e1": "[ref=e1]"}
+
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        last_call = mock_page.evaluate.call_args_list[-1]
+        assert last_call.args[0] is _CLEANUP_ROLE_INDEX_JS
+
+    @pytest.mark.asyncio
+    async def test_cleanup_runs_on_chunk_exception(self, gen: SnapshotGenerator) -> None:
+        """_CLEANUP_ROLE_INDEX_JS is called even when a Phase-2 chunk raises."""
+        from bridgic.browser.session._snapshot import (
+            _BATCH_INFO_JS, _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+
+        async def _raise_on_chunk(js, payload=None):
+            if js is _BUILD_ROLE_INDEX_JS or js is _CLEANUP_ROLE_INDEX_JS:
+                return None
+            # Phase 2: simulate page evaluate failure
+            raise RuntimeError("page evaluate failed")
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=_raise_on_chunk)
+
+        refs_info = {"e1": ("button", "Go", 0)}
+        ref_suffixes = {"e1": "[ref=e1]"}
+
+        # Should not propagate — fallback path handles it
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        cleanup_calls = [
+            c for c in mock_page.evaluate.call_args_list
+            if c.args[0] is _CLEANUP_ROLE_INDEX_JS
+        ]
+        assert len(cleanup_calls) == 1, "cleanup must run even when chunk loop raises"
 
 
 # ---------------------------------------------------------------------------
@@ -2414,8 +2557,9 @@ class TestIframeHandling:
             check_viewport=False, viewport_width=1280, viewport_height=720,
         )
 
-        # evaluate must be called (batch path, not suffix-only)
-        mock_page.evaluate.assert_called_once()
+        # evaluate must be called (batch path, not suffix-only).
+        # Three-phase: build + 1 chunk + cleanup = 3 total calls.
+        assert mock_page.evaluate.call_count == 3
         assert "e5" in visible
 
     @pytest.mark.asyncio
