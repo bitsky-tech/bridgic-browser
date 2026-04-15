@@ -1014,12 +1014,31 @@ class Browser:
                 if init_script:
                     await self._context.add_init_script(init_script)
 
+            # Anti devtools-detector: inject patches safe for both modes.
+            if self._stealth_builder:
+                _adt_script = self._stealth_builder.get_anti_devtools_script()
+                if _adt_script:
+                    await self._context.add_init_script(_adt_script)
+
             # Auto create a new page if no page is open
             pages = self._context.pages
             if len(pages) > 0:
                 self._page = pages[0]
             else:
                 self._page = await self._context.new_page()
+
+            # Anti devtools-detector: skip all debugger-statement pauses.
+            # Playwright enables the Debugger domain internally; debugger
+            # statements would fire Debugger.paused events whose CDP
+            # round-trip delay the debuggerChecker in devtools-detector
+            # can measure (>100 ms => "open").
+            if self.stealth_enabled:
+                try:
+                    _dbg = await self._context.new_cdp_session(self._page)
+                    await _dbg.send("Debugger.setSkipAllPauses", {"skip": True})
+                    await _dbg.detach()
+                except Exception:
+                    logger.debug("Failed to set Debugger.setSkipAllPauses", exc_info=True)
 
             # Attach download manager to handle downloads with correct filenames
             if self._download_manager:

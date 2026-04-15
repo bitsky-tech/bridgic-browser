@@ -1,25 +1,28 @@
 ---
 name: bridgic-browser
 description: |
-  Use when tasks involve browser automation with bridgic-browser via terminal CLI (`bridgic-browser ...`) or Python SDK (`from bridgic.browser.session import Browser`, `from bridgic.browser.tools import BrowserToolSetBuilder`). Trigger for navigation, scraping, form filling, accessibility snapshot refs, e2e checks, stealth browsing, CLI-SDK mapping/migration, and generating SDK code from CLI action steps.
+  Use for any task requiring a real browser: viewing web pages, accessing login-gated sites, operating web UIs, scraping social media (Xiaohongshu/Weibo/Twitter/X, etc.), reading JS-rendered or dynamic pages, bypassing bot detection, form filling, e2e checks, and general web automation. Prefer this over WebFetch whenever the page needs JS execution, authenticated session, interaction, or stealth. Invoke via terminal CLI (`bridgic-browser ...`) or Python SDK (`from bridgic.browser.session import Browser`, `from bridgic.browser.tools import BrowserToolSetBuilder`). Also covers accessibility snapshot refs, CLI-SDK mapping/migration, and generating SDK code from CLI action steps.
 ---
 
-## Prerequisite (Important!!)
+## Dependencies
 
-Before performing any operations, **MAKE SURE to use `uv`** to initialize the execution environment and install dependencies first. Note: DO NOT rely on any execution environment other than `uv`, to ensure the execution environment is isolated from the host machine.
+A bridgic-browser project requires the following packages:
 
-- **Initialize project**: `[ -f pyproject.toml  ] || uv init --bare --python 3.10`
-- **Install dependencies**: `uv add --upgrade bridgic-browser`.
-- **Ensure that `uv` is available**: If `uv` is not found or not installed, run `pip install uv` to install it. Then rerun the previous "Install dependencies" step.
-- **Install browser binaries** (one-time): `uv run playwright install chromium`
+| Package | Description |
+|---------|-------------|
+| `bridgic-browser` | Browser automation CLI + Python SDK (installing one installs both) |
 
-The CLI tools (`references/cli-guide.md`) and the Python SDK (`references/sdk-guide.md`) come from the **same package** — installing one installs both.
+Additionally, browser binaries must be installed once: `uv run playwright install chromium`.
+
+**Installation**: Run the install script to set up all dependencies:
+
+```bash
+bash "skills/bridgic-browser/scripts/install-deps.sh" "$PWD"
+```
+
+The script checks uv availability, initializes a uv project if needed, installs missing packages, and ensures Playwright chromium is available.
 
 ## Strategies & Guidelines (Important!!)
-
-When writing browser automation or web scraping code, **ALWAYS follow this "explore first, then coding" strategy**:
-- First, use the `bridgic-browser` CLI tools to explore the page structure. It is recommended to use headed mode with the command `bridgic-browser open --headed <url>` during exploration.
-- Then, use the `bridgic-browser` Python SDK to write the code.
 
 Notes:
 - Whenever invoking the `bridgic-browser` CLI, you must call it using `uv run`.
