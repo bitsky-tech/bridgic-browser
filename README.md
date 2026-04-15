@@ -16,7 +16,27 @@
 - **Persistent & Ephemeral Sessions** - Persistent profile by default (`~/.bridgic/bridgic-browser/user_data/`); pass `clear_user_data=True` for an ephemeral session with no profile
 - **Nested iframe Support** - Supports DOM element operations within multi-level nested iframes
 
-### Installation
+### Quick Start
+
+#### Integration with Claude Code
+
+The easiest way to use **Bridgic Browser** is with a coding agent or AI assistant (such as Claude Code, Cursor, Codex, or OpenClaw). You can use it in two ways: via a Skill or a Plugin. In both cases, Bridgic Browser is installed automatically.
+
+**Method 1: Use AI to directly control the browser and complete tasks in real time.**
+
+To use this method, install the Skill provided by Bridgic Browser.
+
+```bash
+npx skills add bitsky-tech/bridgic-browser --skill bridgic-browser
+```
+
+After installation, the Skill will appear in your agent directories (for example, Claude Code typically under `.claude/skills/bridgic-browser/`, and Cursor under `.agents/skills/bridgic-browser/`).
+
+**Method 2: Let AI generate repeatable browser automation scripts with minimal token usage.**
+
+To use this method, install the **Plugin** provided by [AmphiLoop](https://github.com/bitsky-tech/AmphiLoop), a new AI-native ecosystem for building AI agents with natural language.
+
+#### Manual Installation
 
 ```bash
 pip install bridgic-browser
@@ -27,8 +47,6 @@ After installation, install Playwright browsers:
 ```bash
 playwright install chromium
 ```
-
-### Quick Start
 
 #### CLI Tools Usage
 
@@ -118,21 +136,6 @@ if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
 ```
-
-#### How to Install Skills?
-
-The skills of this repo can work with most of coding agents / AI assistant, such as Claude Code, Cursor, OpenClaw...
-Install using the `npx skills` CLI:
-
-```bash
-# From this repository checkout
-npx skills add . --skill bridgic-browser
-
-# Or from GitHub
-npx skills add bitsky-tech/bridgic-browser --skill bridgic-browser
-```
-
-After installation, the Skill will appear in your project’s agent directories (for example, Claude Code typically under `.claude/skills/bridgic-browser/`, and Cursor under `.agents/skills/bridgic-browser/`).
 
 #### Browser API Usage
 
