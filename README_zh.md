@@ -24,6 +24,8 @@
 
 **方式 1：让 AI 直接控制浏览器，实时完成任务。**
 
+<video src="https://github.com/user-attachments/assets/1c9b4538-b71c-42b4-899e-7bf5974bac09" controls></video>
+
 要使用这种方式，请安装 Bridgic Browser 提供的 Skill：
 
 ```bash

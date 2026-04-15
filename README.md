@@ -24,7 +24,7 @@ The easiest way to use **Bridgic Browser** is with a coding agent or AI assistan
 
 **Method 1: Use AI to directly control the browser and complete tasks in real time.**
 
-![Follow Karpathy](https://github.com/user-attachments/assets/7ef9304a-34f1-4c87-8eb9-930f6378f020)
+<video src="https://github.com/user-attachments/assets/7ef9304a-34f1-4c87-8eb9-930f6378f020" controls></video>
 
 To use this method, install the Skill provided by Bridgic Browser.
 
