@@ -16,7 +16,27 @@
 - **持久化与临时会话** — 默认持久化 profile（`~/.bridgic/bridgic-browser/user_data/`）；传入 `clear_user_data=True` 可开启临时会话（无 profile）
 - **嵌套 iframe 支持** — 支持在多层嵌套 iframe 内对 DOM 元素进行操作
 
-### 安装
+### 快速开始
+
+#### 与 AI 集成
+
+使用 **Bridgic Browser** 最简单的方式，是配合编程智能体或 AI 助手（例如 Claude Code、Cursor、Codex、OpenClaw）。你可以通过两种方式使用：Skill 或 Plugin。在这两种方式下，Bridgic Browser 都会被自动安装。
+
+**方式 1：让 AI 直接控制浏览器，实时完成任务。**
+
+要使用这种方式，请安装 Bridgic Browser 提供的 Skill：
+
+```bash
+npx skills add bitsky-tech/bridgic-browser --skill bridgic-browser
+```
+
+安装后，Skill 会出现在你的 agent 目录中（例如 Claude Code 常见为 `.claude/skills/bridgic-browser/`，Cursor 常见为 `.agents/skills/bridgic-browser/`）。
+
+**方式 2：让 AI 以更少 token 生成可复用的浏览器自动化脚本。**
+
+要使用这种方式，请安装 [AmphiLoop](https://github.com/bitsky-tech/AmphiLoop) 提供的 **Plugin**。AmphiLoop 是一个新的 AI 原生生态，可通过自然语言构建 AI 智能体。
+
+#### 手动安装
 
 ```bash
 pip install bridgic-browser
@@ -27,8 +47,6 @@ pip install bridgic-browser
 ```bash
 playwright install chromium
 ```
-
-### 快速开始
 
 #### CLI 工具用法
 
@@ -118,21 +136,6 @@ if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
 ```
-
-#### 如何安装 Skills？
-
-本仓库的 skills 可与多数编程类智能体 / AI 助手配合使用，例如 Claude Code、Cursor、OpenClaw……  
-使用 `npx skills` CLI 安装：
-
-```bash
-# 在本仓库 checkout 目录下
-npx skills add . --skill bridgic-browser
-
-# 或从 GitHub 安装
-npx skills add bitsky-tech/bridgic-browser --skill bridgic-browser
-```
-
-安装后，Skill 会出现在项目内的 agent 技能目录中（例如 Claude Code 常见为 `.claude/skills/bridgic-browser/`，Cursor 常见为 `.agents/skills/bridgic-browser/`）。
 
 #### 浏览器 API 用法
 
