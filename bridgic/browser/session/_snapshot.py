@@ -1409,6 +1409,11 @@ class SnapshotGenerator:
                 if interactive_map and original_ref:
                     # Use the pre-computed interactive_map for precise filtering
                     is_effectively_interactive = interactive_map.get(original_ref, False)
+                    # Named noise elements (text labels like "Delete", "Edit") inside
+                    # interactive containers should be preserved — they describe what
+                    # the parent button does, same logic as TEXT_LEAF_ROLES propagation.
+                    if not is_effectively_interactive and is_noise and name:
+                        is_effectively_interactive = any(kept for _, kept, _, _ in depth_stack)
                 elif role_lower in self.TEXT_LEAF_ROLES and playwright_ref_for_element is None:
                     # Playwright does not assign [ref=...] to inline text nodes
                     # (e.g. "- text: QQ"). In interactive mode, depth_stack entries

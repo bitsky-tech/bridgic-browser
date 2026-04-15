@@ -1314,6 +1314,68 @@ class TestProcessPageSnapshotForAI:
 
         assert 'standalone' not in result
 
+    # --- Named noise elements (generic "删除" etc.) inside interactive parents ---
+
+    def test_named_generic_under_interactive_parent_shown_in_interactive_mode(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Named noise elements (e.g. generic "Delete") that are children of an
+        interactive container ([cursor=pointer]) should be preserved in -i mode.
+
+        Real-world case: a button structure like:
+          <div style="cursor:pointer"><svg/><span>Delete</span></div>
+        produces:
+          - generic [ref=e1] [cursor=pointer]
+            - generic "Delete" [ref=e2]
+        Without the fix, "Delete" is filtered out because interactive_map[e2]=False.
+        """
+        raw = (
+            '- generic [ref=e1] [cursor=pointer]\n'
+            '  - generic "Delete" [ref=e2]'
+        )
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+        interactive_map = {"e1": True, "e2": False}
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
+
+        assert 'Delete' in result
+
+    def test_named_generic_under_non_interactive_parent_hidden(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Named noise elements under a non-interactive parent must NOT appear."""
+        raw = (
+            '- heading "Title" [ref=e1]\n'
+            '  - generic "subtitle" [ref=e2]'
+        )
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+        interactive_map = {"e1": False, "e2": False}
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
+
+        assert 'subtitle' not in result
+
+    def test_multiple_named_generics_under_interactive_parent(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Multiple named noise children of an interactive parent all appear."""
+        raw = (
+            '- generic [ref=e1] [cursor=pointer]\n'
+            '  - generic "Edit" [ref=e2]\n'
+            '- generic [ref=e3] [cursor=pointer]\n'
+            '  - generic "Delete" [ref=e4]'
+        )
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+        interactive_map = {"e1": True, "e2": False, "e3": True, "e4": False}
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
+
+        assert 'Edit' in result
+        assert 'Delete' in result
+
 
 # ---------------------------------------------------------------------------
 # 4. Name dedup in clean_suffix

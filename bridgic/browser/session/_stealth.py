@@ -293,6 +293,107 @@ _STEALTH_INIT_SCRIPT_TEMPLATE: str = """
 """
 
 
+# ========== Anti devtools-detector Script ==========
+# Neutralises the devtools-detector library
+# (https://github.com/AEPKILL/devtools-detector).
+#
+# Safe for both headless AND headed modes — only patches console.table,
+# window.devtoolsFormatters, and the Function constructor.  Does NOT
+# touch navigator/window.chrome properties that would break Cloudflare
+# Turnstile challenge iframes.
+#
+# Uses the same _mkNative / _nativeFns infrastructure defined in the
+# main stealth init script when running in headless mode.  In headed
+# mode (where the main script is NOT injected), we bootstrap a minimal
+# _mkNative locally so .toString() on our patches still reports
+# "[native code]".
+_ANTI_DEVTOOLS_DETECTOR_SCRIPT: str = """
+(function () {
+  // Only run in the top-level frame.  CAPTCHA providers (Cloudflare
+  // Turnstile, reCAPTCHA, hCaptcha, etc.) use transient iframes for
+  // verification — these iframes may start as about:blank so their
+  // hostname is unknown at init-script time.  Patching Function or
+  // toString inside them causes detectable inconsistencies that fail
+  // the challenge.  devtools-detector runs in the main page context,
+  // so skipping child frames does not weaken the protection.
+  try { if (window !== window.top) return; } catch (_) { return; }
+
+  // ── Bootstrap _mkNative (reuse existing or create minimal version) ──
+  // In headless mode the main stealth script has already defined _mkNative
+  // in an earlier IIFE scope — we cannot reach it, so we always create our
+  // own lightweight copy.  The overhead is negligible (one WeakSet + WeakMap).
+  var _nativeFns, _nativeFnNames, _mkNative;
+  _nativeFns   = new WeakSet();
+  _nativeFnNames = new WeakMap();
+  _mkNative = function (fn, name) {
+    _nativeFns.add(fn);
+    if (name !== undefined) _nativeFnNames.set(fn, name);
+    return fn;
+  };
+  // Intercept Function.prototype.toString for OUR patches only.
+  // If the main stealth script already installed a toString override,
+  // chain through it — our WeakSet simply won't match functions we
+  // didn't register, so the call falls through transparently.
+  var _prevToString = Function.prototype.toString;
+  Function.prototype.toString = _mkNative(function toString() {
+    if (_nativeFns.has(this)) {
+      var _n = _nativeFnNames.has(this) ? _nativeFnNames.get(this) : (this.name || '');
+      return 'function ' + _n + '() { [native code] }';
+    }
+    return _prevToString.call(this);
+  }, 'toString');
+
+  // ── 1. performanceChecker: console.table timing neutralization ────
+  // devtools-detector compares console.table(largeArray) vs
+  // console.log(largeArray) execution time.  Under CDP Runtime.enable,
+  // console.table incurs extra formatting/serialization overhead.
+  // Replacing it with console.log makes both paths identical in cost.
+  // devtools-detector caches console.table at module-load time via
+  // cacheConsoleMethod('table'), so this must run before page scripts.
+  var _origLog = console.log;
+  console.table = _mkNative(function table() {
+    return _origLog.apply(console, arguments);
+  }, 'table');
+
+  // ── 2. devtoolsFormatterChecker: freeze devtoolsFormatters ────────
+  // devtools-detector registers a custom formatter whose header() fires
+  // when CDP serialises console.log output.  Make the property a no-op
+  // accessor so the formatter array can never be installed.
+  try {
+    Object.defineProperty(window, 'devtoolsFormatters', {
+      get: _mkNative(function () { return undefined; }, ''),
+      set: _mkNative(function () {}, ''),
+      configurable: false,
+    });
+  } catch (_) {}
+
+  // ── 3. debuggerChecker: Function constructor interception ─────────
+  // devtools-detector creates debugger-bearing functions dynamically via
+  //   (() => {}).constructor('debugger')()
+  // Intercept the Function constructor to strip the debugger keyword so
+  // the constructed function body is empty (executes instantly, <1 ms).
+  // The fallback raw `debugger;` in the catch block is handled at the
+  // CDP level (Debugger.setSkipAllPauses).
+  var _OrigFunction = Function;
+  Function = _mkNative(function Function() {
+    var args = [];
+    for (var i = 0; i < arguments.length; i++) {
+      var a = arguments[i];
+      args.push(typeof a === 'string' ? a.replace(/\\bdebugger\\b/g, '') : a);
+    }
+    return _OrigFunction.apply(this, args);
+  }, 'Function');
+  Function.prototype = _OrigFunction.prototype;
+  Object.defineProperty(Function.prototype, 'constructor', {
+    value: Function, writable: true, configurable: true,
+  });
+  try { Object.setPrototypeOf(Function, Object.getPrototypeOf(_OrigFunction)); } catch (_) {}
+  try { Object.defineProperty(Function, 'length', Object.getOwnPropertyDescriptor(_OrigFunction, 'length')); } catch (_) {}
+  try { Object.defineProperty(Function, 'name', { value: 'Function', configurable: true }); } catch (_) {}
+})();
+"""
+
+
 # ========== Chrome Disabled Components (browser-use/profile.py:29-78) ==========
 CHROME_DISABLED_COMPONENTS: List[str] = [
     "AcceptCHFrame",
@@ -703,6 +804,20 @@ class StealthArgsBuilder:
             langs = ["en-US", "en"]
 
         return _STEALTH_INIT_SCRIPT_TEMPLATE.replace("__BRIDGIC_LANGS__", json.dumps(langs))
+
+    def get_anti_devtools_script(self) -> Optional[str]:
+        """Return JS to neutralise the devtools-detector library.
+
+        Safe for **both** headless and headed modes — only patches
+        ``console.table``, ``window.devtoolsFormatters``, and the
+        ``Function`` constructor.  Does NOT touch navigator/window
+        properties that would break Cloudflare Turnstile.
+
+        Returns None when stealth is disabled.
+        """
+        if not self.config.enabled:
+            return None
+        return _ANTI_DEVTOOLS_DETECTOR_SCRIPT
 
 def create_stealth_config(
     enabled: bool = True,

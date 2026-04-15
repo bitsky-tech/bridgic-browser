@@ -16,7 +16,29 @@
 - **Persistent & Ephemeral Sessions** - Persistent profile by default (`~/.bridgic/bridgic-browser/user_data/`); pass `clear_user_data=True` for an ephemeral session with no profile
 - **Nested iframe Support** - Supports DOM element operations within multi-level nested iframes
 
-### Installation
+### Quick Start
+
+#### Integration with AI
+
+The easiest way to use **Bridgic Browser** is with a coding agent or AI assistant (such as Claude Code, Cursor, Codex, or OpenClaw). You can use it in two ways: via a Skill or a Plugin. In both cases, Bridgic Browser is installed automatically.
+
+**Method 1: Use AI to directly control the browser and complete tasks in real time.**
+
+<video src="https://github.com/user-attachments/assets/7ef9304a-34f1-4c87-8eb9-930f6378f020" controls></video>
+
+To use this method, install the Skill provided by Bridgic Browser.
+
+```bash
+npx skills add bitsky-tech/bridgic-browser --skill bridgic-browser
+```
+
+After installation, the Skill will appear in your agent directories (for example, Claude Code typically under `.claude/skills/bridgic-browser/`, and Cursor under `.agents/skills/bridgic-browser/`).
+
+**Method 2: Let AI generate repeatable browser automation scripts with minimal token usage.**
+
+To use this method, install the **Plugin** provided by [AmphiLoop](https://github.com/bitsky-tech/AmphiLoop), a brand new methodology, tech stack and toolchain for building AI agents with natural language.
+
+#### Manual Installation
 
 ```bash
 pip install bridgic-browser
@@ -27,8 +49,6 @@ After installation, install Playwright browsers:
 ```bash
 playwright install chromium
 ```
-
-### Quick Start
 
 #### CLI Tools Usage
 
@@ -118,21 +138,6 @@ if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
 ```
-
-#### How to Install Skills?
-
-The skills of this repo can work with most of coding agents / AI assistant, such as Claude Code, Cursor, OpenClaw...
-Install using the `npx skills` CLI:
-
-```bash
-# From this repository checkout
-npx skills add . --skill bridgic-browser
-
-# Or from GitHub
-npx skills add bitsky-tech/bridgic-browser --skill bridgic-browser
-```
-
-After installation, the Skill will appear in your project’s agent directories (for example, Claude Code typically under `.claude/skills/bridgic-browser/`, and Cursor under `.agents/skills/bridgic-browser/`).
 
 #### Browser API Usage
 
@@ -569,6 +574,13 @@ CLI client converts daemon failures into `BridgicBrowserCommandError`, and CLI o
 - Python 3.10+
 - Playwright 1.57+
 - Pydantic 2.11+
+
+### Community
+
+Join us to share feedback, ask questions, and keep up with what's new:
+
+- 🐦 Twitter / X: [@bridgic](https://x.com/bridgic)
+- 💬 Discord: [Join our server](https://discord.gg/5rQYnTKNCd)
 
 ### License
 
