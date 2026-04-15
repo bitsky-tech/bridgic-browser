@@ -18,7 +18,7 @@
 
 ### Quick Start
 
-#### Integration with Claude Code
+#### Integration with AI
 
 The easiest way to use **Bridgic Browser** is with a coding agent or AI assistant (such as Claude Code, Cursor, Codex, or OpenClaw). You can use it in two ways: via a Skill or a Plugin. In both cases, Bridgic Browser is installed automatically.
 
