@@ -34,7 +34,7 @@ After installation, the Skill will appear in your agent directories (for example
 
 **Method 2: Let AI generate repeatable browser automation scripts with minimal token usage.**
 
-To use this method, install the **Plugin** provided by [AmphiLoop](https://github.com/bitsky-tech/AmphiLoop), a new AI-native ecosystem for building AI agents with natural language.
+To use this method, install the **Plugin** provided by [AmphiLoop](https://github.com/bitsky-tech/AmphiLoop), a new AI-native toolchain and paradigm for building AI agents with natural language.
 
 #### Manual Installation
 

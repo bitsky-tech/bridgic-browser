@@ -34,7 +34,7 @@ npx skills add bitsky-tech/bridgic-browser --skill bridgic-browser
 
 **方式 2：让 AI 以更少 token 生成可复用的浏览器自动化脚本。**
 
-要使用这种方式，请安装 [AmphiLoop](https://github.com/bitsky-tech/AmphiLoop) 提供的 **Plugin**。AmphiLoop 是一个新的 AI 原生生态，可通过自然语言构建 AI 智能体。
+要使用这种方式，请安装 [AmphiLoop](https://github.com/bitsky-tech/AmphiLoop) 提供的 **Plugin**。AmphiLoop 是一套新的 AI 原生工具链与范式，可通过自然语言构建 AI 智能体。
 
 #### 手动安装
 
