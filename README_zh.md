@@ -272,7 +272,7 @@ bridgic-browser open https://example.com --cdp auto
 SDK 等效用法：
 
 ```python
-browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/...")
+browser = Browser(cdp="ws://localhost:9222/devtools/browser/...")
 ```
 
 #### 命令列表
@@ -553,7 +553,7 @@ browser = Browser(
 | `user_data_dir` | str/Path | None | 持久化 profile 自定义路径（`clear_user_data=True` 时忽略） |
 | `clear_user_data` | bool | False | True 时使用临时会话（无 profile）；False 时使用持久化 profile |
 | `stealth` | bool/StealthConfig | True | 隐身模式配置 |
-| `cdp_url` | str | None | 通过 CDP 连接已有 Chrome 的 WebSocket URL（跳过启动） |
+| `cdp` | str | None | 通过 CDP 连接已有 Chrome（跳过启动）。接受端口号、`ws://` / `wss://` URL、`http://host:port`、`"auto"` —— 与 CLI `--cdp` 一致 |
 | `channel` | str | None | 浏览器通道（chrome、msedge 等） |
 | `proxy` | dict | None | 代理设置 |
 | `downloads_path` | str/Path | None | 下载目录 |

@@ -87,8 +87,10 @@ def _make_browser_with_mock_page() -> tuple:
     # CDP-mode attributes — required by start_video / get_pages / _close_page
     # which inspect them to decide whether to filter out user tabs.  Tests in
     # this file simulate launch-mode (non-CDP), so both default to "not CDP".
-    browser._cdp_url = None
+    browser._cdp_resolved = None
+    browser._cdp_raw = None
     browser._cdp_context_owned = False
+    # _is_cdp_borrowed is a read-only property derived from _cdp_raw + _cdp_context_owned.
     browser._context = MagicMock()
     browser._page = MagicMock()
     # get_current_page() returns self._page
@@ -355,8 +357,9 @@ def _make_borrowed_cdp_browser_with_pages(owned_page, user_page):
     """Build a Browser configured as if it had connected to a user's Chrome
     via CDP, with two tabs in the same context."""
     browser = _make_browser_with_mock_page()
-    browser._cdp_url = "ws://localhost:9222/devtools/browser/abc"
-    browser._cdp_context_owned = False  # borrowed
+    browser._cdp_resolved = "ws://localhost:9222/devtools/browser/abc"
+    browser._cdp_raw = "ws://localhost:9222/devtools/browser/abc"
+    browser._cdp_context_owned = False  # borrowed → _is_cdp_borrowed is True via property
     fake_context = MagicMock()
     # Order matters — get_pages preserves the underlying tab order
     fake_context.pages = [user_page, owned_page]
@@ -405,8 +408,9 @@ async def test_start_video_records_only_active_tab_in_cdp_borrowed_mode():
     user.is_closed = MagicMock(return_value=False)
 
     browser = _make_browser_with_mock_page()
-    browser._cdp_url = "ws://localhost:9222/devtools/browser/abc"
-    browser._cdp_context_owned = False
+    browser._cdp_resolved = "ws://localhost:9222/devtools/browser/abc"
+    browser._cdp_raw = "ws://localhost:9222/devtools/browser/abc"
+    browser._cdp_context_owned = False  # borrowed → _is_cdp_borrowed is True via property
 
     fake_context = MagicMock()
     fake_context.pages = [owned, user]
@@ -463,10 +467,13 @@ async def test_cdp_evaluate_on_element_detects_scroll_race():
 
     # bbox BEFORE evaluate: element at (0, 100)
     # bbox AFTER evaluate: element at (0, 500) — page scrolled 400px
+    # M4: after the mismatch, the helper retries once (smooth-scroll recovery).
+    # Return the same shifted bbox on the retry so the race is still detected.
     mock_locator = MagicMock()
     mock_locator.bounding_box = AsyncMock(
         side_effect=[
             {"x": 0, "y": 100, "width": 100, "height": 40},
+            {"x": 0, "y": 500, "width": 100, "height": 40},
             {"x": 0, "y": 500, "width": 100, "height": 40},
         ]
     )

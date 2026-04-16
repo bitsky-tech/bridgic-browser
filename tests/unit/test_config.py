@@ -491,94 +491,110 @@ class TestBrowserConfigIntegration:
         assert "channel" not in browser._extra_kwargs
         assert "locale" not in browser._extra_kwargs
 
-    def test_config_cdp_url_loaded(self, tmp_path):
-        """Browser() picks up cdp_url from config file."""
-        from bridgic.browser.session._browser import Browser
+    def test_config_cdp_loaded(self, tmp_path):
+        """Browser() picks up cdp from config file and stores it raw.
 
-        fake_browser_home = tmp_path / ".bridgic"
-        fake_browser_home.mkdir()
-        (fake_browser_home / "bridgic-browser.json").write_text(
-            json.dumps({"cdp_url": "ws://localhost:9222/devtools/browser/abc"})
-        )
-
-        mock_local = MagicMock()
-        mock_local.is_file.return_value = False
-        with (
-            patch("bridgic.browser._config.BRIDGIC_BROWSER_HOME", fake_browser_home),
-            patch("bridgic.browser._config.Path", return_value=mock_local),
-            patch.dict(os.environ, {}, clear=False),
-        ):
-            os.environ.pop("BRIDGIC_BROWSER_JSON", None)
-            browser = Browser()
-
-        assert browser._cdp_url == "ws://localhost:9222/devtools/browser/abc"
-        assert "cdp_url" not in browser._extra_kwargs
-
-    def test_explicit_cdp_url_overrides_config(self, tmp_path):
-        """Browser(cdp_url=...) overrides config's cdp_url."""
-        from bridgic.browser.session._browser import Browser
-
-        fake_browser_home = tmp_path / ".bridgic"
-        fake_browser_home.mkdir()
-        (fake_browser_home / "bridgic-browser.json").write_text(
-            json.dumps({"cdp_url": "ws://localhost:9222/devtools/browser/old"})
-        )
-
-        mock_local = MagicMock()
-        mock_local.is_file.return_value = False
-        with (
-            patch("bridgic.browser._config.BRIDGIC_BROWSER_HOME", fake_browser_home),
-            patch("bridgic.browser._config.Path", return_value=mock_local),
-            patch.dict(os.environ, {}, clear=False),
-        ):
-            os.environ.pop("BRIDGIC_BROWSER_JSON", None)
-            browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/new")
-
-        assert browser._cdp_url == "ws://localhost:9222/devtools/browser/new"
-        assert "cdp_url" not in browser._extra_kwargs
-
-    # ── M2: cdp_url normalization in __init__ ─────────────────────────
-
-    def test_config_cdp_url_port_string_normalized(self, tmp_path):
-        """Browser() should normalize a bare port number from config to ws:// URL.
-
-        Regression guard for M2: previously, a config like ``{"cdp_url":"9222"}``
-        was passed unchanged to Playwright's connect_over_cdp(), which crashes
-        deep in the driver because the value is not a WebSocket URL.
+        After I1, `_cdp_resolved` is populated lazily by `_start()`; the raw
+        input (pre-resolution) lives on `_cdp_raw`.
         """
         from bridgic.browser.session._browser import Browser
 
         fake_browser_home = tmp_path / ".bridgic"
         fake_browser_home.mkdir()
         (fake_browser_home / "bridgic-browser.json").write_text(
-            json.dumps({"cdp_url": "9222"})
+            json.dumps({"cdp": "ws://localhost:9222/devtools/browser/abc"})
         )
 
         mock_local = MagicMock()
         mock_local.is_file.return_value = False
+        with (
+            patch("bridgic.browser._config.BRIDGIC_BROWSER_HOME", fake_browser_home),
+            patch("bridgic.browser._config.Path", return_value=mock_local),
+            patch.dict(os.environ, {}, clear=False),
+        ):
+            os.environ.pop("BRIDGIC_BROWSER_JSON", None)
+            browser = Browser()
+
+        assert browser._cdp_raw == "ws://localhost:9222/devtools/browser/abc"
+        assert browser._cdp_resolved is None  # resolved lazily in _start()
+        assert "cdp" not in browser._extra_kwargs
+
+    def test_explicit_cdp_overrides_config(self, tmp_path):
+        """Browser(cdp=...) overrides config's cdp (raw storage)."""
+        from bridgic.browser.session._browser import Browser
+
+        fake_browser_home = tmp_path / ".bridgic"
+        fake_browser_home.mkdir()
+        (fake_browser_home / "bridgic-browser.json").write_text(
+            json.dumps({"cdp": "ws://localhost:9222/devtools/browser/old"})
+        )
+
+        mock_local = MagicMock()
+        mock_local.is_file.return_value = False
+        with (
+            patch("bridgic.browser._config.BRIDGIC_BROWSER_HOME", fake_browser_home),
+            patch("bridgic.browser._config.Path", return_value=mock_local),
+            patch.dict(os.environ, {}, clear=False),
+        ):
+            os.environ.pop("BRIDGIC_BROWSER_JSON", None)
+            browser = Browser(cdp="ws://localhost:9222/devtools/browser/new")
+
+        assert browser._cdp_raw == "ws://localhost:9222/devtools/browser/new"
+        assert browser._cdp_resolved is None
+        assert "cdp" not in browser._extra_kwargs
+
+    # ── I1: __init__ no longer performs blocking I/O ─────────────────
+
+    def test_config_cdp_port_string_stored_raw(self, tmp_path):
+        """Browser() with a bare port number in config stores it raw, without I/O.
+
+        Regression guard for I1: previously, `__init__` called
+        ``resolve_cdp_input("9222")`` synchronously, which would hit
+        ``/json/version`` over HTTP. That's unsafe inside an event loop
+        and surprising for an SDK constructor. Now the raw value is kept
+        and normalization is performed by ``_start()``.
+        """
+        from bridgic.browser.session._browser import Browser
+
+        fake_browser_home = tmp_path / ".bridgic"
+        fake_browser_home.mkdir()
+        (fake_browser_home / "bridgic-browser.json").write_text(
+            json.dumps({"cdp": "9222"})
+        )
+
+        mock_local = MagicMock()
+        mock_local.is_file.return_value = False
+        find_cdp_url_mock = MagicMock(
+            return_value="ws://localhost:9222/devtools/browser/zzz"
+        )
         with (
             patch("bridgic.browser._config.BRIDGIC_BROWSER_HOME", fake_browser_home),
             patch("bridgic.browser._config.Path", return_value=mock_local),
             patch.dict(os.environ, {}, clear=False),
             patch(
                 "bridgic.browser.session._browser.find_cdp_url",
-                return_value="ws://localhost:9222/devtools/browser/zzz",
+                find_cdp_url_mock,
             ),
         ):
             os.environ.pop("BRIDGIC_BROWSER_JSON", None)
             browser = Browser()
 
-        assert browser._cdp_url == "ws://localhost:9222/devtools/browser/zzz"
+        # Raw stored, no resolution yet
+        assert browser._cdp_raw == "9222"
+        assert browser._cdp_resolved is None
+        # find_cdp_url was NOT called during construction
+        assert find_cdp_url_mock.call_count == 0
 
-    def test_config_cdp_url_invalid_raises(self, tmp_path):
-        """Browser() with malformed cdp_url in config should raise InvalidInputError."""
+    def test_config_cdp_invalid_raises_on_start(self, tmp_path):
+        """Malformed cdp surfaces as InvalidInputError on _start(), not __init__."""
+        import asyncio
         from bridgic.browser.session._browser import Browser
         from bridgic.browser.errors import InvalidInputError
 
         fake_browser_home = tmp_path / ".bridgic"
         fake_browser_home.mkdir()
         (fake_browser_home / "bridgic-browser.json").write_text(
-            json.dumps({"cdp_url": "this-is-not-valid"})
+            json.dumps({"cdp": "this-is-not-valid"})
         )
 
         mock_local = MagicMock()
@@ -589,16 +605,29 @@ class TestBrowserConfigIntegration:
             patch.dict(os.environ, {}, clear=False),
         ):
             os.environ.pop("BRIDGIC_BROWSER_JSON", None)
-            with pytest.raises(InvalidInputError, match="Failed to resolve cdp_url"):
-                Browser()
+            # Construction must not raise — deferred resolution.
+            browser = Browser()
+            assert browser._cdp_raw == "this-is-not-valid"
 
-    def test_explicit_cdp_url_port_normalized(self, monkeypatch):
-        """Browser(cdp_url='9222') as an explicit argument is also normalized."""
+            # _start() should surface the InvalidInputError.
+            with pytest.raises(InvalidInputError, match="Failed to resolve cdp"):
+                asyncio.run(browser._start())
+
+    def test_explicit_cdp_port_stored_raw(self, monkeypatch):
+        """Browser(cdp='9222') stores raw input; no network I/O in __init__."""
         from bridgic.browser.session._browser import Browser
+
+        calls = []
+
+        def _fake_find_cdp_url(*args, **kwargs):  # pragma: no cover - must not be called
+            calls.append((args, kwargs))
+            return "ws://localhost:9222/devtools/browser/normalized"
 
         monkeypatch.setattr(
             "bridgic.browser.session._browser.find_cdp_url",
-            lambda mode, host, port: f"ws://{host}:{port}/devtools/browser/normalized",
+            _fake_find_cdp_url,
         )
-        browser = Browser(cdp_url="9222")
-        assert browser._cdp_url == "ws://localhost:9222/devtools/browser/normalized"
+        browser = Browser(cdp="9222")
+        assert browser._cdp_raw == "9222"
+        assert browser._cdp_resolved is None
+        assert calls == []  # no resolution attempted during construction

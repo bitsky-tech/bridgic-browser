@@ -173,7 +173,7 @@ def send_command(
     start_if_needed: bool = True,
     headed: bool = False,
     clear_user_data: bool = False,
-    cdp_url: Optional[str] = None,
+    cdp: Optional[str] = None,
 ) -> str:
     """Send *command* with *args* to the daemon.
 
@@ -191,7 +191,7 @@ def send_command(
         If True, start the daemon with ``clear_user_data=True`` (ephemeral
         mode — no persistent browser profile).  Only meaningful when
         *start_if_needed* is True and the daemon is not yet running.
-    cdp_url:
+    cdp:
         If set, connect to an existing Chrome via this CDP WebSocket URL instead
         of launching a new browser.  Only meaningful when the daemon is not yet
         running.
@@ -200,7 +200,7 @@ def send_command(
         args = {}
     if start_if_needed:
         try:
-            ensure_daemon_running(headed=headed, clear_user_data=clear_user_data, cdp_url=cdp_url)
+            ensure_daemon_running(headed=headed, clear_user_data=clear_user_data, cdp=cdp)
         except BridgicBrowserCommandError:
             raise
         except Exception as exc:
@@ -226,7 +226,7 @@ def send_command(
 # Daemon lifecycle helpers
 # ---------------------------------------------------------------------------
 
-def _spawn_daemon(headed: bool = False, clear_user_data: bool = False, cdp_url: Optional[str] = None) -> None:
+def _spawn_daemon(headed: bool = False, clear_user_data: bool = False, cdp: Optional[str] = None) -> None:
     """Spawn the daemon as a detached subprocess and wait for its READY_SIGNAL.
 
     Uses a background reader thread so the 30-second timeout is always
@@ -241,7 +241,7 @@ def _spawn_daemon(headed: bool = False, clear_user_data: bool = False, cdp_url: 
     clear_user_data:
         If True, merge ``{"clear_user_data": true}`` into ``BRIDGIC_BROWSER_JSON``
         so the daemon starts with an ephemeral browser profile (no persistence).
-    cdp_url:
+    cdp:
         If set, pass the already-resolved ws:// URL to the daemon via
         ``BRIDGIC_CDP`` so it connects to an existing Chrome instance via CDP
         instead of launching a new browser. Overrides any ``BRIDGIC_CDP``
@@ -257,8 +257,8 @@ def _spawn_daemon(headed: bool = False, clear_user_data: bool = False, cdp_url: 
         if clear_user_data:
             existing["clear_user_data"] = True
         env["BRIDGIC_BROWSER_JSON"] = _json.dumps(existing)
-    if cdp_url:
-        env["BRIDGIC_CDP"] = cdp_url
+    if cdp:
+        env["BRIDGIC_CDP"] = cdp
 
     popen_kwargs: dict[str, Any] = {
         "stdout": subprocess.PIPE,
@@ -332,7 +332,7 @@ def _probe_socket_sync() -> bool:
     return get_transport().probe()
 
 
-def ensure_daemon_running(headed: bool = False, clear_user_data: bool = False, cdp_url: Optional[str] = None) -> None:
+def ensure_daemon_running(headed: bool = False, clear_user_data: bool = False, cdp: Optional[str] = None) -> None:
     """Start the daemon if it is not already running."""
     if RUN_INFO_PATH.exists():
         if _probe_socket_sync():
@@ -351,4 +351,4 @@ def ensure_daemon_running(headed: bool = False, clear_user_data: bool = False, c
                     ) from exc
         remove_run_info()
 
-    _spawn_daemon(headed=headed, clear_user_data=clear_user_data, cdp_url=cdp_url)
+    _spawn_daemon(headed=headed, clear_user_data=clear_user_data, cdp=cdp)

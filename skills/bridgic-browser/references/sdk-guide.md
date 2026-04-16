@@ -126,21 +126,21 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 
 ## CDP Mode (Connect to Existing Browser)
 
-To connect to an already-running Chrome instead of launching a new one, pass `cdp_url`:
+To connect to an already-running Chrome instead of launching a new one, pass `cdp`:
 
 ```python
-browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/...")
+browser = Browser(cdp="ws://localhost:9222/devtools/browser/...")
 ```
 
-Use `resolve_cdp_input()` to convert user-friendly formats (port, URL, `"auto"`) into a WebSocket URL:
+`Browser(cdp=...)` accepts the same inputs as CLI `--cdp` — port number, `ws://`/`wss://` URL, `http://host:port`, or `"auto"` — and resolves them lazily on first use:
 
 ```python
-from bridgic.browser import resolve_cdp_input
-
-ws_url = resolve_cdp_input("9222")       # queries localhost:9222/json/version
-ws_url = resolve_cdp_input("auto")       # scans local Chrome/Chromium/Brave profiles
-browser = Browser(cdp_url=ws_url)
+browser = Browser(cdp="9222")       # port → resolved on _start()
+browser = Browser(cdp="auto")       # scan local Chrome/Chromium/Brave profiles
+browser = Browser(cdp="http://host:9222")
 ```
+
+`resolve_cdp_input()` is also still exported for the rare case where you want to normalise the value up front.
 
 Notes:
 - Stealth launch args are **not** applied (the Chrome process is already running), but the JS init script is still registered for new pages.

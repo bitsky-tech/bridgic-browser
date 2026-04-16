@@ -365,7 +365,7 @@ def resolve_cdp_input(value: str) -> str:
     Returns
     -------
     str
-        A ``ws://`` or ``wss://`` WebSocket URL ready to pass to ``Browser(cdp_url=...)``.
+        A ``ws://`` or ``wss://`` WebSocket URL ready to pass to ``Browser(cdp=...)``.
 
     Raises
     ------
@@ -687,6 +687,21 @@ async def _cdp_evaluate_on_element(cdp_context, page, locator, code: str) -> Any
         # first bbox() and the elementFromPoint call — the objectId we hold
         # points at a different element than the locator resolves now.
         bbox_after = await locator.bounding_box()
+        # M4: CSS `scroll-behavior: smooth` animates `scrollIntoViewIfNeeded`
+        # across multiple frames. The first post-check can catch the element
+        # mid-animation; if so, wait a short beat and re-probe once. A single
+        # retry is enough for typical smooth-scroll durations (~300ms) while
+        # bounding the latency we add to the common no-race case.
+        _bbox_changed = (
+            bbox_after is None
+            or abs(bbox_after["x"] - bbox["x"]) > 1
+            or abs(bbox_after["y"] - bbox["y"]) > 1
+            or abs(bbox_after["width"] - bbox["width"]) > 1
+            or abs(bbox_after["height"] - bbox["height"]) > 1
+        )
+        if _bbox_changed:
+            await asyncio.sleep(0.1)
+            bbox_after = await locator.bounding_box()
         if bbox_after is None:
             raise RuntimeError(
                 "Element disappeared during CDP resolution — possible scroll race"
@@ -1100,7 +1115,12 @@ class Browser:
         # === Stealth mode (enabled by default for best anti-detection) ===
         stealth: Union[bool, StealthConfig, None] = None,
         # === CDP connection (connect to an existing Chrome instance) ===
-        cdp_url: Optional[str] = None,
+        # Accepts the same inputs as the CLI ``--cdp`` flag: a bare port
+        # number (``"9222"``), a ``ws://`` / ``wss://`` URL, an
+        # ``http://host:port`` endpoint, or ``"auto"`` to auto-discover a
+        # running Chrome. The input is stored raw and resolved to a
+        # ``ws://`` URL lazily inside ``_start()``.
+        cdp: Optional[str] = None,
         # === Browser launch parameters (commonly used) ===
         channel: Optional[str] = None,
         executable_path: Optional[Union[str, Path]] = None,
@@ -1129,25 +1149,14 @@ class Browser:
         # Resolve parameters: explicit (non-None) > config > default.
         # Always pop named-param keys from _cfg so they don't leak into
         # _extra_kwargs (which would corrupt get_config() and Playwright options).
-        cdp_url = cdp_url if cdp_url is not None else _cfg.pop('cdp_url', None)
-        # Normalize cdp_url for *all* sources (config file, explicit ctor arg).
-        # The CLI client and the daemon already run resolve_cdp_input() before
-        # they pass us a value, but a config file like {"cdp_url": "9222"} or
-        # {"cdp_url": "auto"} would otherwise reach Playwright's
-        # connect_over_cdp() unchanged and crash deep in the driver. ws://
-        # and wss:// inputs short-circuit (no extra work, no I/O).
-        if cdp_url is not None and not (
-            isinstance(cdp_url, str)
-            and (cdp_url.startswith("ws://") or cdp_url.startswith("wss://"))
-        ):
-            try:
-                cdp_url = resolve_cdp_input(str(cdp_url))
-            except (RuntimeError, ValueError, ConnectionError) as exc:
-                raise InvalidInputError(
-                    f"Failed to resolve cdp_url={cdp_url!r}: {exc}",
-                    code="INVALID_CDP_URL",
-                    details={"cdp_url": cdp_url, "source": "config_or_argument"},
-                ) from exc
+        cdp = cdp if cdp is not None else _cfg.pop('cdp', None)
+        # NOTE: we no longer run resolve_cdp_input() here. It can hit the
+        # network (/json/version probes for port/http/auto inputs), which
+        # would make `Browser(cdp="9222")` block the constructor —
+        # unsafe inside an event loop and surprising for an SDK __init__.
+        # The raw value is stored on `self._cdp_raw` and resolved lazily
+        # inside the async `_start()` method below (wrapped with
+        # `asyncio.to_thread` so the loop isn't blocked).
         headless = headless if headless is not None else _cfg.pop('headless', True)
         stealth = stealth if stealth is not None else _cfg.pop('stealth', True)
         viewport = viewport if viewport is not None else _cfg.pop('viewport', None)
@@ -1171,7 +1180,7 @@ class Browser:
         color_scheme = color_scheme if color_scheme is not None else _cfg.pop('color_scheme', None)
         # Remove any named-param keys that were skipped above (explicit value won)
         for _named_key in (
-            'cdp_url', 'headless', 'stealth', 'viewport', 'user_data_dir',
+            'cdp', 'headless', 'stealth', 'viewport', 'user_data_dir',
             'clear_user_data', 'channel', 'executable_path', 'proxy', 'timeout',
             'slow_mo', 'args', 'ignore_default_args', 'downloads_path', 'devtools',
             'user_agent', 'locale', 'timezone_id', 'ignore_https_errors',
@@ -1228,8 +1237,15 @@ class Browser:
         if self._stealth_config and self._stealth_config.enabled:
             self._stealth_builder = StealthArgsBuilder(self._stealth_config)
 
-        # CDP connection URL (if set, connect_over_cdp() is used instead of launch)
-        self._cdp_url = cdp_url
+        # CDP connection.
+        # `_cdp_raw` is the user-supplied input (port / ws:// / wss:// /
+        # http:// / "auto"). `_cdp_resolved` is the resolved ws:// URL,
+        # populated lazily by `_start()` — it is `None` until the browser
+        # has been started. Use `_cdp_raw is not None` to ask "did the user
+        # request CDP mode?"; use `_cdp_resolved` after start when the
+        # resolved ws URL is required.
+        self._cdp_raw: Optional[str] = cdp
+        self._cdp_resolved: Optional[str] = None
         # Whether bridgic created the CDP context (vs borrowing an existing one).
         # When True, close() will close the context; when False it only disconnects.
         self._cdp_context_owned = False
@@ -1290,7 +1306,17 @@ class Browser:
         # committing its result under `_snapshot_lock`. Without this a task
         # returning from its await between cancel and commit could clobber
         # a fresh page's cache with a stale snapshot. (C4.)
+        # Invariant: `_prefetch_gen` is bumped synchronously inside
+        # `_cancel_prefetch()` (no awaits before the increment), making it
+        # a single-writer field that does not need a lock for the bump itself.
         self._prefetch_gen: int = 0
+        # I3: dedicated lock for the prefetch commit critical section
+        # (generation check + cache write). Nested inside `_snapshot_lock`
+        # so that concurrent prefetch tasks serialise against each other
+        # independently of user-initiated `get_snapshot` consumers, and so
+        # the invariant is named explicitly at its own lock rather than
+        # relying on `_snapshot_lock` as a catch-all.
+        self._prefetch_lock = asyncio.Lock()
         # Artifacts auto-saved during shutdown (trace/video)
         self._last_shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
         self._last_shutdown_errors: List[str] = []
@@ -1319,15 +1345,36 @@ class Browser:
         """Whether to use persistent context mode (unrelated to headless/headed mode).
 
         Priority (highest to lowest):
-        - cdp_url is set        → always False (connect to existing browser)
+        - cdp is set            → always False (connect to existing browser)
         - clear_user_data=True  → always False (fresh launch+new_context, user_data_dir ignored)
         - clear_user_data=False → always True (persistent; user_data_dir if set, else default dir)
         """
-        # CDP mode: connect to existing browser, never use persistent context
-        if self._cdp_url is not None:
+        # CDP mode: connect to existing browser, never use persistent context.
+        # Check the *raw* input so this property returns the correct answer
+        # even before `_start()` has resolved the URL.
+        if self._cdp_raw is not None:
             return False
 
         return not self._clear_user_data
+
+    @property
+    def _is_cdp_borrowed(self) -> bool:
+        """True when the Browser is running against a CDP-borrowed context.
+
+        A context is *borrowed* when we connected over CDP (``_cdp_resolved``
+        is set) AND bridgic did not create the context itself
+        (``_cdp_context_owned`` is False). Borrowed-context paths must avoid
+        Playwright code that touches ``_mainContext()`` because it hangs on
+        pre-existing tabs.
+
+        This property only makes sense AFTER ``_start()`` has run — before
+        that, ``_cdp_resolved`` is still None (the raw input is stored on
+        ``_cdp_raw`` until lazy resolution inside ``_start()``), and
+        ``_cdp_context_owned`` has its initialisation default. All current
+        call sites are post-start, so checking the resolved ``_cdp_resolved``
+        here matches the previous inline expression exactly.
+        """
+        return bool(self._cdp_resolved) and not self._cdp_context_owned
 
     @property
     def stealth_enabled(self) -> bool:
@@ -1455,7 +1502,10 @@ class Browser:
             "extra_http_headers": self._extra_http_headers,
             "offline": self._offline,
             "color_scheme": self._color_scheme,
-            "cdp_url": self._cdp_url,
+            # Report the raw user-supplied cdp input (pre-resolution) so the
+            # value is visible before _start() runs. The resolved ws:// URL
+            # is only known after the browser connects.
+            "cdp": self._cdp_raw,
             "use_persistent_context": self.use_persistent_context,
             **self._extra_kwargs,
         }
@@ -1733,13 +1783,29 @@ class Browser:
         try:
             self._playwright = await async_playwright().start()
 
-            if self._cdp_url:
+            # Lazy CDP URL resolution. We deliberately defer resolve_cdp_input()
+            # out of __init__ so constructing `Browser(cdp=...)` inside an
+            # event loop never blocks on /json/version. Wrap the sync call in
+            # to_thread because resolve_cdp_input uses urlopen under the hood.
+            if self._cdp_raw and not self._cdp_resolved:
+                try:
+                    self._cdp_resolved = await asyncio.to_thread(
+                        resolve_cdp_input, str(self._cdp_raw)
+                    )
+                except (RuntimeError, ValueError, ConnectionError) as exc:
+                    raise InvalidInputError(
+                        f"Failed to resolve cdp={self._cdp_raw!r}: {exc}",
+                        code="INVALID_CDP_URL",
+                        details={"cdp": self._cdp_raw, "source": "lazy_start"},
+                    ) from exc
+
+            if self._cdp_resolved:
                 # Mode 0: Connect to an already-running Chrome via raw CDP.
                 # Stealth launch args and extensions cannot be applied to an existing
                 # browser process, so they are skipped here.  The JS init script is
                 # still registered so that new pages opened in this session receive it.
-                logger.info("Using CDP connect mode (url=%s)", self._cdp_url)
-                self._browser = await self._playwright.chromium.connect_over_cdp(self._cdp_url)
+                logger.info("Using CDP connect mode (url=%s)", self._cdp_resolved)
+                self._browser = await self._playwright.chromium.connect_over_cdp(self._cdp_resolved)
                 # Playwright invariant for connect_over_cdp() (verified
                 # against playwright-core 1.57):
                 #   chromium.ts _connectOverCDPImpl always passes
@@ -2154,7 +2220,7 @@ class Browser:
         # the very end.  This ensures no Playwright/Chromium process is left orphaned
         # just because one step was interrupted.
         _pending_cancel: Optional[BaseException] = None
-        _is_cdp = self._cdp_url is not None
+        _is_cdp = self._cdp_resolved is not None
 
         # Auto-stop active tracing before context/page teardown so trace data is saved.
         if self._context:
@@ -2686,7 +2752,7 @@ class Browser:
         of Playwright's internal state.  For pages that genuinely cannot run JS
         (e.g. ``chrome://`` internal pages) we fall back to the URL.
         """
-        if self._cdp_url and not self._cdp_context_owned and self._context:
+        if self._is_cdp_borrowed and self._context:
             session = None
             try:
                 session = await self._context.new_cdp_session(page)
@@ -3174,19 +3240,24 @@ class Browser:
             )
 
             async with self._snapshot_lock:
-                if my_gen != self._prefetch_gen:
-                    logger.debug(
-                        "[pre_warm] generation mismatch (own=%d current=%d); discarding result",
-                        my_gen, self._prefetch_gen,
-                    )
-                    return
-                if page.url != target_url or self._page is not page:
-                    logger.debug("[pre_warm] URL changed during pre-warm; discarding result")
-                    return
-                self._prefetch_snapshot = snapshot
-                self._prefetch_options = options
-                self._prefetch_url = target_url
-                logger.info("[pre_warm] snapshot ready for %s", target_url)
+                # I3: inner `_prefetch_lock` serialises the gen-check +
+                # cache-write atomically w.r.t. other prefetch tasks. The
+                # outer `_snapshot_lock` ensures user-initiated get_snapshot
+                # consumers see a coherent view during the commit.
+                async with self._prefetch_lock:
+                    if my_gen != self._prefetch_gen:
+                        logger.debug(
+                            "[pre_warm] generation mismatch (own=%d current=%d); discarding result",
+                            my_gen, self._prefetch_gen,
+                        )
+                        return
+                    if page.url != target_url or self._page is not page:
+                        logger.debug("[pre_warm] URL changed during pre-warm; discarding result")
+                        return
+                    self._prefetch_snapshot = snapshot
+                    self._prefetch_options = options
+                    self._prefetch_url = target_url
+                    logger.info("[pre_warm] snapshot ready for %s", target_url)
         except asyncio.CancelledError:
             logger.debug("[pre_warm] cancelled (navigation superseded)")
         except Exception as e:
@@ -3819,7 +3890,7 @@ Before you return the element ref, reason about the state and elements for a sen
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
-            if self._cdp_url and not self._cdp_context_owned and self._context:
+            if self._is_cdp_borrowed and self._context:
                 # CDP borrowed mode: page.go_back() hangs because Playwright's
                 # navigation tracking relies on _mainContext() which is broken for
                 # pre-existing tabs. Use CDPSession to navigate directly.
@@ -3864,7 +3935,7 @@ Before you return the element ref, reason about the state and elements for a sen
             page = await self.get_current_page()
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
-            if self._cdp_url and not self._cdp_context_owned and self._context:
+            if self._is_cdp_borrowed and self._context:
                 await self._cdp_navigate_history(page, delta=+1)
             else:
                 await asyncio.wait_for(
@@ -4094,7 +4165,7 @@ Before you return the element ref, reason about the state and elements for a sen
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
-            if self._cdp_url and not self._cdp_context_owned and self._context:
+            if self._is_cdp_borrowed and self._context:
                 # CDP borrowed mode: page.evaluate() hangs on pre-existing tabs
                 # because _mainContext() never resolves.  Use a raw CDPSession
                 # Runtime.evaluate call — Chrome responds immediately.
@@ -4395,7 +4466,7 @@ Before you return the element ref, reason about the state and elements for a sen
         queries ``document.body.innerText`` directly from Chrome — no Playwright
         context tracking needed.
         """
-        if self._cdp_url and not self._cdp_context_owned and self._context:
+        if self._is_cdp_borrowed and self._context:
             # Iterate every frame (main + all iframes) to match the non-CDP path.
             #
             # ``new_cdp_session(child_frame)`` silently fails for same-process iframes
@@ -4690,7 +4761,7 @@ Before you return the element ref, reason about the state and elements for a sen
                 "}"
             )
 
-            _cdp_ctx = self._context if (self._cdp_url and not self._cdp_context_owned) else None
+            _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
 
             if clear:
                 if is_vis:
@@ -4814,7 +4885,7 @@ Before you return the element ref, reason about the state and elements for a sen
                     )
                     await locator.dispatch_event("click")
                 else:
-                    _cdp_ctx = self._context if (self._cdp_url and not self._cdp_context_owned) else None
+                    _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
                     covered = await _check_element_covered(locator, cx, cy, cdp_context=_cdp_ctx)
                     if covered:
                         logger.debug("[click_element_by_ref] covered at (%.1f, %.1f), clicking intercepting element", cx, cy)
@@ -4870,7 +4941,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
             # Detect currently selected option(s)
             selected_values: set = set()
-            _cdp_ctx = self._context if (self._cdp_url and not self._cdp_context_owned) else None
+            _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
             if _cdp_ctx is not None:
                 # CDP borrowed mode: locator.evaluate() hangs. Skip — callers
                 # get no [selected] markers, which is a minor cosmetic loss.
@@ -4957,7 +5028,7 @@ Before you return the element ref, reason about the state and elements for a sen
                 logger.warning(f'[select_dropdown_option_by_ref] {msg}')
                 _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
-            _cdp_ctx = self._context if (self._cdp_url and not self._cdp_context_owned) else None
+            _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
             if _cdp_ctx is not None:
                 # CDP borrowed mode: locator.evaluate() (main world) hangs.
                 # locator.select_option() uses the utility world and works correctly.
@@ -5081,7 +5152,7 @@ Before you return the element ref, reason about the state and elements for a sen
                     else:
                         await locator.hover(force=True)
                 else:
-                    _cdp_ctx = self._context if (self._cdp_url and not self._cdp_context_owned) else None
+                    _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
                     covered = await _check_element_covered(locator, cx, cy, cdp_context=_cdp_ctx)
                     if covered:
                         logger.debug("[hover_element_by_ref] covered at (%.1f, %.1f), moving mouse to coordinates", cx, cy)
@@ -5183,7 +5254,7 @@ Before you return the element ref, reason about the state and elements for a sen
                 logger.warning(f'[evaluate_javascript_on_ref] {msg}')
                 _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
-            if self._cdp_url and not self._cdp_context_owned and self._context:
+            if self._is_cdp_borrowed and self._context:
                 # CDP borrowed mode: try native evaluate first (works on pages
                 # navigated via page.goto() — including iframe elements).
                 # Falls back to CDPSession bypass only on truly pre-existing
@@ -5264,7 +5335,7 @@ Before you return the element ref, reason about the state and elements for a sen
             # In CDP borrowed mode use get_attribute() (utility world) instead of
             # locator.evaluate() which hangs. get_attribute("type") works reliably
             # because Playwright's attribute queries use the utility world.
-            if self._cdp_url and not self._cdp_context_owned:
+            if self._is_cdp_borrowed:
                 # get_attribute returns None for elements that don't have the attribute,
                 # and '' for elements that have it but with no value. A file input
                 # always has an explicit type="file" so a None/non-"file" result means
@@ -5424,7 +5495,7 @@ Before you return the element ref, reason about the state and elements for a sen
                         )
                         await locator.dispatch_event("click")
                     else:
-                        _cdp_ctx = self._context if (self._cdp_url and not self._cdp_context_owned) else None
+                        _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
                         covered = await _check_element_covered(locator, cx, cy, cdp_context=_cdp_ctx)
                         if covered:
                             logger.debug("[check_checkbox_or_radio_by_ref] covered at (%.1f, %.1f), clicking intercepting element", cx, cy)
@@ -5442,7 +5513,7 @@ Before you return the element ref, reason about the state and elements for a sen
                     else:
                         await _locator_action_with_fallback(locator, action="check")
             else:
-                _cdp_ctx = self._context if (self._cdp_url and not self._cdp_context_owned) else None
+                _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
                 page = await self.get_current_page()
                 await _click_checkable_target(page, locator, bbox, cdp_context=_cdp_ctx)
 
@@ -5522,7 +5593,7 @@ Before you return the element ref, reason about the state and elements for a sen
                         )
                         await locator.dispatch_event("click")
                     else:
-                        _cdp_ctx = self._context if (self._cdp_url and not self._cdp_context_owned) else None
+                        _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
                         covered = await _check_element_covered(locator, cx, cy, cdp_context=_cdp_ctx)
                         if covered:
                             logger.debug("[uncheck_checkbox_by_ref] covered at (%.1f, %.1f), clicking intercepting element", cx, cy)
@@ -5540,7 +5611,7 @@ Before you return the element ref, reason about the state and elements for a sen
                     else:
                         await _locator_action_with_fallback(locator, action="uncheck")
             else:
-                _cdp_ctx = self._context if (self._cdp_url and not self._cdp_context_owned) else None
+                _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
                 page = await self.get_current_page()
                 await _click_checkable_target(page, locator, bbox, cdp_context=_cdp_ctx)
 
@@ -5613,7 +5684,7 @@ Before you return the element ref, reason about the state and elements for a sen
                     )
                     await locator.dispatch_event("dblclick")
                 else:
-                    _cdp_ctx = self._context if (self._cdp_url and not self._cdp_context_owned) else None
+                    _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
                     covered = await _check_element_covered(locator, cx, cy, cdp_context=_cdp_ctx)
                     if covered:
                         logger.debug("[double_click_element_by_ref] covered at (%.1f, %.1f), dispatching dblclick on intercepting element", cx, cy)
@@ -7038,7 +7109,7 @@ Before you return the element ref, reason about the state and elements for a sen
                 local_storage = origin_data.get("localStorage", [])
 
                 if local_storage and origin:
-                    if self._cdp_url and not self._cdp_context_owned and self._context:
+                    if self._is_cdp_borrowed and self._context:
                         # CDP borrowed mode: page.evaluate() hangs. Use DOMStorage CDP protocol.
                         # DOMStorage.setDOMStorageItem may fail with "Frame not found" when
                         # the target origin has no active frame — this is expected in CDP

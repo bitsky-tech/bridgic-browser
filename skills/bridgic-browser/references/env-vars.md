@@ -33,7 +33,7 @@ Notes:
 | `viewport` | `{ "width": int, "height": int }` or `null` | Default `1600x900` when `no_viewport` is not set. |
 | `user_data_dir` | string (path) | Custom path for persistent profile. Ignored when `clear_user_data=true`. |
 | `clear_user_data` | `true | false` | Default `false`. If `true`, use ephemeral session (`launch`+`new_context`, no profile saved). If `false`, use persistent profile (defaults to `~/.bridgic/bridgic-browser/user_data/`). |
-| `cdp_url` | string | Connect to existing Chrome via CDP instead of launching. Accepts any format supported by `resolve_cdp_input()` (port, `ws://`/`wss://` URL, `http://host:port`, `auto`); non-WebSocket values are auto-resolved at startup. Can be set via config JSON, `BRIDGIC_CDP` env var, or `--cdp` CLI flag. |
+| `cdp` | string | Connect to existing Chrome via CDP instead of launching. Accepts any format supported by `resolve_cdp_input()` (port, `ws://`/`wss://` URL, `http://host:port`, `auto`); non-WebSocket values are auto-resolved at startup. Can be set via config JSON, `BRIDGIC_CDP` env var, or `--cdp` CLI flag. |
 | `stealth` | `true | false` or object | Object uses the StealthConfig keys below. |
 | `channel` | string | Examples: `"chrome"`, `"msedge"`, `"chromium"`. |
 | `executable_path` | string (path) | Custom browser binary path. |

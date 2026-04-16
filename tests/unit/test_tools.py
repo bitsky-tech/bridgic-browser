@@ -22,7 +22,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from bridgic.browser._cli_catalog import (
@@ -45,6 +45,14 @@ from bridgic.browser.session import Browser
 def mock_browser():
     """Create a comprehensive mock Browser instance."""
     browser = MagicMock()
+    # Default to launch-mode (non-CDP-borrowed) so the ``_is_cdp_borrowed``
+    # property does not auto-coerce to a truthy MagicMock and spuriously
+    # route these tests through the CDP-specific code paths. Tests that
+    # *do* exercise CDP paths can override this on the fixture.
+    browser._is_cdp_borrowed = False
+    browser._cdp_resolved = None
+    browser._cdp_raw = None
+    browser._cdp_context_owned = True
     mock_page = MagicMock()
     mock_page.goto = AsyncMock()
     browser._page = mock_page
@@ -209,7 +217,7 @@ class TestNavigationTools:
     async def test_search_engines(self, mock_browser, engine, expected_domain):
         """Test search with different engines."""
 
-        result = await Browser.search(mock_browser, "test query", engine)
+        await Browser.search(mock_browser, "test query", engine)
 
         mock_browser.navigate_to.assert_called_once()
         call_url = mock_browser.navigate_to.call_args[0][0]
@@ -240,7 +248,7 @@ class TestNavigationTools:
         """Test navigate_to adds http:// if missing."""
         mock_browser._page.goto = AsyncMock()
 
-        result = await Browser.navigate_to(mock_browser, "example.com")
+        await Browser.navigate_to(mock_browser, "example.com")
 
         mock_browser._page.goto.assert_called_once_with(
             "http://example.com", wait_until="domcontentloaded"
@@ -353,7 +361,7 @@ class TestPageControlTools:
 
         mock_browser._wait_for_text_across_frames = AsyncMock()
 
-        result = await Browser.wait_for(mock_browser, text="Loading complete")
+        await Browser.wait_for(mock_browser, text="Loading complete")
 
         mock_browser._wait_for_text_across_frames.assert_called_once()
         args, kwargs = mock_browser._wait_for_text_across_frames.call_args
@@ -410,7 +418,7 @@ class TestTabManagementTools:
         """Test new_tab with URL."""
         mock_browser._new_page.return_value = MagicMock()
 
-        result = await Browser.new_tab(mock_browser, "https://example.com")
+        await Browser.new_tab(mock_browser, "https://example.com")
 
         mock_browser._new_page.assert_called_once_with(
             "https://example.com", wait_until="domcontentloaded", timeout=None
@@ -467,7 +475,7 @@ class TestElementInteractionTools:
         mock_locator.is_visible = AsyncMock(return_value=True)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
-        result = await Browser.click_element_by_ref(mock_browser, "e1")
+        await Browser.click_element_by_ref(mock_browser, "e1")
 
         mock_browser.get_element_by_ref.assert_called_once_with("e1")
         mock_locator.click.assert_called_once()
@@ -527,7 +535,7 @@ class TestElementInteractionTools:
         mock_locator.is_visible = AsyncMock(return_value=True)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
-        result = await Browser.input_text_by_ref(mock_browser, "e1", "test text")
+        await Browser.input_text_by_ref(mock_browser, "e1", "test text")
 
         mock_locator.clear.assert_called_once()
         mock_locator.fill.assert_called_once_with("test text")
@@ -559,7 +567,7 @@ class TestElementInteractionTools:
         mock_locator.is_visible = AsyncMock(return_value=True)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
-        result = await Browser.hover_element_by_ref(mock_browser, "e1")
+        await Browser.hover_element_by_ref(mock_browser, "e1")
 
         mock_locator.hover.assert_called_once()
 
@@ -572,7 +580,7 @@ class TestElementInteractionTools:
         mock_locator.is_visible = AsyncMock(return_value=True)
         mock_browser.get_element_by_ref.return_value = mock_locator
 
-        result = await Browser.focus_element_by_ref(mock_browser, "e1")
+        await Browser.focus_element_by_ref(mock_browser, "e1")
 
         mock_locator.focus.assert_called_once()
 
@@ -636,7 +644,7 @@ class TestElementInteractionTools:
         mock_locator.select_option = AsyncMock()
         mock_browser.get_element_by_ref.return_value = mock_locator
 
-        result = await Browser.select_dropdown_option_by_ref(mock_browser, "e1", "Option 1")
+        await Browser.select_dropdown_option_by_ref(mock_browser, "e1", "Option 1")
 
         mock_locator.select_option.assert_called()
 
@@ -653,7 +661,7 @@ class TestElementInteractionTools:
         mock_locator.set_input_files = AsyncMock()
         mock_browser.get_element_by_ref.return_value = mock_locator
 
-        result = await Browser.upload_file_by_ref(mock_browser, "e1", str(test_file))
+        await Browser.upload_file_by_ref(mock_browser, "e1", str(test_file))
 
         mock_locator.set_input_files.assert_called_once()
 
@@ -916,7 +924,7 @@ class TestMouseTools:
     async def test_mouse_click_with_button(self, mock_browser):
         """Test mouse_click with specific button."""
 
-        result = await Browser.mouse_click(mock_browser, x=150, y=250, button="right")
+        await Browser.mouse_click(mock_browser, x=150, y=250, button="right")
 
         mock_page = mock_browser.get_current_page.return_value
         mock_page.mouse.click.assert_called_once()
@@ -962,6 +970,7 @@ class TestMouseTools:
     ])
     async def test_mouse_wheel(self, mock_browser, delta_x, delta_y, direction):
         """Test mouse_wheel scrolling with various deltas."""
+        _ = direction  # parametrize label only
 
         result = await Browser.mouse_wheel(mock_browser, delta_x=delta_x, delta_y=delta_y)
 
@@ -1072,7 +1081,7 @@ class TestScreenshotTools:
     """Tests for screenshot and PDF tools."""
 
     @pytest.mark.asyncio
-    async def test_take_screenshot(self, mock_browser, temp_dir):
+    async def test_take_screenshot(self, mock_browser):
         """Test taking a screenshot."""
 
         result = await Browser.take_screenshot(mock_browser)
@@ -1085,7 +1094,7 @@ class TestScreenshotTools:
     async def test_take_screenshot_full_page(self, mock_browser):
         """Test taking a full-page screenshot."""
 
-        result = await Browser.take_screenshot(mock_browser, full_page=True)
+        await Browser.take_screenshot(mock_browser, full_page=True)
 
         mock_page = mock_browser.get_current_page.return_value
         mock_page.screenshot.assert_called_once()
@@ -1504,7 +1513,7 @@ class TestDevTools:
         assert result == "Tracing started"
 
     @pytest.mark.asyncio
-    async def test_stop_tracing(self, mock_browser, temp_dir):
+    async def test_stop_tracing(self, mock_browser):
         """Test stopping trace recording."""
         with pytest.raises(StateError) as exc_info:
             await Browser.stop_tracing(mock_browser)

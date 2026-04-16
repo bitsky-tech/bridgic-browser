@@ -48,7 +48,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
-logger = logging.getLogger("bridgic.browser")
+logger = logging.getLogger(__name__)
 
 # 25 fps — matches Playwright's videoRecorder.ts (line 17: ``const fps = 25;``).
 _FPS = 25
@@ -239,9 +239,27 @@ class VideoRecorder:
 
         # Frame state — mirrors FfmpegVideoRecorder in Playwright's
         # videoRecorder.ts (lines 98-103).
-        self._first_frame_ts: float = 0.0                              # timestamp of the first frame; used to compute frame numbers
-        self._last_frame: Optional[Tuple[bytes, float, int]] = None    # (jpeg_bytes, timestamp, frame_number)
-        self._last_write_time: float = 0.0                             # monotonic time of the last write_frame() call
+        #
+        # M2 — clock types (do NOT mix):
+        #   * `_first_frame_ts`   — CDP wall-clock seconds (metadata.timestamp)
+        #                           unless no CDP frame ever arrived, in which
+        #                           case the stop() path seeds it with a
+        #                           time.monotonic() value. Either way, all
+        #                           downstream deltas in _write_frame are
+        #                           consistent because the *same* clock fills
+        #                           both operands (timestamp and _first_frame_ts
+        #                           come from the same call site).
+        #   * `_last_frame[1]`    — same clock as _first_frame_ts (see above).
+        #   * `_last_write_time`  — always time.monotonic().
+        #
+        # The only place a cross-clock arithmetic happens is in prepare_stop()
+        # (line ~508): `time.monotonic() - _last_write_time` is a *duration*
+        # and is added to `_last_frame[1]`. Durations are clock-agnostic, so
+        # the sum stays in _last_frame[1]'s clock. Never subtract monotonic
+        # from wall-clock (or vice versa) — only add/subtract durations.
+        self._first_frame_ts: float = 0.0                              # timestamp of the first frame; used to compute frame numbers (wall-clock OR monotonic — see note above)
+        self._last_frame: Optional[Tuple[bytes, float, int]] = None    # (jpeg_bytes, timestamp[same clock as _first_frame_ts], frame_number)
+        self._last_write_time: float = 0.0                             # monotonic seconds of the last _write_frame() call
         self._frame_queue: deque[bytes] = deque()                        # frames waiting to be written to ffmpeg's stdin
         self._is_stopped = False
         self._write_lock = asyncio.Lock()                              # serializes writes to ffmpeg's stdin

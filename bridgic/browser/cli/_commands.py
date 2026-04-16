@@ -134,16 +134,16 @@ def cli() -> None:
 )
 def cmd_open(url: str, headed: bool, clear_user_data: bool, cdp: str | None) -> None:
     """Navigate to URL (starts a browser session if needed)."""
-    cdp_url: str | None = None
+    resolved_cdp: str | None = None
     if cdp:
         from bridgic.browser.session._browser import resolve_cdp_input
         try:
-            cdp_url = resolve_cdp_input(cdp)
+            resolved_cdp = resolve_cdp_input(cdp)
         except Exception as exc:
             _err(exc)
             return
     try:
-        _ok(send_command("open", {"url": url}, headed=headed, clear_user_data=clear_user_data, cdp_url=cdp_url))
+        _ok(send_command("open", {"url": url}, headed=headed, clear_user_data=clear_user_data, cdp=resolved_cdp))
     except Exception as exc:
         _err(exc)
 
@@ -196,16 +196,16 @@ def cmd_reload() -> None:
 )
 def cmd_search(query: str, engine: str, headed: bool, clear_user_data: bool, cdp: str | None) -> None:
     """Search the web using a search engine (starts a browser session if needed)."""
-    cdp_url: str | None = None
+    resolved_cdp: str | None = None
     if cdp:
         from bridgic.browser.session._browser import resolve_cdp_input
         try:
-            cdp_url = resolve_cdp_input(cdp)
+            resolved_cdp = resolve_cdp_input(cdp)
         except Exception as exc:
             _err(exc)
             return
     try:
-        _ok(send_command("search", {"query": query, "engine": engine}, headed=headed, clear_user_data=clear_user_data, cdp_url=cdp_url))
+        _ok(send_command("search", {"query": query, "engine": engine}, headed=headed, clear_user_data=clear_user_data, cdp=resolved_cdp))
     except Exception as exc:
         _err(exc)
 

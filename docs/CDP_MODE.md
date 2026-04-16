@@ -5,8 +5,11 @@ Connect to an already-running Chrome instance instead of launching a new one.
 ```python
 from bridgic.browser import Browser
 
-# SDK
-browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/abc")
+# SDK — accepts the same inputs as CLI --cdp (port / ws / wss / http / "auto")
+browser = Browser(cdp="9222")
+browser = Browser(cdp="auto")
+browser = Browser(cdp="http://host:9222")
+browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc")
 
 # CLI (both open and search support --cdp)
 bridgic-browser open https://example.com --cdp 9222
@@ -14,6 +17,8 @@ bridgic-browser open https://example.com --cdp auto
 bridgic-browser open https://example.com --cdp "ws://localhost:9222/..."
 bridgic-browser search "query" --cdp 9222
 ```
+
+> **Lazy resolution.** The SDK's `Browser(cdp=...)` constructor does not perform any network I/O — it merely stores the raw value. The input is normalised to a `ws://` URL (via `/json/version` probes for port / http / auto) on the first `await browser._start()`, which is also what `await browser.navigate_to(...)` / `await browser.search(...)` trigger automatically. This makes `Browser(cdp="auto")` safe to construct inside a running event loop. A malformed value raises `InvalidInputError` on first use, not at construction time.
 
 ## Starting Chrome with CDP enabled
 
@@ -71,7 +76,7 @@ Then use `--cdp 9222`, `--cdp auto` (scan), or the explicit `ws://` URL.
 
 ## How it works
 
-`Browser(cdp_url=...)` calls Playwright's `connect_over_cdp()` instead of `launch()`. The existing browser's default context is borrowed — bridgic operates as a guest on someone else's browser, sharing cookies, localStorage, and login state with the user's real Chrome session. (That session sharing is the whole point of CDP mode.)
+`Browser(cdp=...)` calls Playwright's `connect_over_cdp()` instead of `launch()`. The existing browser's default context is borrowed — bridgic operates as a guest on someone else's browser, sharing cookies, localStorage, and login state with the user's real Chrome session. (That session sharing is the whole point of CDP mode.)
 
 ## Tab ownership in CDP mode
 

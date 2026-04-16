@@ -1,10 +1,10 @@
 """Unit tests for the daemon's ``_cdp_reconnect`` helper (C-3)."""
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from bridgic.browser.cli._daemon import _cdp_reconnect
+from bridgic.browser.cli._daemon import _cdp_reconnect, _dispatch_inner
 
 
 @pytest.fixture
@@ -38,6 +38,9 @@ class TestCdpReconnect:
 
         browser_stub.close.assert_awaited_once()
         browser_stub._start.assert_awaited_once()
+        # N4: symmetric to test_cancels_prefetch_before_close — the up-front
+        # _cancel_prefetch() must fire on the happy path too.
+        browser_stub._cancel_prefetch.assert_called_once()
         # All four handles reset to None before _start runs.
         assert browser_stub._playwright is None
         assert browser_stub._browser is None
@@ -152,3 +155,65 @@ class TestCdpReconnect:
         assert observed["br"] is None
         assert observed["ctx"] is None
         assert observed["pg"] is None
+
+
+class TestDispatchDetectsPlaywrightClose:
+    """I2: a raw Playwright Error surfacing from a handler must trigger the
+    one-shot ``_cdp_reconnect`` path. This locks in the isinstance-based
+    detection so Playwright upstream rewording the message won't silently
+    regress the reconnect behaviour."""
+
+    @pytest.mark.asyncio
+    async def test_playwright_error_target_closed_triggers_reconnect(self):
+        from playwright.async_api import Error as PlaywrightError
+
+        browser = MagicMock()
+        browser._cdp_resolved = "ws://127.0.0.1:9222/devtools/browser/abc"
+        browser._closing = False
+
+        # First call raises a bare Playwright Error (not a TargetClosedError
+        # subclass); second call succeeds. This proves the substring branch
+        # is still engaged for the generic parent class.
+        handler = AsyncMock(side_effect=[PlaywrightError("Target closed"), "ok"])
+
+        with patch.dict(
+            "bridgic.browser.cli._daemon._HANDLERS",
+            {"open": handler},
+            clear=False,
+        ), patch(
+            "bridgic.browser.cli._daemon._cdp_reconnect",
+            new=AsyncMock(return_value=True),
+        ) as reconnect_mock:
+            resp = await _dispatch_inner(browser, "open", {"url": "https://x"})
+
+        reconnect_mock.assert_awaited_once_with(browser)
+        assert handler.await_count == 2
+        assert resp["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_target_closed_error_isinstance_triggers_reconnect(self):
+        """A ``TargetClosedError`` with an unfamiliar message still reconnects
+        (isinstance short-circuit — no reliance on substring matching)."""
+        from playwright._impl._errors import TargetClosedError
+
+        browser = MagicMock()
+        browser._cdp_resolved = "ws://127.0.0.1:9222/devtools/browser/abc"
+        browser._closing = False
+
+        handler = AsyncMock(side_effect=[
+            TargetClosedError("some future message with no known substring"),
+            "ok",
+        ])
+
+        with patch.dict(
+            "bridgic.browser.cli._daemon._HANDLERS",
+            {"open": handler},
+            clear=False,
+        ), patch(
+            "bridgic.browser.cli._daemon._cdp_reconnect",
+            new=AsyncMock(return_value=True),
+        ) as reconnect_mock:
+            resp = await _dispatch_inner(browser, "open", {"url": "https://x"})
+
+        reconnect_mock.assert_awaited_once_with(browser)
+        assert resp["success"] is True

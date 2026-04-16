@@ -273,7 +273,7 @@ bridgic-browser open https://example.com --cdp auto
 SDK equivalent:
 
 ```python
-browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/...")
+browser = Browser(cdp="ws://localhost:9222/devtools/browser/...")
 ```
 
 #### Command List
@@ -554,7 +554,7 @@ browser = Browser(
 | `user_data_dir` | str/Path | None | Custom path for persistent profile (ignored when `clear_user_data=True`) |
 | `clear_user_data` | bool | False | If True, use ephemeral session (no profile); if False, use persistent profile |
 | `stealth` | bool/StealthConfig | True | Stealth mode configuration |
-| `cdp_url` | str | None | WebSocket URL to connect to an existing Chrome via CDP (skips launch) |
+| `cdp` | str | None | Connect to an existing Chrome via CDP (skips launch). Accepts port number, `ws://` / `wss://` URL, `http://host:port`, or `"auto"` — mirrors the CLI `--cdp` flag. |
 | `channel` | str | None | Browser channel (chrome, msedge, etc.) |
 | `proxy` | dict | None | Proxy settings |
 | `downloads_path` | str/Path | None | Download directory |

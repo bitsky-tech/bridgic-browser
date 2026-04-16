@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 from .._config import _load_config_sources
 from .._constants import BRIDGIC_BROWSER_HOME, BRIDGIC_DOWNLOADS_DIR
 from ..errors import BridgicBrowserError, InvalidInputError
+from ..session._browser import resolve_cdp_input
 from ._transport import (
     get_transport,
     read_run_info,
@@ -55,24 +56,46 @@ _BROWSER_CLOSED_PATTERNS = (
     "target closed",
 )
 
+# Playwright error classes. We match TargetClosedError (and its parent Error)
+# via isinstance as the primary signal; the substring match above is a fallback
+# for wrapped / non-Playwright exceptions that still carry closed-browser text.
+try:
+    from playwright.async_api import Error as _PlaywrightError  # type: ignore
+except ImportError:  # pragma: no cover — playwright is a hard dependency
+    _PlaywrightError = None  # type: ignore[assignment]
+
+try:
+    from playwright._impl._errors import TargetClosedError as _TargetClosedError  # type: ignore
+except ImportError:  # pragma: no cover
+    _TargetClosedError = None  # type: ignore[assignment]
+
 
 def _is_browser_closed_error(exc: BaseException) -> bool:
+    # Primary signal: Playwright raises TargetClosedError when the browser/page
+    # is gone. isinstance is robust against Playwright tweaking the message text
+    # between releases. We also accept any playwright.async_api.Error whose
+    # message matches the known closed-browser substrings.
+    if _TargetClosedError is not None and isinstance(exc, _TargetClosedError):
+        return True
     msg = str(exc).lower()
+    if _PlaywrightError is not None and isinstance(exc, _PlaywrightError):
+        if any(pat in msg for pat in _BROWSER_CLOSED_PATTERNS):
+            return True
     return any(pat in msg for pat in _BROWSER_CLOSED_PATTERNS)
 
 
-def _browser_closed_hint(cdp_url: Optional[str] = None) -> str:
+def _browser_closed_hint(cdp: Optional[str] = None) -> str:
     """Return a BROWSER_CLOSED hint message tailored to the connection mode."""
-    if cdp_url:
+    if cdp:
         # For local Chrome (localhost/127.0.0.1), show port number instead of the full ws:// URL
         # because the browser UUID in the URL changes on every Chrome restart.
-        _parsed = urlparse(cdp_url)
+        _parsed = urlparse(cdp)
         _host = (_parsed.hostname or "").lower()
         if _host in ("localhost", "127.0.0.1", "::1"):
             _cdp_hint = str(_parsed.port or 9222)
             _msg = "Local Chrome closed or crashed."
         else:
-            _cdp_hint = cdp_url
+            _cdp_hint = cdp
             _msg = "Remote browser session closed (the cloud/remote browser disconnected or timed out)."
         return (
             f"{_msg} "
@@ -665,7 +688,7 @@ async def _dispatch_inner(browser: "Browser", command: str, args: Dict[str, Any]
             error_code="UNKNOWN_COMMAND",
         )
 
-    cdp_url: Optional[str] = getattr(browser, "_cdp_url", None)
+    cdp: Optional[str] = getattr(browser, "_cdp_resolved", None)
     # C2 short-circuit: if close() has already published its sentinel,
     # reject the dispatch immediately. The `close` command itself is
     # allowed through so repeated close calls remain idempotent.
@@ -674,13 +697,13 @@ async def _dispatch_inner(browser: "Browser", command: str, args: Dict[str, Any]
     if command != "close" and getattr(browser, "_closing", False) is True:
         return _response(
             success=False,
-            result=_browser_closed_hint(cdp_url),
+            result=_browser_closed_hint(cdp),
             error_code="BROWSER_CLOSED",
         )
     # In CDP mode, attempt one automatic reconnect when the remote session drops.
     # This helps with cloud-browser session timeouts (Browserless, Steel.dev, etc.).
     # We do NOT reconnect for `close` (shutdown intent) or if there is no CDP URL.
-    _max_attempts = 2 if (cdp_url and command != "close") else 1
+    _max_attempts = 2 if (cdp and command != "close") else 1
 
     for _attempt in range(_max_attempts):
         try:
@@ -700,7 +723,7 @@ async def _dispatch_inner(browser: "Browser", command: str, args: Dict[str, Any]
                         continue  # retry the command with the refreshed connection
                 return _response(
                     success=False,
-                    result=_browser_closed_hint(cdp_url),
+                    result=_browser_closed_hint(cdp),
                     error_code="BROWSER_CLOSED",
                 )
             return _response(
@@ -721,7 +744,7 @@ async def _dispatch_inner(browser: "Browser", command: str, args: Dict[str, Any]
                         continue  # retry
                 return _response(
                     success=False,
-                    result=_browser_closed_hint(cdp_url),
+                    result=_browser_closed_hint(cdp),
                     error_code="BROWSER_CLOSED",
                 )
             logger.exception("[daemon] command=%s error", command)
@@ -738,7 +761,7 @@ async def _dispatch_inner(browser: "Browser", command: str, args: Dict[str, Any]
     # returning, the daemon still answers the client with a clean error.
     return _response(
         success=False,
-        result=_browser_closed_hint(cdp_url),
+        result=_browser_closed_hint(cdp),
         error_code="BROWSER_CLOSED",
     )
 
@@ -1046,6 +1069,11 @@ def _resolve_cdp_url_from_env(cdp_input: Optional[str]) -> Optional[str]:
     """
     if not cdp_input:
         return None
+    # I4 invariant: every ws:// / wss:// short-circuit branch MUST call
+    # `_probe_ws_reachable()` before returning. Skipping the probe here
+    # defeats the stale-env protection and reintroduces the Playwright
+    # connect_over_cdp hang. The tests in
+    # `tests/unit/test_daemon_cdp_env.py` lock this contract in.
     if cdp_input.lower().startswith(("ws://", "wss://")):
         try:
             _probe_ws_reachable(cdp_input)
@@ -1056,7 +1084,10 @@ def _resolve_cdp_url_from_env(cdp_input: Optional[str]) -> Optional[str]:
                 "--remote-debugging-port or re-run with a fresh --cdp value."
             ) from exc
         return cdp_input
-    from bridgic.browser.session._browser import resolve_cdp_input
+    # N3: `resolve_cdp_input` is imported at module scope (top of file) so
+    # tests can patch `bridgic.browser.cli._daemon.resolve_cdp_input`
+    # reliably. Patching the source module wouldn't affect the daemon's
+    # local binding if we kept the import inside the function body.
     try:
         return resolve_cdp_input(cdp_input)
     except (RuntimeError, ValueError, ConnectionError) as exc:
@@ -1071,12 +1102,12 @@ async def run_daemon() -> None:
     from bridgic.browser.session._browser import Browser
 
     # Resolve CDP connection if requested via env var.
-    cdp_url: Optional[str] = _resolve_cdp_url_from_env(os.environ.get("BRIDGIC_CDP"))
+    cdp: Optional[str] = _resolve_cdp_url_from_env(os.environ.get("BRIDGIC_CDP"))
 
     # Browser.__init__ auto-loads config from files and env vars.
     kwargs: Dict[str, Any] = {}
-    if cdp_url:
-        kwargs["cdp_url"] = cdp_url
+    if cdp:
+        kwargs["cdp"] = cdp
 
     # Auto-enable downloads in daemon mode.
     # SDK users are unaffected (they control downloads_path explicitly).
@@ -1179,9 +1210,11 @@ async def run_daemon() -> None:
     #
     # Residual micro-race: there is a tiny window between read_run_info() and
     # transport.cleanup() where a new daemon could start and write its run-info.
-    # This window is measured in microseconds (vs. the primary race which spans
-    # the entire browser.close() call — often seconds).  Eliminating it would
-    # require OS-level atomic file locking; the practical risk is negligible.
+    # This window spans one stat+unlink syscall pair — ~low-ms under typical
+    # fs conditions (disk cache/contention can widen it) vs. the primary race
+    # which spans the entire browser.close() call — often seconds. Eliminating
+    # it would require OS-level atomic file locking; the practical risk of
+    # hitting this window is negligible.
     current_info = read_run_info()
     if current_info is None or current_info.get("pid") == os.getpid():
         transport.cleanup()

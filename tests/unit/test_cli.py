@@ -240,7 +240,7 @@ def make_browser() -> MagicMock:
         "trace": [],
         "video": [],
     })
-    b._cdp_url = None  # explicit None so _dispatch treats as local-launch mode
+    b._cdp_resolved = None  # explicit None so _dispatch treats as local-launch mode
     return b
 
 
@@ -424,15 +424,15 @@ class TestCliCommandRouting:
 
     def test_open(self):
         _, sc = invoke(["open", "https://example.com"])
-        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=False, clear_user_data=False, cdp_url=None)
+        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=False, clear_user_data=False, cdp=None)
 
     def test_open_headed(self):
         _, sc = invoke(["open", "--headed", "https://example.com"])
-        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=True, clear_user_data=False, cdp_url=None)
+        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=True, clear_user_data=False, cdp=None)
 
     def test_open_clear_user_data(self):
         _, sc = invoke(["open", "--clear-user-data", "https://example.com"])
-        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=False, clear_user_data=True, cdp_url=None)
+        sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=False, clear_user_data=True, cdp=None)
 
     def test_open_cdp_ws_url_passthrough(self):
         """--cdp ws://... passes through without resolution."""
@@ -441,7 +441,7 @@ class TestCliCommandRouting:
         mock_find.assert_not_called()
         sc.assert_called_once_with(
             "open", {"url": "https://example.com"},
-            headed=False, clear_user_data=False, cdp_url="ws://localhost:9222/devtools/browser/abc",
+            headed=False, clear_user_data=False, cdp="ws://localhost:9222/devtools/browser/abc",
         )
 
     def test_open_cdp_port_number(self):
@@ -451,7 +451,7 @@ class TestCliCommandRouting:
         mock_find.assert_called_once_with(mode="port", host="localhost", port=9222)
         sc.assert_called_once_with(
             "open", {"url": "https://example.com"},
-            headed=False, clear_user_data=False, cdp_url="ws://localhost:9222/devtools/browser/xyz",
+            headed=False, clear_user_data=False, cdp="ws://localhost:9222/devtools/browser/xyz",
         )
 
     def test_open_cdp_http_url(self):
@@ -461,7 +461,7 @@ class TestCliCommandRouting:
         mock_find.assert_called_once_with(mode="port", host="1.2.3.4", port=9222)
         sc.assert_called_once_with(
             "open", {"url": "https://example.com"},
-            headed=False, clear_user_data=False, cdp_url="ws://1.2.3.4:9222/devtools/browser/xyz",
+            headed=False, clear_user_data=False, cdp="ws://1.2.3.4:9222/devtools/browser/xyz",
         )
 
     def test_open_cdp_auto(self):
@@ -471,7 +471,7 @@ class TestCliCommandRouting:
         mock_find.assert_called_once_with(mode="scan")
         sc.assert_called_once_with(
             "open", {"url": "https://example.com"},
-            headed=False, clear_user_data=False, cdp_url="ws://localhost:57234/devtools/browser/auto",
+            headed=False, clear_user_data=False, cdp="ws://localhost:57234/devtools/browser/auto",
         )
 
     def test_open_cdp_wss_url_passthrough(self):
@@ -482,7 +482,7 @@ class TestCliCommandRouting:
         mock_find.assert_not_called()
         sc.assert_called_once_with(
             "open", {"url": "https://example.com"},
-            headed=False, clear_user_data=False, cdp_url=wss_url,
+            headed=False, clear_user_data=False, cdp=wss_url,
         )
 
     def test_open_cdp_invalid_format_shows_error(self):
@@ -506,19 +506,19 @@ class TestCliCommandRouting:
 
     def test_search_default_engine(self):
         _, sc = invoke(["search", "python async"])
-        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=False, clear_user_data=False, cdp_url=None)
+        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=False, clear_user_data=False, cdp=None)
 
     def test_search_custom_engine(self):
         _, sc = invoke(["search", "query", "--engine", "google"])
-        sc.assert_called_once_with("search", {"query": "query", "engine": "google"}, headed=False, clear_user_data=False, cdp_url=None)
+        sc.assert_called_once_with("search", {"query": "query", "engine": "google"}, headed=False, clear_user_data=False, cdp=None)
 
     def test_search_headed(self):
         _, sc = invoke(["search", "--headed", "python async"])
-        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=True, clear_user_data=False, cdp_url=None)
+        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=True, clear_user_data=False, cdp=None)
 
     def test_search_clear_user_data(self):
         _, sc = invoke(["search", "--clear-user-data", "python async"])
-        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=False, clear_user_data=True, cdp_url=None)
+        sc.assert_called_once_with("search", {"query": "python async", "engine": "duckduckgo"}, headed=False, clear_user_data=True, cdp=None)
 
     def test_info(self):
         _, sc = invoke(["info"])
@@ -1241,6 +1241,31 @@ class TestBrowserClosedDetection:
     def test_ignores_unrelated_errors(self):
         assert _is_browser_closed_error(Exception("Element not found")) is False
         assert _is_browser_closed_error(Exception("Timeout exceeded")) is False
+
+    def test_detects_playwright_target_closed_error_isinstance(self):
+        """I2: isinstance check against Playwright's TargetClosedError must win
+        regardless of the exception message — guards against upstream text
+        drift between Playwright releases."""
+        from playwright._impl._errors import TargetClosedError
+
+        exc = TargetClosedError("some future phrasing that no substring matches")
+        assert _is_browser_closed_error(exc) is True
+
+    def test_detects_playwright_error_with_closed_substring(self):
+        """I2: a generic playwright.async_api.Error whose message contains a
+        closed-browser substring is treated as a closed signal."""
+        from playwright.async_api import Error as PlaywrightError
+
+        exc = PlaywrightError("Target closed")
+        assert _is_browser_closed_error(exc) is True
+
+    def test_playwright_error_with_unrelated_message_not_closed(self):
+        """I2: a playwright.async_api.Error with an unrelated message must not
+        be misclassified as a closed-browser error."""
+        from playwright.async_api import Error as PlaywrightError
+
+        exc = PlaywrightError("Element is not visible")
+        assert _is_browser_closed_error(exc) is False
 
     async def test_snapshot_none_returns_hint(self):
         """When get_snapshot_text() returns a failure message (browser gone), propagate it."""
@@ -2780,9 +2805,9 @@ class TestCdpReconnect:
 class TestDispatchCdpReconnect:
     """Tests for _dispatch() CDP reconnect retry logic."""
 
-    def _make_cdp_browser(self, cdp_url="ws://cloud.io/browser/abc"):
+    def _make_cdp_browser(self, cdp="ws://cloud.io/browser/abc"):
         b = make_browser()
-        b._cdp_url = cdp_url
+        b._cdp_resolved = cdp
         return b
 
     async def test_cdp_browser_closed_reconnect_success_retry_success(self):
@@ -2843,7 +2868,7 @@ class TestDispatchCdpReconnect:
         assert resp["error_code"] == "BROWSER_CLOSED"
 
     async def test_non_cdp_browser_closed_no_reconnect(self):
-        browser = make_browser()  # _cdp_url = None
+        browser = make_browser()  # _cdp_resolved = None
         browser.navigate_to = AsyncMock(
             side_effect=RuntimeError("browser has been closed")
         )
@@ -2910,24 +2935,24 @@ class TestSpawnDaemonEnv:
         with patch("subprocess.Popen", side_effect=fake_popen):
             _spawn_daemon(**kwargs)
 
-    def test_cdp_url_sets_env_var(self):
+    def test_cdp_sets_env_var(self):
         captured_env: dict = {}
-        self._run_spawn(captured_env, cdp_url="ws://localhost:9222/devtools/browser/abc")
+        self._run_spawn(captured_env, cdp="ws://localhost:9222/devtools/browser/abc")
         assert captured_env.get("BRIDGIC_CDP") == "ws://localhost:9222/devtools/browser/abc"
 
-    def test_no_cdp_url_env_var_absent(self):
+    def test_no_cdp_env_var_absent(self):
         captured_env: dict = {}
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("BRIDGIC_CDP", None)
             self._run_spawn(captured_env)
         assert "BRIDGIC_CDP" not in captured_env
 
-    def test_headed_and_cdp_url_both_set(self):
+    def test_headed_and_cdp_both_set(self):
         captured_env: dict = {}
         self._run_spawn(
             captured_env,
             headed=True,
-            cdp_url="ws://localhost:9222/devtools/browser/abc",
+            cdp="ws://localhost:9222/devtools/browser/abc",
         )
         assert captured_env.get("BRIDGIC_HEADLESS") is None or "BRIDGIC_BROWSER_JSON" in captured_env
         assert captured_env.get("BRIDGIC_CDP") == "ws://localhost:9222/devtools/browser/abc"

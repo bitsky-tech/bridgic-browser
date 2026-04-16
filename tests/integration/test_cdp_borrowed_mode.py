@@ -10,7 +10,7 @@ events arrive before Playwright registers its handlers, so page.evaluate()
 Setup:
   - Launches system Chrome with --remote-debugging-port=9229
   - Opens 3 pre-existing tabs (Wikipedia, httpbin.org, example.com) via CDP
-  - Then connects bridgic via cdp_url
+  - Then connects bridgic via cdp
 
 Coverage:
   - tabs listing (all 3 pre-existing + 1 bridgic-owned tab)
@@ -30,7 +30,6 @@ Coverage:
 
 import asyncio
 import json
-import os
 import subprocess
 import tempfile
 import time
@@ -132,12 +131,8 @@ def chrome_with_preopened_tabs():
         # Give pages a moment to start loading
         time.sleep(2.0)
 
-        # Get the WS URL
-        tabs = _list_tabs_via_cdp()
-        browser_tab = next(
-            (t for t in tabs if t.get("type") == "browser"), None
-        )
-        # Fall back to /json/version for the browser WS URL
+        # Get the WS URL from /json/version (authoritative for the browser endpoint).
+        _list_tabs_via_cdp()  # probe that CDP is responsive
         with urllib.request.urlopen(
             f"http://{CDP_HOST}:{CDP_PORT}/json/version", timeout=5
         ) as resp:
@@ -164,7 +159,7 @@ def chrome_with_preopened_tabs():
 async def cdp_browser(chrome_with_preopened_tabs):
     """Attach bridgic to the running Chrome via CDP (borrowed mode)."""
     ws_url = chrome_with_preopened_tabs
-    browser = Browser(cdp_url=ws_url, stealth=False, headless=True)
+    browser = Browser(cdp=ws_url, stealth=False, headless=True)
     await browser._start()
     yield browser
     await browser.close()

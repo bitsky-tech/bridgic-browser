@@ -1821,20 +1821,20 @@ class TestBrowserStartCdp:
         return mock_pw, mock_cdp_browser, mock_ctx, mock_pg
 
     @pytest.mark.asyncio
-    async def test_cdp_url_calls_connect_over_cdp(self):
+    async def test_cdp_calls_connect_over_cdp(self):
         mock_pw, mock_cdp_brow, mock_ctx, _ = self._make_cdp_mocks()
-        cdp_url = "ws://localhost:9222/devtools/browser/abc"
-        browser = Browser(cdp_url=cdp_url, stealth=False)
+        cdp = "ws://localhost:9222/devtools/browser/abc"
+        browser = Browser(cdp=cdp, stealth=False)
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
             await browser._start()
-        mock_pw.chromium.connect_over_cdp.assert_awaited_once_with(cdp_url)
+        mock_pw.chromium.connect_over_cdp.assert_awaited_once_with(cdp)
         mock_pw.chromium.launch.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_existing_contexts_reused(self):
         mock_pw, mock_cdp_brow, mock_ctx, _ = self._make_cdp_mocks()
-        browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
             await browser._start()
@@ -1846,7 +1846,7 @@ class TestBrowserStartCdp:
         mock_pw, mock_cdp_brow, mock_ctx, _ = self._make_cdp_mocks(contexts_count=0)
         mock_cdp_brow.contexts = []
         mock_cdp_brow.new_context = AsyncMock(return_value=mock_ctx)
-        browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
             await browser._start()
@@ -1858,7 +1858,7 @@ class TestBrowserStartCdp:
         patch set (window.chrome, WebGL, etc.) AND the anti-devtools script
         (timing neutralization). Parity with non-CDP headless mode."""
         mock_pw, _, mock_ctx, _ = self._make_cdp_mocks()
-        browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/abc", stealth=True, headless=True)
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=True, headless=True)
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
             await browser._start()
@@ -1871,7 +1871,7 @@ class TestBrowserStartCdp:
         still added because it only neutralizes timing probes and is safe in
         Turnstile iframes. Parity with non-CDP headed mode."""
         mock_pw, _, mock_ctx, _ = self._make_cdp_mocks()
-        browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/abc", stealth=True, headless=False)
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=True, headless=False)
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
             await browser._start()
@@ -1880,7 +1880,7 @@ class TestBrowserStartCdp:
     @pytest.mark.asyncio
     async def test_stealth_false_no_add_init_script(self):
         mock_pw, _, mock_ctx, _ = self._make_cdp_mocks()
-        browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
             await browser._start()
@@ -1896,7 +1896,7 @@ class TestBrowserStartCdp:
         # mock_pg is the page returned by mock_ctx.new_page() — this is the
         # page bridgic should adopt as self._page, NOT page2.
         mock_pw, _, mock_ctx, mock_pg = self._make_cdp_mocks(pages=[page1, page2])
-        browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
             await browser._start()
@@ -1909,7 +1909,7 @@ class TestBrowserStartCdp:
         """Even when the borrowed context has no pages, _start() still calls
         new_page() to create a tab for bridgic to drive."""
         mock_pw, _, mock_ctx, mock_pg = self._make_cdp_mocks(pages=[])
-        browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
             await browser._start()
@@ -1925,7 +1925,7 @@ class TestBrowserStartCdp:
         downloads_dir = tmp_path / "dl"
         downloads_dir.mkdir()
         browser = Browser(
-            cdp_url="ws://localhost:9222/devtools/browser/abc",
+            cdp="ws://localhost:9222/devtools/browser/abc",
             stealth=False,
             downloads_path=str(downloads_dir),
         )
@@ -1947,7 +1947,7 @@ class TestBrowserStartCdp:
         downloads_dir = tmp_path / "dl"
         downloads_dir.mkdir()
         browser = Browser(
-            cdp_url="ws://localhost:9222/devtools/browser/abc",
+            cdp="ws://localhost:9222/devtools/browser/abc",
             stealth=False,
             downloads_path=str(downloads_dir),
         )
@@ -1967,9 +1967,9 @@ class TestBrowserStartCdp:
 class TestBrowserUsePersistentContextCdp:
     """Tests for use_persistent_context property in CDP vs normal mode."""
 
-    def test_cdp_url_returns_false(self):
+    def test_cdp_returns_false(self):
         browser = Browser(
-            cdp_url="ws://localhost:9222/devtools/browser/abc",
+            cdp="ws://localhost:9222/devtools/browser/abc",
             user_data_dir="/tmp/profile",
         )
         assert browser.use_persistent_context is False
@@ -2018,9 +2018,9 @@ class TestBrowserCloseCdp:
 
         return mock_pw, mock_cdp_browser, mock_ctx, mock_pg
 
-    async def _start_cdp_browser(self, mock_pw, *, cdp_url="ws://localhost:9222/devtools/browser/abc", **kwargs):
+    async def _start_cdp_browser(self, mock_pw, *, cdp="ws://localhost:9222/devtools/browser/abc", **kwargs):
         """Create and start a Browser in CDP mode."""
-        browser = Browser(cdp_url=cdp_url, stealth=False, **kwargs)
+        browser = Browser(cdp=cdp, stealth=False, **kwargs)
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
             await browser._start()
