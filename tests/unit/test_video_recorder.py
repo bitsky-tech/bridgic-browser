@@ -37,6 +37,7 @@ class TestFindFfmpeg:
         ffmpeg_dir.mkdir()
         ffmpeg_bin = ffmpeg_dir / "ffmpeg-mac"
         ffmpeg_bin.touch()
+        os.chmod(ffmpeg_bin, 0o755)  # _find_ffmpeg requires X_OK (V-2)
         with patch.dict(os.environ, {"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path)}):
             with patch("platform.system", return_value="Darwin"):
                 assert _find_ffmpeg() == str(ffmpeg_bin)
@@ -50,13 +51,69 @@ class TestFindFfmpeg:
         for rev in ("999", "1011", "1000"):
             d = tmp_path / f"ffmpeg-{rev}"
             d.mkdir()
-            (d / "ffmpeg-mac").touch()
+            binary = d / "ffmpeg-mac"
+            binary.touch()
+            os.chmod(binary, 0o755)  # V-2: X_OK check filters out non-exec
         # Distractor: a non-version directory must be ignored.
         (tmp_path / "ffmpeg-").mkdir()
         with patch.dict(os.environ, {"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path)}):
             with patch("platform.system", return_value="Darwin"):
                 resolved = _find_ffmpeg()
         assert resolved == str(tmp_path / "ffmpeg-1011" / "ffmpeg-mac")
+
+    def test_windows_falls_back_to_home_appdata_local(self, tmp_path: Path, monkeypatch) -> None:
+        """V-1 / T-8: Windows without LOCALAPPDATA falls back to ~/AppData/Local/ms-playwright.
+
+        Services, sandboxed sessions, and some CI agents run without
+        LOCALAPPDATA set.  Prior code left browsers_path empty in that case
+        and skipped straight to PATH, missing the Playwright-installed copy.
+        """
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+
+        fake_home = tmp_path / "fake_home"
+        (fake_home / "AppData" / "Local" / "ms-playwright" / "ffmpeg-1011").mkdir(parents=True)
+        ffmpeg_bin = fake_home / "AppData" / "Local" / "ms-playwright" / "ffmpeg-1011" / "ffmpeg-win64.exe"
+        ffmpeg_bin.touch()
+        os.chmod(ffmpeg_bin, 0o755)
+
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+        with patch("platform.system", return_value="Windows"):
+            assert _find_ffmpeg() == str(ffmpeg_bin)
+
+    def test_error_message_lists_three_resolutions(self, tmp_path: Path, monkeypatch) -> None:
+        """V-1: when nothing is found, the error must point at all 3 remedies."""
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path / "empty"))
+        with patch("shutil.which", return_value=None):
+            with pytest.raises(FileNotFoundError) as exc_info:
+                _find_ffmpeg()
+        msg = str(exc_info.value)
+        assert "playwright install ffmpeg" in msg
+        assert "PLAYWRIGHT_BROWSERS_PATH" in msg
+        assert "system ffmpeg" in msg
+
+    def test_skips_non_executable_binary(self, tmp_path: Path) -> None:
+        """V-2 regression: a non-executable ffmpeg (e.g. musl binary on glibc)
+        must be skipped rather than returned and then fail at exec time."""
+        # Highest version has no X bit — must be skipped in favor of the lower
+        # version that is executable.
+        high = tmp_path / "ffmpeg-2000"
+        high.mkdir()
+        high_bin = high / "ffmpeg-mac"
+        high_bin.touch()
+        # Intentionally no chmod → os.access(X_OK) returns False.
+
+        low = tmp_path / "ffmpeg-1000"
+        low.mkdir()
+        low_bin = low / "ffmpeg-mac"
+        low_bin.touch()
+        os.chmod(low_bin, 0o755)
+
+        with patch.dict(os.environ, {"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path)}):
+            with patch("platform.system", return_value="Darwin"):
+                resolved = _find_ffmpeg()
+        assert resolved == str(low_bin)
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +156,12 @@ class TestVideoRecorder:
     def test_init_validates_extension(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="must have .webm extension"):
             VideoRecorder(MagicMock(), MagicMock(), str(tmp_path / "bad.mp4"), (800, 600))
+
+    def test_init_accepts_uppercase_webm_extension(self, tmp_path: Path) -> None:
+        """V-3: .WEBM / .WebM must be accepted (case-insensitive)."""
+        for name in ("x.WEBM", "x.WebM", "x.webm"):
+            # Should not raise.
+            VideoRecorder(MagicMock(), MagicMock(), str(tmp_path / name), (800, 600))
 
     def test_init_sets_state(self, tmp_path: Path) -> None:
         rec = self._make_recorder(tmp_path)
@@ -209,13 +272,15 @@ class TestVideoRecorder:
         mock_stdin.write.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_start_uses_devnull_for_stdout_stderr(self, tmp_path: Path) -> None:
-        """ffmpeg stdout/stderr must be DEVNULL to avoid pipe-buffer back-pressure.
+    async def test_start_uses_pipe_for_stderr_to_enable_diagnostics(self, tmp_path: Path) -> None:
+        """V-4: ffmpeg stderr must be PIPE with a background drainer.
 
-        Regression guard for M3: PIPE without a reader fills the OS pipe buffer
-        (~64 KB on Linux) when ffmpeg writes errors, which then blocks ffmpeg's
-        next write() call, which back-pressures stdin.drain(), which deadlocks
-        the recorder's stop() path.
+        History: previously stderr=DEVNULL to avoid pipe-buffer deadlock
+        (PIPE without a reader fills the OS pipe buffer ~64 KB on Linux,
+        blocking ffmpeg's next write and cascading into a stdin.drain()
+        deadlock).  That made encode failures invisible.  V-4 keeps stderr
+        drained via `_stderr_reader_task` so we get both safety and
+        diagnostics.  stdout stays DEVNULL (never inspected).
         """
         rec = self._make_recorder(tmp_path)
 
@@ -226,6 +291,11 @@ class TestVideoRecorder:
             m = MagicMock()
             m.stdin = MagicMock()
             m.stdin.is_closing = MagicMock(return_value=False)
+            # V-4: stderr must be a readable async stream so _read_stderr
+            # can drain it.  Return EOF immediately so the reader task exits
+            # cleanly after start().
+            m.stderr = MagicMock()
+            m.stderr.read = AsyncMock(return_value=b"")
             m.kill = MagicMock()
             return m
 
@@ -244,9 +314,99 @@ class TestVideoRecorder:
                 await rec.start()
 
         assert captured.get("stdout") == asyncio.subprocess.DEVNULL
-        assert captured.get("stderr") == asyncio.subprocess.DEVNULL
+        assert captured.get("stderr") == asyncio.subprocess.PIPE
         # stdin must remain PIPE — bridgic feeds JPEG bytes into it.
         assert captured.get("stdin") == asyncio.subprocess.PIPE
+        # Reader task must be spawned so the stderr pipe never back-pressures.
+        assert rec._stderr_reader_task is not None
+        # Let the reader task observe EOF and exit.
+        await rec._drain_stderr_reader()
+
+    @pytest.mark.asyncio
+    async def test_stderr_reader_captures_and_logs_output(self, tmp_path: Path) -> None:
+        """V-4 (P1T-1): captured stderr must reach logger.debug on finalize.
+
+        Simulates an ffmpeg encode error by feeding the mock stderr a non-empty
+        chunk followed by EOF.  After finalize() drains the reader, the captured
+        bytes must appear in a logger.debug record so operators can diagnose
+        corrupt-JPEG / codec failures.
+        """
+        import logging
+        rec = self._make_recorder(tmp_path)
+
+        error_msg = b"[mjpeg @ 0xdead] no JPEG data found in input\n"
+        reads_iter = iter([error_msg, b""])
+
+        async def fake_read(_n: int) -> bytes:
+            return next(reads_iter, b"")
+
+        mock_proc = MagicMock()
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.read = fake_read
+        rec._ffmpeg = mock_proc
+        rec._stderr_reader_task = asyncio.create_task(rec._read_stderr())
+
+        # Use a direct handler attached to the bridgic.browser logger so we
+        # don't depend on pytest caplog level propagation ordering.
+        captured_records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured_records.append(record)
+
+        h = _Capture(level=logging.DEBUG)
+        bridgic_logger = logging.getLogger("bridgic.browser")
+        prior_level = bridgic_logger.level
+        bridgic_logger.setLevel(logging.DEBUG)
+        bridgic_logger.addHandler(h)
+        try:
+            await rec._drain_stderr_reader()
+        finally:
+            bridgic_logger.removeHandler(h)
+            bridgic_logger.setLevel(prior_level)
+
+        debug_messages = [
+            r.getMessage() for r in captured_records if r.levelno == logging.DEBUG
+        ]
+        assert any(
+            "ffmpeg stderr" in m and "no JPEG data" in m for m in debug_messages
+        ), f"expected stderr log with ffmpeg error, got: {debug_messages}"
+
+    @pytest.mark.asyncio
+    async def test_stderr_reader_caps_at_64kib(self, tmp_path: Path) -> None:
+        """V-4 (P1T-2): stderr buffer must not grow unbounded.
+
+        Simulates an ffmpeg that writes 1 MiB of stderr.  The reader must cap
+        retention at _STDERR_CAP (64 KiB) and drain the rest silently so the
+        pipe never fills (which would deadlock stdin.drain()).
+        """
+        from bridgic.browser.session._video_recorder import _STDERR_CAP
+        rec = self._make_recorder(tmp_path)
+
+        # Produce 1 MiB in 4 KiB chunks, then EOF.
+        total_bytes = 1024 * 1024
+        chunk = b"x" * 4096
+        remaining = {"n": total_bytes}
+
+        async def fake_read(n: int) -> bytes:
+            if remaining["n"] <= 0:
+                return b""
+            out = chunk[:n] if n < len(chunk) else chunk
+            remaining["n"] -= len(out)
+            return out
+
+        mock_proc = MagicMock()
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.read = fake_read
+        rec._ffmpeg = mock_proc
+
+        # Run the reader to completion (it exits on EOF after ~256 reads).
+        await rec._read_stderr()
+
+        # Buffer must not exceed the cap.
+        assert len(rec._stderr_buf) <= _STDERR_CAP
+        # And should have retained exactly the cap amount (it was fully filled).
+        assert len(rec._stderr_buf) == _STDERR_CAP
 
 
 # ---------------------------------------------------------------------------

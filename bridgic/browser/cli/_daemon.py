@@ -591,6 +591,18 @@ async def _cdp_reconnect(browser: "Browser") -> bool:
         await browser.close()
     except Exception as exc:
         logger.debug("[daemon] cdp_reconnect: close() error (ignored): %s", exc)
+
+    # Force-reset internal handles so `_start()`'s early-return guard
+    # (`if self._playwright is not None: return`) cannot silently skip the
+    # reconnect when close() has raised mid-flight and left handles set.  We
+    # accept a potential driver leak here — the close() attempt above
+    # handles cleanup; these assignments are just insurance against partial
+    # close state.
+    browser._playwright = None
+    browser._browser = None
+    browser._context = None
+    browser._page = None
+
     try:
         await browser._start()
         logger.info("[daemon] cdp_reconnect: reconnected successfully")
@@ -623,7 +635,7 @@ async def _dispatch(browser: "Browser", command: str, args: Dict[str, Any]) -> D
 
     elapsed = time.monotonic() - t0
     success = bool(response.get("success"))
-    log_fn = logger.warning if elapsed > _SLOW_COMMAND_THRESHOLD_S else logger.info
+    log_fn = logger.warning if elapsed >= _SLOW_COMMAND_THRESHOLD_S else logger.info
     log_fn(
         "[CLI-RESP] %s %s in %.3fs error_code=%s",
         command,
@@ -742,6 +754,7 @@ async def _handle_connection(
     stop_event: asyncio.Event,
     *,
     token_verifier: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    on_close_command: Optional[Callable[[], None]] = None,
 ) -> None:
     try:
         try:
@@ -834,10 +847,55 @@ async def _handle_connection(
             resp = _response(success=True, result="\n".join(lines))
             writer.write((json.dumps(resp) + "\n").encode())
             await writer.drain()
-            stop_event.set()
+            # Stop accepting new connections IMMEDIATELY (before browser.close
+            # begins) so a fresh `bridgic-browser open …` does not land on this
+            # dying daemon and trigger the close-mid-dispatch race.  The close
+            # callback also sets stop_event so the main loop can proceed to
+            # actually close the browser.
+            if on_close_command is not None:
+                on_close_command()
+            else:
+                stop_event.set()
             return
 
-        resp = await _dispatch(browser, command, args)
+        # Run dispatch concurrently with an EOF watcher.  If the client
+        # closes the socket while the dispatch is in flight (e.g. CLI hit
+        # its own response timeout), cancel the in-flight task so it does
+        # not continue running against the Browser singleton — otherwise
+        # the next CLI invocation would race against the orphaned task.
+        dispatch_task = asyncio.create_task(_dispatch(browser, command, args))
+        disconnect_task = asyncio.create_task(reader.read())
+        try:
+            done, _pending = await asyncio.wait(
+                {dispatch_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except BaseException:
+            dispatch_task.cancel()
+            disconnect_task.cancel()
+            raise
+
+        if disconnect_task in done and dispatch_task not in done:
+            logger.warning(
+                "[daemon] client disconnected mid-request; cancelling '%s'",
+                command,
+            )
+            dispatch_task.cancel()
+            try:
+                await dispatch_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            return
+
+        # Dispatch finished first — cancel the dangling EOF watcher.
+        if not disconnect_task.done():
+            disconnect_task.cancel()
+            try:
+                await disconnect_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        resp = dispatch_task.result()
         writer.write((json.dumps(resp) + "\n").encode())
         await writer.drain()
     except Exception:
@@ -919,25 +977,35 @@ def _resolve_default_downloads_dir() -> Path:
     return BRIDGIC_DOWNLOADS_DIR
 
 
+def _resolve_cdp_url_from_env(cdp_input: Optional[str]) -> Optional[str]:
+    """Resolve ``BRIDGIC_CDP`` env value to a ws:// URL.
+
+    Short-circuits when the input is already a ws:// / wss:// URL — the CLI
+    client pre-resolves ``--cdp`` and injects the ws URL into the daemon's
+    env, and re-running ``resolve_cdp_input`` on it would only bring the risk
+    of client/daemon parsing drift.  Bare ports / ``auto`` still flow through
+    ``resolve_cdp_input`` so ``BRIDGIC_CDP=9222`` from a shell keeps working.
+    """
+    if not cdp_input:
+        return None
+    if cdp_input.lower().startswith(("ws://", "wss://")):
+        return cdp_input
+    from bridgic.browser.session._browser import resolve_cdp_input
+    try:
+        return resolve_cdp_input(cdp_input)
+    except (RuntimeError, ValueError, ConnectionError) as exc:
+        raise RuntimeError(
+            f"Failed to establish CDP connection: {exc}\n"
+            "Check that the browser is running with --remote-debugging-port "
+            "or that the CDP URL / port is correct."
+        ) from exc
+
+
 async def run_daemon() -> None:
-    from bridgic.browser.session._browser import Browser, resolve_cdp_input
+    from bridgic.browser.session._browser import Browser
 
     # Resolve CDP connection if requested via env var.
-    # BRIDGIC_CDP accepts port/url/auto from the user shell, or an already-
-    # resolved ws:// URL injected by _spawn_daemon() when the CLI client has
-    # pre-resolved the --cdp flag. Both paths go through resolve_cdp_input(),
-    # which is a no-op on ws:///wss:// inputs.
-    _cdp_input: Optional[str] = os.environ.get("BRIDGIC_CDP")
-    cdp_url: Optional[str] = None
-    if _cdp_input:
-        try:
-            cdp_url = resolve_cdp_input(_cdp_input)
-        except (RuntimeError, ValueError, ConnectionError) as exc:
-            raise RuntimeError(
-                f"Failed to establish CDP connection: {exc}\n"
-                "Check that the browser is running with --remote-debugging-port "
-                "or that the CDP URL / port is correct."
-            ) from exc
+    cdp_url: Optional[str] = _resolve_cdp_url_from_env(os.environ.get("BRIDGIC_CDP"))
 
     # Browser.__init__ auto-loads config from files and env vars.
     kwargs: Dict[str, Any] = {}
@@ -955,15 +1023,61 @@ async def run_daemon() -> None:
     logger.info("[daemon] browser ready (lazy start, config=%s)", {k: v for k, v in browser.get_config().items() if k != "proxy"})
 
     stop_event = asyncio.Event()
+    shutdown_started = asyncio.Event()
     transport = get_transport()
 
+    # Reference populated after start_server() returns; close() can be called
+    # multiple times safely.
+    server_holder: Dict[str, Any] = {}
+
+    def _begin_shutdown() -> None:
+        """Stop accepting new connections and trigger main-loop exit.
+
+        Called from the close-command branch in _handle_connection.  Idempotent
+        — safe to invoke more than once.
+        """
+        if shutdown_started.is_set():
+            return
+        shutdown_started.set()
+        srv = server_holder.get("server")
+        if srv is not None:
+            try:
+                srv.close()
+            except Exception:
+                logger.debug("[daemon] server.close() during shutdown raised", exc_info=True)
+        stop_event.set()
+
     async def connection_cb(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        # Fast-path reject: new connections that land while the daemon is
+        # already shutting down (e.g. `close` → `open` back-to-back) get a
+        # clear "shutting down" error instead of a mid-dispatch crash.
+        if shutdown_started.is_set():
+            try:
+                resp = _response(
+                    success=False,
+                    result="Daemon is shutting down; please retry.",
+                    error_code="DAEMON_SHUTTING_DOWN",
+                    meta={"retryable": True},
+                )
+                writer.write((json.dumps(resp) + "\n").encode())
+                await writer.drain()
+            except Exception:
+                pass
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+            return
         await _handle_connection(
             browser, reader, writer, stop_event,
             token_verifier=transport.verify_auth,
+            on_close_command=_begin_shutdown,
         )
 
     server = await transport.start_server(connection_cb, stream_limit=STREAM_LIMIT)
+    server_holder["server"] = server
     write_run_info(transport.build_run_info(pid=os.getpid()))
 
     # Signal ready to parent process

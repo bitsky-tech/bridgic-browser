@@ -1720,22 +1720,28 @@ class TestBrowserStartCdp:
 
     @pytest.mark.asyncio
     async def test_stealth_true_headless_calls_add_init_script(self):
+        """Headless CDP mode with stealth adds two init scripts: the JS stealth
+        patch set (window.chrome, WebGL, etc.) AND the anti-devtools script
+        (timing neutralization). Parity with non-CDP headless mode."""
         mock_pw, _, mock_ctx, _ = self._make_cdp_mocks()
         browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/abc", stealth=True, headless=True)
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
             await browser._start()
-        mock_ctx.add_init_script.assert_awaited_once()
+        assert mock_ctx.add_init_script.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_stealth_true_headed_skips_init_script(self):
-        """Headed CDP mode must skip init script (same as non-CDP headed mode)."""
+    async def test_stealth_true_headed_adds_only_anti_devtools(self):
+        """Headed CDP mode with stealth: the full JS stealth patch is skipped
+        (would break Cloudflare Turnstile), but the anti-devtools script is
+        still added because it only neutralizes timing probes and is safe in
+        Turnstile iframes. Parity with non-CDP headed mode."""
         mock_pw, _, mock_ctx, _ = self._make_cdp_mocks()
         browser = Browser(cdp_url="ws://localhost:9222/devtools/browser/abc", stealth=True, headless=False)
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
             await browser._start()
-        mock_ctx.add_init_script.assert_not_called()
+        mock_ctx.add_init_script.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_stealth_false_no_add_init_script(self):
@@ -1777,8 +1783,11 @@ class TestBrowserStartCdp:
         assert browser._page is mock_pg
 
     @pytest.mark.asyncio
-    async def test_download_manager_attached(self, tmp_path):
-        mock_pw, _, mock_ctx, _ = self._make_cdp_mocks()
+    async def test_download_manager_attached_borrowed_context(self, tmp_path):
+        """In CDP borrowed-context mode the download manager must attach to
+        the bridgic page ONLY — attaching to the whole context would hijack
+        download events from the user's pre-existing tabs."""
+        mock_pw, _, mock_ctx, mock_pg = self._make_cdp_mocks()
         downloads_dir = tmp_path / "dl"
         downloads_dir.mkdir()
         browser = Browser(
@@ -1788,9 +1797,33 @@ class TestBrowserStartCdp:
         )
         with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
             mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
-            with patch.object(browser._download_manager, "attach_to_context") as mock_attach:
+            with patch.object(browser._download_manager, "attach_to_context") as mock_attach_ctx, \
+                 patch.object(browser._download_manager, "attach_to_page") as mock_attach_pg:
                 await browser._start()
-        mock_attach.assert_called_once_with(mock_ctx)
+        mock_attach_ctx.assert_not_called()
+        mock_attach_pg.assert_called_once_with(mock_pg)
+
+    @pytest.mark.asyncio
+    async def test_download_manager_attached_owned_context(self, tmp_path):
+        """In CDP owned-context mode (bridgic created the context because
+        browser.contexts was empty), the manager attaches to the whole
+        context — all pages in it belong to bridgic."""
+        mock_pw, mock_cdp_browser, mock_ctx, _ = self._make_cdp_mocks(contexts_count=0)
+        mock_cdp_browser.contexts = []
+        downloads_dir = tmp_path / "dl"
+        downloads_dir.mkdir()
+        browser = Browser(
+            cdp_url="ws://localhost:9222/devtools/browser/abc",
+            stealth=False,
+            downloads_path=str(downloads_dir),
+        )
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            with patch.object(browser._download_manager, "attach_to_context") as mock_attach_ctx, \
+                 patch.object(browser._download_manager, "attach_to_page") as mock_attach_pg:
+                await browser._start()
+        mock_attach_ctx.assert_called_once_with(mock_ctx)
+        mock_attach_pg.assert_not_called()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1894,9 +1927,10 @@ class TestBrowserCloseCdp:
         mock_ctx.close.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_cdp_close_does_not_close_owned_context(self):
-        """close() in CDP mode must NOT call context.close() even when bridgic
-        created the context — the remote browser manages its own lifecycle."""
+    async def test_cdp_close_closes_owned_context(self):
+        """close() in CDP mode with an owned context (bridgic created it because
+        browser.contexts was empty) MUST call context.close() to avoid leaking
+        the context on the remote Chrome for its lifetime."""
         mock_pw, mock_cdp_browser, mock_ctx, _ = self._make_cdp_mocks(contexts_count=0)
         mock_cdp_browser.contexts = []
         browser = await self._start_cdp_browser(mock_pw)
@@ -1904,7 +1938,7 @@ class TestBrowserCloseCdp:
         assert browser._cdp_context_owned is True
         await browser.close()
 
-        mock_ctx.close.assert_not_called()
+        mock_ctx.close.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_cdp_close_does_not_navigate_about_blank(self):
@@ -1992,15 +2026,17 @@ class TestBrowserCloseCdp:
         mock_pg.close.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_cdp_owned_context_does_not_close_context(self):
-        """Owned CDP context: context.close() is NOT called — bridgic only disconnects."""
+    async def test_cdp_owned_context_closes_context(self):
+        """Owned CDP context: context.close() IS called — otherwise the bridgic
+        -created context leaks on the remote browser indefinitely (repeated
+        connect/disconnect cycles would exhaust remote memory)."""
         mock_pw, mock_cdp_browser, mock_ctx, mock_pg = self._make_cdp_mocks(contexts_count=0)
         mock_cdp_browser.contexts = []
         browser = await self._start_cdp_browser(mock_pw)
 
         await browser.close()
 
-        mock_ctx.close.assert_not_called()
+        mock_ctx.close.assert_awaited_once()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

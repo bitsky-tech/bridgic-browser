@@ -195,6 +195,15 @@ class DownloadManager:
         """
         self._attach_to_page(page)
 
+    def detach_from_page(self, page: "Page") -> None:
+        """Detach download handler from a specific page (no-op if not attached).
+
+        Counterpart to :meth:`attach_to_page`. Use when the handler was
+        registered page-scoped (e.g. CDP borrowed-context mode where attaching
+        to the whole context would hijack the user's other tabs).
+        """
+        self._detach_from_page(page)
+
     def _attach_to_page(self, page: "Page") -> None:
         """Internal method to attach download handler to a page."""
         page_key = str(id(page))

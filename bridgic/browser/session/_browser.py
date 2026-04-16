@@ -62,10 +62,22 @@ _CDP_SCAN_DIRS: Dict[str, List[tuple]] = {
         ("Brave",         "~/Library/Application Support/BraveSoftware/Brave-Browser"),
     ],
     "linux": [
-        ("Chrome",        "~/.config/google-chrome"),
-        ("Chrome Canary", "~/.config/google-chrome-unstable"),
-        ("Chromium",      "~/.config/chromium"),
-        ("Brave",         "~/.config/BraveSoftware/Brave-Browser"),
+        # Native packages (apt / dnf / pacman / AUR etc.)
+        ("Chrome",         "~/.config/google-chrome"),
+        ("Chrome Canary",  "~/.config/google-chrome-unstable"),
+        ("Chrome Beta",    "~/.config/google-chrome-beta"),
+        ("Chromium",       "~/.config/chromium"),
+        ("Brave",          "~/.config/BraveSoftware/Brave-Browser"),
+        ("Edge",           "~/.config/microsoft-edge"),
+        # Snap packages — Snap redirects $XDG_CONFIG_HOME so native paths
+        # above won't find them; must scan inside ~/snap/.
+        ("Chromium (Snap)", "~/snap/chromium/common/chromium"),
+        ("Brave (Snap)",    "~/snap/brave/current/.config/BraveSoftware/Brave-Browser"),
+        # Flatpak packages — same reasoning; sandboxed under ~/.var/app/.
+        ("Chrome (Flatpak)",   "~/.var/app/com.google.Chrome/config/google-chrome"),
+        ("Chromium (Flatpak)", "~/.var/app/org.chromium.Chromium/config/chromium"),
+        ("Brave (Flatpak)",    "~/.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser"),
+        ("Edge (Flatpak)",     "~/.var/app/com.microsoft.Edge/config/microsoft-edge"),
     ],
     "win32": [
         ("Chrome",        r"%LOCALAPPDATA%\Google\Chrome\User Data"),
@@ -87,6 +99,42 @@ def _read_devtools_active_port(base: str) -> Optional[str]:
     except (OSError, ValueError):
         pass
     return None
+
+
+def _probe_cdp_alive(ws_url: str, timeout: float = 2.0) -> bool:
+    """Return True if the CDP HTTP endpoint behind ``ws_url`` answers /json/version.
+
+    Chrome normally removes its DevToolsActivePort file on graceful exit, but a
+    crash or ``kill -9`` leaves it behind. Without a liveness probe, scan/file
+    mode would return a stale ws URL and callers would only see a confusing
+    connection error much later from ``connect_over_cdp``.
+    """
+    import urllib.error
+    import urllib.request
+
+    try:
+        parsed = urlparse(ws_url)
+    except Exception:
+        return False
+    host = parsed.hostname or "localhost"
+    port = parsed.port
+    if port is None:
+        return False
+    host_in_url = f"[{host}]" if ":" in host else host
+    probe_url = f"http://{host_in_url}:{port}/json/version"
+    host_lower = host.lower()
+    is_loopback = host_lower in ("localhost", "127.0.0.1", "::1")
+    try:
+        if is_loopback:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({})
+            )
+            resp = opener.open(probe_url, timeout=timeout)
+        else:
+            resp = urllib.request.urlopen(probe_url, timeout=timeout)
+        return bool(resp.read(1))
+    except (urllib.error.URLError, OSError):
+        return False
 
 
 def find_cdp_url(
@@ -135,10 +183,17 @@ def find_cdp_url(
         return ws_endpoint
 
     if mode == "port":
+        # Strip user-supplied brackets so we never double-bracket IPv6 hosts
+        # (e.g. caller passes "[::1]" → don't produce "[[::1]]").
+        # Lowercase for canonical form: HTTP hostnames and DNS names are
+        # case-insensitive per RFC, and Chrome always reports "localhost"
+        # lowercase in webSocketDebuggerUrl — a mixed-case override would make
+        # the returned URL look wrong.
+        host_clean = (host or "").strip("[]").lower()
         # Bracket IPv6 hosts so the URL stays parseable
         # (e.g. ``::1`` → ``[::1]``).  Plain IPv4 / hostnames pass through
         # unchanged.
-        host_in_url = f"[{host}]" if host and ":" in host else host
+        host_in_url = f"[{host_clean}]" if ":" in host_clean else host_clean
         url = f"http://{host_in_url}:{port}/json/version"
         try:
             # Bypass system HTTP proxy for loopback hosts. macOS reads system
@@ -148,8 +203,8 @@ def find_cdp_url(
             # of the real "Connection refused" / "Connection timed out".
             # Remote hosts (cloud browser services, SSH-tunneled CDP, etc.)
             # MUST keep proxy support, so this branch is loopback-only.
-            host_lower = (host or "").lower().strip()
-            is_loopback = host_lower in ("localhost", "127.0.0.1", "::1")
+            # host_clean is already lowercased above, so no second .lower() needed
+            is_loopback = host_clean in ("localhost", "127.0.0.1", "::1")
             if is_loopback:
                 opener = urllib.request.build_opener(
                     urllib.request.ProxyHandler({})
@@ -170,16 +225,17 @@ def find_cdp_url(
             ) from exc
         except (KeyError, json.JSONDecodeError) as exc:
             raise ValueError(f"Failed to parse /json/version response: {exc}") from exc
-        # Chrome always reports localhost in the URL; replace with the actual
-        # host when the user passed a remote address. Use urlparse to
-        # precisely swap only the hostname component (a naive string replace
-        # could match "localhost" inside a path or query parameter).
-        if host_lower != "localhost":
-            _parsed_ws = urlparse(ws_url)
-            # Rebuild netloc: bracketed IPv6 host + original port
-            _ws_port = _parsed_ws.port or port
-            _new_netloc = f"{host_in_url}:{_ws_port}"
-            ws_url = urlunparse(_parsed_ws._replace(netloc=_new_netloc))
+        # Always rewrite the ws URL netloc to (host_in_url, port) so SSH
+        # tunnels, container port-forwards, and reverse proxies work
+        # correctly.  Chrome embeds its own bound address in
+        # webSocketDebuggerUrl ("ws://localhost:9222/..."), but we know the
+        # address that actually got us a /json/version response — that's
+        # the address the caller can also reach for the WebSocket.
+        # Use urlparse to swap only the netloc component (a naive string
+        # replace could match "localhost" / "9222" inside a path).
+        _parsed_ws = urlparse(ws_url)
+        _new_netloc = f"{host_in_url}:{port}"
+        ws_url = urlunparse(_parsed_ws._replace(netloc=_new_netloc))
         return ws_url
 
     if mode == "scan":
@@ -190,9 +246,19 @@ def find_cdp_url(
         for label, raw_path in candidates:
             base = os.path.expandvars(os.path.expanduser(raw_path))
             ws_url = _read_devtools_active_port(base)
-            if ws_url:
-                logger.info("find_cdp_url(scan): found active CDP port via %s (%s)", label, base)
-                return ws_url
+            if not ws_url:
+                continue
+            # Skip stale DevToolsActivePort files: Chrome removes them on
+            # graceful shutdown, but a crash / kill -9 leaves them behind,
+            # pointing at a dead port. Try the next candidate instead.
+            if not _probe_cdp_alive(ws_url):
+                logger.debug(
+                    "find_cdp_url(scan): skipping %s (%s) — stale DevToolsActivePort (port not reachable)",
+                    label, base,
+                )
+                continue
+            logger.info("find_cdp_url(scan): found active CDP port via %s (%s)", label, base)
+            return ws_url
         # Nothing found — build a helpful error with instructions
         _browsers = ", ".join(label for label, _ in candidates)
         raise RuntimeError(
@@ -256,7 +322,18 @@ def find_cdp_url(
         raise ValueError(
             f"DevToolsActivePort file is malformed (expected 2 lines, got {len(lines)}): {port_file}"
         )
-    return f"ws://localhost:{lines[0]}{lines[1]}"
+    ws_url = f"ws://localhost:{lines[0]}{lines[1]}"
+    # Catch stale DevToolsActivePort files (Chrome crashed / was killed with -9
+    # and the file wasn't cleaned up). Without this probe, callers get an
+    # opaque connect_over_cdp error much later.
+    if not _probe_cdp_alive(ws_url):
+        raise ConnectionError(
+            f"DevToolsActivePort exists at {port_file} but Chrome is not "
+            f"accepting CDP connections on port {lines[0]}. The browser may "
+            f"have crashed or been killed. Restart Chrome with "
+            f"--remote-debugging-port=PORT and try again."
+        )
+    return ws_url
 
 
 def resolve_cdp_input(value: str) -> str:
@@ -322,15 +399,33 @@ def _detect_system_chrome() -> bool:
     Google blocks for OAuth login) to the real system Chrome in headed mode.
     """
     if sys.platform == "darwin":
-        return os.path.isfile(
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        # System-wide install is the common case; ~/Applications covers the
+        # user-level install path (drag-and-drop by non-admin users).
+        candidates = (
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            str(Path.home() / "Applications" / "Google Chrome.app" / "Contents" / "MacOS" / "Google Chrome"),
         )
+        return any(os.path.isfile(c) for c in candidates)
     elif sys.platform == "linux":
         import shutil
-        return (
-            shutil.which("google-chrome") is not None
-            or shutil.which("google-chrome-stable") is not None
+        # Any Chromium-based browser satisfies the "system Chrome present"
+        # check: Playwright's channel="chrome" picks up whatever is on PATH,
+        # and OAuth distinguishes Chrome-for-Testing only by binary signature.
+        # Snap installs land in /snap/bin (normally in $PATH).  Flatpak wrappers
+        # require `flatpak run …` so are NOT picked up here — that case is
+        # covered by the scan-dir list, not this detector.
+        _LINUX_CHROME_BINARIES = (
+            "google-chrome",
+            "google-chrome-stable",
+            "google-chrome-beta",
+            "chromium",
+            "chromium-browser",   # Debian/Ubuntu package wrapper
+            "microsoft-edge",
+            "microsoft-edge-stable",
+            "brave-browser",
+            "brave",
         )
+        return any(shutil.which(b) for b in _LINUX_CHROME_BINARIES)
     elif sys.platform == "win32":
         for env_var in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
             base = os.environ.get(env_var, "")
@@ -1537,6 +1632,24 @@ class Browser:
 
     # ==================== Lifecycle ====================
 
+    async def _apply_debugger_skip_pauses(self, context: "BrowserContext", page: "Page") -> None:
+        """Tell CDP to skip debugger pauses on ``page``.
+
+        Playwright enables the Debugger domain internally; any ``debugger``
+        statement would fire Debugger.paused events whose CDP round-trip
+        delay can be timed by devtools-detector (>100 ms → "open").
+        Invoked from all three start modes (launch / persistent / CDP) so
+        the anti-detection surface stays symmetric.
+        """
+        if not self.stealth_enabled or page is None:
+            return
+        try:
+            _dbg = await context.new_cdp_session(page)
+            await _dbg.send("Debugger.setSkipAllPauses", {"skip": True})
+            await _dbg.detach()
+        except Exception:
+            logger.debug("Failed to set Debugger.setSkipAllPauses", exc_info=True)
+
     async def _start(self) -> None:
         """Start the browser.
 
@@ -1593,6 +1706,15 @@ class Browser:
                     if init_script:
                         await self._context.add_init_script(init_script)
 
+                # Anti devtools-detector init script: safe for both headed and
+                # headless (it only patches timing probes, not window.chrome or
+                # WebGL identity that Turnstile checks).  Without this the CDP
+                # entry point would be detectably weaker than launch/persistent.
+                if self._stealth_builder:
+                    _adt_script = self._stealth_builder.get_anti_devtools_script()
+                    if _adt_script:
+                        await self._context.add_init_script(_adt_script)
+
                 # Always create a new tab for bridgic to drive.  We never
                 # reuse an existing user tab — the very next navigate_to()
                 # would otherwise overwrite whatever the user was looking at.
@@ -1607,8 +1729,23 @@ class Browser:
                     existing_count,
                 )
 
+                # Parity with non-CDP: make the Debugger domain skip pauses on
+                # the bridgic page so devtools-detector cannot time the CDP
+                # round-trip of Debugger.paused events.
+                await self._apply_debugger_skip_pauses(self._context, self._page)
+
+                # Download manager attachment strategy (CDP):
+                # - Owned context (bridgic created it): attach to the whole
+                #   context — all pages in it belong to bridgic anyway.
+                # - Borrowed context (user's): attach ONLY to the bridgic tab.
+                #   attaching to the context would hijack download events from
+                #   the user's pre-existing tabs (they'd land in our
+                #   downloads_path instead of Chrome's default behaviour).
                 if self._download_manager:
-                    self._download_manager.attach_to_context(self._context)
+                    if self._cdp_context_owned:
+                        self._download_manager.attach_to_context(self._context)
+                    else:
+                        self._download_manager.attach_to_page(self._page)
 
                 logger.info("Playwright started (mode=cdp, stealth_js=%s)", self.stealth_enabled)
                 return
@@ -1673,13 +1810,7 @@ class Browser:
             # statements would fire Debugger.paused events whose CDP
             # round-trip delay the debuggerChecker in devtools-detector
             # can measure (>100 ms => "open").
-            if self.stealth_enabled:
-                try:
-                    _dbg = await self._context.new_cdp_session(self._page)
-                    await _dbg.send("Debugger.setSkipAllPauses", {"skip": True})
-                    await _dbg.detach()
-                except Exception:
-                    logger.debug("Failed to set Debugger.setSkipAllPauses", exc_info=True)
+            await self._apply_debugger_skip_pauses(self._context, self._page)
 
             # Attach download manager to handle downloads with correct filenames
             if self._download_manager:
@@ -2071,12 +2202,23 @@ class Browser:
             self._clear_page_scoped_state(self._page, errors)
 
         logger.debug("[close] disconnecting browser")
-        # Detach download manager before context closes to remove handlers
-        if self._download_manager and self._context:
-            try:
-                self._download_manager.detach_from_context(self._context)
-            except Exception as e:
-                errors.append(f"download_manager.detach: {e}")
+        # Detach download manager before context closes to remove handlers.
+        # Mirror the attach strategy:
+        # - Borrowed CDP context: handler was page-scoped on the bridgic tab,
+        #   so detach at the page level (detach_from_context would no-op
+        #   since the context was never attached).
+        # - All other modes: handler was context-scoped, detach at context.
+        if self._download_manager:
+            if _is_cdp and not self._cdp_context_owned and self._page:
+                try:
+                    self._download_manager.detach_from_page(self._page)
+                except Exception as e:
+                    errors.append(f"download_manager.detach_page: {e}")
+            elif self._context:
+                try:
+                    self._download_manager.detach_from_context(self._context)
+                except Exception as e:
+                    errors.append(f"download_manager.detach: {e}")
 
         # Close every page in parallel.
         # CDP mode: skip page cleanup entirely — just disconnect.
@@ -2101,9 +2243,18 @@ class Browser:
                             errors.append(f"page.close: {r}")
 
         # Close context.
-        # NOTE: In persistent context mode, closing context will auto close browser.
-        # CDP mode: skip context.close() — just release the reference and disconnect.
-        if self._context and not _is_cdp:
+        # - Launch / persistent: close context (auto-closes browser).
+        # - CDP owned (`_cdp_context_owned=True`): bridgic created the context
+        #   in _start() because `browser.contexts` was empty on connect. Close
+        #   it explicitly; otherwise the context leaks on the remote Chrome for
+        #   its entire lifetime (frequent connect/disconnect cycles = OOM).
+        # - CDP borrowed (`_cdp_context_owned=False`): the user owns the
+        #   context — release the local reference but never close it, so their
+        #   existing tabs survive the disconnect.
+        _close_context_now = bool(self._context) and (
+            not _is_cdp or self._cdp_context_owned
+        )
+        if _close_context_now:
             _context = self._context
             self._context = None
             try:
@@ -2115,9 +2266,12 @@ class Browser:
                 errors.append(
                     f"context.close: timeout after {self._CONTEXT_CLOSE_TIMEOUT:.1f}s"
                 )
-                # context.close() hung — force-kill the entire Playwright driver
-                # so browser.close() and playwright.stop() don't also time out.
-                if self._playwright:
+                # Launch / persistent only: context.close() hung — force-kill
+                # the Playwright driver so browser.close() / playwright.stop()
+                # don't cascade.  In CDP mode the driver and remote Chrome
+                # share the same WS channel; killing it would orphan the remote
+                # browser from future disconnect signals.
+                if not _is_cdp and self._playwright:
                     _playwright = self._playwright
                     self._playwright = None
                     self._browser = None  # browser dies with driver
@@ -2129,7 +2283,7 @@ class Browser:
                 if _pending_cancel is None:
                     _pending_cancel = e
         elif self._context:
-            # CDP mode: release reference without closing (disconnect only)
+            # CDP borrowed mode: release reference without closing.
             self._context = None
 
         # Close browser.

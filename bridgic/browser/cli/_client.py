@@ -27,6 +27,37 @@ from ._transport import (
 
 _DAEMON_RESPONSE_TIMEOUT = float(os.environ.get("BRIDGIC_DAEMON_RESPONSE_TIMEOUT", "90"))
 
+# Buffer added on top of an arg-driven timeout so the daemon has time to
+# return its "operation timed out" error before the client gives up.  Without
+# this, `wait --timeout 120` would race the 90 s DAEMON_RESPONSE_TIMEOUT and
+# the client would abort while the daemon was still working.
+_DAEMON_RESPONSE_TIMEOUT_BUFFER = float(
+    os.environ.get("BRIDGIC_DAEMON_RESPONSE_TIMEOUT_BUFFER", "30")
+)
+
+
+def _compute_response_timeout(args: Dict[str, Any]) -> float:
+    """Return the effective client-side socket timeout for a command.
+
+    Commands like ``wait``/``wait_network``/``verify_*`` carry a ``timeout``
+    (or ``seconds``) arg that bounds how long the daemon will work.  The
+    client socket timeout must exceed that value, otherwise the client
+    aborts while the daemon is still running, orphaning the in-flight task
+    and confusing the next CLI invocation.
+    """
+    arg_timeouts: list[float] = []
+    for key in ("timeout", "seconds"):
+        val = args.get(key)
+        if val is None:
+            continue
+        try:
+            arg_timeouts.append(float(val))
+        except (TypeError, ValueError):
+            continue
+    if not arg_timeouts:
+        return _DAEMON_RESPONSE_TIMEOUT
+    return max(_DAEMON_RESPONSE_TIMEOUT, max(arg_timeouts) + _DAEMON_RESPONSE_TIMEOUT_BUFFER)
+
 
 # ---------------------------------------------------------------------------
 # Low-level socket helpers
@@ -41,6 +72,7 @@ async def _send_command_async(command: str, args: Dict[str, Any]) -> str:
     """
     transport = get_transport()
     reader, writer = await transport.open_connection(stream_limit=STREAM_LIMIT)
+    response_timeout = _compute_response_timeout(args)
     try:
         payload = transport.inject_auth({"command": command, "args": args})
         writer.write((json.dumps(payload) + "\n").encode())
@@ -49,7 +81,7 @@ async def _send_command_async(command: str, args: Dict[str, Any]) -> str:
         try:
             raw = await asyncio.wait_for(
                 reader.readline(),
-                timeout=_DAEMON_RESPONSE_TIMEOUT,
+                timeout=response_timeout,
             )
         except asyncio.TimeoutError as exc:
             raise BridgicBrowserCommandError(
@@ -57,7 +89,7 @@ async def _send_command_async(command: str, args: Dict[str, Any]) -> str:
                 code="DAEMON_RESPONSE_TIMEOUT",
                 message=(
                     f"Timed out waiting for daemon response after "
-                    f"{_DAEMON_RESPONSE_TIMEOUT:.0f} seconds."
+                    f"{response_timeout:.0f} seconds."
                 ),
                 retryable=True,
             ) from exc

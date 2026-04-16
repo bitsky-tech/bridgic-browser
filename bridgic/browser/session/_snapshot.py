@@ -55,6 +55,7 @@ import asyncio
 import re
 import math
 import logging
+import secrets
 import time
 import hashlib
 from typing import Dict, Optional, Set, List, Tuple, Any
@@ -73,16 +74,24 @@ _BATCH_INFO_CHUNK_SIZE = 500
 # Phase 1 of the three-phase evaluate strategy:
 # Called once before the chunk loop. Runs querySelectorAll for every unique
 # ARIA role across ALL chunks and stores the resulting Element arrays in
-# window.__bridgicRoleIndex.  Because window persists between page.evaluate()
-# calls, subsequent Phase-2 chunks read the pre-built index instead of
-# re-scanning the DOM.  Also initialises WeakMap caches and a generation
-# token so stale data from a previous snapshot cannot bleed into a new one.
+# window['__bridgicRoleIndex_<gen>'] — keyed by a per-call generation so
+# concurrent snapshot tasks (e.g. two daemon clients evaluating against the
+# same page) do not share or clobber each other's state.  Because window
+# persists between page.evaluate() calls, subsequent Phase-2 chunks read the
+# pre-built index instead of re-scanning the DOM.
 #
 # Without this, a 5549-ref page split into 12 chunks would run the expensive
 # `div:not([role])` querySelectorAll 12× instead of once — the observed
 # root cause of 95–123 s runtimes and DAEMON_RESPONSE_TIMEOUT failures.
 _BUILD_ROLE_INDEX_JS = r"""(args) => {
-    if (window.__bridgicRoleGen === args.generation) return null;
+    const gen           = args.generation;
+    const keyIndex      = '__bridgicRoleIndex_'             + gen;
+    const keySelectors  = '__bridgicImplicitRoleSelectors_' + gen;
+    const keyNameCache  = '__bridgicNameCache_'             + gen;
+    const keyTextCache  = '__bridgicTextCache_'             + gen;
+
+    // Idempotent: if this generation already built the index, skip.
+    if (window[keyIndex]) return null;
 
     const IMPLICIT_ROLE_SELECTORS = {
         'button': 'button, input[type="button"], input[type="submit"], input[type="reset"], input[type="file"], [role="button"]',
@@ -171,18 +180,18 @@ _BUILD_ROLE_INDEX_JS = r"""(args) => {
         'presentation': '[role="presentation"]',
     };
 
-    window.__bridgicRoleIndex             = {};
-    window.__bridgicImplicitRoleSelectors = IMPLICIT_ROLE_SELECTORS;
-    window.__bridgicNameCache             = new WeakMap();
-    window.__bridgicTextCache             = new WeakMap();
-    window.__bridgicRoleGen               = args.generation;
+    const roleIndex = {};
+    window[keyIndex]     = roleIndex;
+    window[keySelectors] = IMPLICIT_ROLE_SELECTORS;
+    window[keyNameCache] = new WeakMap();
+    window[keyTextCache] = new WeakMap();
 
     for (const role of args.roles) {
         const selector = IMPLICIT_ROLE_SELECTORS[role] || '[role="' + role + '"]';
         try {
-            window.__bridgicRoleIndex[role] = Array.from(document.querySelectorAll(selector));
+            roleIndex[role] = Array.from(document.querySelectorAll(selector));
         } catch (_e) {
-            window.__bridgicRoleIndex[role] = [];
+            roleIndex[role] = [];
         }
     }
     return null;
@@ -190,16 +199,17 @@ _BUILD_ROLE_INDEX_JS = r"""(args) => {
 
 
 # Phase 3 of the three-phase evaluate strategy:
-# Deletes all window.__bridgic* variables written by _BUILD_ROLE_INDEX_JS.
-# Frees references to potentially thousands of DOM Elements that would
-# otherwise remain reachable through the window object.  Called in a
-# try/except so a closed or navigated page does not raise.
-_CLEANUP_ROLE_INDEX_JS = r"""() => {
-    delete window.__bridgicRoleIndex;
-    delete window.__bridgicImplicitRoleSelectors;
-    delete window.__bridgicNameCache;
-    delete window.__bridgicTextCache;
-    delete window.__bridgicRoleGen;
+# Deletes only THIS generation's window.__bridgic* keys, leaving any
+# concurrently-running snapshot task's state untouched.  Frees references
+# to potentially thousands of DOM Elements that would otherwise remain
+# reachable through the window object.  Called in a try/except so a closed
+# or navigated page does not raise.
+_CLEANUP_ROLE_INDEX_JS = r"""(args) => {
+    const gen = args.generation;
+    delete window['__bridgicRoleIndex_'             + gen];
+    delete window['__bridgicImplicitRoleSelectors_' + gen];
+    delete window['__bridgicNameCache_'             + gen];
+    delete window['__bridgicTextCache_'             + gen];
 }"""
 
 
@@ -210,9 +220,9 @@ _CLEANUP_ROLE_INDEX_JS = r"""() => {
 # empty objects / fresh WeakMaps when Phase 1 was skipped or failed — the
 # findElement fallback QSA path still works, just less efficiently.
 _BATCH_INFO_JS = r"""(args) => {
-    const { elements, viewportWidth, viewportHeight, checkViewport } = args;
+    const { elements, viewportWidth, viewportHeight, checkViewport, generation } = args;
 
-    const IMPLICIT_ROLE_SELECTORS = window.__bridgicImplicitRoleSelectors || {
+    const IMPLICIT_ROLE_SELECTORS = window['__bridgicImplicitRoleSelectors_' + generation] || {
         'button': 'button, input[type="button"], input[type="submit"], input[type="reset"], input[type="file"], [role="button"]',
         'link': 'a[href], area[href], [role="link"]',
         'textbox': 'input:not([type]), input[type="text"], input[type="email"], input[type="password"], input[type="search"], input[type="url"], input[type="tel"], textarea, [role="textbox"], [contenteditable="true"], [contenteditable=""]',
@@ -300,12 +310,13 @@ _BATCH_INFO_JS = r"""(args) => {
     };
 
     // Read the role index and caches built by _BUILD_ROLE_INDEX_JS (Phase 1).
+    // Keys are suffixed with `generation` to isolate concurrent snapshot tasks.
     // If Phase 1 was skipped or failed the fallback path in findElement()
     // issues a one-shot querySelectorAll per missing role and caches it back
     // into roleIndex for subsequent refs in this chunk.
-    const roleIndex = window.__bridgicRoleIndex  || {};
-    const nameCache = window.__bridgicNameCache  || new WeakMap();
-    const textCache = window.__bridgicTextCache  || new WeakMap();
+    const roleIndex = window['__bridgicRoleIndex_' + generation] || {};
+    const nameCache = window['__bridgicNameCache_' + generation] || new WeakMap();
+    const textCache = window['__bridgicTextCache_' + generation] || new WeakMap();
 
     function getAssociatedLabelText(el) {
         if (!el) return '';
@@ -1150,24 +1161,28 @@ class SnapshotGenerator:
         #
         # Phase 1 (_BUILD_ROLE_INDEX_JS): called once before the chunk loop.
         #   Runs querySelectorAll for every unique ARIA role across ALL chunks
-        #   and stores Element arrays in window.__bridgicRoleIndex.  This
-        #   ensures expensive selectors like 'div:not([role])' run exactly
-        #   once regardless of chunk count — the root cause of 95-123 s
-        #   runtimes on 5000+ ref pages was paying that cost once per chunk.
+        #   and stores Element arrays in window['__bridgicRoleIndex_<gen>'].
+        #   This ensures expensive selectors like 'div:not([role])' run
+        #   exactly once regardless of chunk count — the root cause of 95-
+        #   123 s runtimes on 5000+ ref pages was paying that cost once per
+        #   chunk.
         #
         # Phase 2 (_BATCH_INFO_JS): called N times (one per chunk).
-        #   Reads window.__bridgicRoleIndex; no DOM scanning per chunk.
+        #   Reads the per-generation role index; no DOM scanning per chunk.
         #   asyncio.sleep(0) between chunks yields the event loop so other
         #   daemon commands are not starved.
         #
         # Phase 3 (_CLEANUP_ROLE_INDEX_JS): called once in `finally`.
-        #   Removes window.__bridgic* to release Element references and
-        #   prevent cross-snapshot contamination.
+        #   Removes only THIS generation's window.__bridgic*_<gen> keys so
+        #   concurrent snapshot tasks on the same page are isolated.
         batch_results: Dict[str, Any] = {}
 
         # Collect all unique roles up-front for Phase 1.
         all_roles = list({item['role'] for item in batch_elements})
-        generation = f"{id(batch_elements)}-{int(time.time() * 1000)}"
+        # Cryptographically-unique per-call token: isolates window state when
+        # concurrent snapshot tasks run against the same page (e.g. two daemon
+        # clients invoking get_snapshot simultaneously).
+        generation = secrets.token_hex(8)
 
         # Phase 1: build role index in window (one QSA per unique role).
         try:
@@ -1176,19 +1191,24 @@ class SnapshotGenerator:
                 'generation': generation,
             })
         except Exception as e:
-            logger.debug(f"_build_role_index failed (chunk fallback active): {e}")
+            logger.warning(
+                "_build_role_index failed; falling back to per-element lookup "
+                "(roles=%d, fallback=per-element): %s",
+                len(all_roles), e,
+            )
 
         try:
             start_time = time.time()
             total = len(batch_elements)
             for offset in range(0, total, _BATCH_INFO_CHUNK_SIZE):
                 chunk = batch_elements[offset:offset + _BATCH_INFO_CHUNK_SIZE]
-                # Phase 2: resolve refs using pre-built window.__bridgicRoleIndex.
+                # Phase 2: resolve refs using pre-built per-generation index.
                 chunk_result = await page.evaluate(_BATCH_INFO_JS, {
                     'elements': chunk,
                     'viewportWidth': viewport_width,
                     'viewportHeight': viewport_height,
                     'checkViewport': check_viewport,
+                    'generation': generation,
                 })
                 if chunk_result:
                     batch_results.update(chunk_result)
@@ -1210,9 +1230,9 @@ class SnapshotGenerator:
                 interactive_map[item['ref']] = False
             return visible_refs, interactive_map
         finally:
-            # Phase 3: release window.__bridgic* references.
+            # Phase 3: release only THIS generation's window.__bridgic* refs.
             try:
-                await page.evaluate(_CLEANUP_ROLE_INDEX_JS)
+                await page.evaluate(_CLEANUP_ROLE_INDEX_JS, {'generation': generation})
             except Exception:
                 pass
 

@@ -2535,7 +2535,8 @@ class TestFindCdpUrl:
     def test_scan_mode_returns_url_from_file(self):
         from bridgic.browser import find_cdp_url
         fake_url = "ws://localhost:9222/devtools/browser/chrome-uuid"
-        with patch("bridgic.browser.session._browser._read_devtools_active_port", return_value=fake_url):
+        with patch("bridgic.browser.session._browser._read_devtools_active_port", return_value=fake_url), \
+             patch("bridgic.browser.session._browser._probe_cdp_alive", return_value=True):
             url = find_cdp_url(mode="scan")
         assert url == fake_url
 
@@ -2552,13 +2553,26 @@ class TestFindCdpUrl:
                 return chrome_url
             return None
 
-        with patch("bridgic.browser.session._browser._read_devtools_active_port", side_effect=fake_read):
+        with patch("bridgic.browser.session._browser._read_devtools_active_port", side_effect=fake_read), \
+             patch("bridgic.browser.session._browser._probe_cdp_alive", return_value=True):
             result = find_cdp_url(mode="scan")
         assert result == chrome_url
 
     def test_scan_mode_no_profiles_raises_runtime_error(self):
         from bridgic.browser import find_cdp_url
         with patch("bridgic.browser.session._browser._read_devtools_active_port", return_value=None):
+            with pytest.raises(RuntimeError, match="--remote-debugging-port=9222"):
+                find_cdp_url(mode="scan")
+
+    def test_scan_mode_skips_stale_active_port(self):
+        """Stale DevToolsActivePort (file present but port dead) must be skipped."""
+        from bridgic.browser import find_cdp_url
+        stale_url = "ws://localhost:9222/devtools/browser/stale-uuid"
+        # _read_devtools_active_port returns a URL for every candidate, but
+        # _probe_cdp_alive always fails → scan must raise RuntimeError rather
+        # than returning a stale URL.
+        with patch("bridgic.browser.session._browser._read_devtools_active_port", return_value=stale_url), \
+             patch("bridgic.browser.session._browser._probe_cdp_alive", return_value=False):
             with pytest.raises(RuntimeError, match="--remote-debugging-port=9222"):
                 find_cdp_url(mode="scan")
 

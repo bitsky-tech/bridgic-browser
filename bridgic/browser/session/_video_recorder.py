@@ -58,6 +58,12 @@ _FPS = 25
 # "ffmpeg-1011", which would pin us to an older binary).
 _FFMPEG_VERSION_RE = re.compile(r"^ffmpeg-(\d+)$")
 
+# Upper bound on stderr retained in memory per recorder.  64 KiB matches the
+# typical OS pipe buffer, which is why this number also matches the historical
+# deadlock threshold — anything that would fit in the pipe is kept verbatim,
+# and real error scenarios dump a few KiB at most.
+_STDERR_CAP = 64 * 1024
+
 
 # ---------------------------------------------------------------------------
 # ffmpeg path discovery
@@ -82,11 +88,17 @@ def _find_ffmpeg() -> str:
         elif system == "Linux":
             browsers_path = os.path.expanduser("~/.cache/ms-playwright")
         else:
+            # Windows: %LOCALAPPDATA% is the first choice, but services,
+            # sandboxed sessions, and some CI agents run without it set.
+            # Fall back to the canonical ~/AppData/Local path so we still
+            # find Playwright's cache instead of jumping straight to PATH.
             _local_app = os.environ.get("LOCALAPPDATA", "")
             if _local_app:
                 browsers_path = os.path.join(_local_app, "ms-playwright")
             else:
-                browsers_path = ""
+                browsers_path = str(
+                    Path.home() / "AppData" / "Local" / "ms-playwright"
+                )
 
     bp = Path(browsers_path)
     if browsers_path and bp.is_dir():
@@ -105,7 +117,11 @@ def _find_ffmpeg() -> str:
                 candidates.append((int(match.group(1)), entry))
         for _, entry in sorted(candidates, key=lambda c: c[0], reverse=True):
             candidate = entry / f"ffmpeg-{suffix}"
-            if candidate.exists():
+            # X_OK guards against musl/glibc mismatches (e.g. Alpine): the file
+            # exists but the loader refuses to execute it.  Fall through to the
+            # next version, and ultimately to PATH where apk/yum install places
+            # a system-native binary.
+            if candidate.exists() and os.access(str(candidate), os.X_OK):
                 return str(candidate)
 
     system_ffmpeg = shutil.which("ffmpeg")
@@ -113,7 +129,12 @@ def _find_ffmpeg() -> str:
         return system_ffmpeg
 
     raise FileNotFoundError(
-        "ffmpeg not found. Run 'playwright install ffmpeg' or install ffmpeg."
+        "ffmpeg not found. Tried Playwright's cache at "
+        f"{browsers_path or '(unset — LOCALAPPDATA missing on Windows)'} "
+        "and system PATH. Resolve by any of:\n"
+        "  1. playwright install ffmpeg       (downloads the Playwright copy)\n"
+        "  2. set PLAYWRIGHT_BROWSERS_PATH    (point at an existing install)\n"
+        "  3. install system ffmpeg           (apt / brew / choco / manual)"
     )
 
 
@@ -205,7 +226,7 @@ class VideoRecorder:
         output_path: str,
         size: Tuple[int, int],
     ) -> None:
-        if not output_path.endswith(".webm"):
+        if not output_path.lower().endswith(".webm"):
             raise ValueError("Output file must have .webm extension")
         self._context = context
         self._page = page
@@ -226,6 +247,79 @@ class VideoRecorder:
         self._write_lock = asyncio.Lock()                              # serializes writes to ffmpeg's stdin
         self._flush_pending = False                                    # dedup flag: avoid scheduling a flush task per frame
         self._ffmpeg_write_warned = False                               # one-shot dedup for ffmpeg write errors
+
+        # stderr diagnostics — populated by _stderr_reader_task while ffmpeg
+        # runs so its pipe never fills (would deadlock stdin writes).  Capped
+        # at _STDERR_CAP bytes; overflow is dropped with a single log note.
+        self._stderr_buf: bytearray = bytearray()
+        self._stderr_reader_task: Optional[asyncio.Task[None]] = None
+        self._stderr_logged: bool = False
+
+    # ------------------------------------------------------------------
+    # stderr plumbing
+    # ------------------------------------------------------------------
+
+    async def _read_stderr(self) -> None:
+        """Drain ffmpeg's stderr into a capped buffer for diagnostics.
+
+        Runs for the entire ffmpeg lifetime and exits on EOF (which ffmpeg
+        closes when it terminates).  The buffer is capped at _STDERR_CAP;
+        overflow is drained-and-dropped so the pipe never back-pressures
+        into ffmpeg's stdout reader (which would deadlock `stdin.drain()`
+        in the main write path).
+        """
+        if not self._ffmpeg or not self._ffmpeg.stderr:
+            return
+        stderr = self._ffmpeg.stderr
+        truncated_logged = False
+        while True:
+            try:
+                chunk = await stderr.read(4096)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return
+            if not chunk:
+                return
+            remaining = _STDERR_CAP - len(self._stderr_buf)
+            if remaining > 0:
+                self._stderr_buf.extend(chunk[:remaining])
+            elif not truncated_logged:
+                logger.debug(
+                    "[VideoRecorder] ffmpeg stderr exceeded %d bytes, "
+                    "further output dropped: %s",
+                    _STDERR_CAP, self._output_path,
+                )
+                truncated_logged = True
+
+    async def _drain_stderr_reader(self) -> None:
+        """Await the stderr reader task and log captured output once.
+
+        Safe to call multiple times — it's a no-op after the first call.
+        """
+        task = self._stderr_reader_task
+        self._stderr_reader_task = None
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(task, timeout=2.0)
+            except asyncio.TimeoutError:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            except Exception:
+                pass
+        if self._stderr_logged:
+            return
+        self._stderr_logged = True
+        if self._stderr_buf:
+            logger.debug(
+                "[VideoRecorder] ffmpeg stderr (%d bytes) for %s:\n%s",
+                len(self._stderr_buf),
+                self._output_path,
+                bytes(self._stderr_buf).decode("utf-8", errors="replace"),
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -295,20 +389,27 @@ class VideoRecorder:
             "-vf", f"scale={w}:{h}",
             self._output_path,
         ]
-        # stdout/stderr → DEVNULL: ffmpeg launches with `-loglevel error`, so
-        # the streams are silent on the happy path, but on errors (corrupt
-        # JPEG, encoder failures) the text can be large enough to fill the OS
-        # pipe buffer (~64 KB on Linux). With nothing reading those pipes,
-        # ffmpeg's next write() blocks → its stdin reader stalls →
-        # bridgic's `await stdin.drain()` deadlocks → stop() hangs and
-        # eventually force-kills ffmpeg, corrupting the output. We never read
-        # the streams anyway, so dropping them in-kernel is the simplest fix.
+        # stdout → DEVNULL (never inspected), stderr → PIPE + background
+        # reader task.  Prior code pointed stderr at DEVNULL to avoid the
+        # pipe-fill deadlock described below; the tradeoff was that ffmpeg
+        # encode failures were completely silent, making diagnosis of
+        # corrupt-JPEG / codec errors impossible.  The reader task keeps the
+        # pipe drained while buffering up to _STDERR_CAP bytes for later
+        # logging, giving us both safety and visibility.
+        #
+        # Deadlock constraint: if nothing reads stderr and ffmpeg emits >pipe
+        # size (~64 KiB on Linux), its next write() blocks → its stdin
+        # reader stalls → our `await stdin.drain()` deadlocks → stop() hangs
+        # and ffmpeg is force-killed, corrupting the output.
         self._ffmpeg = await asyncio.create_subprocess_exec(
             *args,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
+        self._stderr_buf = bytearray()
+        self._stderr_logged = False
+        self._stderr_reader_task = asyncio.create_task(self._read_stderr())
 
         # Create the CDP session and start the screencast.
         # Reference: Playwright's screencast.ts startScreencast().
@@ -345,6 +446,9 @@ class VideoRecorder:
             if self._ffmpeg:
                 self._ffmpeg.kill()
                 self._ffmpeg = None
+            # Reader task will exit on EOF; await briefly so it doesn't
+            # outlive the recorder.
+            await self._drain_stderr_reader()
             raise
         logger.debug(
             "[VideoRecorder] started screencast %dx%d → %s",
@@ -444,6 +548,11 @@ class VideoRecorder:
             except asyncio.TimeoutError:
                 self._ffmpeg.kill()
                 logger.warning("[VideoRecorder] ffmpeg killed after timeout")
+
+        # Step 6: reader task exits on stderr EOF (which ffmpeg closes when it
+        # exits in step 5).  Await briefly so it doesn't outlive finalize();
+        # emit whatever was captured so operators can diagnose encode failures.
+        await self._drain_stderr_reader()
 
         logger.debug("[VideoRecorder] finalize done → %s", self._output_path)
         return self._output_path
