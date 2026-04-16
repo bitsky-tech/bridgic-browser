@@ -1136,6 +1136,35 @@ class TestDaemonDispatch:
         assert "bridgic-browser close" in resp["result"]
         assert "bridgic-browser open" in resp["result"]
 
+    async def test_dispatch_short_circuits_when_closing(self):
+        """C2 regression guard: dispatches arriving after close() started must
+        fast-fail with BROWSER_CLOSED instead of running the handler."""
+        browser = make_browser()
+        browser._closing = True
+        # Handler must NOT be invoked.
+        browser.navigate_to = AsyncMock(return_value="Navigated")
+
+        resp = await _dispatch(browser, "open", {"url": "https://example.com"})
+
+        assert resp["success"] is False
+        assert resp["error_code"] == "BROWSER_CLOSED"
+        browser.navigate_to.assert_not_called()
+
+    async def test_dispatch_allows_close_command_even_when_closing(self):
+        """The `close` command itself must pass through so idempotent close is safe."""
+        browser = make_browser()
+        browser._closing = True
+        browser.close = AsyncMock(return_value="Browser closed.")
+        browser.inspect_pending_close_artifacts = MagicMock(return_value={
+            "session_dir": "/tmp/x", "trace": [], "video": [],
+        })
+
+        resp = await _dispatch(browser, "close", {})
+
+        # We don't care about the exact success value — the point is the
+        # short-circuit did NOT return BROWSER_CLOSED for the close command.
+        assert resp["error_code"] != "BROWSER_CLOSED"
+
     async def test_dispatch_emits_cli_cmd_and_cli_resp_logs(self, caplog):
         """Every _dispatch call emits a matched [CLI-CMD]/[CLI-RESP] pair with timing."""
         import logging as _logging
@@ -2630,6 +2659,36 @@ class TestReadDevToolsActivePort:
             finally:
                 os.chmod(p, 0o644)
         assert result is None
+
+    def test_non_numeric_port_returns_none(self):
+        """I6: a corrupt file whose first line isn't a port number must be
+        rejected rather than building a nonsense URL like ``ws://localhost:abc/...``.
+        """
+        fn = self._fn()
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "DevToolsActivePort"), "w").write("abc\n/devtools/browser/xyz\n")
+            result = fn(d)
+        assert result is None
+
+    def test_path_not_starting_with_slash_returns_none(self):
+        """I6: a corrupt file whose second line doesn't look like a URL path
+        (missing leading ``/``) must be rejected.
+        """
+        fn = self._fn()
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "DevToolsActivePort"), "w").write("9222\nnot-a-url-path\n")
+            result = fn(d)
+        assert result is None
+
+    def test_whitespace_lines_are_trimmed(self):
+        """Accept files with trailing whitespace that pass validation."""
+        fn = self._fn()
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "DevToolsActivePort"), "w").write(
+                "  9222  \n  /devtools/browser/abc  \n"
+            )
+            result = fn(d)
+        assert result == "ws://localhost:9222/devtools/browser/abc"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

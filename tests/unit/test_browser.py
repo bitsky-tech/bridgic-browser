@@ -1001,6 +1001,140 @@ class TestBrowserStartStop:
             assert browser._context is None
 
 
+class TestCloseClosingFlag:
+    """Regression guard for C2: close() must publish a `_closing` sentinel
+    synchronously (before any await) so concurrent dispatches short-circuit
+    with a clear error, and must defer nulling `_page` until after all page
+    close awaits complete so in-flight calls surface Playwright's own
+    "Target closed" error (which the daemon maps to BROWSER_CLOSED) rather
+    than a misleading NO_ACTIVE_PAGE."""
+
+    @pytest.mark.asyncio
+    async def test_closing_flag_default_false(self):
+        browser = Browser()
+        assert browser._closing is False
+
+    @pytest.mark.asyncio
+    async def test_close_sets_closing_flag_synchronously(self, mock_playwright, mock_page):
+        """`_closing` must flip to True before close() awaits anything."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            close_task = asyncio.ensure_future(browser.close())
+            # Yield ONCE — close() should have set the flag synchronously
+            # before hitting its first await, so after one loop turn the flag
+            # must already be True.
+            await asyncio.sleep(0)
+            try:
+                assert browser._closing is True
+            finally:
+                await close_task
+
+    @pytest.mark.asyncio
+    async def test_close_nulls_page_only_after_page_closes(self, mock_playwright, mock_page):
+        """`_page` must remain non-None while page.close() is still running."""
+        observed_page_ref: list = []
+
+        async def _slow_close(*_a, **_kw):
+            # At this point close() has already entered the page-close phase.
+            # The reference should STILL be present so concurrent dispatchers
+            # raise Playwright's "Target closed" rather than NO_ACTIVE_PAGE.
+            observed_page_ref.append(browser._page)
+            await asyncio.sleep(0)
+
+        mock_page.close = AsyncMock(side_effect=_slow_close)
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+            await browser.close()
+
+        assert observed_page_ref, "page.close() must have been invoked"
+        assert observed_page_ref[0] is not None, (
+            "self._page was already None when page.close() ran — this is the C2 bug"
+        )
+        assert browser._page is None  # eventually nulled after close finishes
+
+
+class TestPrefetchGenerationToken:
+    """Regression guard for C4: `_pre_warm_snapshot` must not clobber a
+    just-cancelled prefetch with a stale snapshot. If the background task
+    returns from its `await` between `_cancel_prefetch()` and the new
+    navigation completing, the old result must be discarded — checked via
+    a monotonic `_prefetch_gen` counter held across the write."""
+
+    @pytest.mark.asyncio
+    async def test_prefetch_gen_default_zero(self):
+        browser = Browser()
+        assert browser._prefetch_gen == 0
+
+    @pytest.mark.asyncio
+    async def test_cancel_prefetch_bumps_generation(self):
+        browser = Browser()
+        gen0 = browser._prefetch_gen
+        browser._cancel_prefetch()
+        assert browser._prefetch_gen == gen0 + 1
+        browser._cancel_prefetch()
+        assert browser._prefetch_gen == gen0 + 2
+
+    @pytest.mark.asyncio
+    async def test_pre_warm_discards_snapshot_if_gen_bumped(self):
+        """If `_cancel_prefetch()` runs while the prefetch task is awaiting,
+        the eventual commit must see a generation mismatch and discard."""
+        from bridgic.browser.session._snapshot import EnhancedSnapshot
+
+        browser = Browser()
+        fake_snap = MagicMock(spec=EnhancedSnapshot)
+        fake_page = MagicMock()
+        fake_page.url = "https://example.com/a"
+        # Pretend this page is the active one — the existing identity guard
+        # (`self._page is page`) should not be the thing that saves us here;
+        # the generation check is.
+        browser._page = fake_page
+
+        _snapshot_returned = asyncio.Event()
+        _can_commit = asyncio.Event()
+
+        async def _fake_gen(_page, _opts):
+            _snapshot_returned.set()
+            await _can_commit.wait()
+            return fake_snap
+
+        browser._prefetch_generator = MagicMock()
+        browser._prefetch_generator.get_enhanced_snapshot_async = _fake_gen
+
+        # Kick off pre-warm capturing the current gen.
+        my_gen = browser._prefetch_gen
+        task = asyncio.ensure_future(browser._pre_warm_snapshot(fake_page, my_gen))
+
+        # Wait until the task has reached the generator await.
+        # (Task yields to sleep(0.5) first — skip it by patching.)
+        with patch("asyncio.sleep", new=AsyncMock(return_value=None)):
+            # Re-schedule under the patch so sleep(0.5) resolves instantly
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            task = asyncio.ensure_future(browser._pre_warm_snapshot(fake_page, my_gen))
+            await _snapshot_returned.wait()
+
+            # Simulate a navigation happening while the task is still awaiting
+            # the snapshot result: this increments the generation.
+            browser._cancel_prefetch()
+
+            # Let the task finish and attempt its (now-stale) commit.
+            _can_commit.set()
+            await task
+
+        assert browser._prefetch_snapshot is None, (
+            "pre-warm wrote a stale snapshot after _cancel_prefetch — C4 is back"
+        )
+
+
 class TestSingleVideoRecorderClose:
     """Tests verifying single-stream video recorder lifecycle during close().
 
@@ -2603,10 +2737,10 @@ class TestRetriableLaunch:
 
         async def launch():
             attempts.append("tried")
-            raise Exception("Target closed still")
+            raise Exception("SingletonLock still held")
 
         with patch("bridgic.browser.session._browser.asyncio.sleep", new=AsyncMock()):
-            with pytest.raises(Exception, match="Target closed"):
+            with pytest.raises(Exception, match="SingletonLock"):
                 await _browser_module._retriable_launch(launch, mode="persistent_context")
 
         assert len(attempts) == len(_browser_module._LAUNCH_RETRY_DELAYS)
@@ -2620,7 +2754,7 @@ class TestRetriableLaunch:
             sleep_calls.append(delay)
 
         async def launch():
-            raise Exception("has been closed")
+            raise Exception("Target page, context or browser has been closed")
 
         with patch("bridgic.browser.session._browser.asyncio.sleep", side_effect=fake_sleep):
             with pytest.raises(Exception):
@@ -2629,3 +2763,39 @@ class TestRetriableLaunch:
         # Only non-zero delays get a real sleep call; attempt 1 has delay=0.0.
         expected = [d for d in _browser_module._LAUNCH_RETRY_DELAYS if d > 0]
         assert sleep_calls == expected
+
+    @pytest.mark.asyncio
+    async def test_bare_target_closed_does_not_retry(self):
+        """Regression guard for I1: bare ``"Target closed"`` (without the
+        full Playwright transient phrase) must NOT be retried — it fires on
+        many permanent failures and earlier spuriously retried 3x each time.
+        """
+        attempts = []
+
+        async def launch():
+            attempts.append("tried")
+            raise Exception("Target closed")
+
+        with patch("bridgic.browser.session._browser.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(Exception, match="Target closed"):
+                await _browser_module._retriable_launch(launch, mode="persistent_context")
+
+        assert len(attempts) == 1
+
+    @pytest.mark.asyncio
+    async def test_bare_has_been_closed_does_not_retry(self):
+        """Regression guard for I1: bare ``"has been closed"`` appears in
+        many permanent failures (e.g. ``"Executable has been closed"`` on a
+        bad binary path); must NOT be retried.
+        """
+        attempts = []
+
+        async def launch():
+            attempts.append("tried")
+            raise Exception("Executable has been closed")
+
+        with patch("bridgic.browser.session._browser.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(Exception, match="has been closed"):
+                await _browser_module._retriable_launch(launch, mode="persistent_context")
+
+        assert len(attempts) == 1

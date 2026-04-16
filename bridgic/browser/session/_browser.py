@@ -89,13 +89,23 @@ _CDP_SCAN_DIRS: Dict[str, List[tuple]] = {
 
 
 def _read_devtools_active_port(base: str) -> Optional[str]:
-    """Return the ws:// URL from a DevToolsActivePort file, or None if absent/invalid."""
+    """Return the ws:// URL from a DevToolsActivePort file, or None if absent/invalid.
+
+    Validates that line 1 is a numeric port and line 2 begins with ``/`` —
+    without this, a corrupted/rotated file (e.g. a leftover PID file sharing
+    the same name) would produce a nonsense URL like ``ws://localhost:abcdef``
+    that fails much later inside Playwright with an opaque error.
+    """
     port_file = os.path.join(base, "DevToolsActivePort")
     try:
         with open(port_file) as f:
             lines = f.read().strip().splitlines()
-        if len(lines) >= 2:
-            return f"ws://localhost:{lines[0]}{lines[1]}"
+        if len(lines) < 2:
+            return None
+        port_str, path = lines[0].strip(), lines[1].strip()
+        if not port_str.isdigit() or not path.startswith("/"):
+            return None
+        return f"ws://localhost:{port_str}{path}"
     except (OSError, ValueError):
         pass
     return None
@@ -316,20 +326,23 @@ def find_cdp_url(
             f"DevToolsActivePort not found: {port_file}\n"
             f"Make sure Chrome has remote debugging enabled." + extra
         )
-    with open(port_file) as f:
-        lines = f.read().strip().splitlines()
-    if len(lines) < 2:
+    # Delegate parsing + validation to the shared helper so scan-mode and
+    # file-mode treat malformed files identically.  The helper returns None
+    # on any parse failure (missing lines, non-numeric port, non-/ path).
+    ws_url = _read_devtools_active_port(base)
+    if ws_url is None:
         raise ValueError(
-            f"DevToolsActivePort file is malformed (expected 2 lines, got {len(lines)}): {port_file}"
+            f"DevToolsActivePort file is malformed or unreadable: {port_file}"
         )
-    ws_url = f"ws://localhost:{lines[0]}{lines[1]}"
     # Catch stale DevToolsActivePort files (Chrome crashed / was killed with -9
     # and the file wasn't cleaned up). Without this probe, callers get an
     # opaque connect_over_cdp error much later.
     if not _probe_cdp_alive(ws_url):
+        # Extract port number purely for the error message.
+        _parsed_port = urlparse(ws_url).port
         raise ConnectionError(
             f"DevToolsActivePort exists at {port_file} but Chrome is not "
-            f"accepting CDP connections on port {lines[0]}. The browser may "
+            f"accepting CDP connections on port {_parsed_port}. The browser may "
             f"have crashed or been killed. Restart Chrome with "
             f"--remote-debugging-port=PORT and try again."
         )
@@ -645,9 +658,11 @@ async def _cdp_evaluate_on_element(cdp_context, page, locator, code: str) -> Any
     so it bypasses Playwright's ``_mainContext()`` which hangs on pre-existing
     CDP-borrowed tabs.  Raises on any failure (caller must handle).
 
-    Note: assumes no concurrent scroll between ``bounding_box()`` and the CDP
-    ``Runtime.evaluate`` call — if the page scrolls in between, the coordinates
-    may resolve to a different element.
+    Scroll-race detection: the locator's bbox is re-acquired after the
+    ``elementFromPoint`` call and compared with the pre-call bbox. If the
+    page scrolled in between, the coordinates resolved to a different
+    element — we raise a clear error so the caller can retry instead of
+    silently executing JS on the wrong node.
     """
     bbox = await locator.bounding_box()
     if bbox is None:
@@ -667,6 +682,25 @@ async def _cdp_evaluate_on_element(cdp_context, page, locator, code: str) -> Any
         object_id = elem_result.get("result", {}).get("objectId")
         if not object_id:
             raise RuntimeError("No element found at coordinates via CDPSession")
+        # Scroll-race post-check: re-acquire bbox and compare. If the element
+        # moved significantly in the viewport, the page scrolled between the
+        # first bbox() and the elementFromPoint call — the objectId we hold
+        # points at a different element than the locator resolves now.
+        bbox_after = await locator.bounding_box()
+        if bbox_after is None:
+            raise RuntimeError(
+                "Element disappeared during CDP resolution — possible scroll race"
+            )
+        if (
+            abs(bbox_after["x"] - bbox["x"]) > 1
+            or abs(bbox_after["y"] - bbox["y"]) > 1
+            or abs(bbox_after["width"] - bbox["width"]) > 1
+            or abs(bbox_after["height"] - bbox["height"]) > 1
+        ):
+            raise RuntimeError(
+                f"Element moved during CDP resolution — scroll race detected "
+                f"(bbox before={bbox}, after={bbox_after})"
+            )
         # Step 2: call the user's arrow function with the element as the first
         # argument (matching Playwright's locator.evaluate() calling convention).
         # objectId is used as the execution context; arguments[0] passes it as
@@ -695,16 +729,19 @@ _LAUNCH_RETRY_DELAYS = (0.0, 1.0, 2.5)
 """Back-off schedule for :func:`_retriable_launch`. Three attempts total."""
 
 _RETRIABLE_LAUNCH_TOKENS = (
-    "has been closed",
     "singleton lock",
     "singletonlock",  # Chrome's on-disk file is literally `SingletonLock` (no space)
-    "target closed",
     "target page, context or browser has been closed",
     "process unexpectedly closed",
 )
 """Substrings in Playwright launch errors that indicate a transient failure
 (typically: the previous Chromium process is still releasing the user-data-dir
-singleton lock). Matched case-insensitively against ``str(exc)``."""
+singleton lock). Matched case-insensitively against ``str(exc)``.
+
+Intentionally narrow: bare phrases like ``"has been closed"`` or
+``"target closed"`` appear in many permanent failures (e.g. "Executable
+... has been closed" on a bad binary path) and would cause spurious
+retries. Only the full Playwright transient-launch phrase is matched."""
 
 
 async def _retriable_launch(launch_callable, *, mode: str):
@@ -746,8 +783,22 @@ async def _retriable_launch(launch_callable, *, mode: str):
             )
             if not will_retry:
                 raise
-    # Unreachable — loop always raises or returns.
-    raise last_exc  # type: ignore[misc]
+    # Defensive guard: the loop above always either returns on success or
+    # raises on the final attempt. If control reaches here, something is
+    # deeply wrong (e.g. _LAUNCH_RETRY_DELAYS was mutated to empty) — surface
+    # it as an AssertionError rather than silently swallowing the issue.
+    raise AssertionError(
+        "_retriable_launch exited its loop without returning or raising — "
+        f"last_exc={last_exc!r}"
+    )
+
+
+_DEFAULT_VIDEO_WIDTH = 1280
+_DEFAULT_VIDEO_HEIGHT = 720
+"""Fallback video recording dimensions used when both CDP
+``Page.getLayoutMetrics`` and ``page.viewport_size`` fail to report usable
+values. 1280x720 is a common default that keeps frames legible without being
+wasteful. VP8 requires even width/height, and both values are already even."""
 
 
 _DEFAULT_CLICK_TIMEOUT_MS = 10000
@@ -1211,6 +1262,10 @@ class Browser:
         self._browser: Optional[PlaywrightBrowser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
+        # C2: set synchronously at the top of close() (before any await) so
+        # concurrent dispatchers can short-circuit with BROWSER_CLOSED rather
+        # than hit a misleading NO_ACTIVE_PAGE when `_page` is mid-teardown.
+        self._closing: bool = False
 
         # Download manager - handles saving files with correct filenames
         self._download_manager: Optional[DownloadManager] = None
@@ -1229,6 +1284,13 @@ class Browser:
         self._prefetch_url: Optional[str] = None
         self._prefetch_task: Optional[asyncio.Task] = None
         self._prefetch_generator: Optional[SnapshotGenerator] = None
+        # Monotonic generation counter — bumped by `_cancel_prefetch()` on
+        # every navigation / tab switch. Each prefetch task captures the
+        # current value at launch and MUST verify it still matches before
+        # committing its result under `_snapshot_lock`. Without this a task
+        # returning from its await between cancel and commit could clobber
+        # a fresh page's cache with a stale snapshot. (C4.)
+        self._prefetch_gen: int = 0
         # Artifacts auto-saved during shutdown (trace/video)
         self._last_shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
         self._last_shutdown_errors: List[str] = []
@@ -2066,6 +2128,13 @@ class Browser:
         if self._playwright is None:
             return "Browser closed."
 
+        # Publish the closing sentinel SYNCHRONOUSLY — before any await — so
+        # the CLI daemon can short-circuit concurrent dispatches with a clean
+        # BROWSER_CLOSED response instead of the handler racing against the
+        # teardown and emitting NO_ACTIVE_PAGE. Critical: do not move this
+        # below any `await`.
+        self._closing = True
+
         # Ensure a close session directory exists so trace/video artifacts are
         # grouped together (e.g. close-{ts}-{rand}/trace.zip, video_1.webm).
         # The CLI daemon calls inspect_pending_close_artifacts() before close(),
@@ -2224,7 +2293,12 @@ class Browser:
         # CDP mode: skip page cleanup entirely — just disconnect.
         #   The remote browser manages its own tab lifecycle.
         # Launch / persistent: close all pages explicitly before context close.
-        self._page = None
+        #
+        # C2: `self._page` is NOT nulled here; we keep the reference alive
+        # until all page.close() awaits return. Nulling early was the root
+        # cause of NO_ACTIVE_PAGE races with in-flight dispatch. Now any
+        # tool method that still sees `self._page` will hit Playwright's
+        # "Target closed" error (mapped to BROWSER_CLOSED by the daemon).
         if self._context and not _is_cdp:
             all_pages = list(self._context.pages)
             if all_pages:
@@ -2241,6 +2315,10 @@ class Browser:
                             _pending_cancel = r
                         elif isinstance(r, Exception):
                             errors.append(f"page.close: {r}")
+        # All pages are now closed at Playwright level. Safe to release our
+        # own handle — no dispatch can mistake this for a "not yet started"
+        # state because `_closing` has been True since the very top.
+        self._page = None
 
         # Close context.
         # - Launch / persistent: close context (auto-closes browser).
@@ -2510,9 +2588,13 @@ class Browser:
             if self._page is not None:
                 self._prefetch_options = SnapshotOptions(interactive=True, full_page=True)
                 self._prefetch_url = actual_url
+                # Snapshot the gen AT SCHEDULING TIME so the task can detect a
+                # subsequent _cancel_prefetch (which bumps the gen) and refuse
+                # to commit its stale result.
+                _my_gen = self._prefetch_gen
                 try:
                     self._prefetch_task = asyncio.ensure_future(
-                        self._pre_warm_snapshot(self._page)
+                        self._pre_warm_snapshot(self._page, _my_gen)
                     )
                 except Exception as _e:
                     # Non-fatal: pre-warm is best-effort (e.g., no running loop in tests)
@@ -3038,7 +3120,12 @@ class Browser:
         current page's snapshot (i.e. everywhere _last_snapshot is set to None).
         Uses getattr throughout so it is safe on Browser instances created via
         Browser.__new__() (test helpers that bypass __init__).
+
+        Also bumps ``_prefetch_gen`` so any pre-warm task that returns from
+        its await AFTER this point will see a stale generation and discard
+        its result rather than clobber the new page's cache. (C4.)
         """
+        self._prefetch_gen = getattr(self, '_prefetch_gen', 0) + 1
         task = getattr(self, '_prefetch_task', None)
         if task is not None and not task.done():
             task.cancel()
@@ -3049,13 +3136,25 @@ class Browser:
             _prefetch_url=None,
         )
 
-    async def _pre_warm_snapshot(self, page: "AsyncPage") -> None:  # type: ignore[name-defined]
+    async def _pre_warm_snapshot(self, page: "AsyncPage", my_gen: int) -> None:  # type: ignore[name-defined]
         """Background task: compute interactive snapshot after navigation.
 
         Uses a dedicated _prefetch_generator instance so it never conflicts
         with the user-triggered _snapshot_generator (which is serialised by
         _snapshot_lock).  Result is written to _prefetch_snapshot; get_snapshot
         consumes it on a cache hit.
+
+        The commit is guarded by two checks:
+
+        1. ``my_gen == self._prefetch_gen`` — a monotonic counter bumped by
+           ``_cancel_prefetch()``.  If a navigation/tab-switch happened while
+           this task was awaiting, the generation differs and we discard.
+        2. ``page.url == target_url`` and ``self._page is page`` — belt-and-
+           suspenders identity check for the rare case where the page object
+           is reused by Playwright across URL changes.
+
+        The commit acquires ``_snapshot_lock`` so the writes happen atomically
+        w.r.t. ``get_snapshot`` consumers.
 
         This is best-effort — any exception or cancellation is silently ignored.
         """
@@ -3074,14 +3173,20 @@ class Browser:
                 page, options
             )
 
-            # Only cache if the page hasn't changed since we started.
-            if page.url == target_url and self._page is page:
+            async with self._snapshot_lock:
+                if my_gen != self._prefetch_gen:
+                    logger.debug(
+                        "[pre_warm] generation mismatch (own=%d current=%d); discarding result",
+                        my_gen, self._prefetch_gen,
+                    )
+                    return
+                if page.url != target_url or self._page is not page:
+                    logger.debug("[pre_warm] URL changed during pre-warm; discarding result")
+                    return
                 self._prefetch_snapshot = snapshot
                 self._prefetch_options = options
                 self._prefetch_url = target_url
                 logger.info("[pre_warm] snapshot ready for %s", target_url)
-            else:
-                logger.debug("[pre_warm] URL changed during pre-warm; discarding result")
         except asyncio.CancelledError:
             logger.debug("[pre_warm] cancelled (navigation superseded)")
         except Exception as e:
@@ -7841,8 +7946,8 @@ Before you return the element ref, reason about the state and elements for a sen
         #     for any of the three modes.
         # ``& ~1``: round down to an even number — VP8 requires even
         # width and height.
-        viewport_width = 1280
-        viewport_height = 720
+        viewport_width = _DEFAULT_VIDEO_WIDTH
+        viewport_height = _DEFAULT_VIDEO_HEIGHT
         try:
             # Use CDP Page.getLayoutMetrics instead of page.evaluate() — avoids the
             # Playwright _mainContext() hang on pre-existing tabs in CDP borrowed mode.
@@ -7897,25 +8002,36 @@ Before you return the element ref, reason about the state and elements for a sen
         self._video_recorder = None
         self._video_state[context_key] = True
 
+        # Subscribe to future pages so newly opened tabs auto-switch
+        # the screencast source to the new page. Define the listener BEFORE
+        # the try so both the happy path and the rollback can reference it.
+        def _on_page_created(new_page: Page) -> None:
+            try:
+                asyncio.get_running_loop().create_task(
+                    self._switch_video_to_page(new_page),
+                )
+            except RuntimeError:
+                logger.warning(
+                    "[start_video] no running loop to switch video to new page",
+                )
+
+        # Sentinel: True once context.on() has attached `_on_page_created`.
+        # Required so the rollback path can ALWAYS remove the listener —
+        # including the narrow window where attach succeeded but
+        # ``self._video_session["page_listener"] = ...`` raised (a real
+        # scenario under BaseException / MemoryError between two
+        # synchronous lines). Without this sentinel the listener would
+        # survive the rollback as a zombie. (C3.)
+        _listener_attached = False
+
         try:
             # Single-stream: start one recorder on the active page.
             await self._start_single_video_recorder(page)
             if self._video_recorder is None:
                 raise RuntimeError("Failed to start video recorder on active page")
 
-            # Subscribe to future pages so newly opened tabs auto-switch
-            # the screencast source to the new page.
-            def _on_page_created(new_page: Page) -> None:
-                try:
-                    asyncio.get_running_loop().create_task(
-                        self._switch_video_to_page(new_page),
-                    )
-                except RuntimeError:
-                    logger.warning(
-                        "[start_video] no running loop to switch video to new page",
-                    )
-
             context.on("page", _on_page_created)
+            _listener_attached = True
             self._video_session["page_listener"] = _on_page_created
 
             result = "Video recording started (recording active tab)"
@@ -7924,6 +8040,13 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             # Rollback the session state we set up above so future
             # start_video() calls are not blocked by a phantom session.
+            if _listener_attached:
+                try:
+                    context.remove_listener("page", _on_page_created)
+                except Exception:
+                    # Best-effort: a backend that raises on remove_listener
+                    # shouldn't mask the original error.
+                    pass
             self._video_session = None
             if self._video_recorder is not None:
                 try:

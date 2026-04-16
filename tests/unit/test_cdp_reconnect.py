@@ -19,6 +19,7 @@ def browser_stub() -> MagicMock:
     b = MagicMock()
     b.close = AsyncMock()
     b._start = AsyncMock()
+    b._cancel_prefetch = MagicMock()
     b._playwright = object()
     b._browser = object()
     b._context = object()
@@ -81,6 +82,48 @@ class TestCdpReconnect:
         # Even on failure, handles must have been reset to None — otherwise
         # a future retry hits the early-return guard.
         assert browser_stub._playwright is None
+
+    @pytest.mark.asyncio
+    async def test_cancels_prefetch_before_close(
+        self, browser_stub: MagicMock,
+    ) -> None:
+        """I2: _cancel_prefetch() must be called BEFORE close().
+
+        close() also cancels prefetch, but if close() raises early (before
+        reaching its own _cancel_prefetch line) an in-flight prefetch task
+        survives into the reconnect window and touches a dead browser. The
+        explicit up-front cancel is idempotent and prevents this race.
+        """
+        call_order: list = []
+
+        browser_stub._cancel_prefetch = MagicMock(
+            side_effect=lambda: call_order.append("cancel_prefetch")
+        )
+
+        async def _close_impl(*_a, **_k):
+            call_order.append("close")
+
+        browser_stub.close.side_effect = _close_impl
+
+        ok = await _cdp_reconnect(browser_stub)
+        assert ok is True
+        assert call_order[:2] == ["cancel_prefetch", "close"], (
+            f"Expected _cancel_prefetch before close, got: {call_order}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancel_prefetch_error_is_swallowed(
+        self, browser_stub: MagicMock,
+    ) -> None:
+        """I2: if _cancel_prefetch raises, the error is swallowed so reconnect
+        still proceeds to close + _start.
+        """
+        browser_stub._cancel_prefetch = MagicMock(side_effect=RuntimeError("boom"))
+
+        ok = await _cdp_reconnect(browser_stub)
+        assert ok is True
+        browser_stub.close.assert_awaited_once()
+        browser_stub._start.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_resets_before_start_even_when_close_succeeds(

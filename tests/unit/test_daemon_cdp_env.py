@@ -29,7 +29,9 @@ class TestResolveCdpUrlFromEnv:
         url = "ws://localhost:9222/devtools/page/abc123"
         with patch(
             "bridgic.browser.session._browser.resolve_cdp_input"
-        ) as mock_resolve:
+        ) as mock_resolve, patch(
+            "bridgic.browser.cli._daemon._probe_ws_reachable"
+        ):
             result = _resolve_cdp_url_from_env(url)
         assert result == url
         mock_resolve.assert_not_called()
@@ -39,7 +41,9 @@ class TestResolveCdpUrlFromEnv:
         url = "wss://remote-host/devtools/page/abc"
         with patch(
             "bridgic.browser.session._browser.resolve_cdp_input"
-        ) as mock_resolve:
+        ) as mock_resolve, patch(
+            "bridgic.browser.cli._daemon._probe_ws_reachable"
+        ):
             result = _resolve_cdp_url_from_env(url)
         assert result == url
         mock_resolve.assert_not_called()
@@ -49,9 +53,27 @@ class TestResolveCdpUrlFromEnv:
         for url in ("WS://host:9222/devtools/", "Ws://host:9222/x"):
             with patch(
                 "bridgic.browser.session._browser.resolve_cdp_input"
-            ) as mock_resolve:
+            ) as mock_resolve, patch(
+                "bridgic.browser.cli._daemon._probe_ws_reachable"
+            ):
                 assert _resolve_cdp_url_from_env(url) == url
                 mock_resolve.assert_not_called()
+
+    def test_ws_url_stale_env_probe_fails_fast(self) -> None:
+        """I4: a ws:// env value pointing at a dead browser must fail fast
+        with a ``RuntimeError`` carrying a friendly hint, instead of
+        hanging inside ``connect_over_cdp``.
+        """
+        url = "ws://localhost:9222/devtools/browser/dead"
+        with patch(
+            "bridgic.browser.cli._daemon._probe_ws_reachable",
+            side_effect=ConnectionError("target unreachable"),
+        ):
+            with pytest.raises(RuntimeError) as excinfo:
+                _resolve_cdp_url_from_env(url)
+        msg = str(excinfo.value)
+        assert "Failed to establish CDP connection" in msg
+        assert "target unreachable" in msg
 
     def test_port_string_calls_resolver(self) -> None:
         """Bare ports from shell must still flow through resolve_cdp_input."""

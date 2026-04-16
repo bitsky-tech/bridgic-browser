@@ -587,6 +587,16 @@ async def _cdp_reconnect(browser: "Browser") -> bool:
     daemon-only concern.  If ``_start()``'s preconditions change, this
     function must be updated accordingly.
     """
+    # Cancel any in-flight snapshot prefetch BEFORE close(). close() also
+    # cancels prefetch, but if it raises mid-way (line before _cancel_prefetch)
+    # the prefetch task survives and later touches a dead browser — producing
+    # spurious errors in the reconnect window. Cancelling up-front is cheap
+    # and idempotent.
+    try:
+        browser._cancel_prefetch()
+    except Exception as exc:
+        logger.debug("[daemon] cdp_reconnect: _cancel_prefetch error (ignored): %s", exc)
+
     try:
         await browser.close()
     except Exception as exc:
@@ -656,6 +666,17 @@ async def _dispatch_inner(browser: "Browser", command: str, args: Dict[str, Any]
         )
 
     cdp_url: Optional[str] = getattr(browser, "_cdp_url", None)
+    # C2 short-circuit: if close() has already published its sentinel,
+    # reject the dispatch immediately. The `close` command itself is
+    # allowed through so repeated close calls remain idempotent.
+    # Use ``is True`` (not truthiness) so MagicMock-based test fixtures
+    # that leave `_closing` as an auto-attribute don't accidentally trip.
+    if command != "close" and getattr(browser, "_closing", False) is True:
+        return _response(
+            success=False,
+            result=_browser_closed_hint(cdp_url),
+            error_code="BROWSER_CLOSED",
+        )
     # In CDP mode, attempt one automatic reconnect when the remote session drops.
     # This helps with cloud-browser session timeouts (Browserless, Steel.dev, etc.).
     # We do NOT reconnect for `close` (shutdown intent) or if there is no CDP URL.
@@ -977,6 +998,38 @@ def _resolve_default_downloads_dir() -> Path:
     return BRIDGIC_DOWNLOADS_DIR
 
 
+def _probe_ws_reachable(ws_url: str, timeout: float = 1.5) -> None:
+    """Best-effort TCP probe: verify the ws:// target's host:port is reachable.
+
+    Raises ``ConnectionError`` with a user-friendly message when the target
+    rejects the connection or is unreachable within *timeout*.  Used to
+    catch stale ``BRIDGIC_CDP`` values pointing at a dead browser *before*
+    Playwright's ``connect_over_cdp`` produces an opaque error.  A TCP
+    accept is NOT a guarantee that the CDP handshake will succeed, but a
+    refused/timed-out connection is a definite failure — so this probe
+    only catches the clear-cut bad case and lets ambiguous ones through
+    for Playwright to handle.
+    """
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(ws_url)
+    host = parsed.hostname
+    # Default CDP WebSocket port is the Chrome DevTools port, typically 9222.
+    port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+    if not host:
+        return  # malformed URL — defer to Playwright's own error handling
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            pass
+    except (OSError, socket.timeout) as exc:
+        raise ConnectionError(
+            f"CDP target {host}:{port} unreachable — {exc}. "
+            f"The browser may have exited since BRIDGIC_CDP was set; "
+            f"re-run with a fresh --cdp or clear the env var."
+        ) from exc
+
+
 def _resolve_cdp_url_from_env(cdp_input: Optional[str]) -> Optional[str]:
     """Resolve ``BRIDGIC_CDP`` env value to a ws:// URL.
 
@@ -985,10 +1038,23 @@ def _resolve_cdp_url_from_env(cdp_input: Optional[str]) -> Optional[str]:
     env, and re-running ``resolve_cdp_input`` on it would only bring the risk
     of client/daemon parsing drift.  Bare ports / ``auto`` still flow through
     ``resolve_cdp_input`` so ``BRIDGIC_CDP=9222`` from a shell keeps working.
+
+    ws:// inputs get a quick TCP probe so a stale env value (browser exited
+    after the CLI cached it) fails fast with a clear message rather than
+    going straight to Playwright's ``connect_over_cdp`` and hanging on the
+    handshake.
     """
     if not cdp_input:
         return None
     if cdp_input.lower().startswith(("ws://", "wss://")):
+        try:
+            _probe_ws_reachable(cdp_input)
+        except ConnectionError as exc:
+            raise RuntimeError(
+                f"Failed to establish CDP connection: {exc}\n"
+                "Check that the browser is still running with "
+                "--remote-debugging-port or re-run with a fresh --cdp value."
+            ) from exc
         return cdp_input
     from bridgic.browser.session._browser import resolve_cdp_input
     try:

@@ -255,6 +255,13 @@ class VideoRecorder:
         self._stderr_reader_task: Optional[asyncio.Task[None]] = None
         self._stderr_logged: bool = False
 
+        # Strong refs to in-flight Page.screencastFrameAck tasks — prevents
+        # the event-loop weak-ref GC from collecting them mid-flight (which
+        # surfaces as "Task was destroyed but it is pending!" warnings) and
+        # lets prepare_stop() cancel any pending acks that would otherwise
+        # race against the CDP session detach.
+        self._ack_tasks: set[asyncio.Task[Any]] = set()
+
     # ------------------------------------------------------------------
     # stderr plumbing
     # ------------------------------------------------------------------
@@ -503,6 +510,18 @@ class VideoRecorder:
 
         self._is_stopped = True
 
+        # Cancel any in-flight screencastFrameAck tasks before detaching
+        # the CDP session — an ack racing against detach() just errors
+        # out and floods logs.  Cancellation is idempotent on already-done
+        # tasks; the done-callback handles bookkeeping either way.
+        if self._ack_tasks:
+            pending = list(self._ack_tasks)
+            for t in pending:
+                if not t.done():
+                    t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
         logger.debug("[VideoRecorder] prepare_stop step4: detach CDP %s", self._output_path)
         # Step 4 (moved here from old stop()): detach the CDP session
         # early so Chrome resources are released before finalize().
@@ -683,7 +702,19 @@ class VideoRecorder:
                     "Page.screencastFrameAck", {"sessionId": session_id}
                 )
             )
-            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+            # Retain a strong ref so the task isn't GC'd mid-flight, and
+            # remove ourselves from the set when done so it stays bounded
+            # to "currently in-flight" rather than "ever created".
+            self._ack_tasks.add(task)
+
+            def _on_ack_done(t: asyncio.Task[Any]) -> None:
+                self._ack_tasks.discard(t)
+                if not t.cancelled():
+                    # Consume the exception so asyncio doesn't warn on
+                    # "exception was never retrieved".
+                    t.exception()
+
+            task.add_done_callback(_on_ack_done)
 
         self._write_frame(data, timestamp)
 

@@ -228,6 +228,84 @@ async def test_start_video_falls_back_to_viewport_size_when_evaluate_fails():
 
 
 @pytest.mark.asyncio
+async def test_start_video_rollback_removes_context_listener_if_attached():
+    """Regression guard for C3: when start_video() raises AFTER
+    ``context.on("page", ...)`` has attached the listener but BEFORE control
+    returns normally, the rollback path must call ``context.remove_listener``
+    — otherwise the zombie listener survives the rollback and fires on every
+    future tab-open, eventually racing with a second start_video().
+
+    The race is narrow but real: any BaseException (KeyboardInterrupt,
+    CancelledError) or memory-pressure Exception raised between the two
+    synchronous lines ``context.on(...)`` and ``self._video_session[...] = ...``
+    leaks the listener with today's code.
+    """
+    from bridgic.browser.errors import OperationError
+
+    browser = _make_browser_with_mock_page()
+
+    attached_listeners: list = []
+
+    def _capture_on(event, cb):
+        # Record the listener reference so we can assert remove_listener
+        # is called with the SAME callable later.
+        attached_listeners.append(cb)
+
+    fake_context = MagicMock()
+    fake_context.pages = []
+    fake_context.on = MagicMock(side_effect=_capture_on)
+    fake_context.remove_listener = MagicMock()
+
+    fake_page = MagicMock()
+    fake_page.context = fake_context
+    fake_page.viewport_size = {"width": 800, "height": 600}
+    fake_page.is_closed = MagicMock(return_value=False)
+    browser.get_current_page = AsyncMock(return_value=fake_page)
+    browser._context.new_cdp_session = AsyncMock(
+        side_effect=RuntimeError("CDP unavailable")
+    )
+
+    async def _fake_start(page):
+        browser._video_recorder = MagicMock()
+    browser._start_single_video_recorder = _fake_start  # type: ignore[method-assign]
+
+    # Force a failure AFTER context.on runs by making the very next state
+    # write raise. ``self._video_session`` is a plain dict; wrap it so the
+    # `["page_listener"] = ...` assignment raises.
+    class _DictRaisingOnSetItem(dict):
+        def __setitem__(self, k, v):
+            if k == "page_listener":
+                raise RuntimeError("simulated mid-setup failure")
+            super().__setitem__(k, v)
+
+    _orig_setattr = Browser.__setattr__
+
+    # Patch the session-assignment step to return a dict that raises on
+    # __setitem__, mirroring the narrow window where context.on has run
+    # but the listener has not been recorded into the session dict yet.
+    def _wrapped_setattr(self, name, value):
+        if name == "_video_session" and isinstance(value, dict):
+            value = _DictRaisingOnSetItem(value)
+        _orig_setattr(self, name, value)
+
+    with pytest.raises((OperationError, RuntimeError)):
+        import unittest.mock as _um
+        with _um.patch.object(Browser, "__setattr__", _wrapped_setattr):
+            await browser.start_video()
+
+    assert attached_listeners, (
+        "context.on must have been called — precondition for this test"
+    )
+    # The rollback must have removed the listener.
+    fake_context.remove_listener.assert_called_once_with(
+        "page", attached_listeners[0]
+    )
+    # And must have cleared the session and state.
+    assert browser._video_session is None
+    assert browser._video_recorder is None
+
+
+@pytest.mark.asyncio
 async def test_start_video_already_active_does_not_destroy_existing_session():
     """Regression: a duplicate start_video() must raise VIDEO_ALREADY_ACTIVE
     *without* tearing down the previously-started session.
@@ -366,3 +444,83 @@ async def test_start_video_records_only_active_tab_in_cdp_borrowed_mode():
     browser._video_session = None
     browser._video_recorder = None
     browser._video_state.clear()
+
+
+# ---------------------------------------------------------------------------
+# C1: _cdp_evaluate_on_element must detect scroll race between bounding_box
+# acquisition and Runtime.evaluate(elementFromPoint)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cdp_evaluate_on_element_detects_scroll_race():
+    """Regression guard for C1: if the page scrolls between the Python-side
+    ``locator.bounding_box()`` call and the CDPSession ``elementFromPoint``
+    call, the coordinates resolve to a DIFFERENT element — silently running
+    JS on the wrong node. Detect via a post-check that the locator's bbox has
+    not shifted meaningfully, and raise a clear error on mismatch.
+    """
+    from bridgic.browser.session._browser import _cdp_evaluate_on_element
+
+    # bbox BEFORE evaluate: element at (0, 100)
+    # bbox AFTER evaluate: element at (0, 500) — page scrolled 400px
+    mock_locator = MagicMock()
+    mock_locator.bounding_box = AsyncMock(
+        side_effect=[
+            {"x": 0, "y": 100, "width": 100, "height": 40},
+            {"x": 0, "y": 500, "width": 100, "height": 40},
+        ]
+    )
+
+    mock_session = MagicMock()
+    mock_session.send = AsyncMock(
+        return_value={"result": {"objectId": "dummy-object-id"}}
+    )
+    mock_session.detach = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.new_cdp_session = AsyncMock(return_value=mock_session)
+
+    mock_page = MagicMock()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await _cdp_evaluate_on_element(
+            mock_context, mock_page, mock_locator, "(el) => el.value"
+        )
+    # Error message must clearly indicate scroll/bbox race so callers can retry.
+    assert "scroll" in str(exc_info.value).lower() or "moved" in str(exc_info.value).lower()
+
+    # Session must still be detached on the error path.
+    mock_session.detach.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cdp_evaluate_on_element_stable_bbox_proceeds_normally():
+    """Happy-path regression: when the bbox is stable across the evaluate
+    call, _cdp_evaluate_on_element must return the evaluated value normally.
+    """
+    from bridgic.browser.session._browser import _cdp_evaluate_on_element
+
+    stable_bbox = {"x": 0, "y": 100, "width": 100, "height": 40}
+    mock_locator = MagicMock()
+    mock_locator.bounding_box = AsyncMock(return_value=stable_bbox)
+
+    mock_session = MagicMock()
+    # Sequence: first call = Runtime.evaluate (elementFromPoint),
+    #           second call = Runtime.callFunctionOn (user code)
+    mock_session.send = AsyncMock(
+        side_effect=[
+            {"result": {"objectId": "resolved-id"}},
+            {"result": {"value": "hello"}},
+        ]
+    )
+    mock_session.detach = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.new_cdp_session = AsyncMock(return_value=mock_session)
+    mock_page = MagicMock()
+
+    result = await _cdp_evaluate_on_element(
+        mock_context, mock_page, mock_locator, "(el) => el.value"
+    )
+    assert result == "hello"
+    mock_session.detach.assert_awaited_once()
