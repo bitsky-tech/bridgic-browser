@@ -329,8 +329,8 @@ def find_cdp_url(
     # Delegate parsing + validation to the shared helper so scan-mode and
     # file-mode treat malformed files identically.  The helper returns None
     # on any parse failure (missing lines, non-numeric port, non-/ path).
-    ws_url = _read_devtools_active_port(base)
-    if ws_url is None:
+    ws_url: Optional[str] = _read_devtools_active_port(base)
+    if ws_url is None:  # pyright: ignore[reportUnnecessaryComparison]
         raise ValueError(
             f"DevToolsActivePort file is malformed or unreadable: {port_file}"
         )
