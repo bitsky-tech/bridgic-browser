@@ -93,6 +93,10 @@ class TestFindFfmpeg:
         assert "PLAYWRIGHT_BROWSERS_PATH" in msg
         assert "system ffmpeg" in msg
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="os.access(X_OK) ignores POSIX mode bits on Windows",
+    )
     def test_skips_non_executable_binary(self, tmp_path: Path) -> None:
         """V-2 regression: a non-executable ffmpeg (e.g. musl binary on glibc)
         must be skipped rather than returned and then fail at exec time."""
