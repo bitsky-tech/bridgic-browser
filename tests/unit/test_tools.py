@@ -586,9 +586,12 @@ class TestElementInteractionTools:
 
     @pytest.mark.asyncio
     async def test_get_dropdown_options_by_ref(self, mock_browser):
-        """Test get_dropdown_options_by_ref."""
+        """Test get_dropdown_options_by_ref on a native <select>."""
 
         mock_locator = MagicMock()
+        # Native <select> path — _safe_tag_name returns "select",
+        # options returned as-is without visibility filtering.
+        mock_locator.evaluate = AsyncMock(return_value="select")
         mock_option1 = MagicMock()
         mock_option1.text_content = AsyncMock(return_value="Option 1")
         mock_option1.get_attribute = AsyncMock(return_value="value1")
@@ -612,6 +615,8 @@ class TestElementInteractionTools:
         """When multiple visible listboxes exist, avoid global fallback option matching."""
 
         mock_locator = MagicMock()
+        # Custom combobox path — non-"select" tagName forces B branch.
+        mock_locator.evaluate = AsyncMock(return_value="div")
         mock_locator.get_attribute = AsyncMock(return_value=None)
 
         mock_empty = MagicMock()

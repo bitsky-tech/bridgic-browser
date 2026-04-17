@@ -565,51 +565,120 @@ def _css_attr_equals(name: str, value: str) -> str:
     return f"[{name}='{escaped}']"
 
 
-async def _prefer_visible_locators(locators: list) -> list:
-    """Keep only visible locators when possible, otherwise preserve original order."""
+async def _filter_visible_locators(locators: list) -> list:
+    """Return only locators confirmed visible; [] when none are.
+
+    Used in dropdown-option resolution where hidden candidates (e.g., the shadow
+    ``<select><option>`` that Arco/AntD-style widgets embed for a11y/form posting)
+    must be dropped. Those hidden options receive dispatched clicks without
+    side-effect, producing silent no-op selections.
+    """
+    if not locators:
+        return []
     results = await asyncio.gather(
         *[locator.is_visible() for locator in locators],
         return_exceptions=True,
     )
-    visible = [loc for loc, r in zip(locators, results) if r is True]
-    return visible or locators
+    return [loc for loc, r in zip(locators, results) if r is True]
+
+
+async def _safe_tag_name(locator) -> str:
+    """Return lowercase tagName or "" on failure/timeout.
+
+    Mirrors the CDP-safe pattern used in ``select_dropdown_option_by_ref``:
+    ``locator.evaluate`` can hang in CDP-borrowed mode, so we bound the call
+    with ``asyncio.wait_for`` and swallow any exception.
+    """
+    try:
+        return await asyncio.wait_for(
+            locator.evaluate("el => el.tagName.toLowerCase()"),
+            timeout=1.0,
+        )
+    except Exception:
+        return ""
 
 
 async def _get_dropdown_option_locators(page, locator) -> list:
-    """Resolve option locators for native, embedded, and portalized dropdowns."""
-    options = await locator.locator("option").all()
-    if options:
-        return options
+    """Resolve option locators for native, embedded, and portalized dropdowns.
 
-    options = await locator.locator("[role='option']").all()
-    if options:
-        return await _prefer_visible_locators(options)
+    Strategy:
+      (A) Native ``<select>``: return ``<option>`` children as-is. Closed
+          ``<select>`` hides options from ``is_visible()`` but Playwright's
+          ``select_option`` still selects them correctly.
+      (B) Custom combobox: skip ``locator.locator("option")`` entirely — in
+          Arco/AntD/Element Plus/Headless UI components those are a hidden
+          shadow ``<select>`` used for form-posting/a11y only, and clicking
+          them is a silent no-op. Instead:
+            B1. ``aria-controls`` / ``aria-owns`` target → visible options
+            B2. Combobox subtree ``[role='option']`` → visible
+            B3. Exactly one visible ``[role='listbox']`` on page → its options
+
+    No page-wide ``[role='option']`` fallback: when multiple listboxes are
+    visible it's ambiguous which one belongs to this trigger, and a wrong
+    guess silently selects from an unrelated widget.
+    """
+    tag = await _safe_tag_name(locator)
+    if tag == "select":
+        return await locator.locator("option").all()
 
     if page is None:
         return []
 
-    # Portalized dropdowns often link the trigger to the listbox via aria-controls
-    # or aria-owns. Prefer that container before scanning the whole page.
-    controlled_ids = []
+    # B1. aria-controls / aria-owns — portalized listbox container.
+    # Trust the aria-controls relationship: shadow-<select> wrappers don't set
+    # aria-controls, so any id target here points at the real listbox. Do NOT
+    # gate on container-level visibility — virtualized dropdowns (AntD
+    # rc-virtual-list, react-window, …) render the container with a 0×0 bbox
+    # while absolutely-positioning visible option rows inside, and Playwright's
+    # is_visible() rejects that container. Filter at the option level instead.
+    controlled_ids: list[str] = []
     for attr_name in ("aria-controls", "aria-owns"):
         attr_value = await locator.get_attribute(attr_name)
         if attr_value:
             controlled_ids.extend(part for part in attr_value.split() if part)
-
     for controlled_id in controlled_ids:
         container = page.locator(_css_attr_equals("id", controlled_id))
-        if await container.count() > 0:
-            options = await container.locator("option, [role='option']").all()
-            if options:
-                return await _prefer_visible_locators(options)
+        if await container.count() == 0:
+            continue
+        candidates = await container.locator("[role='option'], option").all()
+        visible = await _filter_visible_locators(candidates)
+        if visible:
+            return visible
+        # AntD/rc-virtual-list pattern: the aria-controls target is a shadow
+        # a11y listbox containing 0-width ``role='option'`` ghosts, while the
+        # actual rendered menu items (``.ant-select-item-option`` etc.) are
+        # siblings inside the same portal shell (``.ant-select-dropdown``).
+        # Ascend to the target's parent and search broader class-based
+        # patterns covering AntD / Arco / Element Plus / Vuetify / Headless UI.
+        shell = container.locator("xpath=..")
+        shell_candidates = await shell.locator(
+            "[role='option'], option, "
+            "[class*='select-item-option'], [class*='select-option'], "
+            "[class*='select-item'], [class*='menu-item-option'], "
+            "[class*='dropdown-item'], [class*='menu-item']"
+        ).all()
+        visible = await _filter_visible_locators(shell_candidates)
+        if visible:
+            return visible
 
-    # Conservative fallback: if exactly one visible listbox is open, use it.
+    # B2. [role='option'] descendants of the trigger (e.g., when listbox is
+    # a sibling/descendant rather than portalized). Strict visibility filter
+    # is required here: shadow-<select> wrappers nest their hidden <option>
+    # inside the trigger's subtree, and only per-option filtering can drop them.
+    candidates = await locator.locator("[role='option']").all()
+    visible = await _filter_visible_locators(candidates)
+    if visible:
+        return visible
+
+    # B3. Exactly one visible listbox anywhere on the page. Already disambiguated
+    # by container visibility, so skip per-option filtering for the same reason
+    # as B1.
     listboxes = await page.locator("[role='listbox']").all()
-    visible_listboxes = await _prefer_visible_locators(listboxes)
+    visible_listboxes = await _filter_visible_locators(listboxes)
     if len(visible_listboxes) == 1:
-        options = await visible_listboxes[0].locator("option, [role='option']").all()
-        if options:
-            return await _prefer_visible_locators(options)
+        candidates = await visible_listboxes[0].locator("[role='option'], option").all()
+        if candidates:
+            return candidates
 
     return []
 
