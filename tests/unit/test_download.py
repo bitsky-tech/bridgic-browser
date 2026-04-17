@@ -260,6 +260,52 @@ class TestDownloadManagerAttach:
         # Should attempt to remove page-level listener
         mock_page.remove_listener.assert_called()
 
+    @pytest.mark.asyncio
+    async def test_detach_from_page_cancels_in_flight_download_tasks(
+        self, temp_downloads_dir
+    ):
+        """Detach must cancel in-flight download processing tasks.
+
+        Without this, detach/close could let the background task finish and
+        write files after the caller thought the handler was gone.
+        """
+        manager = DownloadManager(downloads_path=temp_downloads_dir)
+
+        page = MagicMock()
+        page.url = "https://example.com"
+        page.on = MagicMock()
+        page.remove_listener = MagicMock()
+
+        manager.attach_to_page(page)
+
+        # Grab the page-scoped "download" handler registered by attach_to_page().
+        handler = page.on.call_args[0][1]
+
+        started = asyncio.Event()
+        never_finishes = asyncio.Event()
+
+        async def _save_as(_path: str) -> None:
+            started.set()
+            await never_finishes.wait()
+
+        download = MagicMock()
+        download.url = "https://example.com/file.pdf"
+        download.suggested_filename = "document.pdf"
+        download.save_as = AsyncMock(side_effect=_save_as)
+        download.failure = AsyncMock(return_value="Network error")
+
+        # Trigger download processing: this schedules _handle_download().
+        handler(download)
+        await asyncio.wait_for(started.wait(), timeout=0.5)
+
+        # Detach must cancel the task while it's mid-save_as().
+        manager.detach_from_page(page)
+        await asyncio.sleep(0)
+
+        assert manager.downloaded_files == []
+        assert manager._pending_downloads == {}
+        download.failure.assert_not_called()
+
 
 class TestDownloadManagerHandleDownload:
     """Tests for DownloadManager download handling."""

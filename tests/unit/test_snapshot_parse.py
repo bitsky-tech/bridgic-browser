@@ -1401,6 +1401,23 @@ class TestProcessPageSnapshotForAI:
         assert "Double-click me!" in result
         assert "Plain label" not in result
 
+    def test_interactive_mode_missing_map_entry_falls_back_to_suffix_heuristics(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Missing interactive_map entry should not force a false negative."""
+        raw = (
+            '- generic "Clickable card" [ref=e1] [cursor=pointer]\n'
+            '- generic "Plain label" [ref=e2]'
+        )
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+        interactive_map = {"e2": False}
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
+
+        assert "Clickable card" in result
+        assert "Plain label" not in result
+
     def test_interactive_mode_flattened_output(self, gen: SnapshotGenerator) -> None:
         """Interactive mode removes indentation (flat list)."""
         raw = (
@@ -2812,8 +2829,10 @@ class TestIframeHandling:
     async def test_interactive_mode_pre_filters_refs_to_interactive_roles(
         self, gen: SnapshotGenerator
     ) -> None:
-        """In -i mode, only INTERACTIVE_ROLES refs are sent to _batch_get_elements_info.
-        Non-interactive refs (heading, paragraph, generic, etc.) bypass batch JS."""
+        """In -i mode, INTERACTIVE_ROLES and STRUCTURAL_NOISE_ROLES refs are sent to
+        _batch_get_elements_info (the latter may carry event handlers / tabindex
+        that require JS inspection). Other non-interactive refs (heading,
+        paragraph, text, etc.) bypass batch JS."""
         from bridgic.browser.session._snapshot import (
             _BATCH_INFO_JS, _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
         )
@@ -2858,10 +2877,11 @@ class TestIframeHandling:
         # button and link are INTERACTIVE_ROLES → sent to batch
         assert "e1" in batched_refs
         assert "e4" in batched_refs
-        # heading, paragraph, generic are NOT interactive roles → NOT sent to batch
+        # heading, paragraph are NOT interactive roles → NOT sent to batch
         assert "e2" not in batched_refs
         assert "e3" not in batched_refs
-        assert "e5" not in batched_refs
+        # named generic may carry event handlers → MUST be sent to batch
+        assert "e5" in batched_refs
 
     @pytest.mark.asyncio
     async def test_non_interactive_refs_assumed_in_viewport_and_marked_false(
@@ -3085,8 +3105,8 @@ class TestViewportContainerPrefilter:
         assert "eMain" in batched_refs
         assert "eNav" in batched_refs
         assert "eList" in batched_refs
-        # Leaf roles must NOT go to batch
-        assert "eLink" not in batched_refs
+        # Controls leaf roles (INTERACTIVE_ROLES) are visibility-checked
+        assert "eLink" in batched_refs
         assert "eLi1" not in batched_refs
         assert "eLi2" not in batched_refs
         assert "eH" not in batched_refs

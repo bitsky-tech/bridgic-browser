@@ -138,7 +138,7 @@ If the remote Chrome was not started with stealth flags, bridgic's JS patches ca
 
 bridgic records video via Chrome's CDP `Page.startScreencast` (piped to ffmpeg), **not** Playwright's `record_video` context option — so video recording works on borrowed contexts.
 
-- **Only the active tab is recorded.** `start_video()` starts a single screencast session on the currently active page. When the active tab changes — whether via `switch_tab`, `new_tab`, `navigate_to` (when it creates a new page), or `close_tab` — the CDP screencast source is hot-swapped to the new page. ffmpeg stays alive and the output is a single continuous `.webm` file.
+- **Only the active tab is recorded.** `start_video()` starts a single screencast session on the currently active page. When bridgic switches the active tab (via `switch_tab`, `new_tab`, `navigate_to` when it creates a new page, or `close_tab`) the CDP screencast source is hot-swapped to the new page. Background tabs/popups created independently do not trigger a switch. ffmpeg stays alive and the output is a single continuous `.webm` file.
 - **`stop_video()` saves the file immediately.** The `.webm` is written as soon as the recorder stops; no page close is needed.
 - **Recording stops cleanly without touching user tabs.** No page is closed or navigated.
 

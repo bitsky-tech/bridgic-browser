@@ -1522,8 +1522,8 @@ class TestDevTools:
     @pytest.mark.asyncio
     async def test_start_video(self, mock_browser):
         """Test starting video recording — single-stream: one recorder on
-        the active page, and context.on('page') is subscribed so new pages
-        auto-switch the screencast source.
+        the active page. bridgic no longer auto-switches on arbitrary
+        newly-created pages (only when bridgic actively switches tabs).
         """
         import types
 
@@ -1549,9 +1549,8 @@ class TestDevTools:
         assert "active tab" in result
         assert mock_browser._video_recorder is mock_recorder
         assert mock_browser._video_session is not None
-        # context.on('page', handler) must be registered for auto-switching.
-        assert mock_context.on.called
-        assert mock_context.on.call_args.args[0] == "page"
+        # No context-wide page listener is registered.
+        mock_context.on.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_stop_video(self, mock_browser):

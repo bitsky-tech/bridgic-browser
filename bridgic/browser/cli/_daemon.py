@@ -95,7 +95,8 @@ def _browser_closed_hint(cdp: Optional[str] = None) -> str:
             _cdp_hint = str(_parsed.port or 9222)
             _msg = "Local Chrome closed or crashed."
         else:
-            _cdp_hint = cdp
+            _port = f":{_parsed.port}" if _parsed.port is not None else ""
+            _cdp_hint = f"{_parsed.scheme}://{_parsed.hostname or _parsed.netloc}{_port}"
             _msg = "Remote browser session closed (the cloud/remote browser disconnected or timed out)."
         return (
             f"{_msg} "

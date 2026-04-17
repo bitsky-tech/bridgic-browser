@@ -230,32 +230,19 @@ async def test_start_video_falls_back_to_viewport_size_when_evaluate_fails():
 
 
 @pytest.mark.asyncio
-async def test_start_video_rollback_removes_context_listener_if_attached():
-    """Regression guard for C3: when start_video() raises AFTER
-    ``context.on("page", ...)`` has attached the listener but BEFORE control
-    returns normally, the rollback path must call ``context.remove_listener``
-    — otherwise the zombie listener survives the rollback and fires on every
-    future tab-open, eventually racing with a second start_video().
-
-    The race is narrow but real: any BaseException (KeyboardInterrupt,
-    CancelledError) or memory-pressure Exception raised between the two
-    synchronous lines ``context.on(...)`` and ``self._video_session[...] = ...``
-    leaks the listener with today's code.
+async def test_start_video_rollback_clears_state_on_failure():
+    """If start_video() raises mid-setup, it must rollback internal state
+    (session + recorder + context video_state). Since single-stream video no
+    longer auto-listens to context page creation, the rollback must not try to
+    remove any page listener.
     """
     from bridgic.browser.errors import OperationError
 
     browser = _make_browser_with_mock_page()
 
-    attached_listeners: list = []
-
-    def _capture_on(event, cb):
-        # Record the listener reference so we can assert remove_listener
-        # is called with the SAME callable later.
-        attached_listeners.append(cb)
-
     fake_context = MagicMock()
     fake_context.pages = []
-    fake_context.on = MagicMock(side_effect=_capture_on)
+    fake_context.on = MagicMock()
     fake_context.remove_listener = MagicMock()
 
     fake_page = MagicMock()
@@ -263,48 +250,25 @@ async def test_start_video_rollback_removes_context_listener_if_attached():
     fake_page.viewport_size = {"width": 800, "height": 600}
     fake_page.is_closed = MagicMock(return_value=False)
     browser.get_current_page = AsyncMock(return_value=fake_page)
+
+    # Make CDP session fail so start_video falls back to viewport_size.
     browser._context.new_cdp_session = AsyncMock(
         side_effect=RuntimeError("CDP unavailable")
     )
 
     async def _fake_start(page):
-        browser._video_recorder = MagicMock()
+        raise RuntimeError("simulated recorder start failure")
+
     browser._start_single_video_recorder = _fake_start  # type: ignore[method-assign]
 
-    # Force a failure AFTER context.on runs by making the very next state
-    # write raise. ``self._video_session`` is a plain dict; wrap it so the
-    # `["page_listener"] = ...` assignment raises.
-    class _DictRaisingOnSetItem(dict):
-        def __setitem__(self, k, v):
-            if k == "page_listener":
-                raise RuntimeError("simulated mid-setup failure")
-            super().__setitem__(k, v)
-
-    _orig_setattr = Browser.__setattr__
-
-    # Patch the session-assignment step to return a dict that raises on
-    # __setitem__, mirroring the narrow window where context.on has run
-    # but the listener has not been recorded into the session dict yet.
-    def _wrapped_setattr(self, name, value):
-        if name == "_video_session" and isinstance(value, dict):
-            value = _DictRaisingOnSetItem(value)
-        _orig_setattr(self, name, value)
-
     with pytest.raises((OperationError, RuntimeError)):
-        import unittest.mock as _um
-        with _um.patch.object(Browser, "__setattr__", _wrapped_setattr):
-            await browser.start_video()
+        await browser.start_video()
 
-    assert attached_listeners, (
-        "context.on must have been called — precondition for this test"
-    )
-    # The rollback must have removed the listener.
-    fake_context.remove_listener.assert_called_once_with(
-        "page", attached_listeners[0]
-    )
-    # And must have cleared the session and state.
+    fake_context.on.assert_not_called()
+    fake_context.remove_listener.assert_not_called()
     assert browser._video_session is None
     assert browser._video_recorder is None
+    assert not browser._video_state
 
 
 @pytest.mark.asyncio
@@ -443,6 +407,7 @@ async def test_start_video_records_only_active_tab_in_cdp_borrowed_mode():
 
     # Only the active (owned) tab should have been started.
     assert started_page is owned
+    fake_context.on.assert_not_called()
 
     # Cleanup.
     browser._video_session = None

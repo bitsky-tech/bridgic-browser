@@ -186,6 +186,7 @@ class TestVideoRecorder:
 
         mock_proc = MagicMock()
         mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock(return_value=0)
         mock_proc.stdin = MagicMock()
 
         with patch("bridgic.browser.session._video_recorder._find_ffmpeg", return_value="/usr/bin/ffmpeg"):
@@ -195,6 +196,8 @@ class TestVideoRecorder:
                     await rec.start()
                 # ffmpeg must have been killed
                 mock_proc.kill.assert_called_once()
+                # And fully reaped (avoids zombie) after kill().
+                mock_proc.wait.assert_awaited_once()
                 assert rec._ffmpeg is None
 
     def test_write_frame_queues_frames(self, tmp_path: Path) -> None:

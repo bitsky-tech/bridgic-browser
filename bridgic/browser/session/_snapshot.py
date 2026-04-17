@@ -1684,9 +1684,9 @@ class SnapshotGenerator:
                 # Reuse the ref already extracted above
                 original_ref = playwright_ref_for_element
 
-                if interactive_map and original_ref:
+                if interactive_map and original_ref and original_ref in interactive_map:
                     # Use the pre-computed interactive_map for precise filtering
-                    is_effectively_interactive = interactive_map.get(original_ref, False)
+                    is_effectively_interactive = interactive_map[original_ref]
                     # Named noise elements (text labels like "Delete", "Edit") inside
                     # interactive containers should be preserved — they describe what
                     # the parent button does, same logic as TEXT_LEAF_ROLES propagation.
@@ -1972,7 +1972,11 @@ class SnapshotGenerator:
             for ref, info in refs_info.items():
                 role = info[0]
                 suffix = ref_suffixes.get(ref, '')
-                if role in self.INTERACTIVE_ROLES or '[cursor=pointer]' in suffix:
+                if (
+                    role in self.INTERACTIVE_ROLES
+                    or '[cursor=pointer]' in suffix
+                    or role in self.STRUCTURAL_NOISE_ROLES
+                ):
                     interactive_refs[ref] = info
                 else:
                     non_interactive_refs[ref] = info
@@ -1986,7 +1990,12 @@ class SnapshotGenerator:
                 viewport_width=viewport_width,
                 viewport_height=viewport_height,
             )
-            # Non-interactive refs: assume in-viewport, mark non-interactive.
+            # Non-interactive refs: assume in-viewport and explicitly mark
+            # them as non-interactive in interactive_map.
+            #
+            # This keeps interactive_map complete (and stable for tests),
+            # and prevents downstream code from inferring incorrect
+            # interactivity solely based on later heuristics.
             for ref in non_interactive_refs:
                 visible_refs.add(ref)
                 interactive_map[ref] = False
@@ -2011,16 +2020,25 @@ class SnapshotGenerator:
             # Result: ~43s → ~1–3s for a 5549-ref page.
             if check_viewport:
                 container_refs: Dict[str, Tuple[str, Optional[str], int]] = {}
-                non_container_refs_keys: Set[str] = set()
+                control_leaf_refs: Dict[str, Tuple[str, Optional[str], int]] = {}
+                assumed_leaf_refs: Set[str] = set()
                 for ref, info in refs_info.items():
-                    if info[0] in self.VIEWPORT_CONTAINER_ROLES:
+                    role = info[0]
+                    if role in self.VIEWPORT_CONTAINER_ROLES:
                         container_refs[ref] = info
+                    elif role in self.INTERACTIVE_ROLES:
+                        # "Controls" (buttons, links, inputs, ...) must not be
+                        # incorrectly assumed visible when they are actually
+                        # outside the viewport (see test_get_snapshot_text_*).
+                        control_leaf_refs[ref] = info
                     else:
-                        non_container_refs_keys.add(ref)
+                        assumed_leaf_refs.add(ref)
                 logger.debug(
                     "Viewport container-only pre-filter: %d container refs checked, "
-                    "%d leaf refs assumed in-viewport",
-                    len(container_refs), len(non_container_refs_keys),
+                    "%d control leaf refs visibility-checked, %d other leaf refs assumed in-viewport",
+                    len(container_refs),
+                    len(control_leaf_refs),
+                    len(assumed_leaf_refs),
                 )
                 visible_refs, interactive_map = await self._batch_get_elements_info(
                     page, container_refs, ref_suffixes,
@@ -2028,10 +2046,25 @@ class SnapshotGenerator:
                     viewport_width=viewport_width,
                     viewport_height=viewport_height,
                 )
-                # Leaf refs: assume in-viewport; invisible_depth propagation in the
-                # filtering pass below correctly excludes children of any off-viewport
-                # container even though these refs are in visible_refs.
-                for ref in non_container_refs_keys:
+                # Controls: check visibility precisely so off-screen controls
+                # are excluded from viewport-only snapshots.
+                if control_leaf_refs:
+                    visible_controls, _ = await self._batch_get_elements_info(
+                        page, control_leaf_refs, ref_suffixes,
+                        check_viewport=check_viewport,
+                        viewport_width=viewport_width,
+                        viewport_height=viewport_height,
+                    )
+                    visible_refs.update(visible_controls)
+
+                for ref in control_leaf_refs:
+                    interactive_map[ref] = False
+
+                # Other leaves: assume in-viewport; invisible_depth propagation
+                # in the filtering pass below correctly excludes children of any
+                # off-viewport container even though these refs are in
+                # visible_refs.
+                for ref in assumed_leaf_refs:
                     visible_refs.add(ref)
                     interactive_map[ref] = False
             else:

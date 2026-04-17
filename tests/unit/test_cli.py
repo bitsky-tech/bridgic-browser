@@ -2743,7 +2743,10 @@ class TestBrowserClosedHint:
     def test_remote_host_exposes_full_url(self):
         url = "wss://my-cloud.io/browser?token=secret123"
         msg = _browser_closed_hint(url)
-        assert url in msg
+        assert "secret123" not in msg
+        assert "/browser" not in msg
+        assert "?token=" not in msg
+        assert "wss://my-cloud.io" in msg
         assert "Remote browser session" in msg
         assert "bridgic-browser close" in msg
 

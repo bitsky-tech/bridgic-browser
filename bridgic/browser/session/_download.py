@@ -124,6 +124,9 @@ class DownloadManager:
         # Track handlers for cleanup
         self._page_handlers: Dict[str, Callable] = {}
         self._context_handlers: Dict[str, Callable] = {}
+        # Track in-flight per-page download handler tasks so detach/close
+        # can cancel them and avoid writing files after teardown.
+        self._page_download_tasks: Dict[str, set[asyncio.Task[None]]] = {}
 
     @property
     def downloads_path(self) -> Path:
@@ -212,7 +215,25 @@ class DownloadManager:
         self._detach_from_page(page)
 
         def handle_download(download):
-            asyncio.create_task(self._handle_download(download))
+            task: asyncio.Task[None] = asyncio.create_task(
+                self._handle_download(download)
+            )
+            self._page_download_tasks.setdefault(page_key, set()).add(task)
+
+            def _on_done(t: asyncio.Task[None]) -> None:
+                tasks = self._page_download_tasks.get(page_key)
+                if tasks is not None:
+                    tasks.discard(t)
+                    if not tasks:
+                        self._page_download_tasks.pop(page_key, None)
+                try:
+                    t.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.warning(f"Download task failed: {e}")
+
+            task.add_done_callback(_on_done)
 
         page.on("download", handle_download)
         self._page_handlers[page_key] = handle_download
@@ -227,6 +248,12 @@ class DownloadManager:
                 page.remove_listener("download", handler)
             except Exception:
                 pass
+
+        # Cancel any in-flight download processing tasks started by this
+        # page-scoped handler.
+        tasks = self._page_download_tasks.pop(page_key, set())
+        for t in tasks:
+            t.cancel()
 
     async def _handle_download(self, download: "Download") -> None:
         """Handle a download event.
@@ -312,6 +339,10 @@ class DownloadManager:
                 except Exception as e:
                     logger.warning(f"Download complete callback error: {e}")
 
+        except asyncio.CancelledError:
+            # Cancellation is part of detach/close lifecycle. Do not treat
+            # it as a download failure, and do not attempt download.failure().
+            raise
         except Exception as e:
             logger.error(f"Download failed: {suggested_filename} - {e}")
             # Try to get failure reason

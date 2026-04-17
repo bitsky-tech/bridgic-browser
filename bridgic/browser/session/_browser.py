@@ -1335,7 +1335,7 @@ class Browser:
         # is hot-swapped via VideoRecorder.switch_page().
         self._video_recorder: Optional["_video_recorder_mod.VideoRecorder"] = None
         # When a recording session is active, holds {"width", "height",
-        # "context", "page_listener"}.  None means no active session.
+        # "context"}.  None means no active session.
         self._video_session: Optional[Dict[str, Any]] = None
 
     # ==================== Properties ====================
@@ -3115,63 +3115,84 @@ class Browser:
         try:
             if not self._page:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
-            _wait_t0 = time.monotonic()
-            async with self._snapshot_lock:
-                _wait_elapsed = time.monotonic() - _wait_t0
-                if _wait_elapsed > 0.1:
-                    # Surfaces "command N was stuck behind snapshot of command N-1"
-                    # situations in the log — the typical second-snapshot-back-to-back
-                    # case on a large page.
-                    logger.info(
-                        "[get_snapshot] waited %.3fs for _snapshot_lock", _wait_elapsed
-                    )
-                options = SnapshotOptions(
-                    interactive=interactive,
-                    full_page=full_page,
-                )
-                if self._snapshot_generator is None:
-                    self._snapshot_generator = SnapshotGenerator()
-                current_url = self.get_current_page_url()
+            options = SnapshotOptions(
+                interactive=interactive,
+                full_page=full_page,
+            )
+            if self._snapshot_generator is None:
+                self._snapshot_generator = SnapshotGenerator()
 
-                # Check if the background pre-warm already computed this snapshot.
-                if (self._prefetch_snapshot is not None
+            # Avoid a classic self-deadlock:
+            # - get_snapshot holds _snapshot_lock while waiting for prefetch_task
+            # - _pre_warm_snapshot() must acquire the same _snapshot_lock to commit
+            #
+            # So when pre-warm is in progress, we must release _snapshot_lock
+            # before awaiting the background task.
+            while True:
+                _wait_t0 = time.monotonic()
+                prefetch_task_to_wait: Optional[asyncio.Task[None]] = None
+                async with self._snapshot_lock:
+                    _wait_elapsed = time.monotonic() - _wait_t0
+                    if _wait_elapsed > 0.1:
+                        # Surfaces "command N was stuck behind snapshot of command N-1"
+                        # situations in the log — the typical second-snapshot-back-to-back
+                        # case on a large page.
+                        logger.info(
+                            "[get_snapshot] waited %.3fs for _snapshot_lock",
+                            _wait_elapsed,
+                        )
+                    current_url = self.get_current_page_url()
+
+                    # Check if the background pre-warm already computed this snapshot.
+                    if (
+                        self._prefetch_snapshot is not None
                         and self._prefetch_options == options
-                        and self._prefetch_url == current_url):
-                    logger.info("[get_snapshot] pre-warm cache hit — returning instantly")
-                    cached = self._prefetch_snapshot
-                    # One-shot: clear so the next call recomputes fresh.
-                    self._prefetch_snapshot = None
-                    self._last_snapshot = cached
-                    self._last_snapshot_url = current_url
-                    return cached
+                        and self._prefetch_url == current_url
+                    ):
+                        logger.info(
+                            "[get_snapshot] pre-warm cache hit — returning instantly"
+                        )
+                        cached = self._prefetch_snapshot
+                        # One-shot: clear so the next call recomputes fresh.
+                        self._prefetch_snapshot = None
+                        self._last_snapshot = cached
+                        self._last_snapshot_url = current_url
+                        return cached
 
-                # Pre-warm miss (either still running or different options).
-                # If the task is for the same options and URL, wait for it
-                # instead of duplicating the work.
-                prefetch_task = self._prefetch_task
-                if (prefetch_task is not None
+                    # Pre-warm miss (either still running or different options).
+                    # If the task is for the same options and URL, wait for it
+                    # instead of duplicating the work — but ONLY after releasing
+                    # _snapshot_lock to allow prefetch commit to proceed.
+                    prefetch_task = self._prefetch_task
+                    if (
+                        prefetch_task is not None
                         and not prefetch_task.done()
                         and self._prefetch_options == options
-                        and self._prefetch_url == current_url):
-                    logger.info("[get_snapshot] pre-warm in progress — waiting for it")
-                    try:
-                        await prefetch_task
-                        if (self._prefetch_snapshot is not None
-                                and self._prefetch_options == options
-                                and self._prefetch_url == current_url):
-                            cached = self._prefetch_snapshot
-                            self._prefetch_snapshot = None
-                            self._last_snapshot = cached
-                            self._last_snapshot_url = current_url
-                            return cached
-                    except Exception:
-                        pass  # pre-warm failed; fall through to normal computation
+                        and self._prefetch_url == current_url
+                    ):
+                        logger.info(
+                            "[get_snapshot] pre-warm in progress — waiting for it"
+                        )
+                        prefetch_task_to_wait = prefetch_task
 
-                self._last_snapshot = await self._snapshot_generator.get_enhanced_snapshot_async(
-                    self._page, options
-                )
-                self._last_snapshot_url = current_url
-                return self._last_snapshot
+                    if prefetch_task_to_wait is None:
+                        # No matching pre-warm in-flight; preserve original
+                        # behavior by serializing snapshot computation.
+                        self._last_snapshot = (
+                            await self._snapshot_generator.get_enhanced_snapshot_async(
+                                self._page, options
+                            )
+                        )
+                        self._last_snapshot_url = current_url
+                        return self._last_snapshot
+
+                # Matching prewarm in-flight: wait for it without holding locks.
+                try:
+                    await prefetch_task_to_wait
+                except Exception:
+                    pass  # pre-warm failed; we'll retry cache check / recompute.
+                # Loop back: if the pre-warm commit populated _prefetch_snapshot,
+                # the next iteration returns instantly; otherwise we recompute.
         except BridgicBrowserError:
             raise
         except Exception as e:
@@ -8068,32 +8089,9 @@ Before you return the element ref, reason about the state and elements for a sen
             "width": w,
             "height": h,
             "context": context,
-            "page_listener": None,
         }
         self._video_recorder = None
         self._video_state[context_key] = True
-
-        # Subscribe to future pages so newly opened tabs auto-switch
-        # the screencast source to the new page. Define the listener BEFORE
-        # the try so both the happy path and the rollback can reference it.
-        def _on_page_created(new_page: Page) -> None:
-            try:
-                asyncio.get_running_loop().create_task(
-                    self._switch_video_to_page(new_page),
-                )
-            except RuntimeError:
-                logger.warning(
-                    "[start_video] no running loop to switch video to new page",
-                )
-
-        # Sentinel: True once context.on() has attached `_on_page_created`.
-        # Required so the rollback path can ALWAYS remove the listener —
-        # including the narrow window where attach succeeded but
-        # ``self._video_session["page_listener"] = ...`` raised (a real
-        # scenario under BaseException / MemoryError between two
-        # synchronous lines). Without this sentinel the listener would
-        # survive the rollback as a zombie. (C3.)
-        _listener_attached = False
 
         try:
             # Single-stream: start one recorder on the active page.
@@ -8101,23 +8099,12 @@ Before you return the element ref, reason about the state and elements for a sen
             if self._video_recorder is None:
                 raise RuntimeError("Failed to start video recorder on active page")
 
-            context.on("page", _on_page_created)
-            _listener_attached = True
-            self._video_session["page_listener"] = _on_page_created
-
             result = "Video recording started (recording active tab)"
             logger.info("[start_video] %s", result)
             return result
         except Exception as e:
             # Rollback the session state we set up above so future
             # start_video() calls are not blocked by a phantom session.
-            if _listener_attached:
-                try:
-                    context.remove_listener("page", _on_page_created)
-                except Exception:
-                    # Best-effort: a backend that raises on remove_listener
-                    # shouldn't mask the original error.
-                    pass
             self._video_session = None
             if self._video_recorder is not None:
                 try:

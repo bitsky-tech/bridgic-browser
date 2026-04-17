@@ -468,12 +468,23 @@ class VideoRecorder:
                 "maxHeight": self._height,
             })
         except BaseException:
-            if self._ffmpeg:
-                self._ffmpeg.kill()
-                self._ffmpeg = None
+            # CDP setup failed after spawning ffmpeg; ensure the process is
+            # fully reaped so we don't leave a zombie around during quick
+            # stop/start cycles.
+            ffmpeg = self._ffmpeg
+            if ffmpeg:
+                try:
+                    ffmpeg.kill()
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(ffmpeg.wait(), timeout=2.0)
+                except Exception:
+                    pass
             # Reader task will exit on EOF; await briefly so it doesn't
             # outlive the recorder.
             await self._drain_stderr_reader()
+            self._ffmpeg = None
             raise
         logger.debug(
             "[VideoRecorder] started screencast %dx%d → %s",

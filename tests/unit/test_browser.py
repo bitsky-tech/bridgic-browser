@@ -1134,6 +1134,43 @@ class TestPrefetchGenerationToken:
             "pre-warm wrote a stale snapshot after _cancel_prefetch — C4 is back"
         )
 
+    @pytest.mark.asyncio
+    async def test_get_snapshot_does_not_deadlock_waiting_for_prefetch_commit(self):
+        """Regression: get_snapshot() must not await prefetch while holding _snapshot_lock."""
+        from bridgic.browser.session._snapshot import EnhancedSnapshot, SnapshotOptions
+
+        browser = Browser()
+        fake_page = MagicMock()
+        fake_page.url = "https://example.com/prefetch"
+        browser._page = fake_page
+
+        prefetched = MagicMock(spec=EnhancedSnapshot)
+        options = SnapshotOptions(interactive=True, full_page=True)
+        browser._prefetch_options = options
+        browser._prefetch_url = fake_page.url
+        allow_commit = asyncio.Event()
+
+        async def _commit_prefetch():
+            await allow_commit.wait()
+            async with browser._snapshot_lock:
+                browser._prefetch_snapshot = prefetched
+
+        browser._prefetch_task = asyncio.create_task(_commit_prefetch())
+        browser._snapshot_generator = MagicMock()
+        browser._snapshot_generator.get_enhanced_snapshot_async = AsyncMock(
+            side_effect=AssertionError("should consume prefetched snapshot instead of recomputing")
+        )
+
+        get_task = asyncio.create_task(
+            browser.get_snapshot(interactive=True, full_page=True)
+        )
+        await asyncio.sleep(0)
+        allow_commit.set()
+
+        result = await asyncio.wait_for(get_task, timeout=0.2)
+
+        assert result is prefetched
+
 
 class TestSingleVideoRecorderClose:
     """Tests verifying single-stream video recorder lifecycle during close().
