@@ -106,9 +106,24 @@ class TestDetectWindows:
                 assert _detect_system_chrome() is True
 
     def test_returns_false_when_no_install_found(self) -> None:
+        # Must mock all three tiers. On a Windows CI runner with Chrome
+        # installed, the shutil.which (Tier 2) and winreg App Paths (Tier 3)
+        # fallbacks would otherwise find the real installation.
+        fake_winreg = type(sys)("winreg")
+        fake_winreg.HKEY_LOCAL_MACHINE = 0
+        fake_winreg.HKEY_CURRENT_USER = 1
+
+        def _open_key(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise OSError("not found")
+
+        fake_winreg.OpenKey = _open_key
+        fake_winreg.QueryValueEx = lambda *_a, **_kw: ("", 0)  # unused
+
         with patch.object(sys, "platform", "win32"):
             with patch.dict(
                 os.environ,
                 {"LOCALAPPDATA": "", "PROGRAMFILES": "", "PROGRAMFILES(X86)": ""},
             ):
-                assert _detect_system_chrome() is False
+                with patch("shutil.which", return_value=None):
+                    with patch.dict(sys.modules, {"winreg": fake_winreg}):
+                        assert _detect_system_chrome() is False

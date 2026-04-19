@@ -196,7 +196,7 @@ wheels = [
 
 [[package]]
 name = "bridgic-browser"
-version = "0.0.5.dev1"
+version = "0.0.5.dev2"
 source = { editable = "." }
 dependencies = [
     { name = "bridgic-core" },

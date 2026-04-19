@@ -22,8 +22,11 @@ class TestFindFfmpeg:
     def test_returns_system_ffmpeg(self, tmp_path: Path) -> None:
         """Falls back to system ffmpeg when no Playwright ffmpeg found."""
         with patch.dict(os.environ, {"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path)}):
-            with patch("shutil.which", return_value="/usr/bin/ffmpeg"):
-                assert _find_ffmpeg() == "/usr/bin/ffmpeg"
+            # platform.system mocked to a non-Windows value so the .exe-suffix
+            # filter in _find_ffmpeg does not drop the mocked PATH result.
+            with patch("platform.system", return_value="Linux"):
+                with patch("shutil.which", return_value="/usr/bin/ffmpeg"):
+                    assert _find_ffmpeg() == "/usr/bin/ffmpeg"
 
     def test_raises_when_not_found(self, tmp_path: Path) -> None:
         with patch.dict(os.environ, {"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path)}):
