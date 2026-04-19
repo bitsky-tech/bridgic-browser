@@ -52,8 +52,11 @@ def scaled_env() -> Iterator[dict]:
 
     AF_UNIX paths max out at ~104 chars on macOS, so we use /tmp/brd-* (short)
     instead of pytest's default tmp_path (which nests under /private/var/...).
+    On Windows /tmp does not exist and the AF_UNIX path-length limit is not a
+    concern, so fall back to the platform default tempdir.
     """
-    short_dir = Path(tempfile.mkdtemp(prefix="brd-", dir="/tmp"))
+    tmp_root = None if os.name == "nt" else "/tmp"
+    short_dir = Path(tempfile.mkdtemp(prefix="brd-", dir=tmp_root))
     socket_path = short_dir / "d.sock"
     user_data = short_dir / "ud"
     user_data.mkdir()

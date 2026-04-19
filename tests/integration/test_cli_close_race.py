@@ -49,8 +49,14 @@ def _run(cmd: str, env: dict, timeout: float = 60.0) -> subprocess.CompletedProc
 
 @pytest.fixture
 def short_env() -> Iterator[dict]:
-    """Isolated daemon state under a short /tmp path (AF_UNIX limit)."""
-    short_dir = Path(tempfile.mkdtemp(prefix="brd-", dir="/tmp"))
+    """Isolated daemon state under a short /tmp path (AF_UNIX limit).
+
+    /tmp sidesteps the 104-char AF_UNIX path limit on macOS. On Windows
+    /tmp does not exist and the limit is not a concern, so fall back to
+    the platform default tempdir.
+    """
+    tmp_root = None if os.name == "nt" else "/tmp"
+    short_dir = Path(tempfile.mkdtemp(prefix="brd-", dir=tmp_root))
     socket_path = short_dir / "d.sock"
     user_data = short_dir / "ud"
     user_data.mkdir()
