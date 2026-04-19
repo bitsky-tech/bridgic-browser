@@ -539,9 +539,12 @@ def cmd_wait(seconds_or_text: str, gone: bool, timeout_seconds: float) -> None:
 
     \b
     SECONDS_OR_TEXT:
-      If a number  → wait exactly that many seconds (e.g. 2, 0.5). Max 60.
+      If a number  → wait exactly that many seconds (e.g. 2, 0.5).
                      NOTE: unit is SECONDS, not milliseconds.
                      --gone and --timeout are ignored when a number is given.
+                     Very long waits are bounded by the daemon response
+                     timeout (BRIDGIC_DAEMON_RESPONSE_TIMEOUT, default 90s,
+                     auto-extended via the arg value + buffer).
       If text      → wait until that text appears on the page.
                      Add --gone to wait until it disappears instead.
                      Use --timeout to set a custom wait limit (default: 30s).

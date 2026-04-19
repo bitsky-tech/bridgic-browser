@@ -11,6 +11,8 @@ import asyncio
 import logging
 import os
 import re
+import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
@@ -114,8 +116,22 @@ class DownloadManager:
                 else Path.home() / "Downloads"
             )
 
-        # Ensure downloads directory exists
-        self._config.downloads_path.mkdir(parents=True, exist_ok=True)
+        # Ensure downloads directory exists. If the configured path is not
+        # writable (read-only FS, permission denied, parent missing on a
+        # locked mount) fall back to a per-user tempdir so downloads still
+        # work instead of raising at construction time.
+        try:
+            self._config.downloads_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            fallback = Path(tempfile.gettempdir()) / "bridgic-downloads"
+            logger.warning(
+                "downloads_path %s not writable (%s); falling back to %s",
+                self._config.downloads_path,
+                exc,
+                fallback,
+            )
+            fallback.mkdir(parents=True, exist_ok=True)
+            self._config.downloads_path = fallback
 
         # Track downloaded files
         self._downloaded_files: List[DownloadedFile] = []
@@ -127,6 +143,10 @@ class DownloadManager:
         # Track in-flight per-page download handler tasks so detach/close
         # can cancel them and avoid writing files after teardown.
         self._page_download_tasks: Dict[str, set[asyncio.Task[None]]] = {}
+        # Re-entrant wait_for_download support: each concurrent call adds its
+        # own Future; _handle_download fulfils the oldest pending waiter on
+        # completion so callers do not stomp on each other's callbacks.
+        self._pending_waiters: List[asyncio.Future[DownloadedFile]] = []
 
     @property
     def downloads_path(self) -> Path:
@@ -339,6 +359,15 @@ class DownloadManager:
                 except Exception as e:
                     logger.warning(f"Download complete callback error: {e}")
 
+            # Wake the oldest still-pending wait_for_download() caller (if any).
+            # Cancelled waiters are skipped silently so callers that timed out
+            # don't block downstream ones.
+            while self._pending_waiters:
+                waiter = self._pending_waiters.pop(0)
+                if not waiter.done():
+                    waiter.set_result(downloaded_file)
+                    break
+
         except asyncio.CancelledError:
             # Cancellation is part of detach/close lifecycle. Do not treat
             # it as a download failure, and do not attempt download.failure().
@@ -392,20 +421,38 @@ class DownloadManager:
             if not (directory / new_filename).exists():
                 return new_filename
             counter += 1
-        # Extremely unlikely: 10000 collisions.  Return a name that is
-        # guaranteed unique by including the counter.
-        return f"{base} ({counter}){ext}"
+
+        # Extremely unlikely: 10000 collisions. Fall back to a timestamp-based
+        # suffix with a nanosecond counter tail — re-check existence to cover
+        # the vanishingly small chance that the tempfile-style name also clashes.
+        unique_suffix = str(int(time.time() * 1000))
+        new_filename = f"{base} ({unique_suffix}){ext}"
+        candidate = directory / new_filename
+        while candidate.exists():
+            new_filename = f"{base} ({unique_suffix}-{time.time_ns()}){ext}"
+            candidate = directory / new_filename
+        return new_filename
 
     # Characters illegal in Windows filenames (also covers / and \ for traversal).
     _UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+    # Windows device-name reservations. Forbidden as a filename stem, with or
+    # without an extension (e.g. `CON`, `CON.pdf`, `com1`). Applied on all
+    # platforms so files are safe to sync/copy onto Windows filesystems later.
+    _WINDOWS_RESERVED_RE = re.compile(
+        r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)",
+        re.IGNORECASE,
+    )
 
     @staticmethod
     def _sanitize_filename(filename: str) -> str:
         """Sanitise a server-suggested filename for safe local storage.
 
         Strips path separators (preventing traversal), replaces Windows-illegal
-        characters, and collapses leading/trailing dots/spaces (reserved on
-        Windows).  Falls back to ``"download"`` if the result is empty.
+        characters, collapses leading/trailing dots/spaces (reserved on
+        Windows), and prefixes Windows device names (CON/PRN/AUX/NUL/COM[1-9]/
+        LPT[1-9]) with ``_``.  Falls back to ``"download"`` if the result is
+        empty.
         """
         # Use only the basename (strip any directory components).
         filename = os.path.basename(filename)
@@ -415,6 +462,10 @@ class DownloadManager:
 
         # Strip leading/trailing dots and spaces (Windows reserved).
         filename = filename.strip(". ")
+
+        # Guard against Windows device names (CON.pdf, COM1, nul.txt, …).
+        if DownloadManager._WINDOWS_RESERVED_RE.match(filename):
+            filename = "_" + filename
 
         return filename or "download"
 
@@ -465,43 +516,33 @@ class DownloadManager:
         ... )
         >>> print(f"Downloaded: {file.file_name}")
         """
-        downloaded = None
-        download_event = asyncio.Event()
-
-        original_callback = self._config.on_download_complete
-
-        def on_complete(file: DownloadedFile):
-            nonlocal downloaded
-            downloaded = file
-            download_event.set()
-            if original_callback:
-                result = original_callback(file)
-                if asyncio.iscoroutine(result):
-                    asyncio.create_task(result)
-
-        self._config.on_download_complete = on_complete
+        # Register our waiter Future before triggering the action so a fast
+        # download can't race past us. Concurrent wait_for_download() calls
+        # each get their own Future; _handle_download resolves them FIFO.
+        waiter: asyncio.Future[DownloadedFile] = asyncio.get_event_loop().create_future()
+        self._pending_waiters.append(waiter)
 
         try:
             # Start waiting for download
-            async with page.expect_download(timeout=timeout) as download_info:
+            async with page.expect_download(timeout=timeout):
                 # Perform the action that triggers download
                 action_result = action()
                 if asyncio.iscoroutine(action_result):
                     await action_result
 
-            # Wait for our handler to process it
-            await asyncio.wait_for(
-                download_event.wait(),
-                timeout=timeout / 1000,
-            )
-
-            return downloaded
+            # Wait for our handler to process it and fulfil the Future.
+            return await asyncio.wait_for(waiter, timeout=timeout / 1000)
 
         except asyncio.TimeoutError:
             logger.warning("Download wait timed out")
             return None
         finally:
-            self._config.on_download_complete = original_callback
+            # Ensure we don't leak a dangling Future in the waiter list, even
+            # if the handler already popped us (the `in` check handles that).
+            if waiter in self._pending_waiters:
+                self._pending_waiters.remove(waiter)
+            if not waiter.done():
+                waiter.cancel()
 
     def clear_history(self) -> None:
         """Clear the download history."""

@@ -84,19 +84,21 @@ def _is_browser_closed_error(exc: BaseException) -> bool:
     return any(pat in msg for pat in _BROWSER_CLOSED_PATTERNS)
 
 
+# Re-export the shared redaction helper under the legacy name so that the
+# CLI client (and any external code that imports from `_daemon`) keeps
+# working. The canonical definition lives in `bridgic.browser._redact`.
+from bridgic.browser._redact import redact_cdp_url as _redact_cdp_url  # noqa: E402
+
+
 def _browser_closed_hint(cdp: Optional[str] = None) -> str:
     """Return a BROWSER_CLOSED hint message tailored to the connection mode."""
     if cdp:
-        # For local Chrome (localhost/127.0.0.1), show port number instead of the full ws:// URL
-        # because the browser UUID in the URL changes on every Chrome restart.
         _parsed = urlparse(cdp)
         _host = (_parsed.hostname or "").lower()
+        _cdp_hint = _redact_cdp_url(cdp)
         if _host in ("localhost", "127.0.0.1", "::1"):
-            _cdp_hint = str(_parsed.port or 9222)
             _msg = "Local Chrome closed or crashed."
         else:
-            _port = f":{_parsed.port}" if _parsed.port is not None else ""
-            _cdp_hint = f"{_parsed.scheme}://{_parsed.hostname or _parsed.netloc}{_port}"
             _msg = "Remote browser session closed (the cloud/remote browser disconnected or timed out)."
         return (
             f"{_msg} "
@@ -600,6 +602,25 @@ _HANDLERS = {
 }
 
 
+def _get_cdp_reconnect_lock(browser: "Browser") -> asyncio.Lock:
+    """Return an asyncio.Lock attached to the Browser, creating it on first use.
+
+    The lock serialises concurrent CDP reconnect attempts. Without it, two
+    dispatchers that both saw a TargetClosedError would race: each runs
+    browser.close() + browser._start() in parallel, which corrupts internal
+    handles and in the worst case leaves the Playwright driver orphaned.
+
+    The lock lives on the Browser instance (not module-global) because SDK
+    users can in principle hold multiple Browser objects; one lock per
+    instance keeps the scope tight.
+    """
+    lock = getattr(browser, "_cdp_reconnect_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        browser._cdp_reconnect_lock = lock  # type: ignore[attr-defined]
+    return lock
+
+
 async def _cdp_reconnect(browser: "Browser") -> bool:
     """Stop and restart *browser* to re-establish a dropped CDP/PW-WS connection.
 
@@ -610,40 +631,50 @@ async def _cdp_reconnect(browser: "Browser") -> bool:
     is no public ``reconnect()`` API. This is intentional — reconnect is a
     daemon-only concern.  If ``_start()``'s preconditions change, this
     function must be updated accordingly.
+
+    Concurrency: serialised per-Browser via ``_get_cdp_reconnect_lock`` so
+    two dispatchers that each caught a ``TargetClosedError`` cannot run
+    close() + _start() in parallel and corrupt internal handles. A
+    follow-up call that acquires the lock after a successful prior reconnect
+    will run close() + _start() again — that is idempotent and the cost is
+    one extra reconnect under a narrow race, which is acceptable compared
+    to the harder-to-debug handle corruption the lock prevents.
     """
-    # Cancel any in-flight snapshot prefetch BEFORE close(). close() also
-    # cancels prefetch, but if it raises mid-way (line before _cancel_prefetch)
-    # the prefetch task survives and later touches a dead browser — producing
-    # spurious errors in the reconnect window. Cancelling up-front is cheap
-    # and idempotent.
-    try:
-        browser._cancel_prefetch()
-    except Exception as exc:
-        logger.debug("[daemon] cdp_reconnect: _cancel_prefetch error (ignored): %s", exc)
+    lock = _get_cdp_reconnect_lock(browser)
+    async with lock:
+        # Cancel any in-flight snapshot prefetch BEFORE close(). close() also
+        # cancels prefetch, but if it raises mid-way (line before _cancel_prefetch)
+        # the prefetch task survives and later touches a dead browser — producing
+        # spurious errors in the reconnect window. Cancelling up-front is cheap
+        # and idempotent.
+        try:
+            browser._cancel_prefetch()
+        except Exception as exc:
+            logger.debug("[daemon] cdp_reconnect: _cancel_prefetch error (ignored): %s", exc)
 
-    try:
-        await browser.close()
-    except Exception as exc:
-        logger.debug("[daemon] cdp_reconnect: close() error (ignored): %s", exc)
+        try:
+            await browser.close()
+        except Exception as exc:
+            logger.debug("[daemon] cdp_reconnect: close() error (ignored): %s", exc)
 
-    # Force-reset internal handles so `_start()`'s early-return guard
-    # (`if self._playwright is not None: return`) cannot silently skip the
-    # reconnect when close() has raised mid-flight and left handles set.  We
-    # accept a potential driver leak here — the close() attempt above
-    # handles cleanup; these assignments are just insurance against partial
-    # close state.
-    browser._playwright = None
-    browser._browser = None
-    browser._context = None
-    browser._page = None
+        # Force-reset internal handles so `_start()`'s early-return guard
+        # (`if self._playwright is not None: return`) cannot silently skip the
+        # reconnect when close() has raised mid-flight and left handles set.  We
+        # accept a potential driver leak here — the close() attempt above
+        # handles cleanup; these assignments are just insurance against partial
+        # close state.
+        browser._playwright = None
+        browser._browser = None
+        browser._context = None
+        browser._page = None
 
-    try:
-        await browser._start()
-        logger.info("[daemon] cdp_reconnect: reconnected successfully")
-        return True
-    except Exception as exc:
-        logger.error("[daemon] cdp_reconnect: _start() failed: %s", exc)
-        return False
+        try:
+            await browser._start()
+            logger.info("[daemon] cdp_reconnect: reconnected successfully")
+            return True
+        except Exception as exc:
+            logger.error("[daemon] cdp_reconnect: _start() failed: %s", exc)
+            return False
 
 
 # Commands that exceed this wall-clock duration get a WARN in daemon logs —
@@ -1022,7 +1053,10 @@ def _resolve_default_downloads_dir() -> Path:
     return BRIDGIC_DOWNLOADS_DIR
 
 
-def _probe_ws_reachable(ws_url: str, timeout: float = 1.5) -> None:
+_CDP_PROBE_TIMEOUT = float(os.environ.get("BRIDGIC_CDP_PROBE_TIMEOUT", "1.5"))
+
+
+def _probe_ws_reachable(ws_url: str, timeout: Optional[float] = None) -> None:
     """Best-effort TCP probe: verify the ws:// target's host:port is reachable.
 
     Raises ``ConnectionError`` with a user-friendly message when the target
@@ -1037,6 +1071,7 @@ def _probe_ws_reachable(ws_url: str, timeout: float = 1.5) -> None:
     import socket
     from urllib.parse import urlparse
 
+    effective_timeout = timeout if timeout is not None else _CDP_PROBE_TIMEOUT
     parsed = urlparse(ws_url)
     host = parsed.hostname
     # Default CDP WebSocket port is the Chrome DevTools port, typically 9222.
@@ -1044,7 +1079,7 @@ def _probe_ws_reachable(ws_url: str, timeout: float = 1.5) -> None:
     if not host:
         return  # malformed URL — defer to Playwright's own error handling
     try:
-        with socket.create_connection((host, port), timeout=timeout):
+        with socket.create_connection((host, port), timeout=effective_timeout):
             pass
     except (OSError, socket.timeout) as exc:
         raise ConnectionError(
@@ -1118,7 +1153,17 @@ async def run_daemon() -> None:
             kwargs["downloads_path"] = str(_resolve_default_downloads_dir())
 
     browser = Browser(**kwargs)
-    logger.info("[daemon] browser ready (lazy start, config=%s)", {k: v for k, v in browser.get_config().items() if k != "proxy"})
+    # Redact `cdp` before logging — raw CDP URLs may carry session tokens
+    # (/devtools/browser/<uuid>) that must never reach logs.
+    _log_config: Dict[str, Any] = {}
+    for k, v in browser.get_config().items():
+        if k == "proxy":
+            continue
+        if k == "cdp" and isinstance(v, str) and v:
+            _log_config[k] = _redact_cdp_url(v)
+        else:
+            _log_config[k] = v
+    logger.info("[daemon] browser ready (lazy start, config=%s)", _log_config)
 
     stop_event = asyncio.Event()
     shutdown_started = asyncio.Event()
@@ -1176,7 +1221,27 @@ async def run_daemon() -> None:
 
     server = await transport.start_server(connection_cb, stream_limit=STREAM_LIMIT)
     server_holder["server"] = server
-    write_run_info(transport.build_run_info(pid=os.getpid()))
+
+    # Enrich run_info with the daemon's effective mode so the CLI client can
+    # detect "daemon already running but in a different mode" and surface a
+    # clear DAEMON_MODE_MISMATCH error instead of silently ignoring user flags
+    # like `--cdp` / `--headed` / `--clear-user-data`. `mode` is derived from
+    # Browser state (the single source of truth) rather than recomputed from
+    # env vars / kwargs to avoid drift.
+    _run_info: Dict[str, Any] = transport.build_run_info(pid=os.getpid())
+    _cdp_raw: Optional[str] = getattr(browser, "_cdp_raw", None)
+    _clear_user_data: bool = bool(getattr(browser, "_clear_user_data", False))
+    _headless: Optional[bool] = getattr(browser, "_headless", None)
+    if _cdp_raw:
+        _run_info["mode"] = "cdp"
+        _run_info["cdp_url_redacted"] = _redact_cdp_url(_cdp_raw)
+    elif _clear_user_data:
+        _run_info["mode"] = "ephemeral"
+    else:
+        _run_info["mode"] = "persistent"
+    _run_info["headed"] = bool(_headless is False)
+    _run_info["clear_user_data"] = _clear_user_data
+    write_run_info(_run_info)
 
     # Signal ready to parent process
     sys.stdout.write(READY_SIGNAL)
@@ -1217,6 +1282,12 @@ async def run_daemon() -> None:
     # it would require OS-level atomic file locking; the practical risk of
     # hitting this window is negligible.
     current_info = read_run_info()
+    # The pid guard assumes daemon never calls os.fork() or spawns
+    # multiprocessing children that share this pid namespace. If that
+    # assumption changes, "am I the original daemon?" must compare against
+    # the pid captured at run_info write time, not os.getpid() at shutdown —
+    # otherwise a forked child would erroneously claim ownership and delete
+    # the parent's socket.
     if current_info is None or current_info.get("pid") == os.getpid():
         transport.cleanup()
         remove_run_info()

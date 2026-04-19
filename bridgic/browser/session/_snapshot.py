@@ -52,6 +52,7 @@ Usage:
 """
 
 import asyncio
+import json
 import re
 import math
 import logging
@@ -83,6 +84,103 @@ _BATCH_INFO_CHUNK_SIZE = 500
 # Without this, a 5549-ref page split into 12 chunks would run the expensive
 # `div:not([role])` querySelectorAll 12× instead of once — the observed
 # root cause of 95–123 s runtimes and DAEMON_RESPONSE_TIMEOUT failures.
+# Single source of truth for role → CSS selector mappings. Both Phase 1
+# (build role index) and Phase 2 (batch info) reference the same mapping — any
+# drift between them causes silent nth-off-by-one ref corruption. See
+# tests/unit/test_snapshot_selectors.py for the round-trip equivalence check
+# that locks this in.
+_IMPLICIT_ROLE_SELECTORS: Dict[str, str] = {
+    'button': 'button, input[type="button"], input[type="submit"], input[type="reset"], input[type="file"], [role="button"]',
+    'link': 'a[href], area[href], [role="link"]',
+    'textbox': 'input:not([type]), input[type="text"], input[type="email"], input[type="password"], input[type="search"], input[type="url"], input[type="tel"], textarea, [role="textbox"], [contenteditable="true"], [contenteditable=""]',
+    'checkbox': 'input[type="checkbox"], [role="checkbox"]',
+    'radio': 'input[type="radio"], [role="radio"]',
+    'combobox': 'select, [role="combobox"]',
+    'option': 'option, [role="option"]',
+    'heading': 'h1, h2, h3, h4, h5, h6, [role="heading"]',
+    'listitem': 'li, [role="listitem"]',
+    'list': 'ul, ol, [role="list"]',
+    'img': 'img[alt], [role="img"]',
+    'row': 'tr, [role="row"]',
+    'cell': 'td, [role="cell"]',
+    'columnheader': 'th, [role="columnheader"]',
+    'navigation': 'nav, [role="navigation"]',
+    'main': 'main, [role="main"]',
+    'banner': 'header, [role="banner"]',
+    'contentinfo': 'footer, [role="contentinfo"]',
+    'table': 'table, [role="table"]',
+    'menuitem': '[role="menuitem"]',
+    'menuitemcheckbox': '[role="menuitemcheckbox"]',
+    'menuitemradio': '[role="menuitemradio"]',
+    'tab': '[role="tab"]',
+    'tabpanel': '[role="tabpanel"]',
+    'treeitem': '[role="treeitem"]',
+    'switch': '[role="switch"]',
+    'slider': 'input[type="range"], [role="slider"]',
+    'spinbutton': 'input[type="number"], [role="spinbutton"]',
+    'searchbox': 'input[type="search"], [role="searchbox"]',
+    'progressbar': 'progress, [role="progressbar"]',
+    'scrollbar': '[role="scrollbar"]',
+    'separator': 'hr, [role="separator"]',
+    'gridcell': '[role="gridcell"]',
+    'grid': '[role="grid"]',
+    'listbox': '[role="listbox"]',
+    'menu': '[role="menu"]',
+    'menubar': '[role="menubar"]',
+    'radiogroup': '[role="radiogroup"]',
+    'tablist': '[role="tablist"]',
+    'tree': '[role="tree"]',
+    'treegrid': '[role="treegrid"]',
+    'alertdialog': '[role="alertdialog"]',
+    'dialog': 'dialog, [role="dialog"]',
+    'application': '[role="application"]',
+    'search': '[role="search"]',
+    'article': 'article, [role="article"]',
+    'region': 'section[aria-label], section[aria-labelledby], [role="region"]',
+    'rowheader': 'th[scope="row"], [role="rowheader"]',
+    'rowgroup': 'thead, tbody, tfoot, [role="rowgroup"]',
+    'toolbar': '[role="toolbar"]',
+    'status': '[role="status"]',
+    'alert': '[role="alert"]',
+    'log': '[role="log"]',
+    'marquee': '[role="marquee"]',
+    'timer': '[role="timer"]',
+    'tooltip': '[role="tooltip"]',
+    'figure': 'figure, [role="figure"]',
+    'paragraph': 'p, [role="paragraph"]',
+    'blockquote': 'blockquote, [role="blockquote"]',
+    'code': 'code, [role="code"]',
+    'emphasis': 'em, [role="emphasis"]',
+    'strong': 'strong, [role="strong"]',
+    'deletion': 'del, [role="deletion"]',
+    'insertion': 'ins, [role="insertion"]',
+    'subscript': 'sub, [role="subscript"]',
+    'superscript': 'sup, [role="superscript"]',
+    'term': 'dfn, [role="term"]',
+    'definition': 'dd, [role="definition"]',
+    'note': '[role="note"]',
+    'math': 'math, [role="math"]',
+    'time': 'time, [role="time"]',
+    'complementary': 'aside, [role="complementary"]',
+    'form': 'form[aria-label], form[aria-labelledby], [role="form"]',
+    'iframe': 'iframe',
+    'feed': '[role="feed"]',
+    'document': '[role="document"]',
+    'caption': 'caption, figcaption, [role="caption"]',
+    'meter': 'meter, [role="meter"]',
+    'summary': 'summary',
+    'details': 'details',
+    'generic': 'div:not([role]), legend, [role="generic"]',
+    'group': 'fieldset, details, optgroup, [role="group"]',
+    'none': '[role="none"]',
+    'presentation': '[role="presentation"]',
+}
+
+# JSON-serialised form of the mapping, injected into JS source via a sentinel
+# placeholder. json.dumps produces a valid JS object literal for this input
+# (ASCII keys/values, no embedded backslashes or unicode escapes needed).
+_IMPLICIT_ROLE_SELECTORS_JS = json.dumps(_IMPLICIT_ROLE_SELECTORS, sort_keys=True)
+
 _BUILD_ROLE_INDEX_JS = r"""(args) => {
     const gen           = args.generation;
     const keyIndex      = '__bridgicRoleIndex_'             + gen;
@@ -93,92 +191,7 @@ _BUILD_ROLE_INDEX_JS = r"""(args) => {
     // Idempotent: if this generation already built the index, skip.
     if (window[keyIndex]) return null;
 
-    const IMPLICIT_ROLE_SELECTORS = {
-        'button': 'button, input[type="button"], input[type="submit"], input[type="reset"], input[type="file"], [role="button"]',
-        'link': 'a[href], area[href], [role="link"]',
-        'textbox': 'input:not([type]), input[type="text"], input[type="email"], input[type="password"], input[type="search"], input[type="url"], input[type="tel"], textarea, [role="textbox"], [contenteditable="true"], [contenteditable=""]',
-        'checkbox': 'input[type="checkbox"], [role="checkbox"]',
-        'radio': 'input[type="radio"], [role="radio"]',
-        'combobox': 'select, [role="combobox"]',
-        'option': 'option, [role="option"]',
-        'heading': 'h1, h2, h3, h4, h5, h6, [role="heading"]',
-        'listitem': 'li, [role="listitem"]',
-        'list': 'ul, ol, [role="list"]',
-        'img': 'img[alt], [role="img"]',
-        'row': 'tr, [role="row"]',
-        'cell': 'td, [role="cell"]',
-        'columnheader': 'th, [role="columnheader"]',
-        'navigation': 'nav, [role="navigation"]',
-        'main': 'main, [role="main"]',
-        'banner': 'header, [role="banner"]',
-        'contentinfo': 'footer, [role="contentinfo"]',
-        'table': 'table, [role="table"]',
-        'menuitem': '[role="menuitem"]',
-        'menuitemcheckbox': '[role="menuitemcheckbox"]',
-        'menuitemradio': '[role="menuitemradio"]',
-        'tab': '[role="tab"]',
-        'tabpanel': '[role="tabpanel"]',
-        'treeitem': '[role="treeitem"]',
-        'switch': '[role="switch"]',
-        'slider': 'input[type="range"], [role="slider"]',
-        'spinbutton': 'input[type="number"], [role="spinbutton"]',
-        'searchbox': 'input[type="search"], [role="searchbox"]',
-        'progressbar': 'progress, [role="progressbar"]',
-        'scrollbar': '[role="scrollbar"]',
-        'separator': 'hr, [role="separator"]',
-        'gridcell': '[role="gridcell"]',
-        'grid': '[role="grid"]',
-        'listbox': '[role="listbox"]',
-        'menu': '[role="menu"]',
-        'menubar': '[role="menubar"]',
-        'radiogroup': '[role="radiogroup"]',
-        'tablist': '[role="tablist"]',
-        'tree': '[role="tree"]',
-        'treegrid': '[role="treegrid"]',
-        'alertdialog': '[role="alertdialog"]',
-        'dialog': 'dialog, [role="dialog"]',
-        'application': '[role="application"]',
-        'search': '[role="search"]',
-        'article': 'article, [role="article"]',
-        'region': 'section[aria-label], section[aria-labelledby], [role="region"]',
-        'rowheader': 'th[scope="row"], [role="rowheader"]',
-        'rowgroup': 'thead, tbody, tfoot, [role="rowgroup"]',
-        'toolbar': '[role="toolbar"]',
-        'status': '[role="status"]',
-        'alert': '[role="alert"]',
-        'log': '[role="log"]',
-        'marquee': '[role="marquee"]',
-        'timer': '[role="timer"]',
-        'tooltip': '[role="tooltip"]',
-        'figure': 'figure, [role="figure"]',
-        'paragraph': 'p, [role="paragraph"]',
-        'blockquote': 'blockquote, [role="blockquote"]',
-        'code': 'code, [role="code"]',
-        'emphasis': 'em, [role="emphasis"]',
-        'strong': 'strong, [role="strong"]',
-        'deletion': 'del, [role="deletion"]',
-        'insertion': 'ins, [role="insertion"]',
-        'subscript': 'sub, [role="subscript"]',
-        'superscript': 'sup, [role="superscript"]',
-        'term': 'dfn, [role="term"]',
-        'definition': 'dd, [role="definition"]',
-        'note': '[role="note"]',
-        'math': 'math, [role="math"]',
-        'time': 'time, [role="time"]',
-        'complementary': 'aside, [role="complementary"]',
-        'form': 'form[aria-label], form[aria-labelledby], [role="form"]',
-        'iframe': 'iframe',
-        'feed': '[role="feed"]',
-        'document': '[role="document"]',
-        'caption': 'caption, figcaption, [role="caption"]',
-        'meter': 'meter, [role="meter"]',
-        'summary': 'summary',
-        'details': 'details',
-        'generic': 'div:not([role]), legend, [role="generic"]',
-        'group': 'fieldset, details, optgroup, [role="group"]',
-        'none': '[role="none"]',
-        'presentation': '[role="presentation"]',
-    };
+    const IMPLICIT_ROLE_SELECTORS = __IMPLICIT_ROLE_SELECTORS__;
 
     const roleIndex = {};
     window[keyIndex]     = roleIndex;
@@ -195,7 +208,7 @@ _BUILD_ROLE_INDEX_JS = r"""(args) => {
         }
     }
     return null;
-}"""
+}""".replace("__IMPLICIT_ROLE_SELECTORS__", _IMPLICIT_ROLE_SELECTORS_JS)
 
 
 # Phase 3 of the three-phase evaluate strategy:
@@ -222,92 +235,7 @@ _CLEANUP_ROLE_INDEX_JS = r"""(args) => {
 _BATCH_INFO_JS = r"""(args) => {
     const { elements, viewportWidth, viewportHeight, checkViewport, generation } = args;
 
-    const IMPLICIT_ROLE_SELECTORS = window['__bridgicImplicitRoleSelectors_' + generation] || {
-        'button': 'button, input[type="button"], input[type="submit"], input[type="reset"], input[type="file"], [role="button"]',
-        'link': 'a[href], area[href], [role="link"]',
-        'textbox': 'input:not([type]), input[type="text"], input[type="email"], input[type="password"], input[type="search"], input[type="url"], input[type="tel"], textarea, [role="textbox"], [contenteditable="true"], [contenteditable=""]',
-        'checkbox': 'input[type="checkbox"], [role="checkbox"]',
-        'radio': 'input[type="radio"], [role="radio"]',
-        'combobox': 'select, [role="combobox"]',
-        'option': 'option, [role="option"]',
-        'heading': 'h1, h2, h3, h4, h5, h6, [role="heading"]',
-        'listitem': 'li, [role="listitem"]',
-        'list': 'ul, ol, [role="list"]',
-        'img': 'img[alt], [role="img"]',
-        'row': 'tr, [role="row"]',
-        'cell': 'td, [role="cell"]',
-        'columnheader': 'th, [role="columnheader"]',
-        'navigation': 'nav, [role="navigation"]',
-        'main': 'main, [role="main"]',
-        'banner': 'header, [role="banner"]',
-        'contentinfo': 'footer, [role="contentinfo"]',
-        'table': 'table, [role="table"]',
-        'menuitem': '[role="menuitem"]',
-        'menuitemcheckbox': '[role="menuitemcheckbox"]',
-        'menuitemradio': '[role="menuitemradio"]',
-        'tab': '[role="tab"]',
-        'tabpanel': '[role="tabpanel"]',
-        'treeitem': '[role="treeitem"]',
-        'switch': '[role="switch"]',
-        'slider': 'input[type="range"], [role="slider"]',
-        'spinbutton': 'input[type="number"], [role="spinbutton"]',
-        'searchbox': 'input[type="search"], [role="searchbox"]',
-        'progressbar': 'progress, [role="progressbar"]',
-        'scrollbar': '[role="scrollbar"]',
-        'separator': 'hr, [role="separator"]',
-        'gridcell': '[role="gridcell"]',
-        'grid': '[role="grid"]',
-        'listbox': '[role="listbox"]',
-        'menu': '[role="menu"]',
-        'menubar': '[role="menubar"]',
-        'radiogroup': '[role="radiogroup"]',
-        'tablist': '[role="tablist"]',
-        'tree': '[role="tree"]',
-        'treegrid': '[role="treegrid"]',
-        'alertdialog': '[role="alertdialog"]',
-        'dialog': 'dialog, [role="dialog"]',
-        'application': '[role="application"]',
-        'search': '[role="search"]',
-        'article': 'article, [role="article"]',
-        'region': 'section[aria-label], section[aria-labelledby], [role="region"]',
-        'rowheader': 'th[scope="row"], [role="rowheader"]',
-        'rowgroup': 'thead, tbody, tfoot, [role="rowgroup"]',
-        'toolbar': '[role="toolbar"]',
-        'status': '[role="status"]',
-        'alert': '[role="alert"]',
-        'log': '[role="log"]',
-        'marquee': '[role="marquee"]',
-        'timer': '[role="timer"]',
-        'tooltip': '[role="tooltip"]',
-        'figure': 'figure, [role="figure"]',
-        'paragraph': 'p, [role="paragraph"]',
-        'blockquote': 'blockquote, [role="blockquote"]',
-        'code': 'code, [role="code"]',
-        'emphasis': 'em, [role="emphasis"]',
-        'strong': 'strong, [role="strong"]',
-        'deletion': 'del, [role="deletion"]',
-        'insertion': 'ins, [role="insertion"]',
-        'subscript': 'sub, [role="subscript"]',
-        'superscript': 'sup, [role="superscript"]',
-        'term': 'dfn, [role="term"]',
-        'definition': 'dd, [role="definition"]',
-        'note': '[role="note"]',
-        'math': 'math, [role="math"]',
-        'time': 'time, [role="time"]',
-        'complementary': 'aside, [role="complementary"]',
-        'form': 'form[aria-label], form[aria-labelledby], [role="form"]',
-        'iframe': 'iframe',
-        'feed': '[role="feed"]',
-        'document': '[role="document"]',
-        'caption': 'caption, figcaption, [role="caption"]',
-        'meter': 'meter, [role="meter"]',
-        'summary': 'summary',
-        'details': 'details',
-        'generic': 'div:not([role]), legend, [role="generic"]',
-        'group': 'fieldset, details, optgroup, [role="group"]',
-        'none': '[role="none"]',
-        'presentation': '[role="presentation"]',
-    };
+    const IMPLICIT_ROLE_SELECTORS = window['__bridgicImplicitRoleSelectors_' + generation] || __IMPLICIT_ROLE_SELECTORS__;
 
     // Read the role index and caches built by _BUILD_ROLE_INDEX_JS (Phase 1).
     // Keys are suffixed with `generation` to isolate concurrent snapshot tasks.
@@ -506,7 +434,7 @@ _BATCH_INFO_JS = r"""(args) => {
         results[item.ref] = getElementInfo(el);
     }
     return results;
-}"""
+}""".replace("__IMPLICIT_ROLE_SELECTORS__", _IMPLICIT_ROLE_SELECTORS_JS)
 
 @dataclass
 class RefData:
@@ -1413,8 +1341,10 @@ class SnapshotGenerator:
 
         WARNING: This method uses Playwright's private/internal API (_impl_obj, _channel).
         These APIs are not part of Playwright's public contract and may change or break
-        in future Playwright versions without notice. Monitor Playwright releases and
-        test thoroughly after upgrades.
+        in future Playwright versions without notice. When the private attributes are
+        unavailable (e.g. Playwright renamed them in a major release), falls back to the
+        public ``page.accessibility.snapshot()`` API so ref generation still works —
+        at reduced quality.
 
         The 'snapshotForAI' command is an internal Playwright feature that returns
         a structured accessibility tree optimized for AI consumption.
@@ -1427,20 +1357,71 @@ class SnapshotGenerator:
         Returns
         -------
         str
-            Raw snapshot string returned by Playwright `snapshotForAI`.
-            Returns None if the snapshot fails or is empty.
+            Raw snapshot string returned by Playwright `snapshotForAI`, or a
+            best-effort YAML-ish rendering of the public accessibility tree
+            when the private API is unavailable.
         """
-        # ACCESS PRIVATE API - May break in future Playwright versions
-        page_impl = page._impl_obj
-        channel = page_impl._channel
-        result = await channel.send_return_as_dict(
-            "snapshotForAI",
-            page_impl._timeout_settings.timeout,
-            {"track": None, "timeout": 30000},
-            is_internal=True
-        )
-        full_data = result.get('full')
+        try:
+            page_impl = page._impl_obj  # type: ignore[attr-defined]
+            channel = page_impl._channel
+            timeout_settings = page_impl._timeout_settings
+        except AttributeError as exc:
+            logger.warning(
+                "Playwright private API (page._impl_obj / _channel / "
+                "_timeout_settings) unavailable (%s); falling back to "
+                "accessibility.snapshot() — ref quality is reduced. "
+                "Pin playwright to a compatible version to restore full output.",
+                exc,
+            )
+            return await self._fallback_accessibility_snapshot(page)
+        try:
+            result = await channel.send_return_as_dict(
+                "snapshotForAI",
+                timeout_settings.timeout,
+                {"track": None, "timeout": 30000},
+                is_internal=True,
+            )
+        except AttributeError as exc:
+            logger.warning(
+                "Playwright snapshotForAI internal call signature changed (%s); "
+                "falling back to accessibility.snapshot()",
+                exc,
+            )
+            return await self._fallback_accessibility_snapshot(page)
+        full_data = result.get("full")
         return full_data
+
+    async def _fallback_accessibility_snapshot(self, page: AsyncPage) -> str:
+        """Render ``page.accessibility.snapshot()`` as a YAML-ish string.
+
+        Output shape mimics Playwright's ``snapshotForAI`` (``- role "name"`` lines)
+        enough for the downstream parser to recover refs. Less detail (no
+        ``[cursor=pointer]``, no ``[disabled]`` hints) is reported — this is a
+        graceful degradation path, not a long-term substitute for the private API.
+        """
+        try:
+            tree = await page.accessibility.snapshot()
+        except Exception as exc:
+            logger.warning("accessibility.snapshot() fallback failed: %s", exc)
+            return ""
+        if not tree:
+            return ""
+
+        lines: List[str] = []
+
+        def _walk(node: Dict[str, Any], depth: int) -> None:
+            role = str(node.get("role") or "generic")
+            name = node.get("name")
+            indent = "  " * depth
+            if name:
+                lines.append(f'{indent}- {role} "{name}"')
+            else:
+                lines.append(f"{indent}- {role}")
+            for child in node.get("children") or []:
+                _walk(child, depth + 1)
+
+        _walk(tree, 0)
+        return "\n".join(lines)
 
     def _process_page_snapshot_for_ai(
         self,

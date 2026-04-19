@@ -20,6 +20,81 @@ from ._constants import BRIDGIC_HOME, BRIDGIC_BROWSER_HOME
 
 logger = logging.getLogger(__name__)
 
+
+class ConfigValidationError(ValueError):
+    """Raised when a config file contains a value of the wrong type."""
+
+
+# Type expectations for well-known top-level config keys. Only keys listed
+# here are validated — anything else is passed through untouched so users
+# can still experiment with new Playwright options without touching this
+# table. Tuple values allow "bool-or-int", "str-or-dict" etc.
+_EXPECTED_TYPES: Dict[str, Any] = {
+    "headless": bool,
+    "stealth": bool,
+    "clear_user_data": bool,
+    "user_data_dir": str,
+    "cdp": str,
+    "channel": str,
+    "executable_path": str,
+    "timeout": (int, float),
+    "slow_mo": (int, float),
+    "devtools": bool,
+    "user_agent": str,
+    "locale": str,
+    "timezone_id": str,
+    "ignore_https_errors": bool,
+    "offline": bool,
+    "color_scheme": str,
+    "chromium_sandbox": bool,
+    "downloads_path": str,
+    "args": list,
+    "ignore_default_args": (bool, list),
+    "viewport": dict,
+    "proxy": dict,
+    "extra_http_headers": dict,
+}
+
+
+def _type_name(expected: Any) -> str:
+    if isinstance(expected, tuple):
+        return " | ".join(t.__name__ for t in expected)
+    return expected.__name__
+
+
+def _validate_config_entry(key: str, value: Any) -> None:
+    expected = _EXPECTED_TYPES.get(key)
+    if expected is None:
+        return
+    # Allow explicit nulls to clear an option; downstream Browser() treats
+    # None as "unset".
+    if value is None:
+        return
+    # Python bool is a subclass of int — exclude that pitfall for int-typed
+    # config entries so `"timeout": true` is still rejected.
+    if expected in (int, float) or (isinstance(expected, tuple) and int in expected):
+        if isinstance(value, bool):
+            raise ConfigValidationError(
+                f"Config '{key}' must be {_type_name(expected)}, got bool"
+            )
+    if not isinstance(value, expected):
+        raise ConfigValidationError(
+            f"Config '{key}' must be {_type_name(expected)}, "
+            f"got {type(value).__name__}"
+        )
+
+
+def _validate_config_schema(cfg: Dict[str, Any]) -> None:
+    """Validate top-level config keys against the known schema.
+
+    Raises :class:`ConfigValidationError` on the first mismatch; the caller
+    is expected to surface the error early (at Browser() construction)
+    rather than let a miscast value propagate into Playwright later and
+    produce a confusing runtime failure.
+    """
+    for key, value in cfg.items():
+        _validate_config_entry(key, value)
+
 # Old config path (pre-0.0.3): ~/.bridgic/bridgic-browser.json
 _LEGACY_CONFIG_PATH = BRIDGIC_HOME / "bridgic-browser.json"
 
@@ -89,6 +164,11 @@ def _load_config_sources() -> Dict[str, Any]:
                 cfg.update(parsed)
         except Exception:
             logger.warning("failed to parse %s: %s", _ENV_VAR, raw, exc_info=True)
+
+    # Surface config schema errors as early as possible (at Browser()
+    # construction) instead of letting them turn into Playwright runtime
+    # errors deep inside _start().
+    _validate_config_schema(cfg)
 
     return cfg
 

@@ -53,10 +53,12 @@ logger = logging.getLogger(__name__)
 # 25 fps — matches Playwright's videoRecorder.ts (line 17: ``const fps = 25;``).
 _FPS = 25
 
-# Matches "ffmpeg-<digits>" so we can sort version directories numerically
-# rather than lexicographically (otherwise "ffmpeg-999" sorts above
-# "ffmpeg-1011", which would pin us to an older binary).
-_FFMPEG_VERSION_RE = re.compile(r"^ffmpeg-(\d+)$")
+# Matches "ffmpeg-<digits>[-tail]" so we can sort version directories
+# numerically rather than lexicographically (otherwise "ffmpeg-999" sorts
+# above "ffmpeg-1011", which would pin us to an older binary). A trailing
+# "-beta" / ".1" is tolerated so pre-release Playwright builds aren't
+# silently skipped.
+_FFMPEG_VERSION_RE = re.compile(r"^ffmpeg-(\d+)(?:[-.].+)?$")
 
 # Upper bound on stderr retained in memory per recorder.  64 KiB matches the
 # typical OS pipe buffer, which is why this number also matches the historical
@@ -125,6 +127,22 @@ def _find_ffmpeg() -> str:
                 return str(candidate)
 
     system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg and platform.system() == "Windows":
+        # asyncio.create_subprocess_exec on Windows can only launch true PE
+        # executables (.exe). Chocolatey / Scoop install ffmpeg via a
+        # ``ffmpeg.cmd`` shim that wraps the real binary — shutil.which()
+        # happily returns it, but exec fails with FileNotFoundError. Filter
+        # non-.exe results here so _find_ffmpeg() either returns a runnable
+        # path or raises a clear "not found" error. We do NOT attempt to
+        # follow the shim: .cmd / .bat templates vary and a silent wrong
+        # guess would be worse than the explicit error.
+        if not system_ffmpeg.lower().endswith(".exe"):
+            logger.debug(
+                "[_find_ffmpeg] skipping non-.exe PATH entry %s "
+                "(asyncio.create_subprocess_exec cannot run Windows shims)",
+                system_ffmpeg,
+            )
+            system_ffmpeg = None
     if system_ffmpeg:
         return system_ffmpeg
 
@@ -182,6 +200,16 @@ def _create_white_jpeg(width: int, height: int) -> bytes:
         img.save(buf, format="JPEG", quality=80)
         return buf.getvalue()
     except ImportError:
+        return _FALLBACK_WHITE_JPEG_1X1
+    except Exception as exc:
+        # Pillow can fail at import/runtime with OSError (libjpeg missing /
+        # Windows DLL load failure) or truncated-image errors on unusual
+        # platforms. A recorder startup failure here is not worth propagating —
+        # ffmpeg will scale the 1×1 placeholder instead.
+        logger.warning(
+            "[_create_white_jpeg] Pillow unavailable at runtime (%s); "
+            "using baked 1x1 placeholder.", exc,
+        )
         return _FALLBACK_WHITE_JPEG_1X1
 
 
@@ -257,7 +285,7 @@ class VideoRecorder:
         # and is added to `_last_frame[1]`. Durations are clock-agnostic, so
         # the sum stays in _last_frame[1]'s clock. Never subtract monotonic
         # from wall-clock (or vice versa) — only add/subtract durations.
-        self._first_frame_ts: float = 0.0                              # timestamp of the first frame; used to compute frame numbers (wall-clock OR monotonic — see note above)
+        self._first_frame_ts: Optional[float] = None                  # timestamp of the first frame; used to compute frame numbers (wall-clock OR monotonic — see note above). None before the first frame; MUST NOT use truthiness to test — CDP can legitimately deliver timestamp=0.0 right after Chrome restart.
         self._last_frame: Optional[Tuple[bytes, float, int]] = None    # (jpeg_bytes, timestamp[same clock as _first_frame_ts], frame_number)
         self._last_write_time: float = 0.0                             # monotonic seconds of the last _write_frame() call
         self._frame_queue: deque[bytes] = deque()                        # frames waiting to be written to ffmpeg's stdin
@@ -595,6 +623,14 @@ class VideoRecorder:
                 await asyncio.wait_for(self._ffmpeg.wait(), timeout=15.0)
             except asyncio.TimeoutError:
                 self._ffmpeg.kill()
+                # Reap the killed process so it does not become a zombie.
+                # Without this await, asyncio retains the child PID handle
+                # and `ResourceWarning: subprocess N is still running` fires
+                # at interpreter shutdown.
+                try:
+                    await asyncio.wait_for(self._ffmpeg.wait(), timeout=2.0)
+                except Exception:
+                    pass
                 logger.warning("[VideoRecorder] ffmpeg killed after timeout")
 
         # Step 6: reader task exits on stderr EOF (which ffmpeg closes when it
@@ -769,7 +805,7 @@ class VideoRecorder:
         if self._is_stopped and frame:
             return
 
-        if not self._first_frame_ts:
+        if self._first_frame_ts is None:
             self._first_frame_ts = timestamp
 
         # Compute the current frame number — videoRecorder.ts line 200.

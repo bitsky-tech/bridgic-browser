@@ -18,6 +18,7 @@ if TYPE_CHECKING:
         OpenAILlm = Any  # type: ignore[misc,assignment]
 
 from .._constants import BRIDGIC_TMP_DIR, BRIDGIC_SNAPSHOT_DIR, BRIDGIC_USER_DATA_DIR
+from .._redact import redact_cdp_url as _redact_cdp_url
 
 from playwright.async_api import (
     async_playwright,
@@ -440,12 +441,38 @@ def _detect_system_chrome() -> bool:
         )
         return any(shutil.which(b) for b in _LINUX_CHROME_BINARIES)
     elif sys.platform == "win32":
+        # Tier 1: well-known install directories via env vars.
         for env_var in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
             base = os.environ.get(env_var, "")
             if base:
                 path = os.path.join(base, "Google", "Chrome", "Application", "chrome.exe")
                 if os.path.isfile(path):
                     return True
+        # Tier 2: PATH fallback — covers non-standard installs (e.g. Chocolatey
+        # shims) and Docker Windows Nano images that strip PROGRAMFILES(X86).
+        import shutil
+        for candidate in ("chrome.exe", "chrome"):
+            found = shutil.which(candidate)
+            if found and os.path.isfile(found):
+                return True
+        # Tier 3: registry App Paths — Chrome installer writes this key on
+        # every install; it's the most reliable signal when env vars / PATH
+        # are missing (WSL proxied shells, Nano images, custom installers).
+        try:
+            import winreg  # type: ignore[import-not-found]
+            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                try:
+                    with winreg.OpenKey(
+                        hive,
+                        r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+                    ) as key:
+                        value, _ = winreg.QueryValueEx(key, None)
+                        if value and os.path.isfile(value):
+                            return True
+                except OSError:
+                    continue
+        except ImportError:  # pragma: no cover — winreg is always present on win32
+            pass
     return False
 
 
@@ -828,10 +855,38 @@ Intentionally narrow: bare phrases like ``"has been closed"`` or
 retries. Only the full Playwright transient-launch phrase is matched."""
 
 
+def _is_retriable_launch_exc(exc: BaseException) -> bool:
+    """Return True if *exc* looks like a transient Playwright launch failure.
+
+    Uses isinstance on Playwright's Error class as the primary signal — this
+    stays correct when Playwright reworks its message strings between
+    releases. Token matching is kept as a fallback so non-Playwright
+    wrappers (e.g. custom asyncio layers) that still carry the known phrase
+    are covered.
+    """
+    msg_lower = str(exc).lower()
+    token_match = any(tok in msg_lower for tok in _RETRIABLE_LAUNCH_TOKENS)
+    try:
+        from playwright.async_api import Error as _PwError  # type: ignore
+    except ImportError:
+        _PwError = None  # type: ignore[assignment]
+    if _PwError is not None and isinstance(exc, _PwError):
+        # A Playwright-native error whose message doesn't match any known
+        # phrase is still worth logging at DEBUG so we notice new transient
+        # phrasings before they become silent permanent failures.
+        if not token_match:
+            logger.debug(
+                "[_is_retriable_launch_exc] Playwright error not matched by any "
+                "known retriable token: %s", msg_lower,
+            )
+        return token_match
+    return token_match
+
+
 async def _retriable_launch(launch_callable, *, mode: str):
     """Call ``launch_callable()`` with exponential back-off.
 
-    Retries on error messages that match :data:`_RETRIABLE_LAUNCH_TOKENS`.
+    Retries on errors classified as transient by :func:`_is_retriable_launch_exc`.
     Non-transient failures (e.g. bad executable path) raise immediately.
 
     Parameters
@@ -855,8 +910,7 @@ async def _retriable_launch(launch_callable, *, mode: str):
             return await launch_callable()
         except Exception as e:
             last_exc = e
-            msg_lower = str(e).lower()
-            retriable = any(tok in msg_lower for tok in _RETRIABLE_LAUNCH_TOKENS)
+            retriable = _is_retriable_launch_exc(e)
             is_last = attempt == len(_LAUNCH_RETRY_DELAYS) - 1
             will_retry = retriable and not is_last
             logger.warning(
@@ -1873,7 +1927,10 @@ class Browser:
                 # Stealth launch args and extensions cannot be applied to an existing
                 # browser process, so they are skipped here.  The JS init script is
                 # still registered so that new pages opened in this session receive it.
-                logger.info("Using CDP connect mode (url=%s)", self._cdp_resolved)
+                logger.info(
+                    "Using CDP connect mode (url=%s)",
+                    _redact_cdp_url(self._cdp_resolved),
+                )
                 self._browser = await self._playwright.chromium.connect_over_cdp(self._cdp_resolved)
                 # Playwright invariant for connect_over_cdp() (verified
                 # against playwright-core 1.57):
@@ -2091,6 +2148,12 @@ class Browser:
                         # The daemon (and direct SDK callers) share the same pgid
                         # as the Node driver because the driver is spawned without
                         # start_new_session=True and inherits the caller's pgrp.
+                        #
+                        # Docker edge case: under `docker exec` / `kubectl exec`,
+                        # the daemon's pgid often equals init(1). This guard then
+                        # short-circuits the group kill and falls back to
+                        # ``proc.kill()`` — intentional. Killing the container's
+                        # init would take down the whole container.
                         if pgid != os.getpgid(os.getpid()):
                             os.killpg(pgid, signal.SIGKILL)
                             killed_via_group = True
@@ -2236,6 +2299,27 @@ class Browser:
             else:
                 video_path = str(session_dir / f"video-{i}.webm")
             artifacts["video"].append(video_path)
+
+        # Pre-seed close-report.json with status=pending so clients (and CI)
+        # can tell that the daemon started close() but may have been SIGKILL'd
+        # before writing the final report. _write_close_report (SDK) and the
+        # daemon's own writer both overwrite this file on the happy path.
+        try:
+            from datetime import datetime, timezone
+            pending_report = {
+                "status": "pending",
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+                "trace_paths": list(artifacts["trace"]),
+                "video_paths": list(artifacts["video"]),
+                "warnings": [],
+                "errors": [],
+            }
+            (session_dir / "close-report.json").write_text(
+                json.dumps(pending_report, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # non-fatal — absence just means no pending marker
+            logger.debug("inspect_pending_close_artifacts: pending preseed failed: %s", exc)
 
         return artifacts
 
@@ -6408,10 +6492,11 @@ Before you return the element ref, reason about the state and elements for a sen
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
-            screenshot_options = {
-                "type": type,
-                "full_page": full_page if ref is None else False,
-            }
+            # ``Locator.screenshot()`` rejects ``full_page`` — only ``Page.screenshot()``
+            # accepts it.  Omit the key entirely in the ref branch.
+            screenshot_options: Dict[str, Any] = {"type": type}
+            if ref is None:
+                screenshot_options["full_page"] = full_page
 
             if type == "jpeg" and quality is not None:
                 screenshot_options["quality"] = quality

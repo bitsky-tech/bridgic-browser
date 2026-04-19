@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -16,6 +17,8 @@ import threading
 from typing import Any, Dict, Optional
 
 from ..errors import BridgicBrowserCommandError
+
+logger = logging.getLogger(__name__)
 from ._daemon import DAEMON_LOG_PATH, READY_SIGNAL, STREAM_LIMIT
 from ._transport import (
     RUN_INFO_PATH,
@@ -35,6 +38,16 @@ _DAEMON_RESPONSE_TIMEOUT_BUFFER = float(
     os.environ.get("BRIDGIC_DAEMON_RESPONSE_TIMEOUT_BUFFER", "30")
 )
 
+# How long to wait for the spawned daemon to emit READY_SIGNAL before giving
+# up. Overridable so slow CI / cold-start environments can bump it without
+# editing code.
+_DAEMON_READY_TIMEOUT = float(os.environ.get("BRIDGIC_DAEMON_READY_TIMEOUT", "30"))
+
+# Argument keys that carry a "how long am I willing to wait" value. Commands
+# like wait/wait_network/verify_* accept any of these; keep them in one place
+# so adding a new one is a one-line change.
+_TIMEOUT_ARG_KEYS: tuple[str, ...] = ("timeout", "seconds", "deadline", "max_wait")
+
 
 def _compute_response_timeout(args: Dict[str, Any]) -> float:
     """Return the effective client-side socket timeout for a command.
@@ -46,7 +59,7 @@ def _compute_response_timeout(args: Dict[str, Any]) -> float:
     and confusing the next CLI invocation.
     """
     arg_timeouts: list[float] = []
-    for key in ("timeout", "seconds"):
+    for key in _TIMEOUT_ARG_KEYS:
         val = args.get(key)
         if val is None:
             continue
@@ -200,7 +213,12 @@ def send_command(
         args = {}
     if start_if_needed:
         try:
-            ensure_daemon_running(headed=headed, clear_user_data=clear_user_data, cdp=cdp)
+            ensure_daemon_running(
+                headed=headed,
+                clear_user_data=clear_user_data,
+                cdp=cdp,
+                command=command,
+            )
         except BridgicBrowserCommandError:
             raise
         except Exception as exc:
@@ -302,7 +320,7 @@ def _spawn_daemon(headed: bool = False, clear_user_data: bool = False, cdp: Opti
 
     t = threading.Thread(target=_reader_thread, daemon=True)
     t.start()
-    ready_event.wait(timeout=30)
+    ready_event.wait(timeout=_DAEMON_READY_TIMEOUT)
     proc.stdout.close()
     t.join(timeout=1)
 
@@ -316,8 +334,9 @@ def _spawn_daemon(headed: bool = False, clear_user_data: bool = False, cdp: Opti
         diagnostics_tail = "\nDaemon output (tail):\n" + "\n".join(diagnostics.splitlines()[-12:])
 
     raise RuntimeError(
-        "Daemon did not send ready signal within 30 seconds. "
-        "Check that Playwright browsers are installed (`python -m playwright install`).\n"
+        f"Daemon did not send ready signal within {_DAEMON_READY_TIMEOUT:.0f} seconds. "
+        "Check that Playwright browsers are installed (`python -m playwright install`). "
+        "Override via BRIDGIC_DAEMON_READY_TIMEOUT env var for slow/cold-start environments.\n"
         f"Daemon log: {DAEMON_LOG_PATH}"
         + diagnostics_tail
     )
@@ -332,11 +351,128 @@ def _probe_socket_sync() -> bool:
     return get_transport().probe()
 
 
-def ensure_daemon_running(headed: bool = False, clear_user_data: bool = False, cdp: Optional[str] = None) -> None:
-    """Start the daemon if it is not already running."""
+def _requested_mode(
+    *, headed: bool, clear_user_data: bool, cdp: Optional[str]
+) -> str:
+    """Return the daemon mode implied by CLI flags.
+
+    Precedence mirrors Browser.__init__: ``--cdp`` wins over ``--clear-user-data``
+    wins over the default persistent profile.
+    """
+    if cdp:
+        return "cdp"
+    if clear_user_data:
+        return "ephemeral"
+    return "persistent"
+
+
+def _check_mode_mismatch(
+    info: Dict[str, Any],
+    *,
+    headed: bool,
+    clear_user_data: bool,
+    cdp: Optional[str],
+    command: Optional[str],
+) -> None:
+    """Raise DAEMON_MODE_MISMATCH when user-supplied flags conflict with the
+    running daemon.
+
+    Only compares when at least one non-default flag is supplied, so commands
+    that never pass flags (``snapshot``, ``click``, …) never trip this check.
+    Legacy daemons that predate the ``mode`` field fall through with a WARNING
+    so existing sessions keep working until they are closed.
+    """
+    if not (headed or clear_user_data or cdp):
+        return
+    if "mode" not in info:
+        logger.warning(
+            "Running daemon predates mode tracking; cannot verify flag "
+            "compatibility. Close and reopen to pick up the new daemon."
+        )
+        return
+
+    running_mode = info.get("mode")
+    running_headed = bool(info.get("headed", False))
+    running_cdp = info.get("cdp_url_redacted")
+
+    requested_mode = _requested_mode(
+        headed=headed, clear_user_data=clear_user_data, cdp=cdp
+    )
+
+    mismatches: list[str] = []
+    if requested_mode != running_mode:
+        mismatches.append(f"mode (requested={requested_mode}, running={running_mode})")
+    if cdp:
+        from ._daemon import _redact_cdp_url
+        requested_cdp = _redact_cdp_url(cdp)
+        if running_cdp and requested_cdp != running_cdp:
+            mismatches.append(
+                f"cdp target (requested={requested_cdp}, running={running_cdp})"
+            )
+    if headed and not running_headed:
+        mismatches.append("headed=True requested, running headless")
+
+    if not mismatches:
+        return
+
+    raise BridgicBrowserCommandError(
+        command=command or "ensure_daemon_running",
+        code="DAEMON_MODE_MISMATCH",
+        message=(
+            "A daemon is already running in a different mode ("
+            + "; ".join(mismatches)
+            + "). Run `bridgic-browser close` first, then re-run your command "
+            "with the desired flags."
+        ),
+        details={
+            "requested": {
+                "mode": requested_mode,
+                "headed": headed,
+                "cdp": _redact_if_set(cdp),
+            },
+            "running": {
+                "mode": running_mode,
+                "headed": running_headed,
+                "cdp_url_redacted": running_cdp,
+            },
+        },
+        retryable=False,
+    )
+
+
+def _redact_if_set(cdp: Optional[str]) -> Optional[str]:
+    if not cdp:
+        return None
+    from ._daemon import _redact_cdp_url
+    return _redact_cdp_url(cdp)
+
+
+def ensure_daemon_running(
+    headed: bool = False,
+    clear_user_data: bool = False,
+    cdp: Optional[str] = None,
+    *,
+    command: Optional[str] = None,
+) -> None:
+    """Start the daemon if it is not already running.
+
+    When a daemon is already running and the caller passed non-default
+    ``headed`` / ``clear_user_data`` / ``cdp`` flags, raise
+    ``DAEMON_MODE_MISMATCH`` instead of silently ignoring them — without this,
+    ``bridgic-browser open`` followed by ``bridgic-browser --cdp ... snapshot``
+    would appear to succeed but still target the original daemon.
+    """
     if RUN_INFO_PATH.exists():
         if _probe_socket_sync():
-            return  # Already running
+            info = read_run_info() or {}
+            _check_mode_mismatch(
+                info,
+                headed=headed,
+                clear_user_data=clear_user_data,
+                cdp=cdp,
+                command=command,
+            )
+            return  # Already running and mode matches
 
         # Run info exists but daemon is unreachable — stale.
         info = read_run_info()

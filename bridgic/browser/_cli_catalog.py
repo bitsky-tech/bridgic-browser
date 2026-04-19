@@ -261,6 +261,13 @@ def _find_duplicates(values: Sequence[str]) -> list[str]:
     return sorted(value for value, count in counts.items() if count > 1)
 
 
+# Populated by `_validate_catalog()` at import time. If consistency checks
+# fail we remember the first error here instead of raising — that way simply
+# `import bridgic.browser` (used by CLI auto-completion, IDE tooling, etc.)
+# never crashes. `main()` inspects this and exits with a clear message.
+CATALOG_VALIDATION_ERROR: Exception | None = None
+
+
 def _validate_catalog() -> None:
     """Fail fast when catalog constants become inconsistent."""
     help_command_duplicates = _find_duplicates(CLI_ALL_COMMANDS)
@@ -339,4 +346,7 @@ def _validate_catalog() -> None:
             )
 
 
-_validate_catalog()
+try:
+    _validate_catalog()
+except Exception as _exc:  # noqa: BLE001 — remember; surface on CLI entry
+    CATALOG_VALIDATION_ERROR = _exc

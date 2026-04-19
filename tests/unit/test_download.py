@@ -499,3 +499,75 @@ class TestDownloadManagerFilenameHelpers:
         """Test file type extraction for hidden file with extension."""
         # Hidden files can have extensions, e.g., .config.json
         assert DownloadManager._get_file_type(".config.json") == "json"
+
+
+class TestSanitizeFilename:
+    """Tests for _sanitize_filename, including Windows reserved-name guard."""
+
+    def test_plain_filename_unchanged(self) -> None:
+        assert DownloadManager._sanitize_filename("report.pdf") == "report.pdf"
+
+    def test_traversal_stripped(self) -> None:
+        assert (
+            DownloadManager._sanitize_filename("../../etc/passwd") == "passwd"
+        )
+
+    def test_illegal_chars_replaced(self) -> None:
+        assert (
+            DownloadManager._sanitize_filename('bad:name"?.pdf')
+            == "bad_name__.pdf"
+        )
+
+    def test_empty_falls_back_to_download(self) -> None:
+        assert DownloadManager._sanitize_filename("") == "download"
+        assert DownloadManager._sanitize_filename("   ...   ") == "download"
+
+    def test_windows_reserved_con(self) -> None:
+        assert DownloadManager._sanitize_filename("CON.pdf") == "_CON.pdf"
+
+    def test_windows_reserved_com1(self) -> None:
+        assert DownloadManager._sanitize_filename("COM1.txt") == "_COM1.txt"
+
+    def test_windows_reserved_bare(self) -> None:
+        # No extension: still reserved on Windows.
+        assert DownloadManager._sanitize_filename("NUL") == "_NUL"
+
+    def test_windows_reserved_case_insensitive(self) -> None:
+        # Windows matches device names case-insensitively.
+        assert DownloadManager._sanitize_filename("aux.log") == "_aux.log"
+
+    def test_non_reserved_prefix_unchanged(self) -> None:
+        # CONsole.pdf is NOT reserved — only the exact device name.
+        assert (
+            DownloadManager._sanitize_filename("CONsole.pdf") == "CONsole.pdf"
+        )
+
+
+class TestGetUniqueFilenameFallback:
+    """Tests for _get_unique_filename 10000-collision fallback path."""
+
+    def test_collision_fallback_returns_non_existent_name(
+        self, temp_downloads_dir
+    ) -> None:
+        """After 9999 collisions the timestamp-suffix name must not clash.
+
+        Pre-create 9999 ``file (N).pdf`` entries plus the original ``file.pdf``
+        so the counter loop exhausts and we take the timestamp branch. The
+        returned name must (a) carry the ``file (...)`` shape and (b) not
+        already exist in the directory.
+        """
+        (temp_downloads_dir / "file.pdf").touch()
+        for i in range(1, 10000):
+            (temp_downloads_dir / f"file ({i}).pdf").touch()
+
+        result = DownloadManager._get_unique_filename(
+            temp_downloads_dir,
+            "file.pdf",
+            overwrite=False,
+        )
+
+        # The counter loop is exhausted — the fallback branch is the only
+        # way we still return a name here.
+        assert result.startswith("file (")
+        assert result.endswith(").pdf")
+        assert not (temp_downloads_dir / result).exists()
