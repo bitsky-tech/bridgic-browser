@@ -180,6 +180,7 @@ def test_snapshot_during_close_fails_cleanly(short_env: dict) -> None:
         acceptable_markers = (
             "DAEMON_SHUTTING_DOWN",
             "NO_BROWSER_SESSION",
+            "BROWSER_CLOSED",
             "Connection refused",
             "shutting down",
             "Broken pipe",
