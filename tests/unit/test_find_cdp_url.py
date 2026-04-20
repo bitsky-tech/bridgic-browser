@@ -156,33 +156,6 @@ class TestProbeCdpAliveTcp:
     back to TCP so scan/file modes don't false-positive-reject a live browser.
     """
 
-    def _free_port(self) -> int:
-        """Return a 127.0.0.1 TCP port that is confirmed to refuse connections.
-
-        On Windows CI, the OS-assigned ephemeral port from ``bind(("", 0))``
-        can collide with ports held open by Defender / RPC / other system
-        services, so a plain bind-then-close no longer guarantees refusal.
-        Verify each candidate with an actual connect attempt and retry on
-        collision.
-        """
-        last_error: Exception | None = None
-        for _ in range(20):
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("127.0.0.1", 0))
-                port = s.getsockname()[1]
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                    continue  # Something is listening; pick a different port.
-            except ConnectionRefusedError:
-                return port
-            except OSError as exc:
-                last_error = exc
-                continue
-        raise RuntimeError(
-            f"Could not find a refused TCP port on 127.0.0.1 after 20 tries "
-            f"(last error: {last_error!r})"
-        )
-
     def test_alive_when_port_listens_even_without_http(self) -> None:
         """Port open but immediately closes connection (no HTTP response)
         — simulates Chrome 144+ chrome://inspect CDP where /json/version is
@@ -218,12 +191,23 @@ class TestProbeCdpAliveTcp:
             t.join(timeout=1.0)
 
     def test_dead_when_port_refused(self) -> None:
-        """Grab a free port and close it — connect now returns
-        ConnectionRefusedError → probe must return False (stale file case).
+        """When ``socket.create_connection`` raises ``ConnectionRefusedError``
+        (stale DevToolsActivePort pointing at a dead port), the probe must
+        return False so callers skip the candidate.
+
+        We mock the socket layer instead of asking the OS for an "unlistened"
+        port — on Windows CI, loopback connects to an ephemeral bind-then-
+        close port may silently time out (Defender/firewall) or succeed
+        (system service reusing the port), neither of which reliably
+        produces ``ConnectionRefusedError``. The probe's *decision logic*
+        is what we're testing here, so mock the error directly.
         """
-        port = self._free_port()
-        ws_url = f"ws://127.0.0.1:{port}/devtools/browser/stale"
-        assert _probe_cdp_alive(ws_url, timeout=1.0) is False
+        ws_url = "ws://127.0.0.1:64311/devtools/browser/stale"
+        with patch(
+            "bridgic.browser.session._browser.socket.create_connection",
+            side_effect=ConnectionRefusedError(),
+        ):
+            assert _probe_cdp_alive(ws_url, timeout=1.0) is False
 
     def test_missing_port_returns_false(self) -> None:
         """A malformed URL without a port is not a valid CDP endpoint."""
