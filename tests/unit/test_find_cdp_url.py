@@ -112,7 +112,7 @@ class TestFindCdpUrlLivenessProbe:
         with patch.object(sys, "platform", "darwin"):
             with patch.dict(_CDP_SCAN_DIRS, patched_dirs, clear=True):
                 with patch(
-                    "bridgic.browser.session._browser._probe_cdp_alive",
+                    "bridgic.browser.session._cdp_discovery._probe_cdp_alive",
                     side_effect=lambda *_a, **_k: next(probe_results),
                 ):
                     result = find_cdp_url(mode="scan")
@@ -128,7 +128,7 @@ class TestFindCdpUrlLivenessProbe:
         with patch.object(sys, "platform", "darwin"):
             with patch.dict(_CDP_SCAN_DIRS, patched_dirs, clear=True):
                 with patch(
-                    "bridgic.browser.session._browser._probe_cdp_alive",
+                    "bridgic.browser.session._cdp_discovery._probe_cdp_alive",
                     return_value=False,
                 ):
                     with pytest.raises(RuntimeError, match="No locally running browser"):
@@ -138,7 +138,7 @@ class TestFindCdpUrlLivenessProbe:
         """mode='file' with explicit user_data_dir: stale file → ConnectionError."""
         (tmp_path / "DevToolsActivePort").write_text("9999\n/devtools/browser/dead\n")
         with patch(
-            "bridgic.browser.session._browser._probe_cdp_alive",
+            "bridgic.browser.session._cdp_discovery._probe_cdp_alive",
             return_value=False,
         ):
             with pytest.raises(ConnectionError, match="not accepting CDP"):
@@ -204,7 +204,7 @@ class TestProbeCdpAliveTcp:
         """
         ws_url = "ws://127.0.0.1:64311/devtools/browser/stale"
         with patch(
-            "bridgic.browser.session._browser.socket.create_connection",
+            "bridgic.browser.session._cdp_discovery.socket.create_connection",
             side_effect=ConnectionRefusedError(),
         ):
             assert _probe_cdp_alive(ws_url, timeout=1.0) is False

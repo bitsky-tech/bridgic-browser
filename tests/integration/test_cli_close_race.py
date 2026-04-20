@@ -95,6 +95,35 @@ def _read_daemon_pid() -> int | None:
 
 
 def _pid_alive(pid: int) -> bool:
+    """Return True iff a process with *pid* is running.
+
+    Intentionally avoids ``os.kill(pid, 0)``:
+      * POSIX: that would work, but we unify the two code paths below.
+      * Windows: ``os.kill(pid, sig)`` maps to ``TerminateProcess(handle, sig)``
+        with ``sig`` as the exit code — i.e. ``os.kill(pid, 0)`` actually
+        **kills** the daemon with exit code 0, which was silently collapsing
+        the close-race probe into a kill-then-check and causing the integration
+        suite to hang when the daemon handle lingered post-kill.
+    """
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # PROCESS_QUERY_LIMITED_INFORMATION (0x1000) is enough for
+        # GetExitCodeProcess and works across user sessions, so we don't
+        # misclassify an elevated daemon as "alive forever".
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+
     try:
         os.kill(pid, 0)
         return True

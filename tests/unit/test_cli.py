@@ -436,7 +436,7 @@ class TestCliCommandRouting:
 
     def test_open_cdp_ws_url_passthrough(self):
         """--cdp ws://... passes through without resolution."""
-        with patch("bridgic.browser.session._browser.find_cdp_url") as mock_find:
+        with patch("bridgic.browser.session._cdp_discovery.find_cdp_url") as mock_find:
             _, sc = invoke(["open", "--cdp", "ws://localhost:9222/devtools/browser/abc", "https://example.com"])
         mock_find.assert_not_called()
         sc.assert_called_once_with(
@@ -446,7 +446,7 @@ class TestCliCommandRouting:
 
     def test_open_cdp_port_number(self):
         """--cdp 9222 calls find_cdp_url(mode='port', host='localhost', port=9222)."""
-        with patch("bridgic.browser.session._browser.find_cdp_url", return_value="ws://localhost:9222/devtools/browser/xyz") as mock_find:
+        with patch("bridgic.browser.session._cdp_discovery.find_cdp_url", return_value="ws://localhost:9222/devtools/browser/xyz") as mock_find:
             _, sc = invoke(["open", "--cdp", "9222", "https://example.com"])
         mock_find.assert_called_once_with(mode="port", host="localhost", port=9222)
         sc.assert_called_once_with(
@@ -456,7 +456,7 @@ class TestCliCommandRouting:
 
     def test_open_cdp_http_url(self):
         """--cdp http://host:port calls find_cdp_url(mode='port', host=..., port=...)."""
-        with patch("bridgic.browser.session._browser.find_cdp_url", return_value="ws://1.2.3.4:9222/devtools/browser/xyz") as mock_find:
+        with patch("bridgic.browser.session._cdp_discovery.find_cdp_url", return_value="ws://1.2.3.4:9222/devtools/browser/xyz") as mock_find:
             _, sc = invoke(["open", "--cdp", "http://1.2.3.4:9222", "https://example.com"])
         mock_find.assert_called_once_with(mode="port", host="1.2.3.4", port=9222)
         sc.assert_called_once_with(
@@ -466,7 +466,7 @@ class TestCliCommandRouting:
 
     def test_open_cdp_auto(self):
         """--cdp auto calls find_cdp_url(mode='scan')."""
-        with patch("bridgic.browser.session._browser.find_cdp_url", return_value="ws://localhost:57234/devtools/browser/auto") as mock_find:
+        with patch("bridgic.browser.session._cdp_discovery.find_cdp_url", return_value="ws://localhost:57234/devtools/browser/auto") as mock_find:
             _, sc = invoke(["open", "--cdp", "auto", "https://example.com"])
         mock_find.assert_called_once_with(mode="scan")
         sc.assert_called_once_with(
@@ -477,7 +477,7 @@ class TestCliCommandRouting:
     def test_open_cdp_wss_url_passthrough(self):
         """--cdp wss://... passes through unchanged (cloud services like Browserless, Steel.dev)."""
         wss_url = "wss://production.browserless.io/chromium/playwright?token=abc123"
-        with patch("bridgic.browser.session._browser.find_cdp_url") as mock_find:
+        with patch("bridgic.browser.session._cdp_discovery.find_cdp_url") as mock_find:
             _, sc = invoke(["open", "--cdp", wss_url, "https://example.com"])
         mock_find.assert_not_called()
         sc.assert_called_once_with(
@@ -2436,7 +2436,7 @@ class TestResolveCdpInput:
 
     def test_port_number_calls_find_cdp_url(self, monkeypatch):
         monkeypatch.setattr(
-            "bridgic.browser.session._browser.find_cdp_url",
+            "bridgic.browser.session._cdp_discovery.find_cdp_url",
             lambda mode, host, port: f"ws://{host}:{port}/fake",
         )
         from bridgic.browser.session._browser import resolve_cdp_input
@@ -2454,7 +2454,7 @@ class TestResolveCdpInput:
 
     def test_http_url_calls_find_cdp_url(self, monkeypatch):
         monkeypatch.setattr(
-            "bridgic.browser.session._browser.find_cdp_url",
+            "bridgic.browser.session._cdp_discovery.find_cdp_url",
             lambda mode, host, port: f"ws://{host}:{port}/fake",
         )
         from bridgic.browser.session._browser import resolve_cdp_input
@@ -2462,7 +2462,7 @@ class TestResolveCdpInput:
 
     def test_auto_calls_scan(self, monkeypatch):
         monkeypatch.setattr(
-            "bridgic.browser.session._browser.find_cdp_url",
+            "bridgic.browser.session._cdp_discovery.find_cdp_url",
             lambda mode: "ws://localhost:54321/fake",
         )
         from bridgic.browser.session._browser import resolve_cdp_input
@@ -2470,7 +2470,7 @@ class TestResolveCdpInput:
 
     def test_scan_alias_calls_scan(self, monkeypatch):
         monkeypatch.setattr(
-            "bridgic.browser.session._browser.find_cdp_url",
+            "bridgic.browser.session._cdp_discovery.find_cdp_url",
             lambda mode: "ws://localhost:54321/fake",
         )
         from bridgic.browser.session._browser import resolve_cdp_input
@@ -2483,7 +2483,7 @@ class TestResolveCdpInput:
 
     def test_whitespace_stripped(self, monkeypatch):
         monkeypatch.setattr(
-            "bridgic.browser.session._browser.find_cdp_url",
+            "bridgic.browser.session._cdp_discovery.find_cdp_url",
             lambda mode, host, port: f"ws://{host}:{port}/fake",
         )
         from bridgic.browser.session._browser import resolve_cdp_input
@@ -2589,8 +2589,8 @@ class TestFindCdpUrl:
     def test_scan_mode_returns_url_from_file(self):
         from bridgic.browser import find_cdp_url
         fake_url = "ws://localhost:9222/devtools/browser/chrome-uuid"
-        with patch("bridgic.browser.session._browser._read_devtools_active_port", return_value=fake_url), \
-             patch("bridgic.browser.session._browser._probe_cdp_alive", return_value=True):
+        with patch("bridgic.browser.session._cdp_discovery._read_devtools_active_port", return_value=fake_url), \
+             patch("bridgic.browser.session._cdp_discovery._probe_cdp_alive", return_value=True):
             url = find_cdp_url(mode="scan")
         assert url == fake_url
 
@@ -2607,14 +2607,14 @@ class TestFindCdpUrl:
                 return chrome_url
             return None
 
-        with patch("bridgic.browser.session._browser._read_devtools_active_port", side_effect=fake_read), \
-             patch("bridgic.browser.session._browser._probe_cdp_alive", return_value=True):
+        with patch("bridgic.browser.session._cdp_discovery._read_devtools_active_port", side_effect=fake_read), \
+             patch("bridgic.browser.session._cdp_discovery._probe_cdp_alive", return_value=True):
             result = find_cdp_url(mode="scan")
         assert result == chrome_url
 
     def test_scan_mode_no_profiles_raises_runtime_error(self):
         from bridgic.browser import find_cdp_url
-        with patch("bridgic.browser.session._browser._read_devtools_active_port", return_value=None):
+        with patch("bridgic.browser.session._cdp_discovery._read_devtools_active_port", return_value=None):
             with pytest.raises(RuntimeError, match="--remote-debugging-port=9222"):
                 find_cdp_url(mode="scan")
 
@@ -2625,8 +2625,8 @@ class TestFindCdpUrl:
         # _read_devtools_active_port returns a URL for every candidate, but
         # _probe_cdp_alive always fails → scan must raise RuntimeError rather
         # than returning a stale URL.
-        with patch("bridgic.browser.session._browser._read_devtools_active_port", return_value=stale_url), \
-             patch("bridgic.browser.session._browser._probe_cdp_alive", return_value=False):
+        with patch("bridgic.browser.session._cdp_discovery._read_devtools_active_port", return_value=stale_url), \
+             patch("bridgic.browser.session._cdp_discovery._probe_cdp_alive", return_value=False):
             with pytest.raises(RuntimeError, match="--remote-debugging-port=9222"):
                 find_cdp_url(mode="scan")
 
