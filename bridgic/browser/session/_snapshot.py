@@ -1924,10 +1924,10 @@ class SnapshotGenerator:
         if not refs_info:
             return raw_snapshot, interactive_map
 
-        # Pre-fetch viewport size once for efficiency
-        viewport = page.viewport_size
-        viewport_width = viewport['width'] if viewport else None
-        viewport_height = viewport['height'] if viewport else None
+        # Pre-fetch viewport size once for efficiency.
+        # In CDP attach mode, page.viewport_size is often None because the tab
+        # was not created with Playwright's set_viewport_size().
+        viewport_width, viewport_height = await self._resolve_viewport_size(page)
         check_viewport = not options.full_page and viewport_width is not None
 
         # Batch check elements for visibility and interactivity.
@@ -2108,6 +2108,40 @@ class SnapshotGenerator:
             result.append(line)
 
         return '\n'.join(result), interactive_map
+
+    async def _resolve_viewport_size(self, page: AsyncPage) -> Tuple[Optional[int], Optional[int]]:
+        """Resolve viewport width/height for viewport filtering."""
+        viewport = page.viewport_size
+        if viewport:
+            width = int(viewport.get('width') or 0)
+            height = int(viewport.get('height') or 0)
+            if width > 0 and height > 0:
+                return width, height
+
+        # CDP fallback for borrowed Chromium tabs (e.g., --cdp auto).
+        try:
+            cdp_session = await page.context.new_cdp_session(page)
+            try:
+                metrics = await asyncio.wait_for(
+                    cdp_session.send("Page.getLayoutMetrics"),
+                    timeout=3.0,
+                )
+            finally:
+                try:
+                    await cdp_session.detach()
+                except Exception:
+                    pass
+
+            visual_viewport = metrics.get("cssVisualViewport", {})
+            width = int(visual_viewport.get("clientWidth") or 0)
+            height = int(visual_viewport.get("clientHeight") or 0)
+            if width > 0 and height > 0:
+                return width, height
+        except Exception:
+            # Non-Chromium or restricted targets may not support CDP metrics.
+            pass
+
+        return None, None
 
     async def _generate_snapshot(
         self,

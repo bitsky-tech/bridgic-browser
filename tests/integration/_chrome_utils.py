@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import subprocess
 
 
 def find_chrome_binary() -> str | None:
@@ -22,10 +23,18 @@ def find_chrome_binary() -> str | None:
     """
     # 1. Explicit override ─────────────────────────────────────────────────
     env_bin = os.environ.get("CHROME_BIN")
-    if env_bin and os.path.isfile(env_bin):
+    if env_bin and os.path.isfile(env_bin) and _is_viable_browser_binary(env_bin):
         return env_bin
 
     system = platform.system()
+
+    # GitHub Actions Linux runners already install Playwright's Chromium via CI
+    # setup; prefer it there to avoid distro wrapper binaries that exist on
+    # disk but fail to expose a usable CDP endpoint.
+    if system == "Linux" and os.environ.get("GITHUB_ACTIONS") == "true":
+        playwright_bin = _find_playwright_chromium(system)
+        if playwright_bin and _is_viable_browser_binary(playwright_bin):
+            return playwright_bin
 
     # 2. Platform-specific known paths ─────────────────────────────────────
     candidates: list[str] = []
@@ -50,7 +59,7 @@ def find_chrome_binary() -> str | None:
                 )
 
     for path in candidates:
-        if os.path.isfile(path):
+        if os.path.isfile(path) and _is_viable_browser_binary(path):
             return path
 
     # 3. shutil.which() fallback ───────────────────────────────────────────
@@ -61,11 +70,14 @@ def find_chrome_binary() -> str | None:
     )
     for name in names:
         found = shutil.which(name)
-        if found:
+        if found and _is_viable_browser_binary(found):
             return found
 
     # 4. Playwright's bundled Chromium ─────────────────────────────────────
-    return _find_playwright_chromium(system)
+    playwright_bin = _find_playwright_chromium(system)
+    if playwright_bin and _is_viable_browser_binary(playwright_bin):
+        return playwright_bin
+    return None
 
 
 # ── internal ──────────────────────────────────────────────────────────────────
@@ -157,3 +169,20 @@ def _scan_mac_app_bundles(base: str, results: list[str]) -> None:
         results.append(os.path.join(
             sub_path, "Chromium.app", "Contents", "MacOS", "Chromium",
         ))
+
+
+def _is_viable_browser_binary(path: str) -> bool:
+    """Return True when *path* looks executable and responds to --version."""
+    if not os.access(path, os.X_OK):
+        return False
+    try:
+        result = subprocess.run(
+            [path, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0

@@ -138,18 +138,23 @@ def chrome_with_preopened_tabs():
     # Chrome only writes noise there.
     stderr_path = os.path.join(tmpdir, "chrome.stderr.log")
     stderr_file = open(stderr_path, "w", encoding="utf-8", errors="replace")
+    launch_args = [
+        CHROME_BIN,
+        f"--remote-debugging-port={CDP_PORT}",
+        f"--user-data-dir={tmpdir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions",
+        "--disable-sync",
+        "--headless=new",
+        "about:blank",  # initial tab
+    ]
+    if os.name != "nt":
+        # Linux CI/container environments often require these for Chromium.
+        launch_args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
+
     proc = subprocess.Popen(
-        [
-            CHROME_BIN,
-            f"--remote-debugging-port={CDP_PORT}",
-            f"--user-data-dir={tmpdir}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-extensions",
-            "--disable-sync",
-            "--headless=new",
-            "about:blank",           # initial tab
-        ],
+        launch_args,
         stdout=subprocess.DEVNULL,
         stderr=stderr_file,
     )

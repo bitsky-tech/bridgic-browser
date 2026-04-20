@@ -149,18 +149,23 @@ def chrome_process():
         pytest.skip("Chrome/Chromium not found on this system")
 
     tmpdir = tempfile.mkdtemp(prefix="bridgic_cli_cdp_")
+    launch_args = [
+        CHROME_BIN,
+        f"--remote-debugging-port={CDP_PORT}",
+        f"--user-data-dir={tmpdir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions",
+        "--disable-sync",
+        "--headless=new",
+        "about:blank",
+    ]
+    if os.name != "nt":
+        # Linux CI/container environments often require these for Chromium.
+        launch_args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
+
     proc = subprocess.Popen(
-        [
-            CHROME_BIN,
-            f"--remote-debugging-port={CDP_PORT}",
-            f"--user-data-dir={tmpdir}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-extensions",
-            "--disable-sync",
-            "--headless=new",
-            "about:blank",
-        ],
+        launch_args,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
