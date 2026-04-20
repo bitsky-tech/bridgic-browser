@@ -47,7 +47,11 @@ from ._chrome_utils import find_chrome_binary
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-CDP_PORT = 9229
+# 9229 is Node.js's default --inspect port. GitHub Actions Windows runners
+# ship with Node preinstalled and may have a process bound there already,
+# which caused this fixture to time out waiting for the debugging endpoint.
+# 9331 is outside every well-known range we know of (Chrome/Node/VS debug).
+CDP_PORT = 9331
 CDP_HOST = "localhost"
 CHROME_BIN: str | None = find_chrome_binary()
 

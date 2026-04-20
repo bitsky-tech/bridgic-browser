@@ -278,6 +278,10 @@ def test_cli_snapshot_interactive_on_preopened_httpbin(session):
     """Interactive snapshot on httpbin form must expose inputs and buttons."""
     out = _ok(f"{CLI} snapshot -i", timeout=30)
     print(f"\n[snapshot -i]\n{out}")
+    # httpbin.org occasionally returns 5xx; the page then has no form to
+    # inspect. Skip rather than fail the build on an upstream outage.
+    if re.search(r"\b5\d\d\b", out) and "bad gateway" in out.lower():
+        pytest.skip(f"httpbin.org returned 5xx error page: {out[:200]}")
     refs = _extract_all_refs(out)
     assert len(refs) >= 3, f"Expected ≥3 interactive refs, got {len(refs)}: {out[:400]}"
 
