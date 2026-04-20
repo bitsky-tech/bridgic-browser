@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import sys
 import tempfile
 import time
@@ -113,16 +114,21 @@ def _read_devtools_active_port(base: str) -> Optional[str]:
 
 
 def _probe_cdp_alive(ws_url: str, timeout: float = 2.0) -> bool:
-    """Return True if the CDP HTTP endpoint behind ``ws_url`` answers /json/version.
+    """Return True if the CDP port behind ``ws_url`` is accepting TCP connections.
 
     Chrome normally removes its DevToolsActivePort file on graceful exit, but a
     crash or ``kill -9`` leaves it behind. Without a liveness probe, scan/file
     mode would return a stale ws URL and callers would only see a confusing
     connection error much later from ``connect_over_cdp``.
-    """
-    import urllib.error
-    import urllib.request
 
+    Probe is a bare TCP connect — NOT an HTTP ``/json/version`` request.
+    Chrome 144+ lets users enable remote debugging via ``chrome://inspect``,
+    which writes DevToolsActivePort but does NOT necessarily expose the HTTP
+    ``/json/`` endpoints (DNS-rebinding protection can block them). A TCP
+    connect still succeeds in that case, and we only need the port to be
+    listening — the actual handshake happens over WebSocket in
+    ``connect_over_cdp`` afterwards.
+    """
     try:
         parsed = urlparse(ws_url)
     except Exception:
@@ -131,21 +137,17 @@ def _probe_cdp_alive(ws_url: str, timeout: float = 2.0) -> bool:
     port = parsed.port
     if port is None:
         return False
-    host_in_url = f"[{host}]" if ":" in host else host
-    probe_url = f"http://{host_in_url}:{port}/json/version"
-    host_lower = host.lower()
-    is_loopback = host_lower in ("localhost", "127.0.0.1", "::1")
     try:
-        if is_loopback:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({})
-            )
-            resp = opener.open(probe_url, timeout=timeout)
-        else:
-            resp = urllib.request.urlopen(probe_url, timeout=timeout)
-        return bool(resp.read(1))
-    except (urllib.error.URLError, OSError):
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except ConnectionRefusedError:
+        # Port is not bound — browser process is gone (stale DevToolsActivePort).
         return False
+    except OSError:
+        # Timeouts, DNS failures, transient network errors: be tolerant. Let
+        # connect_over_cdp surface the real reason instead of silently skipping
+        # a candidate that might actually be live.
+        return True
 
 
 def find_cdp_url(

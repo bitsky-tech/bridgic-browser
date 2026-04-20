@@ -2,14 +2,20 @@
 
 import io
 import json
+import socket
 import sys
+import threading
 import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from bridgic.browser.session._browser import _CDP_SCAN_DIRS, find_cdp_url
+from bridgic.browser.session._browser import (
+    _CDP_SCAN_DIRS,
+    _probe_cdp_alive,
+    find_cdp_url,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +145,69 @@ class TestFindCdpUrlLivenessProbe:
         ):
             with pytest.raises(ConnectionError, match="not accepting CDP"):
                 find_cdp_url(mode="file", user_data_dir=str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# _probe_cdp_alive — TCP-based liveness probe
+# ---------------------------------------------------------------------------
+
+class TestProbeCdpAliveTcp:
+    """Regression: Chrome 144+ lets users enable CDP via ``chrome://inspect``,
+    which writes DevToolsActivePort correctly but may not expose the HTTP
+    ``/json/version`` endpoint (DNS-rebinding protection). The probe must fall
+    back to TCP so scan/file modes don't false-positive-reject a live browser.
+    """
+
+    def _free_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def test_alive_when_port_listens_even_without_http(self) -> None:
+        """Port open but immediately closes connection (no HTTP response)
+        — simulates Chrome 144+ chrome://inspect CDP where /json/version is
+        blocked. Probe must still report alive.
+        """
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+
+        stop = threading.Event()
+
+        def _accept_and_drop() -> None:
+            server.settimeout(0.5)
+            while not stop.is_set():
+                try:
+                    conn, _ = server.accept()
+                    conn.close()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+
+        t = threading.Thread(target=_accept_and_drop, daemon=True)
+        t.start()
+        try:
+            ws_url = f"ws://127.0.0.1:{port}/devtools/browser/fake-uuid"
+            assert _probe_cdp_alive(ws_url, timeout=1.0) is True
+        finally:
+            stop.set()
+            server.close()
+            t.join(timeout=1.0)
+
+    def test_dead_when_port_refused(self) -> None:
+        """Grab a free port and close it — connect now returns
+        ConnectionRefusedError → probe must return False (stale file case).
+        """
+        port = self._free_port()
+        ws_url = f"ws://127.0.0.1:{port}/devtools/browser/stale"
+        assert _probe_cdp_alive(ws_url, timeout=1.0) is False
+
+    def test_missing_port_returns_false(self) -> None:
+        """A malformed URL without a port is not a valid CDP endpoint."""
+        assert _probe_cdp_alive("ws://localhost/devtools/browser/x") is False
 
 
 # ---------------------------------------------------------------------------
