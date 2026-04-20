@@ -30,6 +30,7 @@ Coverage:
 
 import asyncio
 import json
+import os
 import subprocess
 import tempfile
 import time
@@ -81,7 +82,12 @@ def _list_tabs_via_cdp() -> list:
         return json.loads(resp.read())
 
 
-def _wait_for_chrome(timeout: float = 15.0) -> None:
+def _wait_for_chrome(
+    timeout: float = 15.0,
+    *,
+    proc: subprocess.Popen | None = None,
+    stderr_path: str | None = None,
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -89,7 +95,24 @@ def _wait_for_chrome(timeout: float = 15.0) -> None:
             return
         except Exception:
             time.sleep(0.3)
-    raise RuntimeError(f"Chrome did not start debugging interface on port {CDP_PORT}")
+    # Timeout: surface Chrome's own stderr so CI failures aren't a black box.
+    # Silently swallowing stderr hid real causes (crash, missing libs, port
+    # conflict) behind a generic "did not start" message.
+    exit_code = proc.poll() if proc is not None else None
+    stderr_tail = ""
+    if stderr_path:
+        try:
+            with open(stderr_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            tail = "".join(lines[-40:]).rstrip()
+            if tail:
+                stderr_tail = f"\n--- Chrome stderr (last 40 lines) ---\n{tail}"
+        except OSError:
+            pass
+    raise RuntimeError(
+        f"Chrome did not start debugging interface on port {CDP_PORT} "
+        f"(exit_code={exit_code}){stderr_tail}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -110,6 +133,11 @@ def chrome_with_preopened_tabs():
         pytest.skip("Chrome/Chromium not found on this system")
 
     tmpdir = tempfile.mkdtemp(prefix="bridgic_cdp_test_")
+    # Route Chrome's stderr to a file (rather than DEVNULL) so _wait_for_chrome
+    # can surface the real error if launch fails. stdout stays discarded —
+    # Chrome only writes noise there.
+    stderr_path = os.path.join(tmpdir, "chrome.stderr.log")
+    stderr_file = open(stderr_path, "w", encoding="utf-8", errors="replace")
     proc = subprocess.Popen(
         [
             CHROME_BIN,
@@ -123,11 +151,11 @@ def chrome_with_preopened_tabs():
             "about:blank",           # initial tab
         ],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=stderr_file,
     )
 
     try:
-        _wait_for_chrome(timeout=20.0)
+        _wait_for_chrome(timeout=20.0, proc=proc, stderr_path=stderr_path)
 
         # Open pre-existing tabs BEFORE bridgic attaches
         for url in PREOPENED_URLS:
@@ -151,6 +179,10 @@ def chrome_with_preopened_tabs():
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+        try:
+            stderr_file.close()
+        except Exception:
+            pass
         import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
 
