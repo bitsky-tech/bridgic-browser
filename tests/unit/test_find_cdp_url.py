@@ -1,11 +1,9 @@
 """Unit tests for find_cdp_url() — CDP WebSocket URL discovery."""
 
-import io
 import json
 import socket
 import sys
 import threading
-import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
