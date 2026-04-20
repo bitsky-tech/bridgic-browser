@@ -48,6 +48,8 @@ from collections import deque
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
+from .. import _timeouts
+
 logger = logging.getLogger(__name__)
 
 # 25 fps — matches Playwright's videoRecorder.ts (line 17: ``const fps = 25;``).
@@ -70,6 +72,24 @@ _STDERR_CAP = 64 * 1024
 # ---------------------------------------------------------------------------
 # ffmpeg path discovery
 # ---------------------------------------------------------------------------
+
+def _looks_like_posix_shim(path: str) -> bool:
+    """Return True for a Windows ffmpeg path that lives inside a cygwin/msys tree.
+
+    Cygwin / MSYS2 ship a real ``ffmpeg.exe``, but it interprets its command-line
+    arguments as POSIX paths (``/cygdrive/c/...``). bridgic passes native Windows
+    paths to ffmpeg (output file, ``-i`` source, etc.), so such a binary ends up
+    writing to the wrong place or failing to start. Prefer the Playwright-bundled
+    copy in that case by returning True here.
+    """
+    lowered = path.lower().replace("\\", "/")
+    return (
+        "/cygwin" in lowered
+        or "/msys64" in lowered
+        or "/msys32" in lowered
+        or "/msys/" in lowered
+    )
+
 
 def _find_ffmpeg() -> str:
     """Locate Playwright's bundled ffmpeg, or fall back to the one on PATH.
@@ -140,6 +160,18 @@ def _find_ffmpeg() -> str:
             logger.debug(
                 "[_find_ffmpeg] skipping non-.exe PATH entry %s "
                 "(asyncio.create_subprocess_exec cannot run Windows shims)",
+                system_ffmpeg,
+            )
+            system_ffmpeg = None
+        elif _looks_like_posix_shim(system_ffmpeg):
+            # Cygwin / MSYS2 bundles ship ffmpeg.exe as a real PE binary,
+            # but it expects POSIX-style paths (``/cygdrive/c/...``). Feeding
+            # it our Windows path arguments leads to the Playwright recording
+            # being written somewhere unexpected — or the process refusing to
+            # start at all. Prefer the Playwright-bundled copy instead.
+            logger.debug(
+                "[_find_ffmpeg] skipping cygwin/msys shim %s "
+                "(POSIX path handling incompatible with Windows arguments)",
                 system_ffmpeg,
             )
             system_ffmpeg = None
@@ -354,7 +386,7 @@ class VideoRecorder:
         self._stderr_reader_task = None
         if task is not None and not task.done():
             try:
-                await asyncio.wait_for(task, timeout=2.0)
+                await asyncio.wait_for(task, timeout=_timeouts.VIDEO_STDERR_DRAIN_S)
             except asyncio.TimeoutError:
                 task.cancel()
                 try:
@@ -506,7 +538,9 @@ class VideoRecorder:
                 except Exception:
                     pass
                 try:
-                    await asyncio.wait_for(ffmpeg.wait(), timeout=2.0)
+                    await asyncio.wait_for(
+                        ffmpeg.wait(), timeout=_timeouts.VIDEO_FFMPEG_KILL_REAP_S
+                    )
                 except Exception:
                     pass
             # Reader task will exit on EOF; await briefly so it doesn't
@@ -600,7 +634,10 @@ class VideoRecorder:
         """
         if not self._is_stopped:
             try:
-                await asyncio.wait_for(self.prepare_stop(), timeout=10.0)
+                await asyncio.wait_for(
+                    self.prepare_stop(),
+                    timeout=_timeouts.VIDEO_PREPARE_STOP_FALLBACK_S,
+                )
             except asyncio.TimeoutError:
                 logger.warning(
                     "[VideoRecorder] finalize: prepare_stop fallback timed out, "
@@ -620,7 +657,9 @@ class VideoRecorder:
             except Exception:
                 pass
             try:
-                await asyncio.wait_for(self._ffmpeg.wait(), timeout=15.0)
+                await asyncio.wait_for(
+                    self._ffmpeg.wait(), timeout=_timeouts.VIDEO_FFMPEG_EXIT_S
+                )
             except asyncio.TimeoutError:
                 self._ffmpeg.kill()
                 # Reap the killed process so it does not become a zombie.
@@ -628,7 +667,10 @@ class VideoRecorder:
                 # and `ResourceWarning: subprocess N is still running` fires
                 # at interpreter shutdown.
                 try:
-                    await asyncio.wait_for(self._ffmpeg.wait(), timeout=2.0)
+                    await asyncio.wait_for(
+                        self._ffmpeg.wait(),
+                        timeout=_timeouts.VIDEO_FFMPEG_KILL_REAP_S,
+                    )
                 except Exception:
                     pass
                 logger.warning("[VideoRecorder] ffmpeg killed after timeout")
@@ -725,6 +767,17 @@ class VideoRecorder:
     @property
     def is_stopped(self) -> bool:
         return self._is_stopped
+
+    def force_mark_stopped(self) -> None:
+        """Best-effort: mark the recorder as stopped without awaiting I/O.
+
+        Used by ``Browser.close()`` after ``prepare_stop()`` times out or is
+        cancelled — we want subsequent frame callbacks to become no-ops and
+        any lingering CDP session reference to be released, but we cannot
+        ``await`` any more CDP traffic at that point.
+        """
+        self._is_stopped = True
+        self._cdp_session = None
 
     # ------------------------------------------------------------------
     # Frame handling — mirrors _writeFrame() in Playwright's

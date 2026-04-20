@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 from urllib.parse import urlparse
 
+from .. import _timeouts
 from .._config import _load_config_sources
 from .._constants import BRIDGIC_BROWSER_HOME, BRIDGIC_DOWNLOADS_DIR
 from ..errors import BridgicBrowserError, InvalidInputError
@@ -642,46 +643,80 @@ async def _cdp_reconnect(browser: "Browser") -> bool:
     """
     lock = _get_cdp_reconnect_lock(browser)
     async with lock:
-        # Cancel any in-flight snapshot prefetch BEFORE close(). close() also
-        # cancels prefetch, but if it raises mid-way (line before _cancel_prefetch)
-        # the prefetch task survives and later touches a dead browser — producing
-        # spurious errors in the reconnect window. Cancelling up-front is cheap
-        # and idempotent.
+        # Publish a sentinel so concurrent dispatches see DAEMON_RECONNECTING
+        # instead of racing into the partially-reset handles and returning
+        # NO_ACTIVE_PAGE. Cleared in `finally` below.
+        browser._reconnecting = True  # type: ignore[attr-defined]
         try:
-            browser._cancel_prefetch()
-        except Exception as exc:
-            logger.debug("[daemon] cdp_reconnect: _cancel_prefetch error (ignored): %s", exc)
+            # Cancel any in-flight snapshot prefetch BEFORE close(). close() also
+            # cancels prefetch, but if it raises mid-way (line before _cancel_prefetch)
+            # the prefetch task survives and later touches a dead browser — producing
+            # spurious errors in the reconnect window. Cancelling up-front is cheap
+            # and idempotent.
+            try:
+                browser._cancel_prefetch()
+            except Exception as exc:
+                logger.debug("[daemon] cdp_reconnect: _cancel_prefetch error (ignored): %s", exc)
 
-        try:
-            await browser.close()
-        except Exception as exc:
-            logger.debug("[daemon] cdp_reconnect: close() error (ignored): %s", exc)
+            try:
+                await browser.close()
+            except Exception as exc:
+                logger.debug("[daemon] cdp_reconnect: close() error (ignored): %s", exc)
 
-        # Force-reset internal handles so `_start()`'s early-return guard
-        # (`if self._playwright is not None: return`) cannot silently skip the
-        # reconnect when close() has raised mid-flight and left handles set.  We
-        # accept a potential driver leak here — the close() attempt above
-        # handles cleanup; these assignments are just insurance against partial
-        # close state.
-        browser._playwright = None
-        browser._browser = None
-        browser._context = None
-        browser._page = None
+            # Force-reset internal handles so `_start()`'s early-return guard
+            # (`if self._playwright is not None: return`) cannot silently skip the
+            # reconnect when close() has raised mid-flight and left handles set.  We
+            # accept a potential driver leak here — the close() attempt above
+            # handles cleanup; these assignments are just insurance against partial
+            # close state.
+            browser._playwright = None
+            browser._browser = None
+            browser._context = None
+            browser._page = None
 
-        try:
-            await browser._start()
-            logger.info("[daemon] cdp_reconnect: reconnected successfully")
-            return True
-        except Exception as exc:
-            logger.error("[daemon] cdp_reconnect: _start() failed: %s", exc)
-            return False
+            try:
+                await browser._start()
+                logger.info("[daemon] cdp_reconnect: reconnected successfully")
+                return True
+            except Exception as exc:
+                logger.error("[daemon] cdp_reconnect: _start() failed: %s", exc)
+                return False
+        finally:
+            browser._reconnecting = False  # type: ignore[attr-defined]
 
 
 # Commands that exceed this wall-clock duration get a WARN in daemon logs —
 # the CLI's default socket read-timeout is 90s, so anything approaching that
 # is a candidate cause for "CLI froze" user reports. The actual response is
 # unaffected; this is purely observability.
-_SLOW_COMMAND_THRESHOLD_S = 60.0
+_SLOW_COMMAND_THRESHOLD_S = _timeouts.SLOW_COMMAND_S
+
+# Backoff between the command's first failure and the one-shot CDP reconnect.
+# Tuned to give Chrome's remote-debugging port time to unbind after a SIGKILL
+# without materially delaying the happy-retry path.
+_CDP_RECONNECT_BACKOFF_S = _timeouts.CDP_RECONNECT_BACKOFF_S
+
+
+async def _dispatch_heartbeat(command: str, started_at: float) -> None:
+    """Emit a log line every ``DISPATCH_HEARTBEAT_S`` while a command is in flight.
+
+    Output goes through ``logger`` — never to stdout — so an LLM reading the
+    CLI's stdout sees a single final response, while operators tailing
+    ``daemon.log`` get progress signals for any command that overruns the
+    typical latency budget. The task is cancelled by ``_dispatch`` as soon as
+    the handler returns; the first log line is deferred by one interval so
+    sub-second commands never emit one.
+    """
+    try:
+        while True:
+            await asyncio.sleep(_timeouts.DISPATCH_HEARTBEAT_S)
+            logger.info(
+                "[CLI-HEARTBEAT] %s still running (%.1fs elapsed)",
+                command,
+                time.monotonic() - started_at,
+            )
+    except asyncio.CancelledError:
+        return
 
 
 async def _dispatch(browser: "Browser", command: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -690,13 +725,26 @@ async def _dispatch(browser: "Browser", command: str, args: Dict[str, Any]) -> D
     Emits matched ``[CLI-CMD] <cmd> start`` and
     ``[CLI-RESP] <cmd> (ok|err) in X.XXXs`` pairs so every command a client
     sends is visible in ``daemon.log`` with a duration — the primary
-    affordance for diagnosing "CLI appeared frozen" issues.
+    affordance for diagnosing "CLI appeared frozen" issues. A background
+    heartbeat task fills the gap between start and end logs for commands
+    that run long enough to look hung.
     """
     t0 = time.monotonic()
     args_keys = sorted(args.keys()) if args else []
     logger.info("[CLI-CMD] %s start args_keys=%s", command, args_keys)
 
-    response = await _dispatch_inner(browser, command, args)
+    heartbeat = asyncio.create_task(_dispatch_heartbeat(command, t0))
+    try:
+        response = await _dispatch_inner(browser, command, args)
+    finally:
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except (asyncio.CancelledError, Exception):
+            # Heartbeat task swallows CancelledError itself, but a failure in
+            # the logger (rare — e.g. rotating handler I/O error) should not
+            # mask the real handler exception.
+            pass
 
     elapsed = time.monotonic() - t0
     success = bool(response.get("success"))
@@ -732,6 +780,18 @@ async def _dispatch_inner(browser: "Browser", command: str, args: Dict[str, Any]
             result=_browser_closed_hint(cdp),
             error_code="BROWSER_CLOSED",
         )
+    # Reconnect window short-circuit: when another dispatcher is mid-way
+    # through _cdp_reconnect, internal handles are being reset and any
+    # handler that touches self._page would either hang on a half-dead
+    # CDP session or raise NO_ACTIVE_PAGE. Return a retryable marker so
+    # the CLI surfaces a precise, recoverable error.
+    if command != "close" and getattr(browser, "_reconnecting", False) is True:
+        return _response(
+            success=False,
+            result="Daemon is reconnecting to the remote browser; please retry shortly.",
+            error_code="DAEMON_RECONNECTING",
+            meta={"retryable": True},
+        )
     # In CDP mode, attempt one automatic reconnect when the remote session drops.
     # This helps with cloud-browser session timeouts (Browserless, Steel.dev, etc.).
     # We do NOT reconnect for `close` (shutdown intent) or if there is no CDP URL.
@@ -751,6 +811,11 @@ async def _dispatch_inner(browser: "Browser", command: str, args: Dict[str, Any]
                         "[daemon] CDP session closed during %r, attempting one-shot reconnect",
                         command,
                     )
+                    # Small backoff so a remote Chrome that was just SIGKILL'd
+                    # has time to unbind its port before we reconnect. Without
+                    # this, the reconnect races the OS teardown and we fail
+                    # the retry on an identical TargetClosedError.
+                    await asyncio.sleep(_CDP_RECONNECT_BACKOFF_S)
                     if await _cdp_reconnect(browser):
                         continue  # retry the command with the refreshed connection
                 return _response(
@@ -772,6 +837,7 @@ async def _dispatch_inner(browser: "Browser", command: str, args: Dict[str, Any]
                         "[daemon] CDP session closed during %r, attempting one-shot reconnect",
                         command,
                     )
+                    await asyncio.sleep(_CDP_RECONNECT_BACKOFF_S)
                     if await _cdp_reconnect(browser):
                         continue  # retry
                 return _response(
@@ -798,16 +864,12 @@ async def _dispatch_inner(browser: "Browser", command: str, args: Dict[str, Any]
     )
 
 
-_READ_TIMEOUT = 60.0  # seconds to wait for a command line from the client
-# Global safety-net timeout for browser.close(). The large value (300s)
-# accommodates worst-case video finalization (ffmpeg encoding). In practice
-# individual cleanup steps have their own shorter timeouts (video finalize
-# 30s, context close 15s, etc.), so the full 300s is never reached during
-# normal operation.
-try:
-    _DAEMON_STOP_TIMEOUT = float(os.environ.get("BRIDGIC_DAEMON_STOP_TIMEOUT", "300"))
-except (ValueError, TypeError):
-    _DAEMON_STOP_TIMEOUT = 300.0
+_READ_TIMEOUT = _timeouts.DAEMON_READ_S  # wait for a command line from the client
+# Global safety-net timeout for browser.close(). Per-step timeouts (video
+# finalize 30s, context close 15s, etc.) are the primary budget — this is
+# a watchdog that covers aggregate drift. Sourced from _timeouts so the
+# env override (BRIDGIC_DAEMON_STOP_TIMEOUT) resolves in a single place.
+_DAEMON_STOP_TIMEOUT = _timeouts.DAEMON_STOP_S
 
 
 def _setup_signal_handlers(stop_event: asyncio.Event) -> None:
@@ -1053,7 +1115,7 @@ def _resolve_default_downloads_dir() -> Path:
     return BRIDGIC_DOWNLOADS_DIR
 
 
-_CDP_PROBE_TIMEOUT = float(os.environ.get("BRIDGIC_CDP_PROBE_TIMEOUT", "1.5"))
+_CDP_PROBE_TIMEOUT = _timeouts.CDP_PROBE_S
 
 
 def _probe_ws_reachable(ws_url: str, timeout: Optional[float] = None) -> None:
@@ -1256,6 +1318,7 @@ async def run_daemon() -> None:
     logger.info("[daemon] shutting down")
     _stop_timed_out = False
     _stop_exc: Optional[Exception] = None
+    _shutdown_hb = asyncio.create_task(_dispatch_heartbeat("close", time.monotonic()))
     try:
         await asyncio.wait_for(browser.close(), timeout=_DAEMON_STOP_TIMEOUT)
     except asyncio.TimeoutError:
@@ -1264,6 +1327,12 @@ async def run_daemon() -> None:
     except Exception as exc:
         _stop_exc = exc
         logger.exception("[daemon] browser.close() failed during shutdown")
+    finally:
+        _shutdown_hb.cancel()
+        try:
+            await _shutdown_hb
+        except (asyncio.CancelledError, Exception):
+            pass
 
     _write_close_report(browser, timed_out=_stop_timed_out, stop_exc=_stop_exc)
 

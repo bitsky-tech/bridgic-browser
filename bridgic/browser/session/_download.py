@@ -519,7 +519,7 @@ class DownloadManager:
         # Register our waiter Future before triggering the action so a fast
         # download can't race past us. Concurrent wait_for_download() calls
         # each get their own Future; _handle_download resolves them FIFO.
-        waiter: asyncio.Future[DownloadedFile] = asyncio.get_event_loop().create_future()
+        waiter: asyncio.Future[DownloadedFile] = asyncio.get_running_loop().create_future()
         self._pending_waiters.append(waiter)
 
         try:

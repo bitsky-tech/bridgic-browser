@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     except ModuleNotFoundError:  # pragma: no cover - optional dependency
         OpenAILlm = Any  # type: ignore[misc,assignment]
 
+from .. import _timeouts
 from .._constants import BRIDGIC_TMP_DIR, BRIDGIC_SNAPSHOT_DIR, BRIDGIC_USER_DATA_DIR
 from .._redact import redact_cdp_url as _redact_cdp_url
 
@@ -143,10 +144,25 @@ def _probe_cdp_alive(ws_url: str, timeout: float = 2.0) -> bool:
     except ConnectionRefusedError:
         # Port is not bound — browser process is gone (stale DevToolsActivePort).
         return False
-    except OSError:
-        # Timeouts, DNS failures, transient network errors: be tolerant. Let
-        # connect_over_cdp surface the real reason instead of silently skipping
-        # a candidate that might actually be live.
+    except (socket.timeout, TimeoutError):
+        # Port is listening but not responding SYN/ACK in time — treat as dead.
+        # Prevents callers from then waiting again inside connect_over_cdp with
+        # a much more opaque error. Network-latency scenarios can still pass
+        # a larger `timeout` argument from the caller.
+        return False
+    except OSError as exc:
+        # Hard network-unreachable signals: treat as dead so the caller sees a
+        # precise error now rather than a late, opaque connect_over_cdp failure.
+        import errno
+        hard_dead = {
+            errno.ETIMEDOUT,
+            errno.EHOSTUNREACH,
+            errno.ENETUNREACH,
+            errno.EHOSTDOWN,
+        }
+        if getattr(exc, "errno", None) in hard_dead:
+            return False
+        # DNS failures / transient EAGAIN / EINTR: stay tolerant.
         return True
 
 
@@ -2106,15 +2122,16 @@ class Browser:
             await self.close()
             await self._start()
 
-    # Timeout (seconds) applied to individual page.close() calls during
-    # shutdown so that a hung beforeunload handler cannot block forever.
-    _PAGE_CLOSE_TIMEOUT = 5.0
-    _TRACE_STOP_TIMEOUT = 30.0
-    _CONTEXT_CLOSE_TIMEOUT = 15.0
-    _BROWSER_CLOSE_TIMEOUT = 15.0
-    _PLAYWRIGHT_STOP_TIMEOUT = 15.0
-    _VIDEO_PREPARE_STOP_TIMEOUT = 15.0  # single recorder prepare_stop() in close()
-    _VIDEO_FINALIZE_TIMEOUT = 30.0     # single ffmpeg finalize() in close()
+    # Shutdown-pipeline budgets. Sourced from bridgic.browser._timeouts so
+    # the SDK, CLI daemon, and tests all agree on the same number — see that
+    # module for rationale on each value.
+    _PAGE_CLOSE_TIMEOUT = _timeouts.PAGE_CLOSE_S
+    _TRACE_STOP_TIMEOUT = _timeouts.TRACE_STOP_S
+    _CONTEXT_CLOSE_TIMEOUT = _timeouts.CONTEXT_CLOSE_S
+    _BROWSER_CLOSE_TIMEOUT = _timeouts.BROWSER_CLOSE_S
+    _PLAYWRIGHT_STOP_TIMEOUT = _timeouts.PLAYWRIGHT_STOP_S
+    _VIDEO_PREPARE_STOP_TIMEOUT = _timeouts.VIDEO_PREPARE_STOP_S
+    _VIDEO_FINALIZE_TIMEOUT = _timeouts.VIDEO_FINALIZE_S
 
     @staticmethod
     async def _force_kill_playwright_driver(pw: Any) -> None:
@@ -2472,12 +2489,10 @@ class Browser:
                             "[close] prepare_stop failed: %s(%r)",
                             type(_pr).__name__, str(_pr),
                         )
-                        _recorder._is_stopped = True
-                        _recorder._cdp_session = None
+                        _recorder.force_mark_stopped()
                     except BaseException as _pr:
                         logger.warning("[close] prepare_stop cancelled: %s", _pr)
-                        _recorder._is_stopped = True
-                        _recorder._cdp_session = None
+                        _recorder.force_mark_stopped()
                         if _pending_cancel is None:
                             _pending_cancel = _pr
 
@@ -2565,12 +2580,25 @@ class Browser:
                 errors.append(
                     f"context.close: timeout after {self._CONTEXT_CLOSE_TIMEOUT:.1f}s"
                 )
-                # Launch / persistent only: context.close() hung — force-kill
-                # the Playwright driver so browser.close() / playwright.stop()
-                # don't cascade.  In CDP mode the driver and remote Chrome
-                # share the same WS channel; killing it would orphan the remote
-                # browser from future disconnect signals.
-                if not _is_cdp and self._playwright:
+                # Force-kill the Playwright driver when context.close() hung, so
+                # browser.close() / playwright.stop() don't cascade into their
+                # own timeouts.
+                #
+                # CDP borrowed mode is deliberately excluded: the driver and the
+                # *remote* Chrome share the same WS channel and killing the
+                # driver would orphan the user's browser from future disconnect
+                # signals.
+                #
+                # CDP owned mode, however, benefits from this same fallback —
+                # bridgic created the context on a throwaway remote profile, so
+                # tearing down the driver is correct. Without this branch the
+                # daemon could hang indefinitely when the remote Chrome is
+                # unresponsive mid-close().
+                should_force_kill = (
+                    self._playwright is not None
+                    and (not _is_cdp or self._cdp_context_owned)
+                )
+                if should_force_kill:
                     _playwright = self._playwright
                     self._playwright = None
                     self._browser = None  # browser dies with driver
@@ -4916,6 +4944,11 @@ Before you return the element ref, reason about the state and elements for a sen
             If text input fails.
         """
         try:
+            # Any prior prefetch points at the page as it was before this
+            # interaction. Input may trigger navigation (e.g. submit-on-enter),
+            # so invalidate it now rather than returning a stale snapshot.
+            self._cancel_prefetch()
+
             locator = await self.get_element_by_ref(ref)
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
@@ -5040,6 +5073,11 @@ Before you return the element ref, reason about the state and elements for a sen
             If the click fails.
         """
         try:
+            # A click frequently opens a new page / triggers navigation. Any
+            # prefetched snapshot from before the click now refers to the old
+            # page, so drop it before dispatching the action.
+            self._cancel_prefetch()
+
             locator = await self.get_element_by_ref(ref)
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
@@ -5198,6 +5236,10 @@ Before you return the element ref, reason about the state and elements for a sen
             If no matching option is found or the click fails.
         """
         try:
+            # Selecting an option can submit the form or open a linked page,
+            # so any prefetched snapshot from before the selection is stale.
+            self._cancel_prefetch()
+
             locator = await self.get_element_by_ref(ref)
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
@@ -5642,6 +5684,10 @@ Before you return the element ref, reason about the state and elements for a sen
         try:
             logger.info(f'[check_checkbox_or_radio_by_ref] start ref={ref}')
 
+            # Check actions can trigger form-auto-submit flows; drop any stale
+            # prefetched snapshot before the interaction.
+            self._cancel_prefetch()
+
             locator = await self.get_element_by_ref(ref)
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
@@ -5739,6 +5785,8 @@ Before you return the element ref, reason about the state and elements for a sen
         """
         try:
             logger.info(f'[uncheck_checkbox_by_ref] start ref={ref}')
+
+            self._cancel_prefetch()
 
             locator = await self.get_element_by_ref(ref)
             if locator is None:
@@ -5838,6 +5886,10 @@ Before you return the element ref, reason about the state and elements for a sen
         """
         try:
             logger.info(f'[double_click_element_by_ref] start ref={ref}')
+
+            # Double-click can open modals, new tabs, or trigger navigation —
+            # any prefetched snapshot from before the action is stale.
+            self._cancel_prefetch()
 
             locator = await self.get_element_by_ref(ref)
             if locator is None:
@@ -6260,6 +6312,10 @@ Before you return the element ref, reason about the state and elements for a sen
         """
         try:
             logger.info(f"[type_text] start text_len={len(text)} submit={submit}")
+
+            # type_text can submit (Enter) or trigger autocomplete navigation;
+            # drop any prior prefetch so the post-typing snapshot is fresh.
+            self._cancel_prefetch()
 
             page = await self.get_current_page()
             if page is None:

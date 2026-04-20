@@ -44,9 +44,14 @@ class TestCheckModeMismatch:
             command="snapshot",
         )
 
-    def test_legacy_daemon_missing_mode_field_warns(self, caplog) -> None:
-        # No exception should be raised, and a WARNING should be emitted.
-        with caplog.at_level("WARNING"):
+    def test_legacy_daemon_missing_mode_field_raises(self) -> None:
+        # A legacy daemon exposes no `mode` field. Under the old behavior we
+        # logged a warning and silently proceeded, which let a --headed /
+        # --cdp / --clear-user-data request run against a daemon that was
+        # actually headless / persistent. The new contract treats the
+        # ambiguity as DAEMON_MODE_MISMATCH so the caller must explicitly
+        # restart the daemon before flags are honoured.
+        with pytest.raises(BridgicBrowserCommandError) as exc:
             _check_mode_mismatch(
                 {},  # legacy daemon: no `mode` field
                 headed=True,
@@ -54,7 +59,9 @@ class TestCheckModeMismatch:
                 cdp=None,
                 command="snapshot",
             )
-        assert any("predates mode tracking" in r.message for r in caplog.records)
+        assert exc.value.code == "DAEMON_MODE_MISMATCH"
+        assert exc.value.retryable is False
+        assert "predates mode tracking" in str(exc.value)
 
     def test_cdp_against_persistent_raises(self) -> None:
         with pytest.raises(BridgicBrowserCommandError) as exc:

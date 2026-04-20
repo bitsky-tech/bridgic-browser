@@ -16,6 +16,7 @@ import sys
 import threading
 from typing import Any, Dict, Optional
 
+from .. import _timeouts
 from ..errors import BridgicBrowserCommandError
 
 logger = logging.getLogger(__name__)
@@ -28,28 +29,36 @@ from ._transport import (
     remove_run_info,
 )
 
-_DAEMON_RESPONSE_TIMEOUT = float(os.environ.get("BRIDGIC_DAEMON_RESPONSE_TIMEOUT", "90"))
-
-# Buffer added on top of an arg-driven timeout so the daemon has time to
-# return its "operation timed out" error before the client gives up.  Without
-# this, `wait --timeout 120` would race the 90 s DAEMON_RESPONSE_TIMEOUT and
-# the client would abort while the daemon was still working.
-_DAEMON_RESPONSE_TIMEOUT_BUFFER = float(
-    os.environ.get("BRIDGIC_DAEMON_RESPONSE_TIMEOUT_BUFFER", "30")
-)
-
-# How long to wait for the spawned daemon to emit READY_SIGNAL before giving
-# up. Overridable so slow CI / cold-start environments can bump it without
-# editing code.
-_DAEMON_READY_TIMEOUT = float(os.environ.get("BRIDGIC_DAEMON_READY_TIMEOUT", "30"))
+# Thin aliases to the canonical constants in bridgic.browser._timeouts.
+# Env overrides resolve inside that module, so changing BRIDGIC_*_TIMEOUT
+# env vars reconfigures both SDK and CLI consistently.
+_DAEMON_RESPONSE_TIMEOUT = _timeouts.CLIENT_RESPONSE_S
+_DAEMON_RESPONSE_TIMEOUT_BUFFER = _timeouts.CLIENT_RESPONSE_BUFFER_S
+_DAEMON_READY_TIMEOUT = _timeouts.CLIENT_READY_S
 
 # Argument keys that carry a "how long am I willing to wait" value. Commands
 # like wait/wait_network/verify_* accept any of these; keep them in one place
 # so adding a new one is a one-line change.
 _TIMEOUT_ARG_KEYS: tuple[str, ...] = ("timeout", "seconds", "deadline", "max_wait")
 
+# Commands whose expected wall-clock can legitimately exceed the 90s default:
+# downloads over a slow link, video finalize with minutes of footage, storage
+# save/load across many origins. A short fallback here would orphan the daemon
+# task and confuse the next CLI invocation. See _compute_response_timeout.
+_LONG_CMD_FALLBACK_S = _timeouts.CLIENT_LONG_COMMAND_S
+_LONG_COMMANDS: frozenset[str] = frozenset({
+    "download",
+    "wait-download",
+    "video-stop",
+    "video_stop",
+    "storage-save",
+    "storage-load",
+    "storage_save",
+    "storage_load",
+})
 
-def _compute_response_timeout(args: Dict[str, Any]) -> float:
+
+def _compute_response_timeout(args: Dict[str, Any], command: str = "") -> float:
     """Return the effective client-side socket timeout for a command.
 
     Commands like ``wait``/``wait_network``/``verify_*`` carry a ``timeout``
@@ -57,6 +66,10 @@ def _compute_response_timeout(args: Dict[str, Any]) -> float:
     client socket timeout must exceed that value, otherwise the client
     aborts while the daemon is still running, orphaning the in-flight task
     and confusing the next CLI invocation.
+
+    For commands in ``_LONG_COMMANDS`` a larger fallback applies even when
+    no explicit timeout arg is passed, because their natural runtime is far
+    beyond the 90s default.
     """
     arg_timeouts: list[float] = []
     for key in _TIMEOUT_ARG_KEYS:
@@ -67,9 +80,12 @@ def _compute_response_timeout(args: Dict[str, Any]) -> float:
             arg_timeouts.append(float(val))
         except (TypeError, ValueError):
             continue
+    base = _DAEMON_RESPONSE_TIMEOUT
+    if command in _LONG_COMMANDS:
+        base = max(base, _LONG_CMD_FALLBACK_S)
     if not arg_timeouts:
-        return _DAEMON_RESPONSE_TIMEOUT
-    return max(_DAEMON_RESPONSE_TIMEOUT, max(arg_timeouts) + _DAEMON_RESPONSE_TIMEOUT_BUFFER)
+        return base
+    return max(base, max(arg_timeouts) + _DAEMON_RESPONSE_TIMEOUT_BUFFER)
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +101,7 @@ async def _send_command_async(command: str, args: Dict[str, Any]) -> str:
     """
     transport = get_transport()
     reader, writer = await transport.open_connection(stream_limit=STREAM_LIMIT)
-    response_timeout = _compute_response_timeout(args)
+    response_timeout = _compute_response_timeout(args, command)
     try:
         payload = transport.inject_auth({"command": command, "args": args})
         writer.write((json.dumps(payload) + "\n").encode())
@@ -385,11 +401,30 @@ def _check_mode_mismatch(
     if not (headed or clear_user_data or cdp):
         return
     if "mode" not in info:
-        logger.warning(
-            "Running daemon predates mode tracking; cannot verify flag "
-            "compatibility. Close and reopen to pick up the new daemon."
+        # Legacy daemon (predates the ``mode`` field). For plain commands we
+        # already returned above, so here the user is explicitly asking for a
+        # specific mode via ``--cdp`` / ``--clear-user-data`` / ``--headed``.
+        # We cannot verify compatibility, and silently continuing would attach
+        # to whatever the legacy daemon happens to be — exactly the bug this
+        # check exists to prevent. Block and tell the user how to recover.
+        raise BridgicBrowserCommandError(
+            command=command or "ensure_daemon_running",
+            code="DAEMON_MODE_MISMATCH",
+            message=(
+                "A legacy daemon is running that predates mode tracking, so "
+                "the requested flags (--cdp / --clear-user-data / --headed) "
+                "cannot be verified against it. Run `bridgic-browser close` "
+                "first, then re-run your command."
+            ),
+            details={
+                "requested": {
+                    "headed": headed,
+                    "clear_user_data": clear_user_data,
+                    "cdp": _redact_if_set(cdp),
+                },
+                "running": {"mode": "<legacy-unknown>"},
+            },
         )
-        return
 
     running_mode = info.get("mode")
     running_headed = bool(info.get("headed", False))
