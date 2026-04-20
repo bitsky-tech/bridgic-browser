@@ -157,9 +157,31 @@ class TestProbeCdpAliveTcp:
     """
 
     def _free_port(self) -> int:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            return s.getsockname()[1]
+        """Return a 127.0.0.1 TCP port that is confirmed to refuse connections.
+
+        On Windows CI, the OS-assigned ephemeral port from ``bind(("", 0))``
+        can collide with ports held open by Defender / RPC / other system
+        services, so a plain bind-then-close no longer guarantees refusal.
+        Verify each candidate with an actual connect attempt and retry on
+        collision.
+        """
+        last_error: Exception | None = None
+        for _ in range(20):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    continue  # Something is listening; pick a different port.
+            except ConnectionRefusedError:
+                return port
+            except OSError as exc:
+                last_error = exc
+                continue
+        raise RuntimeError(
+            f"Could not find a refused TCP port on 127.0.0.1 after 20 tries "
+            f"(last error: {last_error!r})"
+        )
 
     def test_alive_when_port_listens_even_without_http(self) -> None:
         """Port open but immediately closes connection (no HTTP response)
