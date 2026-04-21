@@ -1172,6 +1172,89 @@ class TestPrefetchGenerationToken:
         assert result is prefetched
 
 
+class TestInvalidatePageState:
+    """Regression guard: every navigation-ish entry point must drop
+    ``_last_snapshot`` + bump ``_prefetch_gen`` BEFORE the navigation, so
+    ``get_element_by_ref`` cannot resolve an old-page ref against the new
+    document (which would silently land on a same-role+name neighbour).
+    """
+
+    @pytest.mark.asyncio
+    async def test_invalidate_page_state_clears_cache_and_bumps_gen(self):
+        browser = Browser()
+        browser._last_snapshot = MagicMock()
+        browser._last_snapshot_url = "https://example.com/a"
+        gen_before = browser._prefetch_gen
+
+        browser._invalidate_page_state()
+
+        assert browser._last_snapshot is None
+        assert browser._last_snapshot_url is None
+        assert browser._prefetch_gen == gen_before + 1
+
+    @pytest.mark.asyncio
+    async def test_go_back_invalidates_page_state(self):
+        # Fresh Browser() has _cdp_resolved=None → _is_cdp_borrowed=False,
+        # so go_back takes the `page.go_back` branch.
+        browser = Browser()
+        fake_page = MagicMock()
+        fake_page.url = "https://example.com/prev"
+        fake_page.go_back = AsyncMock(return_value=None)
+        browser._page = fake_page
+        browser._context = MagicMock()
+
+        browser._last_snapshot = MagicMock()
+        browser._last_snapshot_url = "https://example.com/a"
+        gen_before = browser._prefetch_gen
+
+        await browser.go_back()
+
+        assert browser._last_snapshot is None
+        assert browser._last_snapshot_url is None
+        assert browser._prefetch_gen == gen_before + 1
+
+    @pytest.mark.asyncio
+    async def test_go_forward_invalidates_page_state(self):
+        browser = Browser()
+        fake_page = MagicMock()
+        fake_page.url = "https://example.com/next"
+        fake_page.go_forward = AsyncMock(return_value=None)
+        browser._page = fake_page
+        browser._context = MagicMock()
+
+        browser._last_snapshot = MagicMock()
+        browser._last_snapshot_url = "https://example.com/a"
+        gen_before = browser._prefetch_gen
+
+        await browser.go_forward()
+
+        assert browser._last_snapshot is None
+        assert browser._last_snapshot_url is None
+        assert browser._prefetch_gen == gen_before + 1
+
+    @pytest.mark.asyncio
+    async def test_reload_page_invalidates_page_state(self):
+        browser = Browser()
+        fake_page = MagicMock()
+        fake_page.url = "https://example.com/a"
+        fake_page.reload = AsyncMock(return_value=None)
+        # _get_page_title takes the non-CDP branch and calls page.title()
+        # on a fresh Browser(): _cdp_resolved is None so _is_cdp_borrowed=False.
+        fake_page.title = AsyncMock(return_value="A")
+        browser._page = fake_page
+        browser._context = MagicMock()
+
+        browser._last_snapshot = MagicMock()
+        browser._last_snapshot_url = "https://example.com/a"
+        gen_before = browser._prefetch_gen
+
+        await browser.reload_page()
+
+        assert browser._last_snapshot is None
+        assert browser._last_snapshot_url is None
+        assert browser._prefetch_gen == gen_before + 1
+
+
 class TestSingleVideoRecorderClose:
     """Tests verifying single-stream video recorder lifecycle during close().
 
@@ -2598,14 +2681,27 @@ class TestLocatorActionWithFallback:
     This helper caps Playwright's default 30s locator timeout at 10s and
     dispatches a DOM event as a fallback. It's the core defence against the
     "click hangs for 30s on SPA elements" pathology observed in prod logs.
+
+    The fallback is **gated** on ``is_visible()`` AND ``is_enabled()``: the
+    stable-check-loop pathology always has both True, so we preserve the
+    fallback there; a ``<button disabled>`` or ``aria-disabled="true"``
+    widget has ``is_enabled()`` False, and we must NOT silently click it.
     """
+
+    @staticmethod
+    def _make_locator(*, visible: bool = True, enabled: bool = True) -> MagicMock:
+        """Build a locator mock that reports the given actionability state."""
+        loc = MagicMock()
+        loc.is_visible = AsyncMock(return_value=visible)
+        loc.is_enabled = AsyncMock(return_value=enabled)
+        loc.dispatch_event = AsyncMock()
+        return loc
 
     @pytest.mark.asyncio
     async def test_primary_action_success_uses_timeout(self):
         """Happy path: action succeeds; no fallback event dispatched."""
-        locator = MagicMock()
+        locator = self._make_locator()
         locator.click = AsyncMock(return_value=None)
-        locator.dispatch_event = AsyncMock()
 
         await _browser_module._locator_action_with_fallback(locator, action="click")
 
@@ -2613,15 +2709,17 @@ class TestLocatorActionWithFallback:
         # Timeout must be explicitly passed (lower than Playwright's default).
         assert locator.click.await_args.kwargs.get("timeout") == _browser_module._DEFAULT_CLICK_TIMEOUT_MS
         locator.dispatch_event.assert_not_awaited()
+        # Probe not needed on success.
+        locator.is_visible.assert_not_awaited()
+        locator.is_enabled.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_timeout_triggers_dispatch_event_fallback(self):
-        """On Playwright TimeoutError, dispatch_event is called with the configured event."""
-        locator = MagicMock()
+    async def test_timeout_on_visible_enabled_falls_back(self):
+        """On Playwright TimeoutError with a visible+enabled element, dispatch_event fires."""
+        locator = self._make_locator(visible=True, enabled=True)
         locator.click = AsyncMock(
             side_effect=_browser_module.PlaywrightTimeoutError("locator.click: Timeout 10000ms")
         )
-        locator.dispatch_event = AsyncMock()
 
         await _browser_module._locator_action_with_fallback(
             locator, action="click", fallback_event="click"
@@ -2633,11 +2731,10 @@ class TestLocatorActionWithFallback:
     @pytest.mark.asyncio
     async def test_dblclick_fallback_event(self):
         """dblclick action pairs with a 'dblclick' DOM fallback by convention."""
-        locator = MagicMock()
+        locator = self._make_locator(visible=True, enabled=True)
         locator.dblclick = AsyncMock(
             side_effect=_browser_module.PlaywrightTimeoutError("timeout")
         )
-        locator.dispatch_event = AsyncMock()
 
         await _browser_module._locator_action_with_fallback(
             locator, action="dblclick", fallback_event="dblclick"
@@ -2648,9 +2745,8 @@ class TestLocatorActionWithFallback:
     @pytest.mark.asyncio
     async def test_non_timeout_error_not_swallowed(self):
         """Errors that aren't PlaywrightTimeoutError bubble up unchanged."""
-        locator = MagicMock()
+        locator = self._make_locator()
         locator.click = AsyncMock(side_effect=RuntimeError("not a timeout"))
-        locator.dispatch_event = AsyncMock()
 
         with pytest.raises(RuntimeError, match="not a timeout"):
             await _browser_module._locator_action_with_fallback(locator, action="click")
@@ -2660,7 +2756,7 @@ class TestLocatorActionWithFallback:
     @pytest.mark.asyncio
     async def test_custom_timeout_respected(self):
         """Caller-supplied timeout overrides the module default."""
-        locator = MagicMock()
+        locator = self._make_locator()
         locator.click = AsyncMock(return_value=None)
 
         await _browser_module._locator_action_with_fallback(
@@ -2672,17 +2768,64 @@ class TestLocatorActionWithFallback:
     @pytest.mark.asyncio
     async def test_check_action_dispatches_click_on_timeout(self):
         """`check` action falls back to a 'click' DOM event (same activation semantics)."""
-        locator = MagicMock()
+        locator = self._make_locator(visible=True, enabled=True)
         locator.check = AsyncMock(
             side_effect=_browser_module.PlaywrightTimeoutError("timeout")
         )
-        locator.dispatch_event = AsyncMock()
 
         await _browser_module._locator_action_with_fallback(
             locator, action="check", fallback_event="click"
         )
 
         locator.dispatch_event.assert_awaited_once_with("click")
+
+    @pytest.mark.asyncio
+    async def test_timeout_on_disabled_element_re_raises(self):
+        """<button disabled> / aria-disabled=true: timeout must NOT silent-click."""
+        locator = self._make_locator(visible=True, enabled=False)
+        locator.click = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("timeout")
+        )
+
+        with pytest.raises(_browser_module.PlaywrightTimeoutError):
+            await _browser_module._locator_action_with_fallback(locator, action="click")
+
+        locator.dispatch_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_on_invisible_element_re_raises(self):
+        """display:none / off-screen / hidden: timeout must NOT silent-click."""
+        locator = self._make_locator(visible=False, enabled=True)
+        locator.click = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("timeout")
+        )
+
+        with pytest.raises(_browser_module.PlaywrightTimeoutError):
+            await _browser_module._locator_action_with_fallback(locator, action="click")
+
+        locator.dispatch_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_with_hung_probe_re_raises_conservatively(self):
+        """If the actionability probe itself times out we do NOT silent-click."""
+        import asyncio
+        locator = MagicMock()
+        locator.click = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("timeout")
+        )
+        locator.dispatch_event = AsyncMock()
+
+        async def _hang() -> bool:
+            await asyncio.sleep(10.0)
+            return True
+
+        locator.is_visible = AsyncMock(side_effect=_hang)
+        locator.is_enabled = AsyncMock(side_effect=_hang)
+
+        with pytest.raises(_browser_module.PlaywrightTimeoutError):
+            await _browser_module._locator_action_with_fallback(locator, action="click")
+
+        locator.dispatch_event.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

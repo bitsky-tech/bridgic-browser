@@ -1119,9 +1119,15 @@ class SnapshotGenerator:
                 'generation': generation,
             })
         except Exception as e:
+            # Phase 1 did not build the role index. Phase 2's `findElement()`
+            # has a defensive fallback path: when the expected
+            # `roleIndex[role]` is undefined it issues a one-shot
+            # querySelectorAll per missing role and caches the result for the
+            # remainder of the chunk. Correctness preserved, performance
+            # degrades to "N QSAs per chunk" instead of "N QSAs once".
             logger.warning(
-                "_build_role_index failed; falling back to per-element lookup "
-                "(roles=%d, fallback=per-element): %s",
+                "_build_role_index failed; Phase 2 will QSA per missing role "
+                "(roles=%d, slower but correct): %s",
                 len(all_roles), e,
             )
 
@@ -1159,6 +1165,12 @@ class SnapshotGenerator:
             return visible_refs, interactive_map
         finally:
             # Phase 3: release only THIS generation's window.__bridgic* refs.
+            # If the page navigated mid-snapshot this evaluate runs in the
+            # NEW document's JS context — a no-op there, while the OLD
+            # document's window globals are freed when its JS context is GC'd
+            # along with the document. Either way: safe. The broad except is
+            # intentional: a closed/navigating page is an expected failure
+            # mode and not an error worth surfacing.
             try:
                 await page.evaluate(_CLEANUP_ROLE_INDEX_JS, {'generation': generation})
             except Exception:
@@ -1398,6 +1410,15 @@ class SnapshotGenerator:
         enough for the downstream parser to recover refs. Less detail (no
         ``[cursor=pointer]``, no ``[disabled]`` hints) is reported — this is a
         graceful degradation path, not a long-term substitute for the private API.
+
+        **Performance note**: this fallback emits NO ``[ref=<playwright_ref>]``
+        suffix, so :attr:`RefData.playwright_ref` is empty for every element
+        it produces. Consequence: :meth:`Browser.get_element_by_ref` skips the
+        O(1) aria-ref fast path entirely and rebuilds every locator from role
+        + name + frame_path + nth via Playwright's ``get_by_role``. On a
+        1000-ref page per-call overhead goes from ~1 ms to ~50–200 ms. Pin
+        a compatible Playwright version in ``pyproject.toml`` to restore the
+        fast path.
         """
         try:
             tree = await page.accessibility.snapshot()

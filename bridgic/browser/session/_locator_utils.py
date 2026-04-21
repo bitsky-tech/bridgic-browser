@@ -13,6 +13,8 @@ from typing import Any
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from bridgic.browser import _timeouts as _timeouts
+
 logger = logging.getLogger(__name__)
 
 
@@ -265,15 +267,13 @@ async def _cdp_evaluate_on_element(cdp_context, page, locator, code: str) -> Any
             pass
 
 
-_DEFAULT_CLICK_TIMEOUT_MS = 10000
+_DEFAULT_CLICK_TIMEOUT_MS = int(_timeouts.CLICK_S * 1000)
 """Hard ceiling for locator.click / dblclick / check / uncheck.
 
-Playwright defaults to 30s and retries ``visible, enabled, stable`` up to the
-deadline. On Vue/React SPA pages Chrome can judge a freshly-scrolled element
-as *still* outside viewport (e.g. because a sticky header or transform occupies
-the slot), and the retry loop spins for the full 30s — blocking every other
-CLI command queued on the daemon. Capping at 10s keeps the CLI responsive;
-the dispatch_event fallback below recovers the common case."""
+Derived from :data:`bridgic.browser._timeouts.CLICK_S` so SDK callers and the
+CLI daemon agree, and so a single ``BRIDGIC_CLICK_TIMEOUT`` env var moves
+the ceiling everywhere. See the ``_timeouts.CLICK_S`` docstring for rationale.
+"""
 
 
 async def _locator_action_with_fallback(
@@ -283,7 +283,7 @@ async def _locator_action_with_fallback(
     fallback_event: str = "click",
     timeout_ms: int = _DEFAULT_CLICK_TIMEOUT_MS,
 ) -> None:
-    """Invoke ``locator.<action>`` with a hard timeout and dispatch_event fallback.
+    """Invoke ``locator.<action>`` with a hard timeout and a *gated* dispatch_event fallback.
 
     Parameters
     ----------
@@ -300,20 +300,71 @@ async def _locator_action_with_fallback(
         Explicit timeout passed to Playwright. Shorter than the default 30s
         so a stuck actionability retry loop cannot freeze the CLI.
 
+    Raises
+    ------
+    PlaywrightTimeoutError
+        When the primary action times out AND the element is not eligible for
+        the ``dispatch_event`` fallback (not visible or not enabled). Callers
+        see a clean timeout in this case instead of a silent no-op.
+
     Notes
     -----
-    ``dispatch_event`` bypasses Playwright's actionability checks and directly
-    fires the DOM event on the element. It is the right fallback when the
-    element is logically interactive but geometrically confusing to
-    Playwright (sticky/transform/absolute positioning, SPA layout quirks).
+    The ``dispatch_event`` fallback exists because Vue/React SPAs routinely
+    fail Playwright's ``stable`` actionability sub-check (sticky headers,
+    CSS transitions, transforms) even though the element is visually and
+    logically clickable. For those pages the primary action times out but
+    a direct DOM event still does the right thing.
+
+    The fallback is **gated** on both ``is_visible()`` and ``is_enabled()``:
+
+    * ``<button disabled>`` / ``<div role="button" aria-disabled="true">``:
+      ``is_enabled()`` is False → the timeout re-raises. Without this gate,
+      ``dispatch_event`` would fire a synthetic click that the author
+      explicitly disabled (and in the custom-ARIA case the component's
+      click handler would run, silently violating user intent).
+    * Off-screen / ``display:none`` / ``visibility:hidden``:
+      ``is_visible()`` is False → the timeout re-raises.
+
+    The probe itself has a 1 s wall-clock budget; if the probe hangs (e.g.
+    a CDP-borrowed tab with a wedged context) we treat the element as
+    non-actionable and re-raise, which is the conservative choice.
     """
     method = getattr(locator, action)
     try:
         await method(timeout=timeout_ms)
+        return
     except PlaywrightTimeoutError as e:
+        # Probe actionability cheaply before dispatching. We specifically want
+        # to preserve the fallback for "stable-check loop" cases (visible +
+        # enabled, element just wobbles a bit) while refusing it for cases
+        # where the element is genuinely off (disabled / hidden).
+        visible = enabled = False
+        try:
+            probe = asyncio.gather(
+                locator.is_visible(),
+                locator.is_enabled(),
+                return_exceptions=True,
+            )
+            results = await asyncio.wait_for(probe, timeout=1.0)
+            visible = results[0] is True
+            enabled = results[1] is True
+        except Exception:
+            # Probe itself failed — be conservative.
+            visible = enabled = False
+
+        if not (visible and enabled):
+            logger.warning(
+                "[_locator_action_with_fallback] %s timed out after %dms; "
+                "element visible=%s enabled=%s — not fallback-eligible, re-raising. "
+                "Underlying: %s",
+                action, timeout_ms, visible, enabled, e,
+            )
+            raise
+
         logger.warning(
-            "[_locator_action_with_fallback] %s timed out after %dms; "
-            "falling back to dispatch_event(%r). Underlying: %s",
+            "[_locator_action_with_fallback] %s timed out after %dms on "
+            "visible+enabled element; falling back to dispatch_event(%r). "
+            "Underlying: %s",
             action, timeout_ms, fallback_event, e,
         )
         await locator.dispatch_event(fallback_event)
@@ -322,14 +373,79 @@ async def _locator_action_with_fallback(
 async def _check_element_covered(locator, cx: float, cy: float, cdp_context=None) -> bool:
     """Return True when another element sits on top of (cx, cy).
 
-    In CDP borrowed mode (``cdp_context`` provided) ``locator.evaluate()``
-    hangs because Playwright's ``_mainContext()`` never resolves for
-    pre-existing tabs. We return ``False`` immediately so callers fall
-    through to ``locator.click()`` which uses the utility world and handles
-    overlays internally.
+    Non-CDP path runs the canonical ``t === el && !el.contains(t)`` test via
+    ``locator.evaluate`` (main world). Reliable — Playwright gives us the
+    real object identity.
+
+    CDP borrowed path cannot use ``locator.evaluate`` (the main-world context
+    never resolves for pre-existing tabs). Instead we use raw CDP
+    ``Runtime.evaluate`` to read the bounding box of the element at
+    (cx, cy) and compare it geometrically to the locator's bbox. A match
+    within 1 px on every side is treated as "same element → not covered";
+    otherwise we report covered=True so the caller clicks the intercepting
+    element. This is approximate: two elements occupying the exact same
+    rectangle would be a false negative, but that is uncommon enough that
+    getting the modal-over-button case right is the right trade-off.
     """
     if cdp_context is not None:
-        return False
+        # Geometric covered-check via raw CDP. Requires a bounding box for
+        # the target; without it we cannot compare and conservatively report
+        # not-covered (the pre-fix behaviour).
+        try:
+            self_bbox = await asyncio.wait_for(locator.bounding_box(), timeout=1.0)
+        except Exception:
+            return False
+        if self_bbox is None:
+            return False
+
+        page = getattr(locator, "page", None)
+        if page is None:
+            return False
+
+        session = None
+        try:
+            session = await cdp_context.new_cdp_session(page)
+            expr = (
+                "(() => {"
+                f"  if (window.parent !== window) return null;"
+                f"  const t = document.elementFromPoint({cx}, {cy});"
+                f"  if (!t) return null;"
+                "  const r = t.getBoundingClientRect();"
+                "  return [r.x, r.y, r.width, r.height];"
+                "})()"
+            )
+            res = await asyncio.wait_for(
+                session.send("Runtime.evaluate", {
+                    "expression": expr, "returnByValue": True,
+                }),
+                timeout=2.0,
+            )
+            hit = res.get("result", {}).get("value")
+        except Exception:
+            return False
+        finally:
+            if session is not None:
+                try:
+                    await session.detach()
+                except Exception:
+                    pass
+
+        if hit is None:
+            return False
+        try:
+            hx, hy, hw, hh = hit
+        except Exception:
+            return False
+
+        own_x, own_y = self_bbox.get("x", 0.0), self_bbox.get("y", 0.0)
+        own_w, own_h = self_bbox.get("width", 0.0), self_bbox.get("height", 0.0)
+        # ±1 px tolerance absorbs sub-pixel rounding between DPR boundaries.
+        same_rect = (
+            abs(hx - own_x) <= 1 and abs(hy - own_y) <= 1
+            and abs(hw - own_w) <= 1 and abs(hh - own_h) <= 1
+        )
+        return not same_rect
+
     try:
         return await asyncio.wait_for(
             locator.evaluate(

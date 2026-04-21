@@ -157,3 +157,22 @@ Short enough that an operator watching the daemon log sees progress within
 a few seconds, long enough that a normally-fast command (snapshot, click)
 never emits one.
 """
+
+
+# ---------------------------------------------------------------------------
+# Locator interaction ceiling
+# ---------------------------------------------------------------------------
+
+CLICK_S: float = _float_env("BRIDGIC_CLICK_TIMEOUT", 10.0)
+"""Hard ceiling for a single ``locator.click / dblclick / check / uncheck``.
+
+Playwright defaults to 30 s and retries ``visible, enabled, stable`` up to
+the deadline. On Vue/React SPA pages Chrome can judge a freshly-scrolled
+element as *still* outside viewport (sticky header, transform, animation),
+and the retry loop spins for the full 30 s — blocking every other CLI
+command queued on the daemon. Capping at 10 s keeps the CLI responsive.
+
+The SDK default and the CLI daemon default are the same 10 s. Raise it via
+``BRIDGIC_CLICK_TIMEOUT`` when a test needs to accommodate a slow-starting
+SPA; lower it for tighter bail-out.
+"""
