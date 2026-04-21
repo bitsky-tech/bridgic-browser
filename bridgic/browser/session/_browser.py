@@ -1829,9 +1829,7 @@ class Browser:
                 kwargs["timeout"] = timeout * 1000.0
             await self._page.goto(url, **kwargs)
             # Invalidate snapshot cache and any in-flight pre-warm.
-            self._last_snapshot = None
-            self._last_snapshot_url = None
-            self._cancel_prefetch()
+            self._invalidate_page_state()
             page = await self.get_current_page()
             actual_url = page.url if page else url
             result = f"Navigated to: {actual_url}"
@@ -2030,9 +2028,7 @@ class Browser:
         self._page = page
         await self._switch_video_to_page(page)
         # Clear snapshot cache after switching pages
-        self._last_snapshot = None
-        self._last_snapshot_url = None
-        self._cancel_prefetch()
+        self._invalidate_page_state()
         title = await self._get_page_title(page)
         return True, f"Switched to tab {page_id}: {page.url} (title: {title})"
 
@@ -2093,9 +2089,7 @@ class Browser:
             pages = self.get_pages()
             self._page = pages[0] if pages else None
             # Clear snapshot cache
-            self._last_snapshot = None
-            self._last_snapshot_url = None
-            self._cancel_prefetch()
+            self._invalidate_page_state()
 
         if self._page:
             now_id = generate_page_id(self._page)
@@ -2410,6 +2404,32 @@ class Browser:
             _prefetch_options=None,
             _prefetch_url=None,
         )
+
+    def _invalidate_page_state(self) -> None:
+        """Drop snapshot cache + prefetch state.
+
+        Must be called before any operation that changes *what 'the current
+        page' means* — navigation, reload, tab switch, tab close, etc.
+
+        Skipping this leaves two stale-data hazards:
+
+        1. ``_last_snapshot.refs`` is read directly by ``get_element_by_ref``
+           (no URL gate), so a ref looked up after navigation would point at
+           the OLD page's role+name+frame_path+nth. On SPAs where identical
+           role+name elements exist on both pages (same design system / same
+           "Submit" button), this silently resolves to the wrong element.
+        2. The prefetch cache is URL-gated but shares SPA fragment URLs with
+           the previous page — and the still-running pre-warm task keeps
+           consuming CPU on a 1000+ ref page until it hits the URL/gen check
+           that rejects its commit.
+
+        Pair this with the actual navigation call. All mutation is synchronous
+        so there is no race with concurrent callers of ``get_snapshot()`` —
+        the snapshot lock serialises readers against the next fresh compute.
+        """
+        self._last_snapshot = None
+        self._last_snapshot_url = None
+        self._cancel_prefetch()
 
     async def _pre_warm_snapshot(self, page: "AsyncPage", my_gen: int) -> None:  # type: ignore[name-defined]
         """Background task: compute interactive snapshot after navigation.
@@ -3099,6 +3119,11 @@ Before you return the element ref, reason about the state and elements for a sen
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
+            # History navigation changes the document; drop any cached snapshot
+            # / prefetch BEFORE navigating so a concurrent get_snapshot cannot
+            # observe a mix of old-page refs and the new page's URL.
+            self._invalidate_page_state()
+
             if self._is_cdp_borrowed and self._context:
                 # CDP borrowed mode: page.go_back() hangs because Playwright's
                 # navigation tracking relies on _mainContext() which is broken for
@@ -3144,6 +3169,10 @@ Before you return the element ref, reason about the state and elements for a sen
             page = await self.get_current_page()
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
+
+            # History navigation changes the document — same rationale as go_back.
+            self._invalidate_page_state()
+
             if self._is_cdp_borrowed and self._context:
                 await self._cdp_navigate_history(page, delta=+1)
             else:
@@ -3192,6 +3221,14 @@ Before you return the element ref, reason about the state and elements for a sen
             page = await self.get_current_page()
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
+
+            # Reload re-creates the document; Playwright ref-ids reset and
+            # every DOM Element in _last_snapshot.refs becomes stale. Drop
+            # the cache BEFORE reloading so get_element_by_ref cannot resolve
+            # an old ref against the fresh DOM (which would silently land on
+            # a same-role+name element in a different position).
+            self._invalidate_page_state()
+
             kwargs: Dict[str, Any] = {"wait_until": wait_until}
             if timeout is not None:
                 kwargs["timeout"] = timeout * 1000.0
@@ -3356,12 +3393,25 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         code : str
-            Arrow function format, e.g., "() => document.title".
+            Arrow function format, e.g., ``"() => document.title"``.
 
         Returns
         -------
         str
             Execution result as string.
+
+        Notes
+        -----
+        In CDP borrowed mode (``Browser(cdp_url=...)`` attaching to an existing
+        Chrome) this method routes through raw ``CDPSession.Runtime.evaluate``
+        with ``returnByValue=True`` instead of Playwright's
+        ``page.evaluate()``. Consequence: only values that survive
+        CDP's JSON round-trip are returned as structured data — ``Date``,
+        ``RegExp``, ``Map``, ``Set``, DOM handles, etc. produce no ``value``
+        and bridgic falls back to the CDP ``description`` string so the
+        caller receives a hint instead of ``None``. Regular JSON types
+        (string / number / bool / null / plain object / array) round-trip
+        identically to the non-CDP path.
         """
         try:
             logger.info(f"[evaluate_javascript] start code_preview={code[:100] if code and len(code) > 100 else code!r}")
@@ -3388,7 +3438,18 @@ Before you return the element ref, reason about the state and elements for a sen
                         ),
                         timeout=30.0,
                     )
-                    result = raw.get("result", {}).get("value")
+                    result_obj = raw.get("result", {})
+                    if "value" in result_obj:
+                        result = result_obj["value"]
+                    elif result_obj.get("type") == "undefined":
+                        result = None
+                    else:
+                        # Non-JSON-serializable (Date, RegExp, Map, Set, DOM node...).
+                        # CDP returned type+description without a value. Return the
+                        # description string so the caller has something human-readable
+                        # instead of the misleading ``None`` of earlier behaviour.
+                        desc = result_obj.get("description")
+                        result = desc if desc is not None else f"<non-serializable {result_obj.get('type', 'value')}>"
                 finally:
                     if session:
                         try:
