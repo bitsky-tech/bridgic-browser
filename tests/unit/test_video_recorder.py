@@ -498,3 +498,195 @@ class TestSwitchPage:
     def test_current_page_property(self, tmp_path: Path) -> None:
         rec = self._make_recorder(tmp_path)
         assert rec.current_page is rec._page
+
+
+# ---------------------------------------------------------------------------
+# Stop / finalize / force_mark_stopped lifecycle (from PR #21 CR follow-ups)
+# ---------------------------------------------------------------------------
+# These tests pin down the contract of the two-phase shutdown + fast-path:
+# prepare_stop → finalize (normal), force_mark_stopped (timeout recovery),
+# and the is_stopped guard that makes subsequent frame callbacks no-ops.
+
+
+class TestVideoRecorderLifecycle:
+    def _make_recorder(self, tmp_path: Path) -> VideoRecorder:
+        ctx = MagicMock()
+        page = MagicMock()
+        output = str(tmp_path / "life.webm")
+        return VideoRecorder(ctx, page, output, (800, 600))
+
+    @pytest.mark.asyncio
+    async def test_force_mark_stopped_sets_flag_and_releases_cdp_ref(
+        self, tmp_path: Path,
+    ) -> None:
+        """Browser.close() uses this after prepare_stop() times out.
+
+        Subsequent screencast callbacks must become no-ops; the CDP session
+        reference must be released so it can be GC'd.
+        """
+        rec = self._make_recorder(tmp_path)
+        rec._cdp_session = MagicMock()  # simulate an in-flight session
+
+        rec.force_mark_stopped()
+
+        assert rec.is_stopped is True
+        assert rec._cdp_session is None
+
+    @pytest.mark.asyncio
+    async def test_force_mark_stopped_makes_screencast_callback_noop(
+        self, tmp_path: Path,
+    ) -> None:
+        """After force_mark_stopped, _on_screencast_frame must not queue any frame.
+
+        This is the invariant that keeps late CDP events from corrupting a
+        stopped recorder (e.g. frames that arrived while prepare_stop was
+        detaching the CDP session).
+        """
+        rec = self._make_recorder(tmp_path)
+        rec.force_mark_stopped()
+
+        # _on_screencast_frame pulls base64 data — even a syntactically
+        # valid payload must be dropped after force_mark_stopped.
+        rec._on_screencast_frame({
+            "data": "AA==",  # 1 byte base64
+            "metadata": {"timestamp": 123.0},
+            "sessionId": "abc",
+        })
+
+        assert len(rec._frame_queue) == 0
+
+    def test_write_frame_drops_real_frames_after_is_stopped(
+        self, tmp_path: Path,
+    ) -> None:
+        """Stopped recorder: _write_frame must not pad with real frame bytes."""
+        rec = self._make_recorder(tmp_path)
+        rec._is_stopped = True
+
+        rec._write_frame(b"fake-jpeg-bytes", 123.45)
+
+        # Real frames are dropped; queue stays empty.
+        assert len(rec._frame_queue) == 0
+        assert rec._last_frame is None
+
+    def test_write_frame_first_frame_seeds_timestamp_baseline(
+        self, tmp_path: Path,
+    ) -> None:
+        """First frame seeds ``_first_frame_ts`` — frame-number math is clock-agnostic."""
+        rec = self._make_recorder(tmp_path)
+
+        rec._write_frame(b"first", 100.0)
+
+        assert rec._first_frame_ts == 100.0
+        assert rec._last_frame is not None
+        assert rec._last_frame[0] == b"first"
+        # frame_number = floor((100.0 - 100.0) * FPS) = 0
+        assert rec._last_frame[2] == 0
+
+    def test_write_frame_backwards_timestamp_clamps_repeat_count(
+        self, tmp_path: Path,
+    ) -> None:
+        """CDP can emit backwards timestamps (remote navigation, clock jumps).
+
+        Without the ``max(repeat_count, 0)`` guard, the padding loop would run
+        a negative number of times (actually no times — range(-N) is empty —
+        but the code was written defensively). The cache keeps the latest
+        frame regardless; nothing should be queued for padding.
+        """
+        rec = self._make_recorder(tmp_path)
+
+        # Seed with a "future" frame so _first_frame_ts=100.0 and
+        # _last_frame[2]=0.
+        rec._write_frame(b"A", 100.0)
+        assert len(rec._frame_queue) == 0
+
+        # Second call with an EARLIER timestamp would compute frame_number < 0
+        # and repeat_count < 0. No padding should happen.
+        rec._write_frame(b"B", 99.0)
+
+        # No extra frames queued from the negative-delta case.
+        assert len(rec._frame_queue) == 0
+        # Cache updated with the latest (even if backwards) timestamp.
+        assert rec._last_frame is not None
+        assert rec._last_frame[0] == b"B"
+
+    def test_write_frame_empty_sentinel_preserves_cached_bytes(
+        self, tmp_path: Path,
+    ) -> None:
+        """Empty-sentinel frame (``b""``) advances the frame counter but keeps
+        the cached JPEG — used by ``prepare_stop()`` to pad the tail.
+        """
+        rec = self._make_recorder(tmp_path)
+        rec._write_frame(b"real", 100.0)
+        cached_bytes_before = rec._last_frame[0]
+
+        # Sentinel: empty frame, later timestamp.
+        rec._write_frame(b"", 101.0)
+
+        # Cached bytes unchanged (still the last real frame).
+        assert rec._last_frame[0] == cached_bytes_before
+        # Timestamp and frame number advanced.
+        assert rec._last_frame[1] == 101.0
+
+    @pytest.mark.asyncio
+    async def test_stop_is_idempotent_when_already_stopped(
+        self, tmp_path: Path,
+    ) -> None:
+        """Double ``stop()``: second call returns the path without side effects.
+
+        PR #21 sets ``_is_stopped = True`` inside ``prepare_stop``; the
+        ``stop()`` convenience method checks that flag at the very top so a
+        concurrent / repeat call doesn't double-detach CDP or double-flush
+        ffmpeg stdin.
+        """
+        rec = self._make_recorder(tmp_path)
+        rec._is_stopped = True
+
+        # First call already returned immediately (tested elsewhere).
+        path1 = await rec.stop()
+        path2 = await rec.stop()
+
+        assert path1 == path2 == rec.output_path
+
+
+# ---------------------------------------------------------------------------
+# _on_screencast_frame — CDP event routing
+# ---------------------------------------------------------------------------
+
+class TestOnScreencastFrame:
+    def _make_recorder(self, tmp_path: Path) -> VideoRecorder:
+        return VideoRecorder(
+            MagicMock(), MagicMock(), str(tmp_path / "evt.webm"), (800, 600),
+        )
+
+    def test_valid_frame_decoded_into_queue_flow(self, tmp_path: Path) -> None:
+        """A valid base64 frame seeds _last_frame; ack task is scheduled."""
+        rec = self._make_recorder(tmp_path)
+
+        # Minimal valid base64: "AA==" → single null byte.
+        rec._on_screencast_frame({
+            "data": "AA==",
+            "metadata": {"timestamp": 10.0},
+            "sessionId": "s1",
+        })
+
+        # First frame seeds baseline; cached frame holds the decoded bytes.
+        assert rec._first_frame_ts == 10.0
+        assert rec._last_frame is not None
+        assert rec._last_frame[0] == b"\x00"
+
+    def test_malformed_base64_payload_is_ignored(self, tmp_path: Path) -> None:
+        """Garbled base64 payload must not propagate as an exception.
+
+        Chrome has been observed sending truncated frames at tab close; the
+        recorder must degrade gracefully rather than kill the daemon event loop.
+        """
+        rec = self._make_recorder(tmp_path)
+
+        # Not valid base64 → decode raises → _on_screencast_frame swallows.
+        rec._on_screencast_frame({
+            "data": "!!!!not-base64!!!!",
+            "metadata": {"timestamp": 10.0},
+        })
+
+        # Frame was rejected; no padding, no cached frame.
+        assert rec._last_frame is None

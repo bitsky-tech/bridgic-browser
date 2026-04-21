@@ -3079,3 +3079,158 @@ class TestDaemonDownloadsPath:
 
         # Restore permissions for cleanup
         fake_downloads.chmod(0o755)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Daemon shutdown gate + cancel-in-flight (from PR #21 CR follow-ups)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# PR #21 added two interlocking safety nets around the single Browser
+# singleton inside the daemon:
+#
+#   1. A close-command callback (``on_close_command``) that the outer
+#      ``connection_cb`` wires to stop accepting new connections as soon as
+#      the user asks to shut down.
+#   2. A cancel-in-flight mechanism: if the CLI client hits its own socket
+#      timeout and hangs up while a command is still running inside the
+#      daemon, the dispatch task must be cancelled so it cannot keep
+#      mutating ``self._page`` state against the next command.
+
+
+class TestDaemonCloseCallback:
+    """Ensures the ``on_close_command`` hook fires exactly once, in the
+    close-branch's fast-path, BEFORE any actual browser.close() work starts.
+
+    This is the signal that tells the outer server to stop accepting new
+    connections — if it fired too late, a fresh ``open`` could land on a
+    dying daemon and crash mid-dispatch.
+    """
+
+    async def test_close_command_invokes_on_close_callback(self):
+        browser = make_browser()
+        browser._close_session_dir = ""
+        stop = asyncio.Event()
+        req = json.dumps({"command": "close", "args": {}}).encode() + b"\n"
+
+        callback_calls: list[int] = []
+
+        def _hook() -> None:
+            callback_calls.append(1)
+
+        reader = make_reader(req)
+        writer = make_writer()
+
+        await _handle_connection(
+            browser, reader, writer, stop, on_close_command=_hook,
+        )
+
+        # Callback fires exactly once; the legacy stop_event path is NOT
+        # taken when the hook is provided.
+        assert callback_calls == [1]
+
+    async def test_close_without_callback_falls_back_to_stop_event(self):
+        """Backward compatibility: when no hook is passed, the legacy path
+        sets stop_event directly. Existing callers relying on this keep working.
+        """
+        browser = make_browser()
+        browser._close_session_dir = ""
+        stop = asyncio.Event()
+        req = json.dumps({"command": "close", "args": {}}).encode() + b"\n"
+
+        reader = make_reader(req)
+        writer = make_writer()
+
+        await _handle_connection(browser, reader, writer, stop)
+
+        # Without the hook the legacy stop_event mechanism fires.
+        assert stop.is_set()
+
+
+class TestDaemonCancelInFlight:
+    """Cancel-in-flight on client disconnect.
+
+    Scenario: CLI client has a 90 s socket read budget (or a custom one
+    derived from the command args). If the daemon-side handler has not
+    finished within that window and the client closes the socket, the
+    daemon must cancel the dispatch task. Otherwise the task would keep
+    running against the Browser singleton — and the next CLI invocation
+    would see corrupted interleaved state.
+    """
+
+    async def test_client_disconnect_mid_dispatch_cancels_task(self):
+        """Feed a valid request, then close the reader BEFORE the mocked
+        ``_dispatch`` completes. ``_handle_connection`` must cancel the
+        dispatch task and return (without writing a response).
+        """
+        browser = make_browser()
+        stop = asyncio.Event()
+
+        # A reader that delivers the request then has its transport die
+        # before dispatch finishes: feed_eof makes the second read() (the
+        # EOF watcher) resolve immediately, mimicking the client closing
+        # the socket mid-request.
+        req = json.dumps({"command": "back", "args": {}}).encode() + b"\n"
+        reader = asyncio.StreamReader()
+        reader.feed_data(req)
+        reader.feed_eof()
+        writer = make_writer()
+
+        dispatch_started = asyncio.Event()
+        dispatch_finished = asyncio.Event()
+
+        async def _slow_dispatch(_browser, _cmd, _args):
+            dispatch_started.set()
+            try:
+                # Block until either cancelled by the daemon (desired) or
+                # we give up after a generous test timeout (safety).
+                await asyncio.wait_for(dispatch_finished.wait(), timeout=2.0)
+                return {
+                    "status": "ok", "success": True,
+                    "result": "should not reach", "error_code": None,
+                    "data": None, "meta": {},
+                }
+            except asyncio.CancelledError:
+                dispatch_finished.set()
+                raise
+
+        with patch(
+            "bridgic.browser.cli._daemon._dispatch",
+            new=AsyncMock(side_effect=_slow_dispatch),
+        ):
+            await _handle_connection(browser, reader, writer, stop)
+
+        # The dispatch task started but was cancelled mid-flight: no
+        # response was written (client already disconnected).
+        assert dispatch_started.is_set()
+        # The cancellation unblocked the slow dispatch via CancelledError.
+        assert dispatch_finished.is_set()
+        # The writer must NOT have received a normal response, because
+        # the client is gone.
+        assert writer.write.call_count == 0
+
+
+class TestDaemonShutdownRejectionResponseShape:
+    """The ``connection_cb`` inside ``start_daemon`` rejects new connections
+    once shutdown has begun with a specific ``DAEMON_SHUTTING_DOWN`` error
+    shape. We cannot easily exercise the full daemon loop in a unit test,
+    but we can reproduce the rejection writer code path directly to pin
+    the response shape the CLI client will see.
+    """
+
+    async def test_rejection_response_shape_is_retryable_shutting_down(self):
+        """Reproduce the connection_cb rejection branch: a pre-shutdown
+        connection gets a structured error, not a connection reset.
+        """
+        from bridgic.browser.cli._daemon import _response
+
+        resp = _response(
+            success=False,
+            result="Daemon is shutting down; please retry.",
+            error_code="DAEMON_SHUTTING_DOWN",
+            meta={"retryable": True},
+        )
+
+        assert resp["success"] is False
+        assert resp["error_code"] == "DAEMON_SHUTTING_DOWN"
+        assert resp["meta"]["retryable"] is True
+        assert "shutting down" in resp["result"].lower()
