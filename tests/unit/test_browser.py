@@ -2979,3 +2979,663 @@ class TestRetriableLaunch:
                 await _browser_module._retriable_launch(launch, mode="persistent_context")
 
         assert len(attempts) == 1
+
+
+# ---------------------------------------------------------------------------
+# CDP borrowed-mode browser paths (from PR #21 CR follow-ups)
+# ---------------------------------------------------------------------------
+# `_is_cdp_borrowed` is True when `_cdp_resolved` is set AND
+# `_cdp_context_owned` is False (the default). The paths below bypass
+# Playwright's `_mainContext()` because it never resolves for pre-existing
+# tabs — every CDP-specific branch must be covered here.
+
+
+def _make_cdp_borrowed_browser():
+    """Construct a Browser in CDP borrowed mode without starting Playwright.
+
+    Sets ``_cdp_resolved`` to a fake ws url (truthy) and keeps the default
+    ``_cdp_context_owned = False`` so ``_is_cdp_borrowed`` returns True.
+    """
+    b = Browser()
+    b._cdp_resolved = "ws://localhost:9222/devtools/browser/abc"
+    b._cdp_context_owned = False
+    b._context = MagicMock()
+    return b
+
+
+class TestGetPageTitleCDP:
+    """Tests for ``Browser._get_page_title`` across CDP and non-CDP paths."""
+
+    @pytest.mark.asyncio
+    async def test_non_cdp_calls_playwright_title(self):
+        """Non-CDP path: delegate to ``page.title()`` directly."""
+        browser = Browser()  # _is_cdp_borrowed = False
+        fake_page = MagicMock()
+        fake_page.title = AsyncMock(return_value="Hello World")
+
+        result = await browser._get_page_title(fake_page)
+
+        assert result == "Hello World"
+        fake_page.title.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cdp_uses_runtime_evaluate_for_document_title(self):
+        """CDP borrowed mode: read ``document.title`` via raw ``CDPSession``."""
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.url = "https://example.com"
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(
+            return_value={"result": {"type": "string", "value": "CDP Title"}}
+        )
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        result = await browser._get_page_title(fake_page)
+
+        assert result == "CDP Title"
+        fake_session.send.assert_awaited_once_with(
+            "Runtime.evaluate",
+            {"expression": "document.title", "returnByValue": True},
+        )
+        fake_session.detach.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cdp_falls_back_to_url_on_empty_title(self):
+        """Empty ``document.title`` value → fall back to ``page.url`` (chrome:// etc.)."""
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.url = "chrome://newtab"
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(return_value={"result": {"value": ""}})
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        result = await browser._get_page_title(fake_page)
+
+        assert result == "chrome://newtab"
+
+    @pytest.mark.asyncio
+    async def test_cdp_falls_back_to_url_on_cdp_exception(self):
+        """CDP session raises → fall back to ``page.url`` instead of bubbling up."""
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.url = "https://broken.example.com"
+        browser._context.new_cdp_session = AsyncMock(
+            side_effect=RuntimeError("CDP detach failed")
+        )
+
+        result = await browser._get_page_title(fake_page)
+
+        assert result == "https://broken.example.com"
+
+    @pytest.mark.asyncio
+    async def test_cdp_falls_back_to_url_on_timeout(self):
+        """CDP ``Runtime.evaluate`` timing out → URL fallback.
+
+        The 5 s wait_for inside ``_get_page_title`` is the belt-and-suspenders
+        guard against a truly wedged Chrome; the URL fallback is what the SDK
+        / CLI caller actually sees.
+        """
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.url = "https://wedged.example.com"
+
+        async def _hang(*_a, **_kw):
+            await asyncio.sleep(30.0)
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(side_effect=_hang)
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        # Patch the module's wait_for timeout so the test doesn't actually wait 5s.
+        with patch(
+            "bridgic.browser.session._browser.asyncio.wait_for",
+            new=AsyncMock(side_effect=asyncio.TimeoutError()),
+        ):
+            result = await browser._get_page_title(fake_page)
+
+        assert result == "https://wedged.example.com"
+
+    @pytest.mark.asyncio
+    async def test_cdp_detaches_session_in_finally(self):
+        """The CDPSession must be detached even when send() raises."""
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.url = "https://a.com"
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(side_effect=RuntimeError("boom"))
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        await browser._get_page_title(fake_page)
+
+        fake_session.detach.assert_awaited_once()
+
+
+class TestCdpNavigateHistory:
+    """Tests for ``Browser._cdp_navigate_history`` — CDP-level go_back/forward."""
+
+    @pytest.mark.asyncio
+    async def test_delta_minus_one_navigates_to_previous_entry(self):
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.wait_for_load_state = AsyncMock()
+
+        fake_session = MagicMock()
+        history = {
+            "currentIndex": 2,
+            "entries": [{"id": 10}, {"id": 11}, {"id": 12}],
+        }
+
+        async def _send(cmd, params=None):
+            if cmd == "Page.getNavigationHistory":
+                return history
+            if cmd == "Page.navigateToHistoryEntry":
+                assert params == {"entryId": 11}
+                return {}
+            raise AssertionError(f"unexpected CDP command {cmd}")
+
+        fake_session.send = AsyncMock(side_effect=_send)
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        await browser._cdp_navigate_history(fake_page, delta=-1)
+
+        # Two CDP calls: getNavigationHistory + navigateToHistoryEntry
+        assert fake_session.send.await_count == 2
+        fake_session.detach.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_delta_plus_one_navigates_to_next_entry(self):
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.wait_for_load_state = AsyncMock()
+
+        fake_session = MagicMock()
+        history = {
+            "currentIndex": 0,
+            "entries": [{"id": 10}, {"id": 11}],
+        }
+        entry_ids_visited = []
+
+        async def _send(cmd, params=None):
+            if cmd == "Page.getNavigationHistory":
+                return history
+            if cmd == "Page.navigateToHistoryEntry":
+                entry_ids_visited.append(params["entryId"])
+                return {}
+
+        fake_session.send = AsyncMock(side_effect=_send)
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        await browser._cdp_navigate_history(fake_page, delta=+1)
+
+        assert entry_ids_visited == [11]
+
+    @pytest.mark.asyncio
+    async def test_out_of_bounds_negative_raises_no_history_entry(self):
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.wait_for_load_state = AsyncMock()
+
+        fake_session = MagicMock()
+        history = {"currentIndex": 0, "entries": [{"id": 10}]}
+        fake_session.send = AsyncMock(return_value=history)
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        with pytest.raises(StateError) as exc_info:
+            await browser._cdp_navigate_history(fake_page, delta=-1)
+
+        assert exc_info.value.code == "NO_HISTORY_ENTRY"
+        assert exc_info.value.retryable is False
+        # Session still detached on the error path.
+        fake_session.detach.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_out_of_bounds_positive_raises_no_history_entry(self):
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.wait_for_load_state = AsyncMock()
+
+        fake_session = MagicMock()
+        history = {
+            "currentIndex": 1,
+            "entries": [{"id": 10}, {"id": 11}],
+        }
+        fake_session.send = AsyncMock(return_value=history)
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        with pytest.raises(StateError) as exc_info:
+            await browser._cdp_navigate_history(fake_page, delta=+1)
+
+        assert exc_info.value.code == "NO_HISTORY_ENTRY"
+
+    @pytest.mark.asyncio
+    async def test_load_state_timeout_is_swallowed(self):
+        """wait_for_load_state() may time out when the target already loaded
+        before we called it — not a real error.
+        """
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.wait_for_load_state = AsyncMock(side_effect=asyncio.TimeoutError())
+
+        fake_session = MagicMock()
+        history = {"currentIndex": 1, "entries": [{"id": 10}, {"id": 11}]}
+        fake_session.send = AsyncMock(return_value=history)
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        # Must not raise.
+        await browser._cdp_navigate_history(fake_page, delta=-1)
+
+
+class TestEvaluateJavascriptCDPReturnTypes:
+    """Tests for ``Browser.evaluate_javascript`` CDP return-value handling.
+
+    PR #21 introduced a raw ``Runtime.evaluate`` path in CDP borrowed mode.
+    Unlike Playwright's ``page.evaluate`` (rich serialiser), the raw CDP
+    call is strict JSON and loses non-JSON types. The follow-up fix in
+    PR #26 returns the CDP ``description`` string for those cases instead
+    of a misleading ``None``.
+    """
+
+    @pytest.mark.asyncio
+    async def _run(self, browser, cdp_result):
+        """Helper: invoke ``evaluate_javascript`` with a mocked CDP response."""
+        fake_page = MagicMock()
+        browser.get_current_page = AsyncMock(return_value=fake_page)
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(return_value={"result": cdp_result})
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        return await browser.evaluate_javascript("() => document.title")
+
+    @pytest.mark.asyncio
+    async def test_cdp_plain_string_returned(self):
+        browser = _make_cdp_borrowed_browser()
+        result = await self._run(browser, {"type": "string", "value": "hello"})
+        assert result == "hello"
+
+    @pytest.mark.asyncio
+    async def test_cdp_number_formatted_as_str(self):
+        browser = _make_cdp_borrowed_browser()
+        result = await self._run(browser, {"type": "number", "value": 42})
+        assert result == "42"
+
+    @pytest.mark.asyncio
+    async def test_cdp_boolean_formatted_as_True_False(self):
+        browser = _make_cdp_borrowed_browser()
+        result_true = await self._run(browser, {"type": "boolean", "value": True})
+        assert result_true == "True"
+        result_false = await self._run(browser, {"type": "boolean", "value": False})
+        assert result_false == "False"
+
+    @pytest.mark.asyncio
+    async def test_cdp_null_value_returns_None_string(self):
+        browser = _make_cdp_borrowed_browser()
+        # CDP serialises null as {type: "object", subtype: "null", value: None}
+        result = await self._run(
+            browser, {"type": "object", "subtype": "null", "value": None}
+        )
+        assert result == "None"
+
+    @pytest.mark.asyncio
+    async def test_cdp_undefined_returns_None_string(self):
+        """``{type: 'undefined'}`` has no ``value`` → we coerce to None → 'None'."""
+        browser = _make_cdp_borrowed_browser()
+        result = await self._run(browser, {"type": "undefined"})
+        assert result == "None"
+
+    @pytest.mark.asyncio
+    async def test_cdp_non_serializable_falls_back_to_description(self):
+        """Date / RegExp / Map / Set / DOM node return no ``value``.
+
+        The PR #26 follow-up returns the CDP ``description`` string so the
+        caller gets something human-readable instead of a misleading ``None``.
+        """
+        browser = _make_cdp_borrowed_browser()
+        result = await self._run(
+            browser,
+            {"type": "object", "subtype": "date", "description": "Fri Jan 01 1970 00:00:00 GMT+0000"},
+        )
+        assert "Fri Jan 01 1970" in result
+
+    @pytest.mark.asyncio
+    async def test_cdp_non_serializable_without_description_uses_placeholder(self):
+        """Degenerate CDP response: type but no value AND no description."""
+        browser = _make_cdp_borrowed_browser()
+        result = await self._run(browser, {"type": "object"})
+        assert "<non-serializable" in result
+
+    @pytest.mark.asyncio
+    async def test_cdp_json_object_returns_str_repr(self):
+        """Plain JSON objects round-trip via ``returnByValue: True`` as dicts."""
+        browser = _make_cdp_borrowed_browser()
+        result = await self._run(
+            browser, {"type": "object", "value": {"a": 1, "b": [2, 3]}}
+        )
+        # The exact formatting is ``str(dict)``; what we care about is that
+        # the payload made it out intact.
+        assert "'a'" in result and "'b'" in result
+
+    @pytest.mark.asyncio
+    async def test_non_cdp_calls_page_evaluate_directly(self):
+        """Non-CDP mode: take the standard Playwright path, no CDP session."""
+        browser = Browser()  # _is_cdp_borrowed = False
+        fake_page = MagicMock()
+        fake_page.evaluate = AsyncMock(return_value="ok")
+        browser.get_current_page = AsyncMock(return_value=fake_page)
+
+        result = await browser.evaluate_javascript("() => 'ok'")
+
+        assert result == "ok"
+        fake_page.evaluate.assert_awaited_once_with("() => 'ok'")
+
+
+class TestCheckElementCoveredCDP:
+    """Tests for ``_check_element_covered`` CDP borrowed-mode geometric check.
+
+    Added in PR #26 to fix the "silent miss-click on element under a modal"
+    CDP-mode bug. The CDP path uses raw ``Runtime.evaluate`` instead of
+    ``locator.evaluate()`` (which hangs in borrowed mode).
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_cdp_path_uses_locator_evaluate(self):
+        """Non-CDP path: ``t === el && !el.contains(t)`` via main world."""
+        from bridgic.browser.session._locator_utils import _check_element_covered
+
+        locator = MagicMock()
+        locator.evaluate = AsyncMock(return_value=True)
+
+        result = await _check_element_covered(locator, 100, 200, cdp_context=None)
+
+        assert result is True
+        locator.evaluate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cdp_path_same_rect_reports_not_covered(self):
+        """Locator bbox matches hit rect (± 1 px) → not covered."""
+        from bridgic.browser.session._locator_utils import _check_element_covered
+
+        locator = MagicMock()
+        locator.bounding_box = AsyncMock(
+            return_value={"x": 100.0, "y": 200.0, "width": 50.0, "height": 30.0}
+        )
+        fake_page = MagicMock()
+        locator.page = fake_page
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(
+            return_value={"result": {"value": [100.0, 200.0, 50.0, 30.0]}}
+        )
+        fake_session.detach = AsyncMock()
+        cdp_ctx = MagicMock()
+        cdp_ctx.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        result = await _check_element_covered(locator, 125, 215, cdp_context=cdp_ctx)
+
+        assert result is False
+        fake_session.detach.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cdp_path_different_rect_reports_covered(self):
+        """Hit rect differs from locator bbox → something covers it."""
+        from bridgic.browser.session._locator_utils import _check_element_covered
+
+        locator = MagicMock()
+        locator.bounding_box = AsyncMock(
+            return_value={"x": 100.0, "y": 200.0, "width": 50.0, "height": 30.0}
+        )
+        locator.page = MagicMock()
+
+        fake_session = MagicMock()
+        # Hit element sits somewhere else entirely (modal overlay).
+        fake_session.send = AsyncMock(
+            return_value={"result": {"value": [10.0, 10.0, 800.0, 600.0]}}
+        )
+        fake_session.detach = AsyncMock()
+        cdp_ctx = MagicMock()
+        cdp_ctx.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        result = await _check_element_covered(locator, 125, 215, cdp_context=cdp_ctx)
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_cdp_path_sub_pixel_tolerance(self):
+        """±1 px tolerance absorbs DPR / rounding jitter."""
+        from bridgic.browser.session._locator_utils import _check_element_covered
+
+        locator = MagicMock()
+        locator.bounding_box = AsyncMock(
+            return_value={"x": 100.0, "y": 200.0, "width": 50.0, "height": 30.0}
+        )
+        locator.page = MagicMock()
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(
+            # 0.5 px drift on every side
+            return_value={"result": {"value": [100.5, 200.5, 50.5, 30.5]}}
+        )
+        fake_session.detach = AsyncMock()
+        cdp_ctx = MagicMock()
+        cdp_ctx.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        result = await _check_element_covered(locator, 125, 215, cdp_context=cdp_ctx)
+
+        assert result is False  # within tolerance → not covered
+
+    @pytest.mark.asyncio
+    async def test_cdp_path_missing_bbox_returns_not_covered(self):
+        """Element with no bbox → conservatively return not-covered."""
+        from bridgic.browser.session._locator_utils import _check_element_covered
+
+        locator = MagicMock()
+        locator.bounding_box = AsyncMock(return_value=None)
+        cdp_ctx = MagicMock()
+
+        result = await _check_element_covered(locator, 100, 200, cdp_context=cdp_ctx)
+
+        assert result is False
+        # No CDP session should have been opened when bbox is missing.
+        cdp_ctx.new_cdp_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cdp_path_hit_none_returns_not_covered(self):
+        """``elementFromPoint`` returning null → treat as not covered."""
+        from bridgic.browser.session._locator_utils import _check_element_covered
+
+        locator = MagicMock()
+        locator.bounding_box = AsyncMock(
+            return_value={"x": 100.0, "y": 200.0, "width": 50.0, "height": 30.0}
+        )
+        locator.page = MagicMock()
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(return_value={"result": {"value": None}})
+        fake_session.detach = AsyncMock()
+        cdp_ctx = MagicMock()
+        cdp_ctx.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        result = await _check_element_covered(locator, 125, 215, cdp_context=cdp_ctx)
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_cdp_path_cdp_session_error_returns_not_covered(self):
+        """CDP session exception → swallow and return False (pre-PR #26 behaviour)."""
+        from bridgic.browser.session._locator_utils import _check_element_covered
+
+        locator = MagicMock()
+        locator.bounding_box = AsyncMock(
+            return_value={"x": 100.0, "y": 200.0, "width": 50.0, "height": 30.0}
+        )
+        locator.page = MagicMock()
+
+        cdp_ctx = MagicMock()
+        cdp_ctx.new_cdp_session = AsyncMock(side_effect=RuntimeError("CDP dead"))
+
+        result = await _check_element_covered(locator, 100, 200, cdp_context=cdp_ctx)
+
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Interaction tools — prefetch cancellation + actionability delegation
+# ---------------------------------------------------------------------------
+# Every click-like interaction must invoke ``_cancel_prefetch()`` at the top
+# of its body: a click can silently trigger navigation (<a href>, form submit,
+# SPA route) and any pre-warm snapshot started BEFORE the click is now stale.
+# Likewise every normal (non-covered, non-shadow-DOM) click path funnels
+# through ``_locator_action_with_fallback`` so the daemon-responsive 10 s
+# cap and the PR #26 enabled/visible fallback gate both apply.
+
+
+class TestInteractionToolsCancelPrefetch:
+    """Pin down that each interaction tool bumps ``_prefetch_gen`` on entry.
+
+    This is the contract that lets ``_pre_warm_snapshot`` reject a stale
+    commit when the action it was racing against has already happened.
+    """
+
+    def _make_browser(self) -> Browser:
+        b = Browser()
+        b._context = MagicMock()
+        b._page = MagicMock()
+        return b
+
+    @pytest.mark.asyncio
+    async def test_click_element_by_ref_cancels_prefetch_before_action(self):
+        """``click_element_by_ref`` must call ``_cancel_prefetch`` before any
+        other work (observed via ``_prefetch_gen`` bump when the element
+        lookup fails immediately).
+        """
+        browser = self._make_browser()
+        browser.get_element_by_ref = AsyncMock(return_value=None)  # trigger early return
+
+        gen_before = browser._prefetch_gen
+        with pytest.raises(StateError):
+            await browser.click_element_by_ref("nonexistent")
+
+        assert browser._prefetch_gen == gen_before + 1, (
+            "click must bump _prefetch_gen before raising REF_NOT_AVAILABLE"
+        )
+
+    @pytest.mark.asyncio
+    async def test_check_checkbox_or_radio_cancels_prefetch(self):
+        browser = self._make_browser()
+        browser.get_element_by_ref = AsyncMock(return_value=None)
+
+        gen_before = browser._prefetch_gen
+        with pytest.raises(StateError):
+            await browser.check_checkbox_or_radio_by_ref("x")
+
+        assert browser._prefetch_gen == gen_before + 1
+
+    @pytest.mark.asyncio
+    async def test_uncheck_checkbox_cancels_prefetch(self):
+        browser = self._make_browser()
+        browser.get_element_by_ref = AsyncMock(return_value=None)
+
+        gen_before = browser._prefetch_gen
+        with pytest.raises(StateError):
+            await browser.uncheck_checkbox_by_ref("x")
+
+        assert browser._prefetch_gen == gen_before + 1
+
+    @pytest.mark.asyncio
+    async def test_double_click_cancels_prefetch(self):
+        browser = self._make_browser()
+        browser.get_element_by_ref = AsyncMock(return_value=None)
+
+        gen_before = browser._prefetch_gen
+        with pytest.raises(StateError):
+            await browser.double_click_element_by_ref("x")
+
+        assert browser._prefetch_gen == gen_before + 1
+
+    @pytest.mark.asyncio
+    async def test_select_dropdown_option_cancels_prefetch(self):
+        browser = self._make_browser()
+        browser.get_element_by_ref = AsyncMock(return_value=None)
+
+        gen_before = browser._prefetch_gen
+        with pytest.raises(StateError):
+            await browser.select_dropdown_option_by_ref("x", "option1")
+
+        assert browser._prefetch_gen == gen_before + 1
+
+
+class TestClickIntegrationUsesFallbackGate:
+    """End-to-end-style verification that a visible+enabled element with a
+    stable-check timeout still succeeds (via fallback), while a visible but
+    *disabled* element raises — exercising the PR #26 gating logic through
+    ``click_element_by_ref``.
+    """
+
+    def _make_browser(self) -> Browser:
+        b = Browser()
+        b._context = MagicMock()
+        b._page = MagicMock()
+        return b
+
+    @pytest.mark.asyncio
+    async def test_click_on_stable_flap_element_succeeds_via_fallback(self):
+        """Element is visible+enabled but Playwright's stable check flaps →
+        fallback dispatches the click and the call returns 'Clicked ...'.
+        """
+        browser = self._make_browser()
+
+        locator = MagicMock()
+        locator.bounding_box = AsyncMock(return_value=None)  # force the "no bbox" branch
+        locator.is_visible = AsyncMock(return_value=True)
+        locator.is_enabled = AsyncMock(return_value=True)
+        # Primary click times out — Vue/React SPA stable-check loop.
+        locator.click = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("timeout")
+        )
+        locator.dispatch_event = AsyncMock()
+
+        browser.get_element_by_ref = AsyncMock(return_value=locator)
+
+        result = await browser.click_element_by_ref("ref1")
+
+        assert "Clicked" in result
+        # Fallback dispatch actually fired (visible + enabled = eligible).
+        locator.dispatch_event.assert_awaited_once_with("click")
+
+    @pytest.mark.asyncio
+    async def test_click_on_aria_disabled_element_raises(self):
+        """Visible but aria-disabled button → fallback gate rejects → user sees
+        a real TIMEOUT error (wrapped as OperationError via the tool's outer
+        except clause), never a misleading silent 'Clicked'.
+        """
+        browser = self._make_browser()
+
+        locator = MagicMock()
+        locator.bounding_box = AsyncMock(return_value=None)
+        locator.is_visible = AsyncMock(return_value=True)
+        locator.is_enabled = AsyncMock(return_value=False)  # aria-disabled
+        locator.click = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("timeout")
+        )
+        locator.dispatch_event = AsyncMock()
+
+        browser.get_element_by_ref = AsyncMock(return_value=locator)
+
+        with pytest.raises((_browser_module.PlaywrightTimeoutError, OperationError)):
+            await browser.click_element_by_ref("ref1")
+
+        # Crucially: dispatch_event was NEVER called — the gate rejected it.
+        locator.dispatch_event.assert_not_awaited()
