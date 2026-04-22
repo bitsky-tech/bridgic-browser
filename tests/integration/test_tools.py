@@ -36,6 +36,7 @@ Tool Coverage (67 tools, aligned with CLI sections):
 """
 
 import asyncio
+import json
 import os
 import re
 import tempfile
@@ -706,6 +707,89 @@ class TestStorageTools:
             # Restore it
             result = await browser.restore_storage_state(filename=filepath)
             assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_restore_storage_state_multi_origin(self):
+        """Restored localStorage must be scoped to its own origin, not the current page's origin."""
+        async def _stub(route):
+            try:
+                await route.fulfill(
+                    status=200,
+                    content_type="text/html",
+                    body="<!doctype html><html></html>",
+                )
+            except Exception:
+                try:
+                    await route.abort()
+                except Exception:
+                    pass
+
+        origins = [
+            "http://alpha.bridgic.test",
+            "http://beta.bridgic.test",
+            "http://gamma.bridgic.test",
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "state.json")
+
+            seed = Browser(headless=True, stealth=False)
+            await seed._start()
+            try:
+                await seed._context.route("**/*", _stub)
+                seed_page = await seed.get_current_page()
+                if seed_page is None:
+                    seed_page = await seed._context.new_page()
+                for origin in origins:
+                    await seed_page.goto(origin, wait_until="domcontentloaded")
+                    await seed_page.evaluate(
+                        "origin => { localStorage.setItem('origin_marker', origin);"
+                        " localStorage.setItem('flag', 'seeded');"
+                        " document.cookie = 'site_marker=' + location.hostname + '; path=/; max-age=3600'; }",
+                        origin,
+                    )
+                await seed.save_storage_state(filename=state_path)
+            finally:
+                await seed.close()
+
+            with open(state_path) as f:
+                state = json.load(f)
+            assert {o["origin"] for o in state["origins"]} == set(origins)
+
+            restore = Browser(headless=True, stealth=False)
+            await restore._start()
+            try:
+                await restore._context.route("**/*", _stub)
+                page = await restore.get_current_page()
+                if page is None:
+                    page = await restore._context.new_page()
+                await page.goto(origins[0], wait_until="domcontentloaded")
+
+                await restore.restore_storage_state(filename=state_path)
+
+                for origin in origins:
+                    await page.goto(origin, wait_until="domcontentloaded")
+                    result = await page.evaluate(
+                        "() => ({ origin: location.origin,"
+                        " marker: localStorage.getItem('origin_marker'),"
+                        " flag: localStorage.getItem('flag'),"
+                        " keyCount: localStorage.length,"
+                        " cookie: document.cookie })"
+                    )
+                    assert result["origin"] == origin, f"goto origin mismatch for {origin}"
+                    assert result["marker"] == origin, (
+                        f"localStorage scoped to wrong origin: {origin} got marker={result['marker']}"
+                    )
+                    assert result["flag"] == "seeded", f"missing flag on {origin}"
+                    assert result["keyCount"] == 2, (
+                        f"unexpected localStorage key count on {origin}: {result['keyCount']}"
+                    )
+                    hostname = origin.split("//", 1)[1]
+                    assert f"site_marker={hostname}" in result["cookie"], (
+                        f"cookie missing/wrong on {origin}: {result['cookie']!r}"
+                    )
+            finally:
+                await restore.close()
 
 # ==================== 11. Verification Tools (6 tools) ====================
 
