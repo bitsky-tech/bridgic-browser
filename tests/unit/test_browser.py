@@ -501,25 +501,78 @@ class TestBrowserStartStop:
 
     @pytest.mark.asyncio
     async def test_default_persistent_uses_bridgic_user_data_dir(self, mock_playwright):
-        """Default (clear_user_data=False, no user_data_dir) passes BRIDGIC_USER_DATA_DIR to launch_persistent_context."""
-        from bridgic.browser._constants import BRIDGIC_USER_DATA_DIR
+        """Default (no user_data_dir) → BRIDGIC_USER_DATA_DIR/headless is passed to launch_persistent_context."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_base = Path(tmpdir) / "user_data"
+            with patch("bridgic.browser.session._browser.async_playwright") as mock_ap, \
+                 patch("bridgic.browser.session._browser.BRIDGIC_USER_DATA_DIR", fake_base):
+                mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
-        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
-            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+                browser = Browser(stealth=False)
+                assert browser.use_persistent_context is True
+                assert browser.clear_user_data is False
 
-            browser = Browser(stealth=False)
-            assert browser.use_persistent_context is True
-            assert browser.clear_user_data is False
+                await browser._start()
 
-            await browser._start()
+                mock_playwright.chromium.launch_persistent_context.assert_called_once()
+                call_kwargs = mock_playwright.chromium.launch_persistent_context.call_args
+                assert call_kwargs.kwargs.get("user_data_dir") == str(fake_base / "headless")
+                assert (fake_base / "headless").is_dir()
 
-            mock_playwright.chromium.launch_persistent_context.assert_called_once()
-            call_kwargs = mock_playwright.chromium.launch_persistent_context.call_args
-            # _isolate_config fixture patches BRIDGIC_USER_DATA_DIR with a MagicMock whose
-            # str() returns str(BRIDGIC_USER_DATA_DIR), so this check remains meaningful.
-            assert call_kwargs.kwargs.get("user_data_dir") == str(BRIDGIC_USER_DATA_DIR)
+                await browser.close()
 
-            await browser.close()
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "headless,use_custom_base,expected_mode",
+        [
+            (True, False, "headless"),
+            (False, False, "headed"),
+            (True, True, "headless"),
+            (False, True, "headed"),
+        ],
+    )
+    async def test_persistent_profile_dir_split_headed_headless(
+        self, mock_playwright, headless, use_custom_base, expected_mode
+    ):
+        """Persistent profile is placed under <base>/headed or <base>/headless per mode.
+
+        Covers both the default base (BRIDGIC_USER_DATA_DIR) and a user-supplied
+        base; the suffix must always be applied to prevent SingletonLock collisions.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir) / ("custom" if use_custom_base else "user_data")
+            kwargs = {"stealth": False, "headless": headless}
+            patches = [patch("bridgic.browser.session._browser.async_playwright")]
+            if use_custom_base:
+                kwargs["user_data_dir"] = str(base)
+            else:
+                patches.append(
+                    patch("bridgic.browser.session._browser.BRIDGIC_USER_DATA_DIR", base)
+                )
+
+            with patches[0] as mock_ap:
+                mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+                stack = patches[1] if len(patches) > 1 else None
+                if stack is not None:
+                    stack.start()
+                try:
+                    browser = Browser(**kwargs)
+                    await browser._start()
+
+                    call_kwargs = mock_playwright.chromium.launch_persistent_context.call_args
+                    expected = base / expected_mode
+                    assert call_kwargs.kwargs.get("user_data_dir") == str(expected)
+                    assert expected.is_dir()
+                    # Public property still reflects the user-supplied value (or None).
+                    if use_custom_base:
+                        assert browser.user_data_dir == base
+                    else:
+                        assert browser.user_data_dir is None
+
+                    await browser.close()
+                finally:
+                    if stack is not None:
+                        stack.stop()
 
     @pytest.mark.asyncio
     async def test_async_context_manager_uses_start_and_kill(self, mock_playwright, mock_context, mock_page):
@@ -1420,12 +1473,16 @@ class TestBrowserNavigation:
             assert browser._last_snapshot_url is None
 
     @pytest.mark.asyncio
-    async def test_navigate_to_empty_url_raises_invalid_input(self):
-        browser = Browser(stealth=False)
+    async def test_navigate_to_empty_url_raises_invalid_input(self, mock_playwright):
+        # navigate_to runs _ensure_started() before the URL_EMPTY check, so
+        # async_playwright must be mocked or this test launches real Chromium.
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
 
-        with pytest.raises(InvalidInputError) as exc_info:
-            await browser.navigate_to("   ")
-        assert exc_info.value.code == "URL_EMPTY"
+            with pytest.raises(InvalidInputError) as exc_info:
+                await browser.navigate_to("   ")
+            assert exc_info.value.code == "URL_EMPTY"
 
     @pytest.mark.asyncio
     async def test_navigate_to_wraps_playwright_errors(self, mock_playwright, mock_page):

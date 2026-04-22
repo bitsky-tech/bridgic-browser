@@ -894,6 +894,20 @@ class Browser:
 
         return options
 
+    def _resolve_persistent_profile_dir(self) -> Path:
+        """Resolve the final profile dir, split into headed/headless subdirs.
+
+        Headed and headless Chromium can't safely share the same profile dir
+        (SingletonLock / GPU-cache state collisions cause cross-mode startup
+        crashes), so the mode-specific subdir is always applied. The public
+        ``user_data_dir`` property still returns the user-supplied base path.
+        """
+        base = self._user_data_dir if self._user_data_dir else BRIDGIC_USER_DATA_DIR
+        mode = "headed" if self._headless is False else "headless"
+        profile_dir = base / mode
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        return profile_dir
+
     def _get_persistent_context_options(self) -> Dict[str, Any]:
         """Get options for launch_persistent_context() method.
 
@@ -910,14 +924,13 @@ class Browser:
         # Add context options
         options.update(self._get_context_options())
 
-        # Determine user_data_dir (only reached when clear_user_data=False)
-        if self._user_data_dir:
-            options["user_data_dir"] = str(self._user_data_dir)
-        else:
-            # No custom path: use the default persistent profile directory.
-            BRIDGIC_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
-            options["user_data_dir"] = str(BRIDGIC_USER_DATA_DIR)
-            logger.info(f"Using default user data dir: {BRIDGIC_USER_DATA_DIR}")
+        # Determine user_data_dir (only reached when clear_user_data=False).
+        # Always split into <base>/headed or <base>/headless to avoid
+        # SingletonLock collisions when switching modes on the same profile.
+        profile_dir = self._resolve_persistent_profile_dir()
+        options["user_data_dir"] = str(profile_dir)
+        if not self._user_data_dir:
+            logger.info(f"Using default user data dir: {profile_dir}")
 
         return options
 
@@ -6454,64 +6467,120 @@ Before you return the element ref, reason about the state and elements for a sen
 
             _skipped_ls_items: list[str] = []
             origins = state.get("origins", [])
-            for origin_data in origins:
-                origin = origin_data.get("origin", "")
-                local_storage = origin_data.get("localStorage", [])
+            origins_with_ls = [
+                o for o in origins
+                if o.get("origin") and o.get("localStorage")
+            ]
 
-                if local_storage and origin:
-                    if self._is_cdp_borrowed and self._context:
-                        # CDP borrowed mode: page.evaluate() hangs. Use DOMStorage CDP protocol.
-                        # DOMStorage.setDOMStorageItem may fail with "Frame not found" when
-                        # the target origin has no active frame — this is expected in CDP
-                        # borrowed mode.  Collect failures and warn rather than hard-fail,
-                        # because cookies have already been restored successfully.
-                        session = await self._context.new_cdp_session(page)
-                        try:
-                            storage_id = {"storageId": {"securityOrigin": origin, "isLocalStorage": True}}
-                            for item in local_storage:
-                                name = item.get("name", "")
-                                value = item.get("value", "")
-                                if name:
-                                    try:
-                                        await asyncio.wait_for(
-                                            session.send("DOMStorage.setDOMStorageItem", {
-                                                **storage_id,
-                                                "key": name,
-                                                "value": value,
-                                            }),
-                                            timeout=5.0,
-                                        )
-                                    except Exception as _ls_err:
-                                        logger.debug(
-                                            "[restore_storage_state] localStorage item skipped "
-                                            "(origin=%s key=%s): %s",
-                                            origin, name, _ls_err,
-                                        )
-                                        _skipped_ls_items.append(f"{origin}/{name}")
-                        finally:
-                            try:
-                                await session.detach()
-                            except Exception:
-                                pass
-                    else:
+            if origins_with_ls and self._is_cdp_borrowed and self._context:
+                # CDP borrowed mode: page.evaluate() hangs. Use DOMStorage CDP
+                # protocol, which targets storage by securityOrigin rather than
+                # the currently loaded page.  setDOMStorageItem may fail with
+                # "Frame not found" when the target origin has no active frame
+                # — expected in CDP borrowed mode; collect failures and warn
+                # rather than hard-fail because cookies are already restored.
+                session = await self._context.new_cdp_session(page)
+                try:
+                    for origin_data in origins_with_ls:
+                        origin = origin_data["origin"]
+                        local_storage = origin_data["localStorage"]
+                        storage_id = {"storageId": {"securityOrigin": origin, "isLocalStorage": True}}
                         for item in local_storage:
                             name = item.get("name", "")
                             value = item.get("value", "")
-                            if name:
+                            if not name:
+                                continue
+                            try:
                                 await asyncio.wait_for(
-                                    page.evaluate(
-                                        f"localStorage.setItem({json.dumps(name)}, {json.dumps(value)})"
-                                    ),
-                                    timeout=10.0,
+                                    session.send("DOMStorage.setDOMStorageItem", {
+                                        **storage_id,
+                                        "key": name,
+                                        "value": value,
+                                    }),
+                                    timeout=5.0,
                                 )
+                            except Exception as _ls_err:
+                                logger.debug(
+                                    "[restore_storage_state] localStorage item skipped "
+                                    "(origin=%s key=%s): %s",
+                                    origin, name, _ls_err,
+                                )
+                                _skipped_ls_items.append(f"{origin}/{name}")
+                finally:
+                    try:
+                        await session.detach()
+                    except Exception:
+                        pass
+            elif origins_with_ls:
+                # Non-CDP mode: open a dedicated temp page, intercept every
+                # request with a minimal HTML stub so navigation does not touch
+                # the network, then for each origin goto(origin) + evaluate
+                # setItem.  This scopes localStorage writes to the correct
+                # origin's storage area rather than the user's current page.
+                temp_page = await context.new_page()
+
+                async def _stub_route(route):
+                    try:
+                        await route.fulfill(
+                            status=200,
+                            content_type="text/html",
+                            body="<!doctype html><html></html>",
+                        )
+                    except Exception:
+                        try:
+                            await route.abort()
+                        except Exception:
+                            pass
+
+                try:
+                    await temp_page.route("**/*", _stub_route)
+                    for origin_data in origins_with_ls:
+                        origin = origin_data["origin"]
+                        local_storage = origin_data["localStorage"]
+                        items = [
+                            [it.get("name"), it.get("value", "")]
+                            for it in local_storage
+                            if it.get("name")
+                        ]
+                        if not items:
+                            continue
+                        try:
+                            await asyncio.wait_for(
+                                temp_page.goto(origin, wait_until="domcontentloaded"),
+                                timeout=10.0,
+                            )
+                            await asyncio.wait_for(
+                                temp_page.evaluate(
+                                    "items => { for (const [k,v] of items) localStorage.setItem(k, v); }",
+                                    items,
+                                ),
+                                timeout=10.0,
+                            )
+                        except Exception as _origin_err:
+                            logger.debug(
+                                "[restore_storage_state] origin restore failed "
+                                "(origin=%s items=%d): %s",
+                                origin, len(items), _origin_err,
+                            )
+                            _skipped_ls_items.extend(
+                                f"{origin}/{name}" for name, _ in items
+                            )
+                finally:
+                    try:
+                        await temp_page.close()
+                    except Exception:
+                        pass
 
             result = f"Storage state restored from: {filename} ({len(cookies)} cookies)"
             if _skipped_ls_items:
                 result += (
-                    f". Warning: {len(_skipped_ls_items)} localStorage item(s) could not be"
-                    " restored in CDP borrowed mode (navigate to the target origin first,"
-                    " then call storage-load again to apply localStorage)"
+                    f". Warning: {len(_skipped_ls_items)} localStorage item(s) could not be restored"
                 )
+                if self._is_cdp_borrowed:
+                    result += (
+                        " (CDP borrowed mode: navigate to the target origin first,"
+                        " then call storage-load again to apply localStorage)"
+                    )
             logger.info(f"[restore_storage_state] done {result}")
             return result
         except BridgicBrowserError:
