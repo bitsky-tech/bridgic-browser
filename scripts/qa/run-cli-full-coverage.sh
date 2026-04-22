@@ -7,10 +7,42 @@ THIS_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$THIS_DIR/.." && pwd)/.."
 source "$THIS_DIR/env.sh"
 
-REPORT_DIR="$QA_DIR/cli-full-coverage"
+# ---------------------------------------------------------------------------
+# Mode-variant configuration
+# ---------------------------------------------------------------------------
+# BRIDGIC_QA_VARIANT defaults to V1 (persistent, headless, stealth=on) for
+# backward compatibility. When invoked from run-mode-matrix.sh the orchestrator
+# sets these env vars per variant.
+#
+#   BRIDGIC_QA_VARIANT          short id (V1..V7), used as report subdir name
+#   BRIDGIC_QA_HEADED           "1" = pass --headed to open/search
+#   BRIDGIC_QA_CLEAR_USER_DATA  "1" = pass --clear-user-data to open/search
+#   BRIDGIC_QA_CDP              non-empty = pass --cdp <value> to open/search
+#   BRIDGIC_QA_STEALTH          "0" = write {"stealth":false} into BRIDGIC_BROWSER_JSON
+# ---------------------------------------------------------------------------
+: "${BRIDGIC_QA_VARIANT:=V1}"
+: "${BRIDGIC_QA_HEADED:=0}"
+: "${BRIDGIC_QA_CLEAR_USER_DATA:=0}"
+: "${BRIDGIC_QA_CDP:=}"
+: "${BRIDGIC_QA_STEALTH:=1}"
+
+MODE_FLAGS=()
+if [[ "$BRIDGIC_QA_HEADED" == "1" ]]; then MODE_FLAGS+=(--headed); fi
+if [[ "$BRIDGIC_QA_CLEAR_USER_DATA" == "1" ]]; then MODE_FLAGS+=(--clear-user-data); fi
+if [[ -n "$BRIDGIC_QA_CDP" ]]; then MODE_FLAGS+=(--cdp "$BRIDGIC_QA_CDP"); fi
+
+REPORT_DIR="$QA_DIR/cli-full-coverage/$BRIDGIC_QA_VARIANT"
 LOG_DIR="$REPORT_DIR/logs"
 ART_DIR="$REPORT_DIR/artifacts"
 mkdir -p "$LOG_DIR" "$ART_DIR"
+
+# Compose stealth override. Writing the JSON into BRIDGIC_BROWSER_JSON env
+# causes the daemon (started fresh for this variant via full_reset) to pick it
+# up. We intentionally avoid touching ~/.bridgic/bridgic-browser/bridgic-browser.json.
+if [[ "$BRIDGIC_QA_STEALTH" == "0" ]]; then
+  export BRIDGIC_BROWSER_JSON='{"stealth": false}'
+  qa_log "cli-full-coverage[$BRIDGIC_QA_VARIANT]: stealth disabled via BRIDGIC_BROWSER_JSON"
+fi
 
 PLAYGROUND_URL="file://$THIS_DIR/cli-full-coverage.html"
 INJECT_MODAL_URL="file://$THIS_DIR/inject-modal.html"
@@ -79,13 +111,26 @@ mark_na() {
   record_result "$command" "N/A" "-" "$reason"
 }
 
-qa_log "cli-full-coverage: starting, report_dir=$REPORT_DIR"
+# Wrap run_and_record for entry commands that trigger browser start-up
+# (open / search). These are the only CLI subcommands that accept --headed,
+# --clear-user-data, --cdp. All other commands inherit the running daemon mode.
+run_entry_and_record() {
+  local key="$1"; shift
+  local subcmd="$1"; shift
+  if [[ ${#MODE_FLAGS[@]} -gt 0 ]]; then
+    run_and_record "$key" "$subcmd" "$@" "${MODE_FLAGS[@]}"
+  else
+    run_and_record "$key" "$subcmd" "$@"
+  fi
+}
+
+qa_log "cli-full-coverage[$BRIDGIC_QA_VARIANT]: starting, mode_flags=(${MODE_FLAGS[*]:-}), report_dir=$REPORT_DIR"
 
 # Navigation + baseline
-run_and_record "open" open https://example.com
+run_entry_and_record "open" open https://example.com
 run_and_record "info" info
 run_and_record "reload" reload
-run_and_record "search" search "bridgic browser cli" --engine duckduckgo
+run_entry_and_record "search" search "bridgic browser cli" --engine duckduckgo
 run_and_record "back" back
 run_and_record "forward" forward
 run_and_record "snapshot" snapshot
@@ -95,7 +140,7 @@ run_and_record "snapshot_l" snapshot -l 300
 run_and_record "snapshot_s" snapshot -s "$ART_DIR/snapshot-full.txt"
 
 # Playground for element/ref driven actions
-run_and_record "open_playground" open "$PLAYGROUND_URL"
+run_entry_and_record "open_playground" open "$PLAYGROUND_URL"
 refresh_snapshot
 
 CLICK_REF="$(ref_by_text "Click Target" 2>/dev/null || true)"
@@ -156,7 +201,7 @@ else
 fi
 
 # Evaluate + keyboard + mouse
-run_and_record "open_playground_for_eval" open "$PLAYGROUND_URL"
+run_entry_and_record "open_playground_for_eval" open "$PLAYGROUND_URL"
 refresh_snapshot
 CLICK_REF="$(ref_by_text "Click Target" 2>/dev/null || true)"
 NAME_REF="$(ref_by_text "Name Input" 2>/dev/null || true)"
@@ -184,14 +229,14 @@ run_and_record "screenshot" screenshot "$ART_DIR/page.png"
 run_and_record "screenshot_full" screenshot "$ART_DIR/page-full.png" --full-page
 run_and_record "pdf" pdf "$ART_DIR/page.pdf"
 run_and_record "network-start" network-start
-run_and_record "open_for_network" open https://example.com
+run_entry_and_record "open_for_network" open https://example.com
 run_and_record "wait-network" wait-network 10
 run_and_record "network" network --no-clear
 run_and_record "network_static" network --static
 run_and_record "network-stop" network-stop
 
 # Dialog + storage + verify
-run_and_record "open_playground_again" open "$PLAYGROUND_URL"
+run_entry_and_record "open_playground_again" open "$PLAYGROUND_URL"
 refresh_snapshot
 ALERT_REF="$(ref_by_text "Open Alert" 2>/dev/null || true)"
 CONFIRM_REF="$(ref_by_text "Open Confirm" 2>/dev/null || true)"
@@ -240,8 +285,10 @@ run_and_record "video-stop" video-stop "$ART_DIR/video.webm"
 run_and_record "resize" resize 1024 768
 run_and_record "close" close
 
-# CDP mode (optional)
-if [[ -n "${QA_CHROME_BIN:-}" && -x "${QA_CHROME_BIN:-}" ]]; then
+# CDP smoke (only when the whole run is NOT already CDP-mode)
+if [[ -n "$BRIDGIC_QA_CDP" ]]; then
+  mark_na "open --cdp" "already covered by variant $BRIDGIC_QA_VARIANT (CDP-mode run)"
+elif [[ -n "${QA_CHROME_BIN:-}" && -x "${QA_CHROME_BIN:-}" ]]; then
   "$QA_CHROME_BIN" --remote-debugging-port="$QA_CDP_PORT" --user-data-dir="$QA_USER_DATA" about:blank >/dev/null 2>&1 &
   sleep 2
   if run_cli "open_cdp" open https://example.com --cdp "$QA_CDP_PORT"; then

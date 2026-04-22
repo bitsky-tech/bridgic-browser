@@ -2,10 +2,23 @@
 
 Source of truth: `uv run bridgic-browser -h` (captured on 2026-04-21).
 
-Latest execution:
-- Run id: `20260421-182513`
-- Summary: `PASS=90 FAIL=0 N/A=0`
-- Report: `/tmp/bridgic-qa-20260421-182513/cli-full-coverage/coverage-report.md`
+Latest execution (mode matrix, 2026-04-22):
+- Run id: `20260422-115425`
+- Orchestrator: `scripts/qa/run-mode-matrix.sh` (7 variants)
+- Aggregate report: `/tmp/bridgic-qa-20260422-115425/mode-matrix/mode-matrix-report.md`
+
+| Variant | Mode | CLI | SDK diff |
+|---|---|---|---|
+| V1 | Persistent × Headless × Stealth=on | PASS=90 FAIL=0 N/A=0 | PASS=11 FAIL=0 N/A=1 |
+| V2 | Persistent × Headed × Stealth=on | PASS=90 FAIL=0 N/A=0 | — |
+| V3 | Ephemeral × Headless × Stealth=on | PASS=90 FAIL=0 N/A=0 | PASS=11 FAIL=0 N/A=1 |
+| V4 | Ephemeral × Headed × Stealth=on | PASS=90 FAIL=0 N/A=0 | — |
+| V5 | CDP × Headless × Stealth=on | PASS=89 FAIL=0 N/A=1 | PASS=11 FAIL=0 N/A=1 |
+| V6 | CDP × Headed × Stealth=on | PASS=89 FAIL=0 N/A=1 | — |
+| V7 | Persistent × Headless × Stealth=off (smoke) | PASS=8 FAIL=0 N/A=0 | — |
+
+- N/A entries: under V5/V6 the inline `open --cdp` smoke is marked N/A (the whole variant is already CDP mode, so no re-test is needed); in the SDK differential pass `get_element_by_prompt` is always N/A (requires `OPENAI_API_KEY`).
+- Previous baseline (single mode): `20260421-182513` PASS=90 FAIL=0 N/A=0 (equivalent to V1 only).
 
 Status legend:
 - `PENDING`: not executed yet

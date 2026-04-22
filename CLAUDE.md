@@ -36,6 +36,13 @@ make publish version=0.1.0 repo=testpypi      # Full release: version check → 
 make playwright-install
 ```
 
+**Mode matrix QA** (real-browser coverage across all link modes × display modes):
+```bash
+bash scripts/qa/run-mode-matrix.sh                            # full V1..V7 matrix
+BRIDGIC_QA_VARIANTS="V1" bash scripts/qa/run-mode-matrix.sh   # single-variant regression
+```
+Report: `$QA_DIR/mode-matrix/mode-matrix-report.md`. Per-variant semantics and expected N/A in `scripts/qa/mode-matrix-scenarios.md`.
+
 ## Architecture
 
 ### Package structure
