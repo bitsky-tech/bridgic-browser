@@ -72,3 +72,7 @@ skills-lock.json
 
 test-report.md
 task.md
+
+# QA local artifacts (generated)
+scripts/qa/tmp-upload.txt
+scripts/qa/cli-full-coverage.html
