@@ -21,6 +21,9 @@ BRIDGIC_SNAPSHOT_DIR = BRIDGIC_BROWSER_HOME / "snapshot"
 # Default persistent user data directory for browser sessions
 BRIDGIC_USER_DATA_DIR = BRIDGIC_BROWSER_HOME / "user_data"
 
+# Default directory for browser downloads (app-managed fallback)
+BRIDGIC_DOWNLOADS_DIR = BRIDGIC_BROWSER_HOME / "downloads"
+
 
 class ToolCategory(Enum):
     """Browser tool categories.

@@ -51,9 +51,12 @@ Usage:
     asyncio.run(main())
 """
 
+import asyncio
+import json
 import re
 import math
 import logging
+import secrets
 import time
 import hashlib
 from typing import Dict, Optional, Set, List, Tuple, Any
@@ -61,6 +64,377 @@ from dataclasses import dataclass
 from playwright.async_api import FrameLocator as AsyncFrameLocator, Page as AsyncPage, Locator as AsyncLocator
 
 logger = logging.getLogger(__name__)
+
+
+# Chunk size for _batch_get_elements_info; keeps a single page.evaluate() call
+# bounded so the browser JS thread can yield back to the daemon's event loop
+# between chunks. 500 is comfortable for 1000–5000 ref pages.
+_BATCH_INFO_CHUNK_SIZE = 500
+
+
+# Phase 1 of the three-phase evaluate strategy:
+# Called once before the chunk loop. Runs querySelectorAll for every unique
+# ARIA role across ALL chunks and stores the resulting Element arrays in
+# window['__bridgicRoleIndex_<gen>'] — keyed by a per-call generation so
+# concurrent snapshot tasks (e.g. two daemon clients evaluating against the
+# same page) do not share or clobber each other's state.  Because window
+# persists between page.evaluate() calls, subsequent Phase-2 chunks read the
+# pre-built index instead of re-scanning the DOM.
+#
+# Without this, a 5549-ref page split into 12 chunks would run the expensive
+# `div:not([role])` querySelectorAll 12× instead of once — the observed
+# root cause of 95–123 s runtimes and DAEMON_RESPONSE_TIMEOUT failures.
+# Single source of truth for role → CSS selector mappings. Both Phase 1
+# (build role index) and Phase 2 (batch info) reference the same mapping — any
+# drift between them causes silent nth-off-by-one ref corruption. See
+# tests/unit/test_snapshot_selectors.py for the round-trip equivalence check
+# that locks this in.
+_IMPLICIT_ROLE_SELECTORS: Dict[str, str] = {
+    'button': 'button, input[type="button"], input[type="submit"], input[type="reset"], input[type="file"], [role="button"]',
+    'link': 'a[href], area[href], [role="link"]',
+    'textbox': 'input:not([type]), input[type="text"], input[type="email"], input[type="password"], input[type="search"], input[type="url"], input[type="tel"], textarea, [role="textbox"], [contenteditable="true"], [contenteditable=""]',
+    'checkbox': 'input[type="checkbox"], [role="checkbox"]',
+    'radio': 'input[type="radio"], [role="radio"]',
+    'combobox': 'select, [role="combobox"]',
+    'option': 'option, [role="option"]',
+    'heading': 'h1, h2, h3, h4, h5, h6, [role="heading"]',
+    'listitem': 'li, [role="listitem"]',
+    'list': 'ul, ol, [role="list"]',
+    'img': 'img[alt], [role="img"]',
+    'row': 'tr, [role="row"]',
+    'cell': 'td, [role="cell"]',
+    'columnheader': 'th, [role="columnheader"]',
+    'navigation': 'nav, [role="navigation"]',
+    'main': 'main, [role="main"]',
+    'banner': 'header, [role="banner"]',
+    'contentinfo': 'footer, [role="contentinfo"]',
+    'table': 'table, [role="table"]',
+    'menuitem': '[role="menuitem"]',
+    'menuitemcheckbox': '[role="menuitemcheckbox"]',
+    'menuitemradio': '[role="menuitemradio"]',
+    'tab': '[role="tab"]',
+    'tabpanel': '[role="tabpanel"]',
+    'treeitem': '[role="treeitem"]',
+    'switch': '[role="switch"]',
+    'slider': 'input[type="range"], [role="slider"]',
+    'spinbutton': 'input[type="number"], [role="spinbutton"]',
+    'searchbox': 'input[type="search"], [role="searchbox"]',
+    'progressbar': 'progress, [role="progressbar"]',
+    'scrollbar': '[role="scrollbar"]',
+    'separator': 'hr, [role="separator"]',
+    'gridcell': '[role="gridcell"]',
+    'grid': '[role="grid"]',
+    'listbox': '[role="listbox"]',
+    'menu': '[role="menu"]',
+    'menubar': '[role="menubar"]',
+    'radiogroup': '[role="radiogroup"]',
+    'tablist': '[role="tablist"]',
+    'tree': '[role="tree"]',
+    'treegrid': '[role="treegrid"]',
+    'alertdialog': '[role="alertdialog"]',
+    'dialog': 'dialog, [role="dialog"]',
+    'application': '[role="application"]',
+    'search': '[role="search"]',
+    'article': 'article, [role="article"]',
+    'region': 'section[aria-label], section[aria-labelledby], [role="region"]',
+    'rowheader': 'th[scope="row"], [role="rowheader"]',
+    'rowgroup': 'thead, tbody, tfoot, [role="rowgroup"]',
+    'toolbar': '[role="toolbar"]',
+    'status': '[role="status"]',
+    'alert': '[role="alert"]',
+    'log': '[role="log"]',
+    'marquee': '[role="marquee"]',
+    'timer': '[role="timer"]',
+    'tooltip': '[role="tooltip"]',
+    'figure': 'figure, [role="figure"]',
+    'paragraph': 'p, [role="paragraph"]',
+    'blockquote': 'blockquote, [role="blockquote"]',
+    'code': 'code, [role="code"]',
+    'emphasis': 'em, [role="emphasis"]',
+    'strong': 'strong, [role="strong"]',
+    'deletion': 'del, [role="deletion"]',
+    'insertion': 'ins, [role="insertion"]',
+    'subscript': 'sub, [role="subscript"]',
+    'superscript': 'sup, [role="superscript"]',
+    'term': 'dfn, [role="term"]',
+    'definition': 'dd, [role="definition"]',
+    'note': '[role="note"]',
+    'math': 'math, [role="math"]',
+    'time': 'time, [role="time"]',
+    'complementary': 'aside, [role="complementary"]',
+    'form': 'form[aria-label], form[aria-labelledby], [role="form"]',
+    'iframe': 'iframe',
+    'feed': '[role="feed"]',
+    'document': '[role="document"]',
+    'caption': 'caption, figcaption, [role="caption"]',
+    'meter': 'meter, [role="meter"]',
+    'summary': 'summary',
+    'details': 'details',
+    'generic': 'div:not([role]), legend, [role="generic"]',
+    'group': 'fieldset, details, optgroup, [role="group"]',
+    'none': '[role="none"]',
+    'presentation': '[role="presentation"]',
+}
+
+# JSON-serialised form of the mapping, injected into JS source via a sentinel
+# placeholder. json.dumps produces a valid JS object literal for this input
+# (ASCII keys/values, no embedded backslashes or unicode escapes needed).
+_IMPLICIT_ROLE_SELECTORS_JS = json.dumps(_IMPLICIT_ROLE_SELECTORS, sort_keys=True)
+
+_BUILD_ROLE_INDEX_JS = r"""(args) => {
+    const gen           = args.generation;
+    const keyIndex      = '__bridgicRoleIndex_'             + gen;
+    const keySelectors  = '__bridgicImplicitRoleSelectors_' + gen;
+    const keyNameCache  = '__bridgicNameCache_'             + gen;
+    const keyTextCache  = '__bridgicTextCache_'             + gen;
+
+    // Idempotent: if this generation already built the index, skip.
+    if (window[keyIndex]) return null;
+
+    const IMPLICIT_ROLE_SELECTORS = __IMPLICIT_ROLE_SELECTORS__;
+
+    const roleIndex = {};
+    window[keyIndex]     = roleIndex;
+    window[keySelectors] = IMPLICIT_ROLE_SELECTORS;
+    window[keyNameCache] = new WeakMap();
+    window[keyTextCache] = new WeakMap();
+
+    for (const role of args.roles) {
+        const selector = IMPLICIT_ROLE_SELECTORS[role] || '[role="' + role + '"]';
+        try {
+            roleIndex[role] = Array.from(document.querySelectorAll(selector));
+        } catch (_e) {
+            roleIndex[role] = [];
+        }
+    }
+    return null;
+}""".replace("__IMPLICIT_ROLE_SELECTORS__", _IMPLICIT_ROLE_SELECTORS_JS)
+
+
+# Phase 3 of the three-phase evaluate strategy:
+# Deletes only THIS generation's window.__bridgic* keys, leaving any
+# concurrently-running snapshot task's state untouched.  Frees references
+# to potentially thousands of DOM Elements that would otherwise remain
+# reachable through the window object.  Called in a try/except so a closed
+# or navigated page does not raise.
+_CLEANUP_ROLE_INDEX_JS = r"""(args) => {
+    const gen = args.generation;
+    delete window['__bridgicRoleIndex_'             + gen];
+    delete window['__bridgicImplicitRoleSelectors_' + gen];
+    delete window['__bridgicNameCache_'             + gen];
+    delete window['__bridgicTextCache_'             + gen];
+}"""
+
+
+# Phase 2 of the three-phase evaluate strategy (called once per chunk):
+# Reads the role index and caches pre-built by _BUILD_ROLE_INDEX_JS from
+# window globals, then resolves each ref to an Element and collects the
+# metadata needed for visibility / interactivity decisions.  Falls back to
+# empty objects / fresh WeakMaps when Phase 1 was skipped or failed — the
+# findElement fallback QSA path still works, just less efficiently.
+_BATCH_INFO_JS = r"""(args) => {
+    const { elements, viewportWidth, viewportHeight, checkViewport, generation } = args;
+
+    const IMPLICIT_ROLE_SELECTORS = window['__bridgicImplicitRoleSelectors_' + generation] || __IMPLICIT_ROLE_SELECTORS__;
+
+    // Read the role index and caches built by _BUILD_ROLE_INDEX_JS (Phase 1).
+    // Keys are suffixed with `generation` to isolate concurrent snapshot tasks.
+    // If Phase 1 was skipped or failed the fallback path in findElement()
+    // issues a one-shot querySelectorAll per missing role and caches it back
+    // into roleIndex for subsequent refs in this chunk.
+    const roleIndex = window['__bridgicRoleIndex_' + generation] || {};
+    const nameCache = window['__bridgicNameCache_' + generation] || new WeakMap();
+    const textCache = window['__bridgicTextCache_' + generation] || new WeakMap();
+
+    function getAssociatedLabelText(el) {
+        if (!el) return '';
+        if (el.labels && el.labels.length > 0) {
+            const texts = Array.from(el.labels)
+                .map(label => (label.textContent || '').trim())
+                .filter(Boolean);
+            if (texts.length) return texts.join(' ');
+        }
+        if (el.id) {
+            const explicitLabels = Array.from(
+                document.querySelectorAll('label[for="' + el.id + '"]')
+            )
+                .map(label => (label.textContent || '').trim())
+                .filter(Boolean);
+            if (explicitLabels.length) return explicitLabels.join(' ');
+        }
+        return '';
+    }
+
+    function getAccessibleName(el) {
+        const ariaLabel = el.getAttribute('aria-label');
+        if (ariaLabel) return ariaLabel.trim();
+
+        const labelledBy = el.getAttribute('aria-labelledby');
+        if (labelledBy) {
+            const parts = labelledBy.split(/\s+/).map(id => {
+                const ref = document.getElementById(id);
+                return ref ? ref.textContent.trim() : '';
+            }).filter(Boolean);
+            if (parts.length) return parts.join(' ');
+        }
+
+        const associatedLabel = getAssociatedLabelText(el);
+        if (associatedLabel) return associatedLabel;
+
+        const tagName = el.tagName.toUpperCase();
+        if (tagName === 'IMG') {
+            const alt = el.getAttribute('alt');
+            if (alt) return alt.trim();
+        }
+
+        if (tagName === 'INPUT') {
+            const inputType = (el.getAttribute('type') || '').toLowerCase();
+            if (['button', 'submit', 'reset'].includes(inputType)) {
+                const valueAttr = el.getAttribute('value');
+                if (valueAttr) return valueAttr.trim();
+            }
+            if (inputType === 'image') {
+                const alt = el.getAttribute('alt');
+                if (alt) return alt.trim();
+            }
+        }
+
+        const title = el.getAttribute('title');
+        if (title) return title.trim();
+
+        // For inputs: placeholder is a valid accessible name source (W3C accname-1.2).
+        // Do NOT use el.value — it holds user-typed content, not the accessible name,
+        // and would cause findElement to fail after the user fills the field.
+        if (['INPUT', 'TEXTAREA'].includes(tagName)) {
+            if (el.placeholder) return el.placeholder;
+            const ariaPlaceholder = el.getAttribute('aria-placeholder');
+            if (ariaPlaceholder) return ariaPlaceholder.trim();
+        }
+
+        return el.textContent ? el.textContent.trim() : '';
+    }
+
+    function getAccessibleNameCached(el) {
+        const cached = nameCache.get(el);
+        if (cached !== undefined) return cached;
+        const name = getAccessibleName(el) || '';
+        nameCache.set(el, name);
+        return name;
+    }
+
+    function getTextCached(el) {
+        const cached = textCache.get(el);
+        if (cached !== undefined) return cached;
+        const text = el.innerText || el.textContent || '';
+        textCache.set(el, text);
+        return text;
+    }
+
+    function normalizeText(value) {
+        if (!value) return '';
+        return String(value).replace(/\s+/g, ' ').trim();
+    }
+
+    const roleTextMatchRoles = new Set([
+        'listitem', 'row', 'cell', 'gridcell', 'columnheader', 'rowheader'
+    ]);
+
+    function findElement(role, name, nth) {
+        // O(1) lookup from pre-built index; fall back to a one-shot query if
+        // the role wasn't in the initial unique-role set (defensive only).
+        let all = roleIndex[role];
+        if (!all) {
+            const selector = IMPLICIT_ROLE_SELECTORS[role] || '[role="' + role + '"]';
+            try { all = Array.from(document.querySelectorAll(selector)); }
+            catch (_e) { all = []; }
+            roleIndex[role] = all;
+        }
+        if (!name) return all[nth] || null;
+
+        const normalizedName = normalizeText(name);
+        if (!normalizedName) return all[nth] || null;
+
+        let matching = [];
+        if (roleTextMatchRoles.has(role)) {
+            if (role === 'row') {
+                matching = all.filter(el => {
+                    const rowText = normalizeText(getTextCached(el));
+                    if (rowText === normalizedName) return true;
+                    // Row names can map to a single cell/header text. Check descendants.
+                    const descendants = [el, ...Array.from(el.querySelectorAll('*'))];
+                    return descendants.some(node =>
+                        normalizeText(node.innerText || node.textContent || '') === normalizedName
+                    );
+                });
+            } else {
+                matching = all.filter(el =>
+                    normalizeText(getTextCached(el)) === normalizedName
+                );
+            }
+        } else {
+            matching = all.filter(
+                el => normalizeText(getAccessibleNameCached(el)) === normalizedName
+            );
+        }
+
+        return matching[nth] || null;
+    }
+
+    function getElementInfo(el) {
+        if (!el) return null;
+        const computed = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        const tag = el.tagName.toLowerCase();
+
+        const hasEventHandler = !!(
+            el.onclick || el.onmousedown || el.onmouseup ||
+            el.onkeydown || el.onkeyup || el.onkeypress ||
+            el.onmouseenter || el.onmouseleave ||
+            el.ondblclick || el.onfocus || el.onblur
+        );
+
+        let classAndId = '';
+        if (el.className && typeof el.className === 'string') classAndId += el.className + ' ';
+        if (el.id) classAndId += el.id + ' ';
+        let dataAction = null;
+        for (let attr of el.attributes) {
+            if (attr.name.startsWith('data-')) {
+                classAndId += attr.value + ' ';
+                if (attr.name === 'data-action') dataAction = attr.value;
+            }
+        }
+
+        return {
+            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+                    right: rect.right, bottom: rect.bottom },
+            tagName: tag,
+            cursor: computed.cursor,
+            width: el.offsetWidth,
+            height: el.offsetHeight,
+            hasEventHandler: hasEventHandler,
+            tabindex: el.getAttribute('tabindex'),
+            classAndId: classAndId.toLowerCase().trim(),
+            dataAction: dataAction,
+            ariaRequired: el.hasAttribute('aria-required'),
+            ariaAutocomplete: el.getAttribute('aria-autocomplete'),
+            ariaKeyshortcuts: el.getAttribute('aria-keyshortcuts'),
+            ariaHidden: el.getAttribute('aria-hidden') === 'true',
+            ariaDisabled: el.getAttribute('aria-disabled') === 'true',
+            isContentEditable: el.isContentEditable,
+            role: el.getAttribute('role'),
+            isEditable: el.isContentEditable ||
+                (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName.toUpperCase()) && !el.disabled && !el.readOnly),
+            isDisabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true',
+        };
+    }
+
+    const results = {};
+    for (const item of elements) {
+        const el = findElement(item.role, item.name, item.nth);
+        results[item.ref] = getElementInfo(el);
+    }
+    return results;
+}""".replace("__IMPLICIT_ROLE_SELECTORS__", _IMPLICIT_ROLE_SELECTORS_JS)
 
 @dataclass
 class RefData:
@@ -386,6 +760,38 @@ class SnapshotGenerator:
         'directory',
     }
 
+    # Roles worth checking for viewport position in non-interactive viewport-only mode.
+    # These are structural containers whose off-viewport status causes many children to
+    # be excluded via invisible_depth propagation — so checking just these ~20–100
+    # elements per page is sufficient to prune entire subtrees.
+    #
+    # Leaf roles (heading, link, button, listitem, cell, row …) are intentionally
+    # excluded: (a) they are typically inside one of these containers, so they get
+    # excluded through invisible_depth propagation; (b) including them would negate
+    # the performance benefit.
+    #
+    # Precision trade-off: standalone leaf elements NOT inside any listed container
+    # may be wrongly included when they are near the viewport boundary.  This is
+    # acceptable for snapshot -F use-cases (LLM context, not pixel-perfect selection).
+    VIEWPORT_CONTAINER_ROLES: Set[str] = {
+        # Page landmark containers
+        'main', 'navigation', 'banner', 'contentinfo', 'complementary', 'region',
+        # Section-level containers
+        'article', 'form', 'search',
+        # Data container roots (not individual rows/cells)
+        'list', 'table', 'grid', 'listbox', 'tree', 'treegrid',
+        'rowgroup',            # <thead>/<tbody>/<tfoot> — one check per rowgroup
+        # Interaction containers
+        'tabpanel', 'tablist',
+        'dialog', 'alertdialog',
+        'menu', 'menubar', 'toolbar',
+        'radiogroup', 'feed',
+        # iframes are containers: off-viewport iframes must exclude their subtrees
+        # (the invisible_depth path also preserves the iframe line itself for
+        # frame-path local-index alignment — see _pre_filter_raw_snapshot).
+        'iframe',
+    }
+
     # Namespace salt baked into every fingerprint.
     # Changing this value invalidates all existing refs (intentional for major versions).
     _REF_NAMESPACE = "bridgic-browser-v1"
@@ -679,284 +1085,96 @@ class SnapshotGenerator:
         if not batch_elements:
             return visible_refs, interactive_map
 
-        # Single page.evaluate for all remaining elements
+        # Three-phase evaluate strategy:
+        #
+        # Phase 1 (_BUILD_ROLE_INDEX_JS): called once before the chunk loop.
+        #   Runs querySelectorAll for every unique ARIA role across ALL chunks
+        #   and stores Element arrays in window['__bridgicRoleIndex_<gen>'].
+        #   This ensures expensive selectors like 'div:not([role])' run
+        #   exactly once regardless of chunk count — the root cause of 95-
+        #   123 s runtimes on 5000+ ref pages was paying that cost once per
+        #   chunk.
+        #
+        # Phase 2 (_BATCH_INFO_JS): called N times (one per chunk).
+        #   Reads the per-generation role index; no DOM scanning per chunk.
+        #   asyncio.sleep(0) between chunks yields the event loop so other
+        #   daemon commands are not starved.
+        #
+        # Phase 3 (_CLEANUP_ROLE_INDEX_JS): called once in `finally`.
+        #   Removes only THIS generation's window.__bridgic*_<gen> keys so
+        #   concurrent snapshot tasks on the same page are isolated.
+        batch_results: Dict[str, Any] = {}
+
+        # Collect all unique roles up-front for Phase 1.
+        all_roles = list({item['role'] for item in batch_elements})
+        # Cryptographically-unique per-call token: isolates window state when
+        # concurrent snapshot tasks run against the same page (e.g. two daemon
+        # clients invoking get_snapshot simultaneously).
+        generation = secrets.token_hex(8)
+
+        # Phase 1: build role index in window (one QSA per unique role).
+        try:
+            await page.evaluate(_BUILD_ROLE_INDEX_JS, {
+                'roles': all_roles,
+                'generation': generation,
+            })
+        except Exception as e:
+            # Phase 1 did not build the role index. Phase 2's `findElement()`
+            # has a defensive fallback path: when the expected
+            # `roleIndex[role]` is undefined it issues a one-shot
+            # querySelectorAll per missing role and caches the result for the
+            # remainder of the chunk. Correctness preserved, performance
+            # degrades to "N QSAs per chunk" instead of "N QSAs once".
+            logger.warning(
+                "_build_role_index failed; Phase 2 will QSA per missing role "
+                "(roles=%d, slower but correct): %s",
+                len(all_roles), e,
+            )
+
         try:
             start_time = time.time()
-            batch_results = await page.evaluate("""(args) => {
-                const { elements, viewportWidth, viewportHeight, checkViewport } = args;
-
-                const IMPLICIT_ROLE_SELECTORS = {
-                    'button': 'button, input[type="button"], input[type="submit"], input[type="reset"], input[type="file"], [role="button"]',
-                    'link': 'a[href], area[href], [role="link"]',
-                    'textbox': 'input:not([type]), input[type="text"], input[type="email"], input[type="password"], input[type="search"], input[type="url"], input[type="tel"], textarea, [role="textbox"], [contenteditable="true"], [contenteditable=""]',
-                    'checkbox': 'input[type="checkbox"], [role="checkbox"]',
-                    'radio': 'input[type="radio"], [role="radio"]',
-                    'combobox': 'select, [role="combobox"]',
-                    'option': 'option, [role="option"]',
-                    'heading': 'h1, h2, h3, h4, h5, h6, [role="heading"]',
-                    'listitem': 'li, [role="listitem"]',
-                    'list': 'ul, ol, [role="list"]',
-                    'img': 'img[alt], [role="img"]',
-                    'row': 'tr, [role="row"]',
-                    'cell': 'td, [role="cell"]',
-                    'columnheader': 'th, [role="columnheader"]',
-                    'navigation': 'nav, [role="navigation"]',
-                    'main': 'main, [role="main"]',
-                    'banner': 'header, [role="banner"]',
-                    'contentinfo': 'footer, [role="contentinfo"]',
-                    'table': 'table, [role="table"]',
-                    'menuitem': '[role="menuitem"]',
-                    'menuitemcheckbox': '[role="menuitemcheckbox"]',
-                    'menuitemradio': '[role="menuitemradio"]',
-                    'tab': '[role="tab"]',
-                    'tabpanel': '[role="tabpanel"]',
-                    'treeitem': '[role="treeitem"]',
-                    'switch': '[role="switch"]',
-                    'slider': 'input[type="range"], [role="slider"]',
-                    'spinbutton': 'input[type="number"], [role="spinbutton"]',
-                    'searchbox': 'input[type="search"], [role="searchbox"]',
-                    'progressbar': 'progress, [role="progressbar"]',
-                    'scrollbar': '[role="scrollbar"]',
-                    'separator': 'hr, [role="separator"]',
-                    'gridcell': '[role="gridcell"]',
-                    'grid': '[role="grid"]',
-                    'listbox': '[role="listbox"]',
-                    'menu': '[role="menu"]',
-                    'menubar': '[role="menubar"]',
-                    'radiogroup': '[role="radiogroup"]',
-                    'tablist': '[role="tablist"]',
-                    'tree': '[role="tree"]',
-                    'treegrid': '[role="treegrid"]',
-                    'alertdialog': '[role="alertdialog"]',
-                    'dialog': 'dialog, [role="dialog"]',
-                    'application': '[role="application"]',
-                    'search': '[role="search"]',
-                    'article': 'article, [role="article"]',
-                    'region': 'section[aria-label], section[aria-labelledby], [role="region"]',
-                    'rowheader': 'th[scope="row"], [role="rowheader"]',
-                    'rowgroup': 'thead, tbody, tfoot, [role="rowgroup"]',
-                    'toolbar': '[role="toolbar"]',
-                    'status': '[role="status"]',
-                    'alert': '[role="alert"]',
-                    'log': '[role="log"]',
-                    'marquee': '[role="marquee"]',
-                    'timer': '[role="timer"]',
-                    'tooltip': '[role="tooltip"]',
-                    'figure': 'figure, [role="figure"]',
-                    'paragraph': 'p, [role="paragraph"]',
-                    'blockquote': 'blockquote, [role="blockquote"]',
-                    'code': 'code, [role="code"]',
-                    'emphasis': 'em, [role="emphasis"]',
-                    'strong': 'strong, [role="strong"]',
-                    'deletion': 'del, [role="deletion"]',
-                    'insertion': 'ins, [role="insertion"]',
-                    'subscript': 'sub, [role="subscript"]',
-                    'superscript': 'sup, [role="superscript"]',
-                    'term': 'dfn, [role="term"]',
-                    'definition': 'dd, [role="definition"]',
-                    'note': '[role="note"]',
-                    'math': 'math, [role="math"]',
-                    'time': 'time, [role="time"]',
-                    'complementary': 'aside, [role="complementary"]',
-                    'form': 'form[aria-label], form[aria-labelledby], [role="form"]',
-                    'iframe': 'iframe',
-                    'feed': '[role="feed"]',
-                    'document': '[role="document"]',
-                    'caption': 'caption, figcaption, [role="caption"]',
-                    'meter': 'meter, [role="meter"]',
-                    'summary': 'summary',
-                    'details': 'details',
-                    'generic': 'div:not([role]), legend, [role="generic"]',
-                    'group': 'fieldset, details, optgroup, [role="group"]',
-                    'none': '[role="none"]',
-                    'presentation': '[role="presentation"]',
-                };
-
-                function getAssociatedLabelText(el) {
-                    if (!el) return '';
-
-                    // Prefer the browser's label association when available.
-                    if (el.labels && el.labels.length > 0) {
-                        const texts = Array.from(el.labels)
-                            .map(label => (label.textContent || '').trim())
-                            .filter(Boolean);
-                        if (texts.length) return texts.join(' ');
-                    }
-
-                    if (el.id) {
-                        const explicitLabels = Array.from(
-                            document.querySelectorAll('label[for="' + el.id + '"]')
-                        )
-                            .map(label => (label.textContent || '').trim())
-                            .filter(Boolean);
-                        if (explicitLabels.length) return explicitLabels.join(' ');
-                    }
-
-                    return '';
-                }
-
-                function getAccessibleName(el) {
-                    const ariaLabel = el.getAttribute('aria-label');
-                    if (ariaLabel) return ariaLabel.trim();
-
-                    const labelledBy = el.getAttribute('aria-labelledby');
-                    if (labelledBy) {
-                        const parts = labelledBy.split(/\\s+/).map(id => {
-                            const ref = document.getElementById(id);
-                            return ref ? ref.textContent.trim() : '';
-                        }).filter(Boolean);
-                        if (parts.length) return parts.join(' ');
-                    }
-
-                    const associatedLabel = getAssociatedLabelText(el);
-                    if (associatedLabel) return associatedLabel;
-
-                    const tagName = el.tagName.toUpperCase();
-                    if (tagName === 'IMG') {
-                        const alt = el.getAttribute('alt');
-                        if (alt) return alt.trim();
-                    }
-
-                    if (tagName === 'INPUT') {
-                        const inputType = (el.getAttribute('type') || '').toLowerCase();
-                        if (['button', 'submit', 'reset'].includes(inputType)) {
-                            const valueAttr = el.getAttribute('value');
-                            if (valueAttr) return valueAttr.trim();
-                        }
-                        if (inputType === 'image') {
-                            const alt = el.getAttribute('alt');
-                            if (alt) return alt.trim();
-                        }
-                    }
-
-                    const title = el.getAttribute('title');
-                    if (title) return title.trim();
-
-                    // For inputs: placeholder is a valid accessible name source (W3C accname-1.2).
-                    // Do NOT use el.value — it holds user-typed content, not the accessible name,
-                    // and would cause findElement to fail after the user fills the field.
-                    if (['INPUT', 'TEXTAREA'].includes(tagName)) {
-                        if (el.placeholder) return el.placeholder;
-                        const ariaPlaceholder = el.getAttribute('aria-placeholder');
-                        if (ariaPlaceholder) return ariaPlaceholder.trim();
-                    }
-
-                    return el.textContent ? el.textContent.trim() : '';
-                }
-
-                function normalizeText(value) {
-                    if (!value) return '';
-                    return String(value).replace(/\\s+/g, ' ').trim();
-                }
-
-                function findElement(role, name, nth) {
-                    const selector = IMPLICIT_ROLE_SELECTORS[role] || '[role="' + role + '"]';
-                    const all = Array.from(document.querySelectorAll(selector));
-                    if (!name) return all[nth] || null;
-
-                    const normalizedName = normalizeText(name);
-                    if (!normalizedName) return all[nth] || null;
-
-                    const roleTextMatchRoles = new Set([
-                        'listitem', 'row', 'cell', 'gridcell', 'columnheader', 'rowheader'
-                    ]);
-
-                    let matching = [];
-                    if (roleTextMatchRoles.has(role)) {
-                        if (role === 'row') {
-                            matching = all.filter(el => {
-                                const rowText = normalizeText(el.innerText || el.textContent || '');
-                                if (rowText === normalizedName) return true;
-
-                                // Row names can map to a single cell/header text. Check descendants.
-                                const descendants = [el, ...Array.from(el.querySelectorAll('*'))];
-                                return descendants.some(node =>
-                                    normalizeText(node.innerText || node.textContent || '') === normalizedName
-                                );
-                            });
-                        } else {
-                            matching = all.filter(el =>
-                                normalizeText(el.innerText || el.textContent || '') === normalizedName
-                            );
-                        }
-                    } else {
-                        matching = all.filter(
-                            el => normalizeText(getAccessibleName(el)) === normalizedName
-                        );
-                    }
-
-                    return matching[nth] || null;
-                }
-
-                function getElementInfo(el) {
-                    if (!el) return null;
-                    const computed = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    const tag = el.tagName.toLowerCase();
-
-                    const hasEventHandler = !!(
-                        el.onclick || el.onmousedown || el.onmouseup ||
-                        el.onkeydown || el.onkeyup || el.onkeypress ||
-                        el.onmouseenter || el.onmouseleave ||
-                        el.ondblclick || el.onfocus || el.onblur
-                    );
-
-                    let classAndId = '';
-                    if (el.className && typeof el.className === 'string') classAndId += el.className + ' ';
-                    if (el.id) classAndId += el.id + ' ';
-                    let dataAction = null;
-                    for (let attr of el.attributes) {
-                        if (attr.name.startsWith('data-')) {
-                            classAndId += attr.value + ' ';
-                            if (attr.name === 'data-action') dataAction = attr.value;
-                        }
-                    }
-
-                    return {
-                        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height,
-                                right: rect.right, bottom: rect.bottom },
-                        tagName: tag,
-                        cursor: computed.cursor,
-                        width: el.offsetWidth,
-                        height: el.offsetHeight,
-                        hasEventHandler: hasEventHandler,
-                        tabindex: el.getAttribute('tabindex'),
-                        classAndId: classAndId.toLowerCase().trim(),
-                        dataAction: dataAction,
-                        ariaRequired: el.hasAttribute('aria-required'),
-                        ariaAutocomplete: el.getAttribute('aria-autocomplete'),
-                        ariaKeyshortcuts: el.getAttribute('aria-keyshortcuts'),
-                        ariaHidden: el.getAttribute('aria-hidden') === 'true',
-                        ariaDisabled: el.getAttribute('aria-disabled') === 'true',
-                        isContentEditable: el.isContentEditable,
-                        role: el.getAttribute('role'),
-                        isEditable: el.isContentEditable ||
-                            (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName.toUpperCase()) && !el.disabled && !el.readOnly),
-                        isDisabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true',
-                    };
-                }
-
-                const results = {};
-                for (const item of elements) {
-                    const el = findElement(item.role, item.name, item.nth);
-                    results[item.ref] = getElementInfo(el);
-                }
-                return results;
-            }""", {
-                'elements': batch_elements,
-                'viewportWidth': viewport_width,
-                'viewportHeight': viewport_height,
-                'checkViewport': check_viewport,
-            })
+            total = len(batch_elements)
+            for offset in range(0, total, _BATCH_INFO_CHUNK_SIZE):
+                chunk = batch_elements[offset:offset + _BATCH_INFO_CHUNK_SIZE]
+                # Phase 2: resolve refs using pre-built per-generation index.
+                chunk_result = await page.evaluate(_BATCH_INFO_JS, {
+                    'elements': chunk,
+                    'viewportWidth': viewport_width,
+                    'viewportHeight': viewport_height,
+                    'checkViewport': check_viewport,
+                    'generation': generation,
+                })
+                if chunk_result:
+                    batch_results.update(chunk_result)
+                # Yield to other daemon commands waiting on the event loop.
+                # Only needed when we still have more chunks to send.
+                if offset + _BATCH_INFO_CHUNK_SIZE < total:
+                    await asyncio.sleep(0)
             end_time = time.time()
-            logger.info(f"_batch_get_elements_info Time taken: {end_time - start_time:.3f}s for {len(batch_elements)} elements")
+            logger.info(
+                f"_batch_get_elements_info Time taken: {end_time - start_time:.3f}s "
+                f"for {total} elements ({(total + _BATCH_INFO_CHUNK_SIZE - 1) // _BATCH_INFO_CHUNK_SIZE} chunks)"
+            )
         except Exception as e:
             logger.debug(f"Batch element info failed: {e}")
-            # Fallback: include all elements
+            # Fallback: include all elements (non-interactive to be safe).
+            # The return below triggers finally (cleanup) before actually returning.
             for item in batch_elements:
                 visible_refs.add(item['ref'])
                 interactive_map[item['ref']] = False
             return visible_refs, interactive_map
+        finally:
+            # Phase 3: release only THIS generation's window.__bridgic* refs.
+            # If the page navigated mid-snapshot this evaluate runs in the
+            # NEW document's JS context — a no-op there, while the OLD
+            # document's window globals are freed when its JS context is GC'd
+            # along with the document. Either way: safe. The broad except is
+            # intentional: a closed/navigating page is an expected failure
+            # mode and not an error worth surfacing.
+            try:
+                await page.evaluate(_CLEANUP_ROLE_INDEX_JS, {'generation': generation})
+            except Exception:
+                pass
 
         # Process batch results
         for item in batch_elements:
@@ -1135,8 +1353,10 @@ class SnapshotGenerator:
 
         WARNING: This method uses Playwright's private/internal API (_impl_obj, _channel).
         These APIs are not part of Playwright's public contract and may change or break
-        in future Playwright versions without notice. Monitor Playwright releases and
-        test thoroughly after upgrades.
+        in future Playwright versions without notice. When the private attributes are
+        unavailable (e.g. Playwright renamed them in a major release), falls back to the
+        public ``page.accessibility.snapshot()`` API so ref generation still works —
+        at reduced quality.
 
         The 'snapshotForAI' command is an internal Playwright feature that returns
         a structured accessibility tree optimized for AI consumption.
@@ -1149,20 +1369,80 @@ class SnapshotGenerator:
         Returns
         -------
         str
-            Raw snapshot string returned by Playwright `snapshotForAI`.
-            Returns None if the snapshot fails or is empty.
+            Raw snapshot string returned by Playwright `snapshotForAI`, or a
+            best-effort YAML-ish rendering of the public accessibility tree
+            when the private API is unavailable.
         """
-        # ACCESS PRIVATE API - May break in future Playwright versions
-        page_impl = page._impl_obj
-        channel = page_impl._channel
-        result = await channel.send_return_as_dict(
-            "snapshotForAI",
-            page_impl._timeout_settings.timeout,
-            {"track": None, "timeout": 30000},
-            is_internal=True
-        )
-        full_data = result.get('full')
+        try:
+            page_impl = page._impl_obj  # type: ignore[attr-defined]
+            channel = page_impl._channel
+            timeout_settings = page_impl._timeout_settings
+        except AttributeError as exc:
+            logger.warning(
+                "Playwright private API (page._impl_obj / _channel / "
+                "_timeout_settings) unavailable (%s); falling back to "
+                "accessibility.snapshot() — ref quality is reduced. "
+                "Pin playwright to a compatible version to restore full output.",
+                exc,
+            )
+            return await self._fallback_accessibility_snapshot(page)
+        try:
+            result = await channel.send_return_as_dict(
+                "snapshotForAI",
+                timeout_settings.timeout,
+                {"track": None, "timeout": 30000},
+                is_internal=True,
+            )
+        except AttributeError as exc:
+            logger.warning(
+                "Playwright snapshotForAI internal call signature changed (%s); "
+                "falling back to accessibility.snapshot()",
+                exc,
+            )
+            return await self._fallback_accessibility_snapshot(page)
+        full_data = result.get("full")
         return full_data
+
+    async def _fallback_accessibility_snapshot(self, page: AsyncPage) -> str:
+        """Render ``page.accessibility.snapshot()`` as a YAML-ish string.
+
+        Output shape mimics Playwright's ``snapshotForAI`` (``- role "name"`` lines)
+        enough for the downstream parser to recover refs. Less detail (no
+        ``[cursor=pointer]``, no ``[disabled]`` hints) is reported — this is a
+        graceful degradation path, not a long-term substitute for the private API.
+
+        **Performance note**: this fallback emits NO ``[ref=<playwright_ref>]``
+        suffix, so :attr:`RefData.playwright_ref` is empty for every element
+        it produces. Consequence: :meth:`Browser.get_element_by_ref` skips the
+        O(1) aria-ref fast path entirely and rebuilds every locator from role
+        + name + frame_path + nth via Playwright's ``get_by_role``. On a
+        1000-ref page per-call overhead goes from ~1 ms to ~50–200 ms. Pin
+        a compatible Playwright version in ``pyproject.toml`` to restore the
+        fast path.
+        """
+        try:
+            tree = await page.accessibility.snapshot()
+        except Exception as exc:
+            logger.warning("accessibility.snapshot() fallback failed: %s", exc)
+            return ""
+        if not tree:
+            return ""
+
+        lines: List[str] = []
+
+        def _walk(node: Dict[str, Any], depth: int) -> None:
+            role = str(node.get("role") or "generic")
+            name = node.get("name")
+            indent = "  " * depth
+            if name:
+                lines.append(f'{indent}- {role} "{name}"')
+            else:
+                lines.append(f"{indent}- {role}")
+            for child in node.get("children") or []:
+                _walk(child, depth + 1)
+
+        _walk(tree, 0)
+        return "\n".join(lines)
 
     def _process_page_snapshot_for_ai(
         self,
@@ -1406,9 +1686,9 @@ class SnapshotGenerator:
                 # Reuse the ref already extracted above
                 original_ref = playwright_ref_for_element
 
-                if interactive_map and original_ref:
+                if interactive_map and original_ref and original_ref in interactive_map:
                     # Use the pre-computed interactive_map for precise filtering
-                    is_effectively_interactive = interactive_map.get(original_ref, False)
+                    is_effectively_interactive = interactive_map[original_ref]
                     # Named noise elements (text labels like "Delete", "Edit") inside
                     # interactive containers should be preserved — they describe what
                     # the parent button does, same logic as TEXT_LEAF_ROLES propagation.
@@ -1665,19 +1945,137 @@ class SnapshotGenerator:
         if not refs_info:
             return raw_snapshot, interactive_map
 
-        # Pre-fetch viewport size once for efficiency
-        viewport = page.viewport_size
-        viewport_width = viewport['width'] if viewport else None
-        viewport_height = viewport['height'] if viewport else None
+        # Pre-fetch viewport size once for efficiency.
+        # In CDP attach mode, page.viewport_size is often None because the tab
+        # was not created with Playwright's set_viewport_size().
+        viewport_width, viewport_height = await self._resolve_viewport_size(page)
         check_viewport = not options.full_page and viewport_width is not None
 
-        # Batch check all elements in a single page.evaluate() call
-        visible_refs, interactive_map = await self._batch_get_elements_info(
-            page, refs_info, ref_suffixes,
-            check_viewport=check_viewport,
-            viewport_width=viewport_width,
-            viewport_height=viewport_height,
-        )
+        # Batch check elements for visibility and interactivity.
+        #
+        # Interactive-mode pre-filtering:
+        # In -i mode the caller only needs interactive elements.  The role is
+        # already known from the raw snapshot (zero IPC cost), so we bucket
+        # refs up-front and only run the expensive getBoundingClientRect path
+        # for refs that could plausibly be interactive (INTERACTIVE_ROLES or
+        # [cursor=pointer] suffix signal).
+        #
+        # Non-interactive refs are added directly to visible_refs (assumed
+        # in-viewport) and marked non-interactive.  This is safe because:
+        #   1. _generate_snapshot will filter them via interactive_map anyway.
+        #   2. Adding them to visible_refs prevents invisible_depth propagation
+        #      from incorrectly hiding their interactive children.
+        #
+        # On a 5549-ref page this reduces BoundingClientRect calls from
+        # 5549 → ~834 — a 6.5× speedup (41-50s → ~6-8s in -i mode).
+        if options.interactive:
+            interactive_refs: Dict[str, Tuple[str, Optional[str], int]] = {}
+            non_interactive_refs: Dict[str, Tuple[str, Optional[str], int]] = {}
+            for ref, info in refs_info.items():
+                role = info[0]
+                suffix = ref_suffixes.get(ref, '')
+                if (
+                    role in self.INTERACTIVE_ROLES
+                    or '[cursor=pointer]' in suffix
+                    or role in self.STRUCTURAL_NOISE_ROLES
+                ):
+                    interactive_refs[ref] = info
+                else:
+                    non_interactive_refs[ref] = info
+            logger.debug(
+                f"Interactive pre-filter: {len(interactive_refs)} interactive-role refs, "
+                f"{len(non_interactive_refs)} non-interactive skipped"
+            )
+            visible_refs, interactive_map = await self._batch_get_elements_info(
+                page, interactive_refs, ref_suffixes,
+                check_viewport=check_viewport,
+                viewport_width=viewport_width,
+                viewport_height=viewport_height,
+            )
+            # Non-interactive refs: assume in-viewport and explicitly mark
+            # them as non-interactive in interactive_map.
+            #
+            # This keeps interactive_map complete (and stable for tests),
+            # and prevents downstream code from inferring incorrect
+            # interactivity solely based on later heuristics.
+            for ref in non_interactive_refs:
+                visible_refs.add(ref)
+                interactive_map[ref] = False
+        else:
+            # Non-interactive mode.
+            #
+            # Viewport-only path (snapshot -F: full_page=False, interactive=False):
+            # Checking every ref via getBoundingClientRect takes ~43s on large pages
+            # (5549 refs × full getElementInfo JS overhead).  For viewport filtering the
+            # only purpose of the batch is to determine which elements are off-screen
+            # so their subtrees can be excluded via invisible_depth propagation below.
+            #
+            # Key insight: checking STRUCTURAL CONTAINER roles only (~20–100 per page)
+            # is sufficient.  When a container (section, table, list …) is off-viewport,
+            # ALL its descendant refs are excluded by invisible_depth propagation in the
+            # filtering pass — even though those descendants were added to visible_refs
+            # as assumed in-viewport.  Leaf elements (heading, link, button, cell …)
+            # that are NOT inside an off-viewport container are assumed in-viewport; in
+            # the rare case a standalone leaf sits just outside the viewport boundary it
+            # may be wrongly included, which is acceptable for snapshot -F use cases.
+            #
+            # Result: ~43s → ~1–3s for a 5549-ref page.
+            if check_viewport:
+                container_refs: Dict[str, Tuple[str, Optional[str], int]] = {}
+                control_leaf_refs: Dict[str, Tuple[str, Optional[str], int]] = {}
+                assumed_leaf_refs: Set[str] = set()
+                for ref, info in refs_info.items():
+                    role = info[0]
+                    if role in self.VIEWPORT_CONTAINER_ROLES:
+                        container_refs[ref] = info
+                    elif role in self.INTERACTIVE_ROLES:
+                        # "Controls" (buttons, links, inputs, ...) must not be
+                        # incorrectly assumed visible when they are actually
+                        # outside the viewport (see test_get_snapshot_text_*).
+                        control_leaf_refs[ref] = info
+                    else:
+                        assumed_leaf_refs.add(ref)
+                logger.debug(
+                    "Viewport container-only pre-filter: %d container refs checked, "
+                    "%d control leaf refs visibility-checked, %d other leaf refs assumed in-viewport",
+                    len(container_refs),
+                    len(control_leaf_refs),
+                    len(assumed_leaf_refs),
+                )
+                visible_refs, interactive_map = await self._batch_get_elements_info(
+                    page, container_refs, ref_suffixes,
+                    check_viewport=check_viewport,
+                    viewport_width=viewport_width,
+                    viewport_height=viewport_height,
+                )
+                # Controls: check visibility precisely so off-screen controls
+                # are excluded from viewport-only snapshots.
+                if control_leaf_refs:
+                    visible_controls, _ = await self._batch_get_elements_info(
+                        page, control_leaf_refs, ref_suffixes,
+                        check_viewport=check_viewport,
+                        viewport_width=viewport_width,
+                        viewport_height=viewport_height,
+                    )
+                    visible_refs.update(visible_controls)
+
+                for ref in control_leaf_refs:
+                    interactive_map[ref] = False
+
+                # Other leaves: assume in-viewport; invisible_depth propagation
+                # in the filtering pass below correctly excludes children of any
+                # off-viewport container even though these refs are in
+                # visible_refs.
+                for ref in assumed_leaf_refs:
+                    visible_refs.add(ref)
+                    interactive_map[ref] = False
+            else:
+                visible_refs, interactive_map = await self._batch_get_elements_info(
+                    page, refs_info, ref_suffixes,
+                    check_viewport=check_viewport,
+                    viewport_width=viewport_width,
+                    viewport_height=viewport_height,
+                )
 
         logger.debug(f"Pre-filter: {len(visible_refs)}/{len(refs_info)} refs visible/in-viewport")
         if options.interactive:
@@ -1731,6 +2129,40 @@ class SnapshotGenerator:
             result.append(line)
 
         return '\n'.join(result), interactive_map
+
+    async def _resolve_viewport_size(self, page: AsyncPage) -> Tuple[Optional[int], Optional[int]]:
+        """Resolve viewport width/height for viewport filtering."""
+        viewport = page.viewport_size
+        if viewport:
+            width = int(viewport.get('width') or 0)
+            height = int(viewport.get('height') or 0)
+            if width > 0 and height > 0:
+                return width, height
+
+        # CDP fallback for borrowed Chromium tabs (e.g., --cdp auto).
+        try:
+            cdp_session = await page.context.new_cdp_session(page)
+            try:
+                metrics = await asyncio.wait_for(
+                    cdp_session.send("Page.getLayoutMetrics"),
+                    timeout=3.0,
+                )
+            finally:
+                try:
+                    await cdp_session.detach()
+                except Exception:
+                    pass
+
+            visual_viewport = metrics.get("cssVisualViewport", {})
+            width = int(visual_viewport.get("clientWidth") or 0)
+            height = int(visual_viewport.get("clientHeight") or 0)
+            if width > 0 and height > 0:
+                return width, height
+        except Exception:
+            # Non-Chromium or restricted targets may not support CDP metrics.
+            pass
+
+        return None, None
 
     async def _generate_snapshot(
         self,

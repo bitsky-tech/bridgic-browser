@@ -3,12 +3,14 @@ import base64
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import tempfile
+import time
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Union, NoReturn
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Union
 
 if TYPE_CHECKING:
     try:
@@ -16,7 +18,48 @@ if TYPE_CHECKING:
     except ModuleNotFoundError:  # pragma: no cover - optional dependency
         OpenAILlm = Any  # type: ignore[misc,assignment]
 
+from .. import _timeouts
 from .._constants import BRIDGIC_TMP_DIR, BRIDGIC_SNAPSHOT_DIR, BRIDGIC_USER_DATA_DIR
+from .._redact import redact_cdp_url as _redact_cdp_url
+from ._cdp_discovery import (
+    _CDP_SCAN_DIRS as _CDP_SCAN_DIRS,
+    _probe_cdp_alive as _probe_cdp_alive,
+    _read_devtools_active_port as _read_devtools_active_port,
+    find_cdp_url as find_cdp_url,
+    resolve_cdp_input as resolve_cdp_input,
+)
+from ._launch import (
+    _LAUNCH_DEBUG_LOG as _LAUNCH_DEBUG_LOG,
+    _LAUNCH_RETRY_DELAYS as _LAUNCH_RETRY_DELAYS,
+    _RETRIABLE_LAUNCH_TOKENS as _RETRIABLE_LAUNCH_TOKENS,
+    _detect_system_chrome as _detect_system_chrome,
+    _is_retriable_launch_exc as _is_retriable_launch_exc,
+    _retriable_launch as _retriable_launch,
+    _write_launch_debug_log as _write_launch_debug_log,
+)
+from ._errors import (
+    _raise_invalid_input as _raise_invalid_input,
+    _raise_operation_error as _raise_operation_error,
+    _raise_state_error as _raise_state_error,
+    _raise_verification_error as _raise_verification_error,
+    _strip_playwright_call_log as _strip_playwright_call_log,
+)
+from ._locator_utils import (
+    _DEFAULT_CLICK_TIMEOUT_MS as _DEFAULT_CLICK_TIMEOUT_MS,
+    _cdp_evaluate_on_element as _cdp_evaluate_on_element,
+    _check_element_covered as _check_element_covered,
+    _click_checkable_target as _click_checkable_target,
+    _click_covering_element as _click_covering_element,
+    _css_attr_equals as _css_attr_equals,
+    _filter_visible_locators as _filter_visible_locators,
+    _get_context_key as _get_context_key,
+    _get_dropdown_option_locators as _get_dropdown_option_locators,
+    _get_page_key as _get_page_key,
+    _is_checked as _is_checked,
+    _is_native_checkbox_or_radio as _is_native_checkbox_or_radio,
+    _locator_action_with_fallback as _locator_action_with_fallback,
+    _safe_tag_name as _safe_tag_name,
+)
 
 from playwright.async_api import (
     async_playwright,
@@ -26,18 +69,24 @@ from playwright.async_api import (
     Page,
     Locator,
     ProxySettings,
+    TimeoutError as _PlaywrightTimeoutError,
 )
+
+PlaywrightTimeoutError = _PlaywrightTimeoutError
+"""Re-exported for tests (``tests/unit/test_browser.py``) and SDK consumers that
+historically imported ``PlaywrightTimeoutError`` from this module. The actual
+usage site has moved to :mod:`._locator_utils`."""
 from pydantic import BaseModel
 
 from ._snapshot import EnhancedSnapshot, SnapshotGenerator, SnapshotOptions
 from ._browser_model import FullPageInfo, PageDesc, PageInfo, PageSizeInfo
 from ._stealth import StealthConfig, StealthArgsBuilder
 from ._download import DownloadManager, DownloadedFile
+from . import _video_recorder as _video_recorder_mod
 from ..utils import find_page_by_id, generate_page_id, model_to_llm_string
 from ..errors import (
     BridgicBrowserError,
     InvalidInputError,
-    OperationError,
     StateError,
     VerificationError,
 )
@@ -46,253 +95,45 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_SNAPSHOT_LIMIT = 10000
 
-_LAUNCH_DEBUG_LOG = str(BRIDGIC_TMP_DIR / "launch-debug.json")
+
+_DEFAULT_VIDEO_WIDTH = 1280
+_DEFAULT_VIDEO_HEIGHT = 720
+"""Fallback video recording dimensions used when both CDP
+``Page.getLayoutMetrics`` and ``page.viewport_size`` fail to report usable
+values. 1280x720 is a common default that keeps frames legible without being
+wasteful. VP8 requires even width/height, and both values are already even."""
 
 
-def _detect_system_chrome() -> bool:
-    """Check if system Google Chrome is installed.
+# ---------------------------------------------------------------------------
+# M01: arrow-function literal auto-wrap for CDP ``Runtime.evaluate``
+# ---------------------------------------------------------------------------
 
-    Used to auto-switch from Playwright's bundled "Chrome for Testing" (which
-    Google blocks for OAuth login) to the real system Chrome in headed mode.
+_ARROW_FN_RE = re.compile(r"^\s*(async\s+)?(\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>")
+"""Match a top-level arrow-function literal (e.g. ``() => 1``, ``x => x+1``,
+``async () => 2``). Used to wrap such expressions as an IIFE before sending
+them through raw CDP ``Runtime.evaluate``.
+
+Intentionally conservative: the expression must *start* with the arrow form.
+String literals containing ``=>`` are not matched because they can't start
+the expression without a leading quote.
+"""
+
+
+def _maybe_wrap_arrow_fn(expr: str) -> str:
+    """Wrap a lone arrow-function literal as an IIFE.
+
+    Playwright's ``page.evaluate(str)`` auto-unwraps arrow-function literals
+    (invoking them and returning the result). Raw CDP ``Runtime.evaluate``
+    does not: it evaluates the expression as-is, so ``() => "x"`` returns
+    the function object and the JSON round-trip loses the body (``{}``).
+    Wrapping to ``(() => "x")()`` restores parity with the non-CDP path.
+
+    Non-arrow expressions (``document.title``, ``42``, ``typeof document``)
+    are returned unchanged — the CDP path already handles those correctly.
     """
-    if sys.platform == "darwin":
-        return os.path.isfile(
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        )
-    elif sys.platform == "linux":
-        import shutil
-        return (
-            shutil.which("google-chrome") is not None
-            or shutil.which("google-chrome-stable") is not None
-        )
-    elif sys.platform == "win32":
-        for env_var in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
-            base = os.environ.get(env_var, "")
-            if base:
-                path = os.path.join(base, "Google", "Chrome", "Application", "chrome.exe")
-                if os.path.isfile(path):
-                    return True
-    return False
-
-
-def _write_launch_debug_log(options: Dict[str, Any], mode: str) -> None:
-    """Write Chrome launch args to launch-debug.json for debugging."""
-    import datetime, json as _json
-    try:
-        os.makedirs(os.path.dirname(_LAUNCH_DEBUG_LOG), exist_ok=True)
-        record = {
-            "time": datetime.datetime.now().isoformat(),
-            "mode": mode,
-            "args": options.get("args", []),
-            "ignore_default_args": options.get("ignore_default_args", []),
-            "headless": options.get("headless"),
-            "channel": options.get("channel"),
-            "executable_path": str(options["executable_path"]) if options.get("executable_path") else None,
-        }
-        with open(_LAUNCH_DEBUG_LOG, "w", encoding="utf-8") as f:
-            _json.dump(record, f, indent=2)
-    except Exception as e:
-        logger.warning("Failed to write launch debug log: %s", e)
-
-
-def _strip_playwright_call_log(message: str) -> str:
-    marker = "Call Log:"
-    idx = message.find(marker)
-    if idx == -1:
-        marker = "Call log:"
-        idx = message.find(marker)
-    if idx == -1:
-        return message
-    return message[:idx].rstrip()
-
-
-def _raise_invalid_input(
-    message: str,
-    *,
-    code: str = "INVALID_INPUT",
-    details: Optional[Dict[str, Any]] = None,
-    retryable: bool = False,
-) -> NoReturn:
-    raise InvalidInputError(
-        message,
-        code=code,
-        details=details,
-        retryable=retryable,
-    )
-
-
-def _raise_state_error(
-    message: str,
-    *,
-    code: str = "INVALID_STATE",
-    details: Optional[Dict[str, Any]] = None,
-    retryable: bool = True,
-) -> NoReturn:
-    raise StateError(
-        message,
-        code=code,
-        details=details,
-        retryable=retryable,
-    )
-
-
-def _raise_operation_error(
-    message: str,
-    *,
-    code: str = "OPERATION_FAILED",
-    details: Optional[Dict[str, Any]] = None,
-    retryable: bool = False,
-) -> NoReturn:
-    current_exc = sys.exc_info()[1]
-    if isinstance(current_exc, BridgicBrowserError):
-        raise current_exc
-
-    message = _strip_playwright_call_log(message)
-    raise OperationError(
-        message,
-        code=code,
-        details=details,
-        retryable=retryable,
-    )
-
-
-def _raise_verification_error(
-    message: str,
-    *,
-    code: str = "VERIFICATION_FAILED",
-    details: Optional[Dict[str, Any]] = None,
-    retryable: bool = False,
-) -> NoReturn:
-    current_exc = sys.exc_info()[1]
-    if isinstance(current_exc, BridgicBrowserError):
-        raise current_exc
-
-    message = _strip_playwright_call_log(message)
-    raise VerificationError(
-        message,
-        code=code,
-        details=details,
-        retryable=retryable,
-    )
-
-def _get_page_key(page) -> str:
-    """Get a unique key for a page."""
-    return str(id(page))
-
-
-def _get_context_key(context) -> str:
-    """Get a unique key for a context."""
-    return str(id(context))
-
-
-def _css_attr_equals(name: str, value: str) -> str:
-    """Build a CSS attribute selector with basic quote escaping."""
-    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
-    return f"[{name}='{escaped}']"
-
-
-async def _prefer_visible_locators(locators: list) -> list:
-    """Keep only visible locators when possible, otherwise preserve original order."""
-    visible = []
-    for locator in locators:
-        try:
-            if await locator.is_visible():
-                visible.append(locator)
-        except Exception:
-            continue
-    return visible or locators
-
-
-async def _get_dropdown_option_locators(page, locator) -> list:
-    """Resolve option locators for native, embedded, and portalized dropdowns."""
-    options = await locator.locator("option").all()
-    if options:
-        return options
-
-    options = await locator.locator("[role='option']").all()
-    if options:
-        return await _prefer_visible_locators(options)
-
-    if page is None:
-        return []
-
-    # Portalized dropdowns often link the trigger to the listbox via aria-controls
-    # or aria-owns. Prefer that container before scanning the whole page.
-    controlled_ids = []
-    for attr_name in ("aria-controls", "aria-owns"):
-        attr_value = await locator.get_attribute(attr_name)
-        if attr_value:
-            controlled_ids.extend(part for part in attr_value.split() if part)
-
-    for controlled_id in controlled_ids:
-        container = page.locator(_css_attr_equals("id", controlled_id))
-        if await container.count() > 0:
-            options = await container.locator("option, [role='option']").all()
-            if options:
-                return await _prefer_visible_locators(options)
-
-    # Conservative fallback: if exactly one visible listbox is open, use it.
-    listboxes = await page.locator("[role='listbox']").all()
-    visible_listboxes = await _prefer_visible_locators(listboxes)
-    if len(visible_listboxes) == 1:
-        options = await visible_listboxes[0].locator("option, [role='option']").all()
-        if options:
-            return await _prefer_visible_locators(options)
-
-    return []
-
-
-async def _is_native_checkbox_or_radio(locator) -> bool:
-    """Return True when locator points to <input type=checkbox|radio>."""
-    try:
-        tag_name = await locator.evaluate("el => el.tagName.toLowerCase()")
-    except Exception:
-        return False
-    if tag_name != "input":
-        return False
-    input_type = (await locator.get_attribute("type") or "").strip().lower()
-    return input_type in {"checkbox", "radio"}
-
-
-async def _is_checked(locator) -> bool:
-    """Check both native .checked and aria-checked state."""
-    return bool(
-        await locator.evaluate(
-            "el => el.checked === true || el.getAttribute('aria-checked') === 'true'"
-        )
-    )
-
-
-async def _click_checkable_target(page, locator, bbox) -> None:
-    """Click a checkable target with overlay handling and shadow DOM fallback."""
-    if bbox is not None:
-        cx = bbox["x"] + bbox["width"] / 2
-        cy = bbox["y"] + bbox["height"] / 2
-        if not await locator.is_visible():
-            logger.debug("_click_checkable_target: bbox present but is_visible()=False; using dispatch_event click")
-            await locator.dispatch_event("click")
-            return
-
-        covered = await locator.evaluate(
-            f"(el) => {{ if (window.parent !== window) return false; "
-            f"const t = document.elementFromPoint({cx}, {cy}); "
-            f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
-        )
-        if covered:
-            logger.debug("_click_checkable_target: covered at (%.1f, %.1f), clicking intercepting element", cx, cy)
-            if page:
-                await page.evaluate(f"document.elementFromPoint({cx}, {cy})?.click()")
-            else:
-                await locator.dispatch_event("click")
-        else:
-            await locator.click()
-        return
-
-    if await locator.is_visible():
-        await locator.click()
-    else:
-        logger.debug("_click_checkable_target: no bbox and is_visible()=False; using dispatch_event click")
-        await locator.dispatch_event("click")
+    if _ARROW_FN_RE.match(expr):
+        return f"({expr.strip()})()"
+    return expr
 
 
 # Type aliases for Playwright types
@@ -399,7 +240,7 @@ class Browser:
         - device_scale_factor, is_mobile, has_touch: Device emulation
         - reduced_motion, forced_colors, contrast: Accessibility
         - accept_downloads: Auto-accept downloads
-        - record_har_*, record_video_*: Recording options
+        - record_har_*: HAR recording options
         - base_url, strict_selectors, service_workers: Navigation/selector options
         - client_certificates: TLS client authentication
 
@@ -452,6 +293,13 @@ class Browser:
         clear_user_data: Optional[bool] = None,
         # === Stealth mode (enabled by default for best anti-detection) ===
         stealth: Union[bool, StealthConfig, None] = None,
+        # === CDP connection (connect to an existing Chrome instance) ===
+        # Accepts the same inputs as the CLI ``--cdp`` flag: a bare port
+        # number (``"9222"``), a ``ws://`` / ``wss://`` URL, an
+        # ``http://host:port`` endpoint, or ``"auto"`` to auto-discover a
+        # running Chrome. The input is stored raw and resolved to a
+        # ``ws://`` URL lazily inside ``_start()``.
+        cdp: Optional[str] = None,
         # === Browser launch parameters (commonly used) ===
         channel: Optional[str] = None,
         executable_path: Optional[Union[str, Path]] = None,
@@ -480,6 +328,14 @@ class Browser:
         # Resolve parameters: explicit (non-None) > config > default.
         # Always pop named-param keys from _cfg so they don't leak into
         # _extra_kwargs (which would corrupt get_config() and Playwright options).
+        cdp = cdp if cdp is not None else _cfg.pop('cdp', None)
+        # NOTE: we no longer run resolve_cdp_input() here. It can hit the
+        # network (/json/version probes for port/http/auto inputs), which
+        # would make `Browser(cdp="9222")` block the constructor —
+        # unsafe inside an event loop and surprising for an SDK __init__.
+        # The raw value is stored on `self._cdp_raw` and resolved lazily
+        # inside the async `_start()` method below (wrapped with
+        # `asyncio.to_thread` so the loop isn't blocked).
         headless = headless if headless is not None else _cfg.pop('headless', True)
         stealth = stealth if stealth is not None else _cfg.pop('stealth', True)
         viewport = viewport if viewport is not None else _cfg.pop('viewport', None)
@@ -503,11 +359,11 @@ class Browser:
         color_scheme = color_scheme if color_scheme is not None else _cfg.pop('color_scheme', None)
         # Remove any named-param keys that were skipped above (explicit value won)
         for _named_key in (
-            'headless', 'stealth', 'viewport', 'user_data_dir', 'clear_user_data', 'channel',
-            'executable_path', 'proxy', 'timeout', 'slow_mo', 'args',
-            'ignore_default_args', 'downloads_path', 'devtools', 'user_agent',
-            'locale', 'timezone_id', 'ignore_https_errors', 'extra_http_headers',
-            'offline', 'color_scheme',
+            'cdp', 'headless', 'stealth', 'viewport', 'user_data_dir',
+            'clear_user_data', 'channel', 'executable_path', 'proxy', 'timeout',
+            'slow_mo', 'args', 'ignore_default_args', 'downloads_path', 'devtools',
+            'user_agent', 'locale', 'timezone_id', 'ignore_https_errors',
+            'extra_http_headers', 'offline', 'color_scheme',
         ):
             _cfg.pop(_named_key, None)
 
@@ -540,7 +396,7 @@ class Browser:
         # Stealth configuration
         self._stealth_config: Optional[StealthConfig] = None
         self._stealth_builder: Optional[StealthArgsBuilder] = None
-        self._temp_video_dir: Optional[str] = None  # For auto-created video dir
+
         self._preallocated_trace_path: Optional[str] = None
         self._close_session_dir: Optional[str] = None
 
@@ -559,6 +415,19 @@ class Browser:
 
         if self._stealth_config and self._stealth_config.enabled:
             self._stealth_builder = StealthArgsBuilder(self._stealth_config)
+
+        # CDP connection.
+        # `_cdp_raw` is the user-supplied input (port / ws:// / wss:// /
+        # http:// / "auto"). `_cdp_resolved` is the resolved ws:// URL,
+        # populated lazily by `_start()` — it is `None` until the browser
+        # has been started. Use `_cdp_raw is not None` to ask "did the user
+        # request CDP mode?"; use `_cdp_resolved` after start when the
+        # resolved ws URL is required.
+        self._cdp_raw: Optional[str] = cdp
+        self._cdp_resolved: Optional[str] = None
+        # Whether bridgic created the CDP context (vs borrowing an existing one).
+        # When True, close() will close the context; when False it only disconnects.
+        self._cdp_context_owned = False
 
         # Browser launch parameters
         self._channel = channel
@@ -588,6 +457,10 @@ class Browser:
         self._browser: Optional[PlaywrightBrowser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
+        # C2: set synchronously at the top of close() (before any await) so
+        # concurrent dispatchers can short-circuit with BROWSER_CLOSED rather
+        # than hit a misleading NO_ACTIVE_PAGE when `_page` is mid-teardown.
+        self._closing: bool = False
 
         # Download manager - handles saving files with correct filenames
         self._download_manager: Optional[DownloadManager] = None
@@ -599,6 +472,30 @@ class Browser:
         self._last_snapshot_url: Optional[str] = None
         self._snapshot_generator: Optional[SnapshotGenerator] = None
         self._snapshot_lock = asyncio.Lock()
+        # Background snapshot pre-warm (kicked off after navigate_to).
+        # Uses a dedicated generator so it never races with _snapshot_generator.
+        self._prefetch_snapshot: Optional[EnhancedSnapshot] = None
+        self._prefetch_options: Optional[SnapshotOptions] = None
+        self._prefetch_url: Optional[str] = None
+        self._prefetch_task: Optional[asyncio.Task] = None
+        self._prefetch_generator: Optional[SnapshotGenerator] = None
+        # Monotonic generation counter — bumped by `_cancel_prefetch()` on
+        # every navigation / tab switch. Each prefetch task captures the
+        # current value at launch and MUST verify it still matches before
+        # committing its result under `_snapshot_lock`. Without this a task
+        # returning from its await between cancel and commit could clobber
+        # a fresh page's cache with a stale snapshot. (C4.)
+        # Invariant: `_prefetch_gen` is bumped synchronously inside
+        # `_cancel_prefetch()` (no awaits before the increment), making it
+        # a single-writer field that does not need a lock for the bump itself.
+        self._prefetch_gen: int = 0
+        # I3: dedicated lock for the prefetch commit critical section
+        # (generation check + cache write). Nested inside `_snapshot_lock`
+        # so that concurrent prefetch tasks serialise against each other
+        # independently of user-initiated `get_snapshot` consumers, and so
+        # the invariant is named explicitly at its own lock rather than
+        # relying on `_snapshot_lock` as a catch-all.
+        self._prefetch_lock = asyncio.Lock()
         # Artifacts auto-saved during shutdown (trace/video)
         self._last_shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
         self._last_shutdown_errors: List[str] = []
@@ -612,10 +509,13 @@ class Browser:
         # Context-scoped state (keyed by _get_context_key)
         self._tracing_state: Dict[str, bool] = {}
         self._video_state: Dict[str, bool] = {}
-        # Deferred video save requests from stop_video(): context_key → target filename.
-        # None means save to the Playwright temp path (stop_video called without filename).
-        # Key absent means stop_video was not called for this context.
-        self._pending_video_save_path: Dict[str, Optional[str]] = {}
+        # Single-stream video recording: one ffmpeg process records the
+        # active tab. When the user switches tabs the screencast source
+        # is hot-swapped via VideoRecorder.switch_page().
+        self._video_recorder: Optional["_video_recorder_mod.VideoRecorder"] = None
+        # When a recording session is active, holds {"width", "height",
+        # "context"}.  None means no active session.
+        self._video_session: Optional[Dict[str, Any]] = None
 
     # ==================== Properties ====================
 
@@ -624,10 +524,36 @@ class Browser:
         """Whether to use persistent context mode (unrelated to headless/headed mode).
 
         Priority (highest to lowest):
+        - cdp is set            → always False (connect to existing browser)
         - clear_user_data=True  → always False (fresh launch+new_context, user_data_dir ignored)
         - clear_user_data=False → always True (persistent; user_data_dir if set, else default dir)
         """
+        # CDP mode: connect to existing browser, never use persistent context.
+        # Check the *raw* input so this property returns the correct answer
+        # even before `_start()` has resolved the URL.
+        if self._cdp_raw is not None:
+            return False
+
         return not self._clear_user_data
+
+    @property
+    def _is_cdp_borrowed(self) -> bool:
+        """True when the Browser is running against a CDP-borrowed context.
+
+        A context is *borrowed* when we connected over CDP (``_cdp_resolved``
+        is set) AND bridgic did not create the context itself
+        (``_cdp_context_owned`` is False). Borrowed-context paths must avoid
+        Playwright code that touches ``_mainContext()`` because it hangs on
+        pre-existing tabs.
+
+        This property only makes sense AFTER ``_start()`` has run — before
+        that, ``_cdp_resolved`` is still None (the raw input is stored on
+        ``_cdp_raw`` until lazy resolution inside ``_start()``), and
+        ``_cdp_context_owned`` has its initialisation default. All current
+        call sites are post-start, so checking the resolved ``_cdp_resolved``
+        here matches the previous inline expression exactly.
+        """
+        return bool(self._cdp_resolved) and not self._cdp_context_owned
 
     @property
     def stealth_enabled(self) -> bool:
@@ -683,6 +609,47 @@ class Browser:
         """Browser distribution channel."""
         return self._channel
 
+    @property
+    def last_close_artifacts(self) -> Dict[str, List[str]]:
+        """Trace and video paths produced by the most recent ``close()`` call.
+
+        Returns
+        -------
+        Dict[str, List[str]]
+            ``{"trace": [...], "video": [...]}``. The lists are empty
+            when ``close()`` ran but produced no artifacts, and also
+            when ``close()`` has never been called on this instance.
+
+        Notes
+        -----
+        Returns a fresh shallow copy on every access — mutating the
+        returned dict (or its inner lists) does not affect the
+        browser's internal state, and a subsequent ``close()`` will
+        not clobber the copy you already hold.
+        """
+        src = self._last_shutdown_artifacts or {}
+        return {
+            "trace": list(src.get("trace", [])),
+            "video": list(src.get("video", [])),
+        }
+
+    @property
+    def last_close_errors(self) -> List[str]:
+        """Warnings/errors collected during the most recent ``close()`` call.
+
+        Returns
+        -------
+        List[str]
+            One entry per cleanup step that raised. Empty when
+            ``close()`` succeeded cleanly or has never been called.
+
+        Notes
+        -----
+        Returns a fresh copy on every access; mutating it does not
+        affect the browser's internal state.
+        """
+        return list(self._last_shutdown_errors or [])
+
     def get_config(self) -> Dict[str, Any]:
         """Get all current browser configuration.
 
@@ -714,6 +681,10 @@ class Browser:
             "extra_http_headers": self._extra_http_headers,
             "offline": self._offline,
             "color_scheme": self._color_scheme,
+            # Report the raw user-supplied cdp input (pre-resolution) so the
+            # value is visible before _start() runs. The resolved ws:// URL
+            # is only known after the browser connects.
+            "cdp": self._cdp_raw,
             "use_persistent_context": self.use_persistent_context,
             **self._extra_kwargs,
         }
@@ -839,9 +810,13 @@ class Browser:
             options["devtools"] = self._devtools
         if self._proxy is not None:
             options["proxy"] = self._proxy
-        # NOTE: Don't pass downloads_path to Playwright - DownloadManager handles it
-        # Passing downloads_path to Playwright causes files to be saved with hash names
-        # Our DownloadManager uses download.save_as() to save with correct filenames
+        # NOTE: We intentionally do NOT pass downloads_path to Playwright.
+        # Playwright uses CDP `Browser.setDownloadBehavior(allowAndName)` to
+        # intercept all downloads, which breaks Chrome's native download UI
+        # (e.g. "Show in Folder" does nothing).  This is a known Chromium bug:
+        # https://issues.chromium.org/issues/324282051
+        # Instead, DownloadManager uses download.save_as() to copy files with
+        # correct filenames to the user's downloads_path.
         if self._slow_mo is not None:
             options["slow_mo"] = self._slow_mo
 
@@ -911,22 +886,27 @@ class Browser:
             "accept_downloads", "base_url", "strict_selectors", "service_workers",
             "record_har_path", "record_har_omit_content", "record_har_url_filter",
             "record_har_mode", "record_har_content",
-            "record_video_dir", "record_video_size",
             "client_certificates"
         }
         for key in context_keys:
             if key in self._extra_kwargs:
                 options[key] = self._extra_kwargs[key]
 
-        # Auto-create a default video dir so video recording is always available
-        if "record_video_dir" not in options:
-            if not self._temp_video_dir:
-                self._temp_video_dir = str(BRIDGIC_TMP_DIR)
-                os.makedirs(self._temp_video_dir, exist_ok=True)
-                logger.info(f"Using default video dir: {self._temp_video_dir}")
-            options["record_video_dir"] = self._temp_video_dir
-
         return options
+
+    def _resolve_persistent_profile_dir(self) -> Path:
+        """Resolve the final profile dir, split into headed/headless subdirs.
+
+        Headed and headless Chromium can't safely share the same profile dir
+        (SingletonLock / GPU-cache state collisions cause cross-mode startup
+        crashes), so the mode-specific subdir is always applied. The public
+        ``user_data_dir`` property still returns the user-supplied base path.
+        """
+        base = self._user_data_dir if self._user_data_dir else BRIDGIC_USER_DATA_DIR
+        mode = "headed" if self._headless is False else "headless"
+        profile_dir = base / mode
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        return profile_dir
 
     def _get_persistent_context_options(self) -> Dict[str, Any]:
         """Get options for launch_persistent_context() method.
@@ -944,18 +924,35 @@ class Browser:
         # Add context options
         options.update(self._get_context_options())
 
-        # Determine user_data_dir (only reached when clear_user_data=False)
-        if self._user_data_dir:
-            options["user_data_dir"] = str(self._user_data_dir)
-        else:
-            # No custom path: use the default persistent profile directory.
-            BRIDGIC_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
-            options["user_data_dir"] = str(BRIDGIC_USER_DATA_DIR)
-            logger.info(f"Using default user data dir: {BRIDGIC_USER_DATA_DIR}")
+        # Determine user_data_dir (only reached when clear_user_data=False).
+        # Always split into <base>/headed or <base>/headless to avoid
+        # SingletonLock collisions when switching modes on the same profile.
+        profile_dir = self._resolve_persistent_profile_dir()
+        options["user_data_dir"] = str(profile_dir)
+        if not self._user_data_dir:
+            logger.info(f"Using default user data dir: {profile_dir}")
 
         return options
 
     # ==================== Lifecycle ====================
+
+    async def _apply_debugger_skip_pauses(self, context: "BrowserContext", page: "Page") -> None:
+        """Tell CDP to skip debugger pauses on ``page``.
+
+        Playwright enables the Debugger domain internally; any ``debugger``
+        statement would fire Debugger.paused events whose CDP round-trip
+        delay can be timed by devtools-detector (>100 ms → "open").
+        Invoked from all three start modes (launch / persistent / CDP) so
+        the anti-detection surface stays symmetric.
+        """
+        if not self.stealth_enabled or page is None:
+            return
+        try:
+            _dbg = await context.new_cdp_session(page)
+            await _dbg.send("Debugger.setSkipAllPauses", {"skip": True})
+            await _dbg.detach()
+        except Exception:
+            logger.debug("Failed to set Debugger.setSkipAllPauses", exc_info=True)
 
     async def _start(self) -> None:
         """Start the browser.
@@ -978,14 +975,115 @@ class Browser:
         try:
             self._playwright = await async_playwright().start()
 
-            if self.use_persistent_context:
+            # Lazy CDP URL resolution. We deliberately defer resolve_cdp_input()
+            # out of __init__ so constructing `Browser(cdp=...)` inside an
+            # event loop never blocks on /json/version. Wrap the sync call in
+            # to_thread because resolve_cdp_input uses urlopen under the hood.
+            if self._cdp_raw and not self._cdp_resolved:
+                try:
+                    self._cdp_resolved = await asyncio.to_thread(
+                        resolve_cdp_input, str(self._cdp_raw)
+                    )
+                except (RuntimeError, ValueError, ConnectionError) as exc:
+                    raise InvalidInputError(
+                        f"Failed to resolve cdp={self._cdp_raw!r}: {exc}",
+                        code="INVALID_CDP_URL",
+                        details={"cdp": self._cdp_raw, "source": "lazy_start"},
+                    ) from exc
+
+            if self._cdp_resolved:
+                # Mode 0: Connect to an already-running Chrome via raw CDP.
+                # Stealth launch args and extensions cannot be applied to an existing
+                # browser process, so they are skipped here.  The JS init script is
+                # still registered so that new pages opened in this session receive it.
+                logger.info(
+                    "Using CDP connect mode (url=%s)",
+                    _redact_cdp_url(self._cdp_resolved),
+                )
+                self._browser = await self._playwright.chromium.connect_over_cdp(self._cdp_resolved)
+                # Playwright invariant for connect_over_cdp() (verified
+                # against playwright-core 1.57):
+                #   chromium.ts _connectOverCDPImpl always passes
+                #   persistent={noDefaultViewport: true}, so
+                #   crBrowser.ts:_connect skips the early `if (!options.persistent)`
+                #   branch and creates `_defaultContext`. The Node-side
+                #   browserDispatcher then dispatches it as a `context`
+                #   event, which the Python client appends to
+                #   `Browser._contexts`.
+                # Net effect: ``self._browser.contexts`` is never empty
+                # in current Playwright versions. The else branch below
+                # is a defensive fallback in case this invariant ever
+                # changes upstream.
+                if self._browser.contexts:
+                    self._context = self._browser.contexts[0]
+                    self._cdp_context_owned = False
+                else:
+                    self._context = await self._browser.new_context(**self._get_context_options())
+                    self._cdp_context_owned = True
+
+                # Inject JS stealth patches only in headless mode.  Headed mode
+                # skips the script to avoid breaking Cloudflare Turnstile (same
+                # rationale as the non-CDP code path below).
+                if self._stealth_builder and self._headless:
+                    init_script = self._stealth_builder.get_init_script(locale=self._locale)
+                    if init_script:
+                        await self._context.add_init_script(init_script)
+
+                # Anti devtools-detector init script: safe for both headed and
+                # headless (it only patches timing probes, not window.chrome or
+                # WebGL identity that Turnstile checks).  Without this the CDP
+                # entry point would be detectably weaker than launch/persistent.
+                if self._stealth_builder:
+                    _adt_script = self._stealth_builder.get_anti_devtools_script()
+                    if _adt_script:
+                        await self._context.add_init_script(_adt_script)
+
+                # Always create a new tab for bridgic to drive.  We never
+                # reuse an existing user tab — the very next navigate_to()
+                # would otherwise overwrite whatever the user was looking at.
+                # In owned-context mode the new context is empty anyway, so
+                # this is a no-op cost.
+                existing_count = len(self._context.pages)
+                self._page = await self._context.new_page()
+                logger.info(
+                    "[CDP] connected; created new bridgic tab "
+                    "(borrowed_context=%s, preserved_existing_tabs=%d)",
+                    not self._cdp_context_owned,
+                    existing_count,
+                )
+
+                # Parity with non-CDP: make the Debugger domain skip pauses on
+                # the bridgic page so devtools-detector cannot time the CDP
+                # round-trip of Debugger.paused events.
+                await self._apply_debugger_skip_pauses(self._context, self._page)
+
+                # Download manager attachment strategy (CDP):
+                # - Owned context (bridgic created it): attach to the whole
+                #   context — all pages in it belong to bridgic anyway.
+                # - Borrowed context (user's): attach ONLY to the bridgic tab.
+                #   attaching to the context would hijack download events from
+                #   the user's pre-existing tabs (they'd land in our
+                #   downloads_path instead of Chrome's default behaviour).
+                if self._download_manager:
+                    if self._cdp_context_owned:
+                        self._download_manager.attach_to_context(self._context)
+                    else:
+                        self._download_manager.attach_to_page(self._page)
+
+                logger.info("Playwright started (mode=cdp, stealth_js=%s)", self.stealth_enabled)
+                return
+
+            elif self.use_persistent_context:
                 # Mode 1: Persistent context (clear_user_data=False)
                 logger.info("Using persistent context mode")
                 persistent_options = self._get_persistent_context_options()
                 logger.debug(f"Persistent context options: {persistent_options}")
                 _write_launch_debug_log(persistent_options, mode="persistent_context")
-                self._context = await self._playwright.chromium.launch_persistent_context(
-                    **persistent_options
+                self._context = await _retriable_launch(
+                    lambda: self._playwright.chromium.launch_persistent_context(
+                        **persistent_options
+                    ),
+                    mode="persistent_context",
                 )
                 self._browser = self._context.browser
             else:
@@ -994,7 +1092,10 @@ class Browser:
                 launch_options = self._get_launch_options()
                 logger.debug(f"Launch options: {launch_options}")
                 _write_launch_debug_log(launch_options, mode="launch")
-                self._browser = await self._playwright.chromium.launch(**launch_options)
+                self._browser = await _retriable_launch(
+                    lambda: self._playwright.chromium.launch(**launch_options),
+                    mode="launch",
+                )
 
                 context_options = self._get_context_options()
                 logger.debug(f"Context options: {context_options}")
@@ -1032,13 +1133,7 @@ class Browser:
             # statements would fire Debugger.paused events whose CDP
             # round-trip delay the debuggerChecker in devtools-detector
             # can measure (>100 ms => "open").
-            if self.stealth_enabled:
-                try:
-                    _dbg = await self._context.new_cdp_session(self._page)
-                    await _dbg.send("Debugger.setSkipAllPauses", {"skip": True})
-                    await _dbg.detach()
-                except Exception:
-                    logger.debug("Failed to set Debugger.setSkipAllPauses", exc_info=True)
+            await self._apply_debugger_skip_pauses(self._context, self._page)
 
             # Attach download manager to handle downloads with correct filenames
             if self._download_manager:
@@ -1078,15 +1173,16 @@ class Browser:
             await self.close()
             await self._start()
 
-    # Timeout (seconds) applied to individual page.close() calls during
-    # shutdown so that a hung beforeunload handler cannot block forever.
-    _PAGE_CLOSE_TIMEOUT = 5.0
-    _TRACE_STOP_TIMEOUT = 10.0
-    _VIDEO_PATH_TIMEOUT = 10.0
-    _VIDEO_SAVE_AS_TIMEOUT = 120.0  # save_as copies a file; large recordings need more time
-    _CONTEXT_CLOSE_TIMEOUT = 15.0
-    _BROWSER_CLOSE_TIMEOUT = 15.0
-    _PLAYWRIGHT_STOP_TIMEOUT = 15.0
+    # Shutdown-pipeline budgets. Sourced from bridgic.browser._timeouts so
+    # the SDK, CLI daemon, and tests all agree on the same number — see that
+    # module for rationale on each value.
+    _PAGE_CLOSE_TIMEOUT = _timeouts.PAGE_CLOSE_S
+    _TRACE_STOP_TIMEOUT = _timeouts.TRACE_STOP_S
+    _CONTEXT_CLOSE_TIMEOUT = _timeouts.CONTEXT_CLOSE_S
+    _BROWSER_CLOSE_TIMEOUT = _timeouts.BROWSER_CLOSE_S
+    _PLAYWRIGHT_STOP_TIMEOUT = _timeouts.PLAYWRIGHT_STOP_S
+    _VIDEO_PREPARE_STOP_TIMEOUT = _timeouts.VIDEO_PREPARE_STOP_S
+    _VIDEO_FINALIZE_TIMEOUT = _timeouts.VIDEO_FINALIZE_S
 
     @staticmethod
     async def _force_kill_playwright_driver(pw: Any) -> None:
@@ -1122,6 +1218,12 @@ class Browser:
                         # The daemon (and direct SDK callers) share the same pgid
                         # as the Node driver because the driver is spawned without
                         # start_new_session=True and inherits the caller's pgrp.
+                        #
+                        # Docker edge case: under `docker exec` / `kubectl exec`,
+                        # the daemon's pgid often equals init(1). This guard then
+                        # short-circuits the group kill and falls back to
+                        # ``proc.kill()`` — intentional. Killing the container's
+                        # init would take down the whole container.
                         if pgid != os.getpgid(os.getpid()):
                             os.killpg(pgid, signal.SIGKILL)
                             killed_via_group = True
@@ -1212,21 +1314,21 @@ class Browser:
         Returns
         -------
         Dict with keys:
-          session_dir : str         — unique per-close directory under BRIDGIC_TMP_DIR
+          session_dir : str         — unique per-close directory under
+                                      BRIDGIC_TMP_DIR, or "" when no
+                                      artifact will be produced
           trace       : List[str]   — pre-created trace path (if tracing is active)
           video       : List[str]   — pre-allocated video paths in session dir
+
+        Notes
+        -----
+        We deliberately skip creating the session directory when no
+        tracing/video session is active. Otherwise every SDK ``close()``
+        call would leak an empty ``close-<ts>-<rand>`` directory under
+        ``BRIDGIC_TMP_DIR``, which previously accumulated indefinitely.
         """
-        import random
-        from datetime import datetime
-
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        session_name = f"close-{ts}-{random.randint(0, 0xffff):04x}"
-        session_dir = Path(str(BRIDGIC_TMP_DIR)) / session_name
-        session_dir.mkdir(parents=True, exist_ok=True)
-        self._close_session_dir = str(session_dir)
-
         artifacts: Dict[str, Any] = {
-            "session_dir": str(session_dir),
+            "session_dir": "",
             "trace": [],
             "video": [],
         }
@@ -1236,33 +1338,58 @@ class Browser:
 
         context_key = _get_context_key(self._context)
 
+        tracing_active = bool(self._tracing_state.get(context_key))
+        video_count = 1 if self._video_recorder is not None else 0
+        if not tracing_active and video_count == 0:
+            # Nothing to write — don't create a directory.
+            return artifacts
+
+        import random
+        from datetime import datetime
+
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        session_name = f"close-{ts}-{random.randint(0, 0xffff):04x}"
+        session_dir = Path(str(BRIDGIC_TMP_DIR)) / session_name
+        session_dir.mkdir(parents=True, exist_ok=True)
+        self._close_session_dir = str(session_dir)
+        artifacts["session_dir"] = str(session_dir)
+
         # Pre-allocate trace path inside session dir
-        if self._tracing_state.get(context_key):
+        if tracing_active:
             trace_path = str(session_dir / "trace.zip")
             Path(trace_path).touch()          # create empty file; tracing.stop() will overwrite
             self._preallocated_trace_path = trace_path
             artifacts["trace"].append(trace_path)
 
-        # Determine video artifact info
-        _absent: Any = object()
-        pending_raw = self._pending_video_save_path.get(context_key, _absent)
-        has_pending = pending_raw is not _absent
-
-        if self._video_state.get(context_key) or has_pending:
-            if has_pending and pending_raw:
-                artifacts["video"].append(os.path.abspath(str(pending_raw)))
+        # Pre-allocate one video path per active recorder.  Multi-page
+        # recording produces N files: video.webm, video-1.webm, ...
+        for i in range(video_count):
+            if i == 0:
+                video_path = str(session_dir / "video.webm")
             else:
-                # Pre-allocate video paths inside session dir so all artifacts
-                # are grouped together instead of scattered in tmp/ with hashes.
-                pages_with_video = [
-                    p for p in list(self._context.pages)
-                    if getattr(p, "video", None) is not None
-                ]
-                need_suffix = len(pages_with_video) > 1
-                for i in range(len(pages_with_video)):
-                    suffix = f"_{i + 1}" if need_suffix else ""
-                    video_path = str(session_dir / f"video{suffix}.webm")
-                    artifacts["video"].append(video_path)
+                video_path = str(session_dir / f"video-{i}.webm")
+            artifacts["video"].append(video_path)
+
+        # Pre-seed close-report.json with status=pending so clients (and CI)
+        # can tell that the daemon started close() but may have been SIGKILL'd
+        # before writing the final report. _write_close_report (SDK) and the
+        # daemon's own writer both overwrite this file on the happy path.
+        try:
+            from datetime import datetime, timezone
+            pending_report = {
+                "status": "pending",
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+                "trace_paths": list(artifacts["trace"]),
+                "video_paths": list(artifacts["video"]),
+                "warnings": [],
+                "errors": [],
+            }
+            (session_dir / "close-report.json").write_text(
+                json.dumps(pending_report, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # non-fatal — absence just means no pending marker
+            logger.debug("inspect_pending_close_artifacts: pending preseed failed: %s", exc)
 
         return artifacts
 
@@ -1274,6 +1401,9 @@ class Browser:
         dialog handlers) — no need to call ``stop_*`` / ``remove_*`` methods
         beforehand. Active tracing/video sessions are auto-finalized and their
         paths included in the result.
+
+        **CDP mode**: only disconnects the Playwright session from the remote
+        browser — pages, tabs, and contexts are left intact.
 
         Safe to call even when the browser was never started — returns
         ``"Browser closed."`` immediately without raising.
@@ -1287,6 +1417,13 @@ class Browser:
         if self._playwright is None:
             return "Browser closed."
 
+        # Publish the closing sentinel SYNCHRONOUSLY — before any await — so
+        # the CLI daemon can short-circuit concurrent dispatches with a clean
+        # BROWSER_CLOSED response instead of the handler racing against the
+        # teardown and emitting NO_ACTIVE_PAGE. Critical: do not move this
+        # below any `await`.
+        self._closing = True
+
         # Ensure a close session directory exists so trace/video artifacts are
         # grouped together (e.g. close-{ts}-{rand}/trace.zip, video_1.webm).
         # The CLI daemon calls inspect_pending_close_artifacts() before close(),
@@ -1297,11 +1434,16 @@ class Browser:
         errors: List[str] = []
         shutdown_artifacts: Dict[str, List[str]] = {"trace": [], "video": []}
         context_key: Optional[str] = None
+        # Recorder whose prepare_stop() has run but finalize() is deferred
+        # until after Chrome exits (two-phase video shutdown).
+        # Currently only one single-stream recorder is supported.
+        _deferred_recorder: Optional[Any] = None
         # Deferred re-raise: if CancelledError / KeyboardInterrupt arrives during any
         # cleanup await we record it here, finish ALL cleanup steps, then re-raise at
         # the very end.  This ensures no Playwright/Chromium process is left orphaned
         # just because one step was interrupted.
         _pending_cancel: Optional[BaseException] = None
+        _is_cdp = self._cdp_resolved is not None
 
         # Auto-stop active tracing before context/page teardown so trace data is saved.
         if self._context:
@@ -1353,127 +1495,131 @@ class Browser:
                 finally:
                     self._tracing_state[context_key] = False
 
+            # Two-phase video recorder shutdown.
+            #
+            # Phase 1 (here, before Chrome exits): prepare_stop() each
+            # recorder — stops the CDP screencast, pads frames, detaches
+            # the CDP session.  Fast (~milliseconds per recorder).
+            #
+            # Phase 2 (after Chrome exits): finalize() each recorder —
+            # flushes the frame queue to ffmpeg and waits for the process
+            # to write the .webm file.  Slow (seconds), but Chrome is
+            # already dead so user_data_dir is released.
+            #
+            # Why two phases: the old single-phase stop() held Chrome
+            # alive while 50 ffmpeg processes fought for CPU, blocking
+            # user_data_dir release.  Splitting lets Chrome exit ASAP.
+            #
+            # Why we snapshot the dict before awaiting:
+            #   stop_video() and close() can race in the daemon flow. We
+            #   clear the dict first so the other path observes "no work
+            #   left" and skips the duplicate stop() call.
+            if self._video_recorder is not None or self._video_session is not None:
+                # Detach the context "page" listener so new pages aren't
+                # auto-started during shutdown.
+                if self._video_session:
+                    _listener = self._video_session.get("page_listener")
+                    if _listener is not None:
+                        try:
+                            self._context.remove_listener("page", _listener)
+                        except Exception:
+                            pass
+                _recorder = self._video_recorder
+                self._video_recorder = None
+                self._video_session = None
+
+                # Phase 1: prepare_stop() the single recorder (fast).
+                if _recorder is not None:
+                    try:
+                        await asyncio.wait_for(
+                            _recorder.prepare_stop(),
+                            timeout=self._VIDEO_PREPARE_STOP_TIMEOUT,
+                        )
+                    except Exception as _pr:
+                        logger.warning(
+                            "[close] prepare_stop failed: %s(%r)",
+                            type(_pr).__name__, str(_pr),
+                        )
+                        _recorder.force_mark_stopped()
+                    except BaseException as _pr:
+                        logger.warning("[close] prepare_stop cancelled: %s", _pr)
+                        _recorder.force_mark_stopped()
+                        if _pending_cancel is None:
+                            _pending_cancel = _pr
+
+                    # Stash for Phase 2 (runs after Chrome exits).
+                    _deferred_recorder = _recorder
+
+            logger.debug("[close] Phase 1 done, clearing page state")
             # Always clear page-scoped listeners/caches for every context page.
             for page in list(self._context.pages):
                 self._clear_page_scoped_state(page, errors)
-
-            # Navigate all pages to about:blank before video finalization to
-            # terminate service workers and ongoing network activity.  This
-            # prevents context.close() from hanging later.
-            #
-            # Must run BEFORE video finalization because _finalize_video()
-            # calls page.close() for each page — after that the page list is
-            # empty and about:blank would be a no-op.
-            for _nav_page in list(self._context.pages):
-                try:
-                    await asyncio.wait_for(
-                        _nav_page.goto("about:blank", wait_until="commit"),
-                        timeout=self._PAGE_CLOSE_TIMEOUT,
-                    )
-                except Exception as exc:
-                    logger.debug("close: about:blank navigation failed: %s", exc)
-                except BaseException as e:
-                    if _pending_cancel is None:
-                        _pending_cancel = e
-
-            # Save videos when: (a) video_start() was called and never stopped, or
-            # (b) stop_video() deferred the save to close time.
-            # Use a sentinel because pop() returns None both for "absent" and "stored None".
-            _absent: Any = object()
-            pending_save_raw = self._pending_video_save_path.pop(context_key, _absent)
-            has_pending_save = pending_save_raw is not _absent
-            pending_filename: Optional[str] = pending_save_raw if has_pending_save else None  # type: ignore[assignment]
-
-            if self._video_state.get(context_key) or has_pending_save:
-                pages_with_video = [
-                    (p, p.video)
-                    for p in list(self._context.pages)
-                    if getattr(p, "video", None) is not None
-                ]
-
-                need_suffix = len(pages_with_video) > 1
-                dest_dir: Optional[str] = None
-                dest_stem: Optional[str] = None
-                dest_ext = ".webm"
-                if pending_filename:
-                    dest_dir = os.path.dirname(pending_filename)
-                    dest_stem = os.path.splitext(os.path.basename(pending_filename))[0]
-                elif self._close_session_dir:
-                    # No explicit filename — save into session dir so all
-                    # close artifacts are grouped together.
-                    dest_dir = self._close_session_dir
-                    dest_stem = "video"
-
-                async def _finalize_video(page_: Any, video_: Any, idx: int) -> Optional[str]:
-                    await asyncio.wait_for(page_.close(), timeout=self._PAGE_CLOSE_TIMEOUT)
-                    if dest_dir is not None and dest_stem is not None:
-                        suffix = f"_{idx}" if need_suffix else ""
-                        dest = os.path.join(dest_dir, f"{dest_stem}{suffix}{dest_ext}")
-                        await asyncio.wait_for(
-                            video_.save_as(dest),
-                            timeout=self._VIDEO_SAVE_AS_TIMEOUT,
-                        )
-                        return dest
-                    vp = await asyncio.wait_for(
-                        video_.path(),
-                        timeout=self._VIDEO_PATH_TIMEOUT,
-                    )
-                    return os.path.abspath(str(vp))
-
-                results = await asyncio.gather(
-                    *(_finalize_video(p, v, i + 1) for i, (p, v) in enumerate(pages_with_video)),
-                    return_exceptions=True,
-                )
-                for r in results:
-                    if isinstance(r, BaseException):
-                        errors.append(f"video.finalize: {r}")
-                    elif r is not None:
-                        shutdown_artifacts["video"].append(r)
-
-                self._video_state[context_key] = False
-                # We may have closed the current page above.
-                self._page = None
         else:
             self._clear_page_scoped_state(self._page, errors)
 
-        # Close page (with timeout to guard against hung beforeunload handlers)
-        if self._page:
-            _page = self._page
-            self._page = None
-            try:
-                await asyncio.wait_for(
-                    _page.close(), timeout=self._PAGE_CLOSE_TIMEOUT,
-                )
-            except BaseException as e:
-                errors.append(f"page.close: {e}")
-                if not isinstance(e, Exception) and _pending_cancel is None:
-                    _pending_cancel = e
-
-        # Detach download manager before context closes to remove handlers
-        if self._download_manager and self._context:
-            try:
-                self._download_manager.detach_from_context(self._context)
-            except Exception as e:
-                errors.append(f"download_manager.detach: {e}")
-
-        # Close all remaining pages in context before closing context.
-        # This avoids context.close() hanging on beforeunload handlers of extra
-        # tabs the user may have opened manually (or pages we didn't track).
-        if self._context:
-            for extra_page in list(self._context.pages):
+        logger.debug("[close] disconnecting browser")
+        # Detach download manager before context closes to remove handlers.
+        # Mirror the attach strategy:
+        # - Borrowed CDP context: handler was page-scoped on the bridgic tab,
+        #   so detach at the page level (detach_from_context would no-op
+        #   since the context was never attached).
+        # - All other modes: handler was context-scoped, detach at context.
+        if self._download_manager:
+            if _is_cdp and not self._cdp_context_owned and self._page:
                 try:
-                    await asyncio.wait_for(
-                        extra_page.close(run_before_unload=False),
-                        timeout=self._PAGE_CLOSE_TIMEOUT,
-                    )
-                except BaseException as e:
-                    if not isinstance(e, Exception) and _pending_cancel is None:
-                        _pending_cancel = e
-                    # best-effort; context.close() will handle remaining pages
+                    self._download_manager.detach_from_page(self._page)
+                except Exception as e:
+                    errors.append(f"download_manager.detach_page: {e}")
+            elif self._context:
+                try:
+                    self._download_manager.detach_from_context(self._context)
+                except Exception as e:
+                    errors.append(f"download_manager.detach: {e}")
 
-        # Close context
-        # NOTE: In persistent context mode, closing context will auto close browser
-        if self._context:
+        # Close every page in parallel.
+        # CDP mode: skip page cleanup entirely — just disconnect.
+        #   The remote browser manages its own tab lifecycle.
+        # Launch / persistent: close all pages explicitly before context close.
+        #
+        # C2: `self._page` is NOT nulled here; we keep the reference alive
+        # until all page.close() awaits return. Nulling early was the root
+        # cause of NO_ACTIVE_PAGE races with in-flight dispatch. Now any
+        # tool method that still sees `self._page` will hit Playwright's
+        # "Target closed" error (mapped to BROWSER_CLOSED by the daemon).
+        if self._context and not _is_cdp:
+            all_pages = list(self._context.pages)
+            if all_pages:
+                page_results = await asyncio.gather(
+                    *(asyncio.wait_for(
+                        p.close(run_before_unload=False),
+                        timeout=self._PAGE_CLOSE_TIMEOUT,
+                    ) for p in all_pages),
+                    return_exceptions=True,
+                )
+                for r in page_results:
+                    if isinstance(r, BaseException):
+                        if not isinstance(r, Exception) and _pending_cancel is None:
+                            _pending_cancel = r
+                        elif isinstance(r, Exception):
+                            errors.append(f"page.close: {r}")
+        # All pages are now closed at Playwright level. Safe to release our
+        # own handle — no dispatch can mistake this for a "not yet started"
+        # state because `_closing` has been True since the very top.
+        self._page = None
+
+        # Close context.
+        # - Launch / persistent: close context (auto-closes browser).
+        # - CDP owned (`_cdp_context_owned=True`): bridgic created the context
+        #   in _start() because `browser.contexts` was empty on connect. Close
+        #   it explicitly; otherwise the context leaks on the remote Chrome for
+        #   its entire lifetime (frequent connect/disconnect cycles = OOM).
+        # - CDP borrowed (`_cdp_context_owned=False`): the user owns the
+        #   context — release the local reference but never close it, so their
+        #   existing tabs survive the disconnect.
+        _close_context_now = bool(self._context) and (
+            not _is_cdp or self._cdp_context_owned
+        )
+        if _close_context_now:
             _context = self._context
             self._context = None
             try:
@@ -1485,9 +1631,25 @@ class Browser:
                 errors.append(
                     f"context.close: timeout after {self._CONTEXT_CLOSE_TIMEOUT:.1f}s"
                 )
-                # context.close() hung — force-kill the entire Playwright driver
-                # so browser.close() and playwright.stop() don't also time out.
-                if self._playwright:
+                # Force-kill the Playwright driver when context.close() hung, so
+                # browser.close() / playwright.stop() don't cascade into their
+                # own timeouts.
+                #
+                # CDP borrowed mode is deliberately excluded: the driver and the
+                # *remote* Chrome share the same WS channel and killing the
+                # driver would orphan the user's browser from future disconnect
+                # signals.
+                #
+                # CDP owned mode, however, benefits from this same fallback —
+                # bridgic created the context on a throwaway remote profile, so
+                # tearing down the driver is correct. Without this branch the
+                # daemon could hang indefinitely when the remote Chrome is
+                # unresponsive mid-close().
+                should_force_kill = (
+                    self._playwright is not None
+                    and (not _is_cdp or self._cdp_context_owned)
+                )
+                if should_force_kill:
                     _playwright = self._playwright
                     self._playwright = None
                     self._browser = None  # browser dies with driver
@@ -1498,9 +1660,15 @@ class Browser:
                 errors.append(f"context.close: {e}")
                 if _pending_cancel is None:
                     _pending_cancel = e
+        elif self._context:
+            # CDP borrowed mode: release reference without closing.
+            self._context = None
 
-        # Close browser (only needed in normal launch mode, not persistent context)
-        # In persistent context mode, browser is None or already closed
+        # Close browser.
+        # - Normal launch mode: closes browser process.
+        # - Persistent context mode: browser is None or already closed via context.
+        # - CDP mode: close() disconnects the Playwright session without killing the
+        #   remote Chrome process (the process continues running after disconnect).
         if self._browser:
             _browser = self._browser
             self._browser = None
@@ -1540,9 +1708,40 @@ class Browser:
                 if _pending_cancel is None:
                     _pending_cancel = e
 
+        # Phase 2: finalize() the deferred video recorder.
+        # Chrome is dead, user_data_dir is released.  Now flush the ffmpeg
+        # frame queue.
+        if _deferred_recorder is not None:
+            logger.info("[close] Phase 2: finalize single recorder")
+            try:
+                rec_path: str = await asyncio.wait_for(
+                    _deferred_recorder.finalize(),
+                    timeout=self._VIDEO_FINALIZE_TIMEOUT,
+                )
+                if self._close_session_dir:
+                    dest = os.path.join(self._close_session_dir, "video.webm")
+                    self._move_video_local(Path(rec_path), dest)
+                    shutdown_artifacts["video"].append(dest)
+                else:
+                    shutdown_artifacts["video"].append(rec_path)
+            except asyncio.TimeoutError:
+                errors.append(
+                    f"video_recorder.finalize: timeout after "
+                    f"{self._VIDEO_FINALIZE_TIMEOUT:.1f}s"
+                )
+            except Exception as _fin_err:
+                errors.append(f"video_recorder.finalize: {_fin_err}")
+            except BaseException as _fin_err:
+                errors.append(f"video_recorder.finalize: {_fin_err}")
+                if _pending_cancel is None:
+                    _pending_cancel = _fin_err
+            if context_key is not None:
+                self._video_state.pop(context_key, None)
+
         # Clear snapshot cache
         self._last_snapshot = None
         self._last_snapshot_url = None
+        self._cancel_prefetch()
         self._last_shutdown_artifacts = shutdown_artifacts
         self._last_shutdown_errors = list(errors)
 
@@ -1562,7 +1761,6 @@ class Browser:
         self._dialog_handlers.clear()
         self._tracing_state.clear()
         self._video_state.clear()
-        self._pending_video_save_path.clear()
 
         trace_paths = shutdown_artifacts.get("trace", [])
         video_paths = shutdown_artifacts.get("video", [])
@@ -1670,19 +1868,36 @@ class Browser:
                 # All tabs were closed (e.g. via close_tab); _context is still alive.
                 logger.info("No page is open, creating a new page in existing context")
                 self._page = await self._context.new_page()
+                await self._switch_video_to_page(self._page)
 
             kwargs: Dict[str, Any] = {"wait_until": wait_until}
             if timeout is not None:
                 kwargs["timeout"] = timeout * 1000.0
             await self._page.goto(url, **kwargs)
-            # Update cache
-            self._last_snapshot = None
-            self._last_snapshot_url = None
+            # Invalidate snapshot cache and any in-flight pre-warm.
+            self._invalidate_page_state()
             page = await self.get_current_page()
             actual_url = page.url if page else url
             result = f"Navigated to: {actual_url}"
-
             logger.info(f"[navigate_to] done {result}")
+
+            # Kick off background snapshot pre-warm so the first snapshot
+            # call after navigation returns instantly (cache hit).
+            if self._page is not None:
+                self._prefetch_options = SnapshotOptions(interactive=True, full_page=True)
+                self._prefetch_url = actual_url
+                # Snapshot the gen AT SCHEDULING TIME so the task can detect a
+                # subsequent _cancel_prefetch (which bumps the gen) and refuse
+                # to commit its stale result.
+                _my_gen = self._prefetch_gen
+                try:
+                    self._prefetch_task = asyncio.ensure_future(
+                        self._pre_warm_snapshot(self._page, _my_gen)
+                    )
+                except Exception as _e:
+                    # Non-fatal: pre-warm is best-effort (e.g., no running loop in tests)
+                    logger.debug("[navigate_to] pre-warm scheduling failed: %s", _e)
+
             return result
         except BridgicBrowserError:
             raise
@@ -1703,10 +1918,93 @@ class Browser:
                 code="NO_BROWSER_CONTEXT",
             )
         self._page = await self._context.new_page()
+        await self._switch_video_to_page(self._page)
         if url:
             await self.navigate_to(url, wait_until=wait_until, timeout=timeout)
         await self._page.bring_to_front()
         return self._page
+
+    async def _cdp_navigate_history(self, page: "Page", delta: int) -> None:
+        """Navigate browser history by *delta* (-1 = back, +1 = forward) using a
+        raw CDPSession, bypassing ``page.go_back/forward()`` which relies on
+        Playwright's ``_mainContext()`` tracking.  That tracking can hang on tabs
+        opened before bridgic attached (CDP borrowed mode).
+        """
+        session = None
+        try:
+            session = await self._context.new_cdp_session(page)
+            history = await asyncio.wait_for(
+                session.send("Page.getNavigationHistory"),
+                timeout=5.0,
+            )
+            current_idx = history.get("currentIndex", 0)
+            entries = history.get("entries", [])
+            target_idx = current_idx + delta
+            if target_idx < 0 or target_idx >= len(entries):
+                direction = "back" if delta < 0 else "forward"
+                _raise_state_error(
+                    f"Cannot navigate {direction}: no history entry",
+                    code="NO_HISTORY_ENTRY",
+                    retryable=False,
+                )
+            entry_id = entries[target_idx]["id"]
+            await asyncio.wait_for(
+                session.send("Page.navigateToHistoryEntry", {"entryId": entry_id}),
+                timeout=15.0,
+            )
+        finally:
+            if session:
+                try:
+                    await session.detach()
+                except Exception:
+                    pass
+        # Wait for page to reach domcontentloaded; ignore timeout (navigation may
+        # already be complete when we get here for cached/fast pages).
+        try:
+            await asyncio.wait_for(
+                page.wait_for_load_state("domcontentloaded"),
+                timeout=10.0,
+            )
+        except Exception:
+            pass
+
+    async def _get_page_title(self, page: Page) -> str:
+        """Return the title of *page*, handling CDP borrowed-mode pages correctly.
+
+        ``page.title()`` internally calls Playwright's ``frame._mainContext()``,
+        which waits on a Promise that is resolved when Playwright sees the CDP
+        ``Runtime.executionContextCreated`` event.  For **pre-existing tabs**
+        when bridgic connects via ``connect_over_cdp()``, Playwright may have
+        missed that event (it fired before Playwright registered its listener),
+        so the Promise never resolves and ``page.title()`` hangs indefinitely.
+
+        In CDP borrowed-mode we bypass Playwright's context-tracking entirely by
+        opening a fresh ``CDPSession`` directly to the target and sending
+        ``Runtime.evaluate`` ourselves.  Chrome responds immediately regardless
+        of Playwright's internal state.  For pages that genuinely cannot run JS
+        (e.g. ``chrome://`` internal pages) we fall back to the URL.
+        """
+        if self._is_cdp_borrowed and self._context:
+            session = None
+            try:
+                session = await self._context.new_cdp_session(page)
+                result = await asyncio.wait_for(
+                    session.send(
+                        "Runtime.evaluate",
+                        {"expression": "document.title", "returnByValue": True},
+                    ),
+                    timeout=5.0,
+                )
+                return result.get("result", {}).get("value", "") or page.url
+            except Exception:
+                return page.url
+            finally:
+                if session:
+                    try:
+                        await session.detach()
+                    except Exception:
+                        pass
+        return await page.title()
 
     async def get_page_desc(self, page: Optional[Page] = None) -> Optional[PageDesc]:
         if not page:
@@ -1715,7 +2013,7 @@ class Browser:
             logger.warning("No page is open")
             return None
         page_id = generate_page_id(page)
-        title = await page.title()
+        title = await self._get_page_title(page)
         page_desc = PageDesc(
             url=page.url,
             title=title,
@@ -1725,14 +2023,28 @@ class Browser:
 
     async def get_all_page_descs(self) -> List[PageDesc]:
         pages = self.get_pages()
-        page_descs = []
-        for page in pages:
-            page_desc = await self.get_page_desc(page)
-            if page_desc:
-                page_descs.append(page_desc)
-        return page_descs
+        if not pages:
+            return []
+
+        async def _safe_desc(p: Page) -> Optional[PageDesc]:
+            try:
+                page_id = generate_page_id(p)
+                title = await self._get_page_title(p)
+                return PageDesc(url=p.url, title=title, page_id=page_id)
+            except Exception:
+                return None
+
+        results = await asyncio.gather(*(_safe_desc(p) for p in pages))
+        return [d for d in results if d is not None]
 
     def get_pages(self) -> List[Page]:
+        """Return all pages in the current browser context.
+
+        In CDP mode bridgic operates as a guest on the remote browser, so all
+        tabs — including pre-existing user tabs and pop-ups spawned by pages
+        bridgic was driving — are part of the session and are reachable via
+        ``get_tabs`` / ``switch_tab``.
+        """
         if not self._context:
             return []
         return self._context.pages
@@ -1760,10 +2072,10 @@ class Browser:
             return False, f"Page with page_id '{page_id}' not found"
         await page.bring_to_front()
         self._page = page
+        await self._switch_video_to_page(page)
         # Clear snapshot cache after switching pages
-        self._last_snapshot = None
-        self._last_snapshot_url = None
-        title = await page.title()
+        self._invalidate_page_state()
+        title = await self._get_page_title(page)
         return True, f"Switched to tab {page_id}: {page.url} (title: {title})"
 
     async def _close_page(self, page: Page | str) -> tuple[bool, str]:
@@ -1795,19 +2107,39 @@ class Browser:
         if not page:
             logger.warning("Page is None, can't close")
             return False, "Page is None, can't close"
+
+        # If the page being closed is the one currently recorded,
+        # switch the single-stream recorder to a remaining page BEFORE
+        # closing — the CDP session is bound to this page and will die
+        # once the page is gone.
+        if (
+            self._video_recorder is not None
+            and not self._video_recorder.is_stopped
+            and self._video_recorder.current_page == page
+        ):
+            remaining = [p for p in self.get_pages() if p != page and not p.is_closed()]
+            if remaining:
+                try:
+                    await self._video_recorder.switch_page(remaining[0])
+                    logger.debug("[_close_page] video switched to remaining page")
+                except Exception as e:
+                    logger.debug("[_close_page] video switch error: %s", e)
+            else:
+                # Last page — stop screencast but keep ffmpeg alive for finalize.
+                await self._video_recorder.detach_screencast()
+
         await page.close()
 
-        # If the closed page is the current page, switch to another
+        # If the closed page is the current page, switch to another.
         if self._page == page:
-            pages = self._context.pages
+            pages = self.get_pages()
             self._page = pages[0] if pages else None
             # Clear snapshot cache
-            self._last_snapshot = None
-            self._last_snapshot_url = None
+            self._invalidate_page_state()
 
         if self._page:
             now_id = generate_page_id(self._page)
-            now_title = await self._page.title()
+            now_title = await self._get_page_title(self._page)
             return True, f"Closed tab {page_id}. Now on {now_id}: {self._page.url} (title: {now_title})"
         return True, f"Closed tab {page_id}. No tabs remaining"
 
@@ -1815,96 +2147,38 @@ class Browser:
         if not self._page:
             logger.warning("No page is open")
             return None
-        # use CDP to get page size info
-        if self._context:
-            cdp_session = None
+        if not self._context:
+            logger.warning("No context is open")
+            return None
+        try:
+            # Use CDP Page.getLayoutMetrics directly — avoids page.evaluate() which hangs
+            # indefinitely on pre-existing tabs in CDP borrowed mode (Playwright misses the
+            # Runtime.executionContextCreated event for those tabs).
+            session = None
             try:
-                # NOTE: CDP sessions are only supported on Chromium-based browsers.
-                # create cdp session for the page
-                cdp_session = await self._context.new_cdp_session(self._page)
-                # get page size info：more information see https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-getLayoutMetrics
-                result = await cdp_session.send("Page.getLayoutMetrics")
-                logger.debug(f"Page size info: {result}")
-                # use modern css properties if available
-                layout_viewport = result.get('cssLayoutViewport') or result.get('layoutViewport', {})
-                content_size = result.get('cssContentSize') or result.get('contentSize', {})
-                visual_viewport = result.get('cssVisualViewport') or result.get('visualViewport')
-                # viewport size (visualViewport is more accurate, considering zoom)
-                if visual_viewport:
-                    viewport_width = int(visual_viewport.get('clientWidth') or 0)
-                    viewport_height = int(visual_viewport.get('clientHeight') or 0)
-                else:
-                    viewport_width = int(layout_viewport.get('clientWidth') or 0)
-                    viewport_height = int(layout_viewport.get('clientHeight') or 0)
-
-                # scroll position (get pageX/pageY from layoutViewport)
-                scroll_x = int(layout_viewport.get('pageX') or 0)
-                scroll_y = int(layout_viewport.get('pageY') or 0)
-
-                # page total size (contentSize contains all scrollable content)
-                page_width = int(content_size.get('width') or viewport_width)
-                page_height = int(content_size.get('height') or viewport_height)
-
-                # calculate scrollable distance
-                pixels_above = scroll_y
-                pixels_below = max(0, page_height - viewport_height - scroll_y)
-                pixels_left = scroll_x
-                pixels_right = max(0, page_width - viewport_width - scroll_x)
-
-                return PageSizeInfo(
-                    viewport_width=viewport_width,
-                    viewport_height=viewport_height,
-                    page_width=page_width,
-                    page_height=page_height,
-                    scroll_x=scroll_x,
-                    scroll_y=scroll_y,
-                    pixels_above=pixels_above,
-                    pixels_below=pixels_below,
-                    pixels_left=pixels_left,
-                    pixels_right=pixels_right,
+                session = await self._context.new_cdp_session(self._page)
+                metrics = await asyncio.wait_for(
+                    session.send("Page.getLayoutMetrics"),
+                    timeout=5.0,
                 )
-            except Exception as e:
-                logger.debug(f"Failed to get page size info: {e}")
             finally:
-                # Always detach CDP session to prevent resource leak
-                if cdp_session:
+                if session:
                     try:
-                        await cdp_session.detach()
+                        await session.detach()
                     except Exception:
                         pass
 
-        # fallback to js to get page size info
-        try:
-            page_size_info = await self._page.evaluate("""() => {
-                // 1. viewport size (without scrollbar, aligned with cssLayoutViewport in CDP)
-                const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
-                const viewportHeight = document.documentElement.clientHeight || window.innerHeight;
-                
-                // 2. page total size (most reliable in standard mode)
-                const pageWidth = document.documentElement.scrollWidth;
-                const pageHeight = document.documentElement.scrollHeight;
-                
-                // 3. scroll position (modern browser universal API)
-                const scrollX = window.scrollX || window.pageXOffset;
-                const scrollY = window.scrollY || window.pageYOffset;
-                
-                return {
-                    viewport_width: viewportWidth,
-                    viewport_height: viewportHeight,
-                    page_width: pageWidth,
-                    page_height: pageHeight,
-                    scroll_x: scrollX,
-                    scroll_y: scrollY
-                };
-            }""")
-            logger.debug(f"Page size info: {page_size_info}")
+            layout = metrics.get("cssLayoutViewport", {})
+            content = metrics.get("cssContentSize", {})
 
-            viewport_width = page_size_info.get('viewport_width', 0)
-            viewport_height = page_size_info.get('viewport_height', 0)
-            page_width = page_size_info.get('page_width', 0)
-            page_height = page_size_info.get('page_height', 0)
-            scroll_x = page_size_info.get('scroll_x', 0)
-            scroll_y = page_size_info.get('scroll_y', 0)
+            viewport_width = layout.get("clientWidth", 0)
+            viewport_height = layout.get("clientHeight", 0)
+            page_width = content.get("width", 0)
+            page_height = content.get("height", 0)
+            scroll_x = layout.get("pageX", 0)
+            scroll_y = layout.get("pageY", 0)
+            logger.debug("Page size info via CDP: vp=%dx%d page=%dx%d scroll=(%d,%d)",
+                         viewport_width, viewport_height, page_width, page_height, scroll_x, scroll_y)
 
             pixels_above = scroll_y
             pixels_below = max(0, page_height - viewport_height - scroll_y)
@@ -1941,7 +2215,9 @@ class Browser:
         Optional[str]
             Page title, or None if no page is open.
         """
-        return await self._page.title() if self._page else None
+        if not self._page:
+            return None
+        return await self._get_page_title(self._page)
 
     async def _get_page_info(self) -> Optional[PageInfo]:
         if not self._page:
@@ -1968,23 +2244,18 @@ class Browser:
             logger.warning("No page is open, can't get full page info")
             return None
         try:
-            snapshot = await self.get_snapshot(
-                interactive=interactive,
-                full_page=full_page,
+            snapshot, page_info = await asyncio.gather(
+                self.get_snapshot(interactive=interactive, full_page=full_page),
+                self._get_page_info(),
+                return_exceptions=True,
             )
-            if snapshot is None:
+            if isinstance(snapshot, BaseException) or snapshot is None:
                 logger.warning("Failed to get snapshot")
                 return None
-            page_info = await self._get_page_info()
-            if page_info is None:
+            if isinstance(page_info, BaseException) or page_info is None:
                 logger.warning("Failed to get page info")
                 return None
-            full_page_info = FullPageInfo(
-                url=page_info.url,
-                title=page_info.title,
-                **page_info.model_dump(),
-                tree=snapshot.tree,
-            )
+            full_page_info = FullPageInfo(**page_info.model_dump(), tree=snapshot.tree)
             return full_page_info
         except Exception as e:
             logger.debug(f"Failed to get full page info: {e}")
@@ -2072,19 +2343,84 @@ class Browser:
         try:
             if not self._page:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
-            async with self._snapshot_lock:
-                options = SnapshotOptions(
-                    interactive=interactive,
-                    full_page=full_page,
-                )
-                if self._snapshot_generator is None:
-                    self._snapshot_generator = SnapshotGenerator()
-                current_url = self.get_current_page_url()
-                self._last_snapshot = await self._snapshot_generator.get_enhanced_snapshot_async(
-                    self._page, options
-                )
-                self._last_snapshot_url = current_url
-                return self._last_snapshot
+            options = SnapshotOptions(
+                interactive=interactive,
+                full_page=full_page,
+            )
+            if self._snapshot_generator is None:
+                self._snapshot_generator = SnapshotGenerator()
+
+            # Avoid a classic self-deadlock:
+            # - get_snapshot holds _snapshot_lock while waiting for prefetch_task
+            # - _pre_warm_snapshot() must acquire the same _snapshot_lock to commit
+            #
+            # So when pre-warm is in progress, we must release _snapshot_lock
+            # before awaiting the background task.
+            while True:
+                _wait_t0 = time.monotonic()
+                prefetch_task_to_wait: Optional[asyncio.Task[None]] = None
+                async with self._snapshot_lock:
+                    _wait_elapsed = time.monotonic() - _wait_t0
+                    if _wait_elapsed > 0.1:
+                        # Surfaces "command N was stuck behind snapshot of command N-1"
+                        # situations in the log — the typical second-snapshot-back-to-back
+                        # case on a large page.
+                        logger.info(
+                            "[get_snapshot] waited %.3fs for _snapshot_lock",
+                            _wait_elapsed,
+                        )
+                    current_url = self.get_current_page_url()
+
+                    # Check if the background pre-warm already computed this snapshot.
+                    if (
+                        self._prefetch_snapshot is not None
+                        and self._prefetch_options == options
+                        and self._prefetch_url == current_url
+                    ):
+                        logger.info(
+                            "[get_snapshot] pre-warm cache hit — returning instantly"
+                        )
+                        cached = self._prefetch_snapshot
+                        # One-shot: clear so the next call recomputes fresh.
+                        self._prefetch_snapshot = None
+                        self._last_snapshot = cached
+                        self._last_snapshot_url = current_url
+                        return cached
+
+                    # Pre-warm miss (either still running or different options).
+                    # If the task is for the same options and URL, wait for it
+                    # instead of duplicating the work — but ONLY after releasing
+                    # _snapshot_lock to allow prefetch commit to proceed.
+                    prefetch_task = self._prefetch_task
+                    if (
+                        prefetch_task is not None
+                        and not prefetch_task.done()
+                        and self._prefetch_options == options
+                        and self._prefetch_url == current_url
+                    ):
+                        logger.info(
+                            "[get_snapshot] pre-warm in progress — waiting for it"
+                        )
+                        prefetch_task_to_wait = prefetch_task
+
+                    if prefetch_task_to_wait is None:
+                        # No matching pre-warm in-flight; preserve original
+                        # behavior by serializing snapshot computation.
+                        self._last_snapshot = (
+                            await self._snapshot_generator.get_enhanced_snapshot_async(
+                                self._page, options
+                            )
+                        )
+                        self._last_snapshot_url = current_url
+                        return self._last_snapshot
+
+                # Matching prewarm in-flight: wait for it without holding locks.
+                try:
+                    await prefetch_task_to_wait
+                except Exception:
+                    pass  # pre-warm failed; we'll retry cache check / recompute.
+                # Loop back: if the pre-warm commit populated _prefetch_snapshot,
+                # the next iteration returns instantly; otherwise we recompute.
         except BridgicBrowserError:
             raise
         except Exception as e:
@@ -2092,6 +2428,116 @@ class Browser:
             logger.error(f"[get_snapshot] {error_msg}", exc_info=True)
             _raise_operation_error(error_msg)
     
+    def _cancel_prefetch(self) -> None:
+        """Cancel any in-flight pre-warm task and clear prefetch state.
+
+        Must be called whenever navigation or page-switch invalidates the
+        current page's snapshot (i.e. everywhere _last_snapshot is set to None).
+        Uses getattr throughout so it is safe on Browser instances created via
+        Browser.__new__() (test helpers that bypass __init__).
+
+        Also bumps ``_prefetch_gen`` so any pre-warm task that returns from
+        its await AFTER this point will see a stale generation and discard
+        its result rather than clobber the new page's cache. (C4.)
+        """
+        self._prefetch_gen = getattr(self, '_prefetch_gen', 0) + 1
+        task = getattr(self, '_prefetch_task', None)
+        if task is not None and not task.done():
+            task.cancel()
+        self.__dict__.update(
+            _prefetch_task=None,
+            _prefetch_snapshot=None,
+            _prefetch_options=None,
+            _prefetch_url=None,
+        )
+
+    def _invalidate_page_state(self) -> None:
+        """Drop snapshot cache + prefetch state.
+
+        Must be called before any operation that changes *what 'the current
+        page' means* — navigation, reload, tab switch, tab close, etc.
+
+        Skipping this leaves two stale-data hazards:
+
+        1. ``_last_snapshot.refs`` is read directly by ``get_element_by_ref``
+           (no URL gate), so a ref looked up after navigation would point at
+           the OLD page's role+name+frame_path+nth. On SPAs where identical
+           role+name elements exist on both pages (same design system / same
+           "Submit" button), this silently resolves to the wrong element.
+        2. The prefetch cache is URL-gated but shares SPA fragment URLs with
+           the previous page — and the still-running pre-warm task keeps
+           consuming CPU on a 1000+ ref page until it hits the URL/gen check
+           that rejects its commit.
+
+        Pair this with the actual navigation call. All mutation is synchronous
+        so there is no race with concurrent callers of ``get_snapshot()`` —
+        the snapshot lock serialises readers against the next fresh compute.
+        """
+        self._last_snapshot = None
+        self._last_snapshot_url = None
+        self._cancel_prefetch()
+
+    async def _pre_warm_snapshot(self, page: "AsyncPage", my_gen: int) -> None:  # type: ignore[name-defined]
+        """Background task: compute interactive snapshot after navigation.
+
+        Uses a dedicated _prefetch_generator instance so it never conflicts
+        with the user-triggered _snapshot_generator (which is serialised by
+        _snapshot_lock).  Result is written to _prefetch_snapshot; get_snapshot
+        consumes it on a cache hit.
+
+        The commit is guarded by two checks:
+
+        1. ``my_gen == self._prefetch_gen`` — a monotonic counter bumped by
+           ``_cancel_prefetch()``.  If a navigation/tab-switch happened while
+           this task was awaiting, the generation differs and we discard.
+        2. ``page.url == target_url`` and ``self._page is page`` — belt-and-
+           suspenders identity check for the rare case where the page object
+           is reused by Playwright across URL changes.
+
+        The commit acquires ``_snapshot_lock`` so the writes happen atomically
+        w.r.t. ``get_snapshot`` consumers.
+
+        This is best-effort — any exception or cancellation is silently ignored.
+        """
+        try:
+            # Brief settle: let DOMContentLoaded side-effects stabilize.
+            await asyncio.sleep(0.5)
+
+            options = SnapshotOptions(interactive=True, full_page=True)
+            target_url = page.url
+
+            if self._prefetch_generator is None:
+                self._prefetch_generator = SnapshotGenerator()
+
+            logger.info("[pre_warm] starting snapshot for %s", target_url)
+            snapshot = await self._prefetch_generator.get_enhanced_snapshot_async(
+                page, options
+            )
+
+            async with self._snapshot_lock:
+                # I3: inner `_prefetch_lock` serialises the gen-check +
+                # cache-write atomically w.r.t. other prefetch tasks. The
+                # outer `_snapshot_lock` ensures user-initiated get_snapshot
+                # consumers see a coherent view during the commit.
+                async with self._prefetch_lock:
+                    if my_gen != self._prefetch_gen:
+                        logger.debug(
+                            "[pre_warm] generation mismatch (own=%d current=%d); discarding result",
+                            my_gen, self._prefetch_gen,
+                        )
+                        return
+                    if page.url != target_url or self._page is not page:
+                        logger.debug("[pre_warm] URL changed during pre-warm; discarding result")
+                        return
+                    self._prefetch_snapshot = snapshot
+                    self._prefetch_options = options
+                    self._prefetch_url = target_url
+                    logger.info("[pre_warm] snapshot ready for %s", target_url)
+        except asyncio.CancelledError:
+            logger.debug("[pre_warm] cancelled (navigation superseded)")
+        except Exception as e:
+            logger.debug("[pre_warm] failed (best-effort): %s", e)
+
     async def get_element_by_ref(self, ref: str, _fallback_depth: int = 0) -> Optional[Locator]:
         """Resolve a snapshot ref to a Playwright Locator.
 
@@ -2546,13 +2992,38 @@ Before you return the element ref, reason about the state and elements for a sen
                         details={"file": file},
                     )
 
-            snapshot = await self.get_snapshot(
-                interactive=interactive,
-                full_page=full_page,
-            )
             _page = getattr(self, "_page", None)
+
+            async def _get_title() -> str:
+                if not _page:
+                    return ""
+                return await self._get_page_title(_page)
+
+            snapshot, page_title = await asyncio.gather(
+                self.get_snapshot(interactive=interactive, full_page=full_page),
+                _get_title(),
+                return_exceptions=True,
+            )
+            if isinstance(snapshot, BaseException):
+                # `gather(return_exceptions=True)` yields the exception as a
+                # value — sys.exc_info() is empty, so re-raising it first
+                # primes the context so _raise_operation_error can chain via
+                # ``from current_exc``. Without this, a TargetClosedError
+                # during snapshot prefetch would surface as OPERATION_FAILED
+                # at the daemon (H02) because the closed-browser substring
+                # is stripped from the outer message and there is no cause
+                # to unwrap.
+                if isinstance(snapshot, BridgicBrowserError):
+                    raise snapshot
+                try:
+                    raise snapshot
+                except BaseException:
+                    _raise_operation_error("Failed to get snapshot")
+            if snapshot is None:
+                _raise_operation_error("Failed to get snapshot")
+            if isinstance(page_title, BaseException):
+                page_title = ""
             page_url = _page.url if _page else ""
-            page_title = await _page.title() if _page else ""
             header = f"[Page: {page_url} | {page_title}]\n"
             full_text = snapshot.tree
 
@@ -2709,7 +3180,21 @@ Before you return the element ref, reason about the state and elements for a sen
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
-            await page.go_back()
+            # History navigation changes the document; drop any cached snapshot
+            # / prefetch BEFORE navigating so a concurrent get_snapshot cannot
+            # observe a mix of old-page refs and the new page's URL.
+            self._invalidate_page_state()
+
+            if self._is_cdp_borrowed and self._context:
+                # CDP borrowed mode: page.go_back() hangs because Playwright's
+                # navigation tracking relies on _mainContext() which is broken for
+                # pre-existing tabs. Use CDPSession to navigate directly.
+                await self._cdp_navigate_history(page, delta=-1)
+            else:
+                await asyncio.wait_for(
+                    page.go_back(wait_until="domcontentloaded"),
+                    timeout=20.0,
+                )
             result = f"Navigated back to: {page.url}"
             logger.info(f"[go_back] done {result}")
             return result
@@ -2745,7 +3230,17 @@ Before you return the element ref, reason about the state and elements for a sen
             page = await self.get_current_page()
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
-            await page.go_forward()
+
+            # History navigation changes the document — same rationale as go_back.
+            self._invalidate_page_state()
+
+            if self._is_cdp_borrowed and self._context:
+                await self._cdp_navigate_history(page, delta=+1)
+            else:
+                await asyncio.wait_for(
+                    page.go_forward(wait_until="domcontentloaded"),
+                    timeout=20.0,
+                )
             result = f"Navigated forward to: {page.url}"
             logger.info(f"[go_forward] done {result}")
             return result
@@ -2787,11 +3282,19 @@ Before you return the element ref, reason about the state and elements for a sen
             page = await self.get_current_page()
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
+
+            # Reload re-creates the document; Playwright ref-ids reset and
+            # every DOM Element in _last_snapshot.refs becomes stale. Drop
+            # the cache BEFORE reloading so get_element_by_ref cannot resolve
+            # an old ref against the fresh DOM (which would silently land on
+            # a same-role+name element in a different position).
+            self._invalidate_page_state()
+
             kwargs: Dict[str, Any] = {"wait_until": wait_until}
             if timeout is not None:
                 kwargs["timeout"] = timeout * 1000.0
             await page.reload(**kwargs)
-            title = await page.title()
+            title = await self._get_page_title(page)
             result = f"Page reloaded: {page.url} (title: {title})"
             logger.info(f"[reload_page] done {result}")
             return result
@@ -2951,12 +3454,25 @@ Before you return the element ref, reason about the state and elements for a sen
         Parameters
         ----------
         code : str
-            Arrow function format, e.g., "() => document.title".
+            Arrow function format, e.g., ``"() => document.title"``.
 
         Returns
         -------
         str
             Execution result as string.
+
+        Notes
+        -----
+        In CDP borrowed mode (``Browser(cdp_url=...)`` attaching to an existing
+        Chrome) this method routes through raw ``CDPSession.Runtime.evaluate``
+        with ``returnByValue=True`` instead of Playwright's
+        ``page.evaluate()``. Consequence: only values that survive
+        CDP's JSON round-trip are returned as structured data — ``Date``,
+        ``RegExp``, ``Map``, ``Set``, DOM handles, etc. produce no ``value``
+        and bridgic falls back to the CDP ``description`` string so the
+        caller receives a hint instead of ``None``. Regular JSON types
+        (string / number / bool / null / plain object / array) round-trip
+        identically to the non-CDP path.
         """
         try:
             logger.info(f"[evaluate_javascript] start code_preview={code[:100] if code and len(code) > 100 else code!r}")
@@ -2969,7 +3485,43 @@ Before you return the element ref, reason about the state and elements for a sen
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
-            result = await page.evaluate(code)
+            if self._is_cdp_borrowed and self._context:
+                # CDP borrowed mode: page.evaluate() hangs on pre-existing tabs
+                # because _mainContext() never resolves.  Use a raw CDPSession
+                # Runtime.evaluate call — Chrome responds immediately.
+                session = None
+                try:
+                    session = await self._context.new_cdp_session(page)
+                    raw = await asyncio.wait_for(
+                        session.send(
+                            "Runtime.evaluate",
+                            {
+                                "expression": _maybe_wrap_arrow_fn(code),
+                                "returnByValue": True,
+                            },
+                        ),
+                        timeout=30.0,
+                    )
+                    result_obj = raw.get("result", {})
+                    if "value" in result_obj:
+                        result = result_obj["value"]
+                    elif result_obj.get("type") == "undefined":
+                        result = None
+                    else:
+                        # Non-JSON-serializable (Date, RegExp, Map, Set, DOM node...).
+                        # CDP returned type+description without a value. Return the
+                        # description string so the caller has something human-readable
+                        # instead of the misleading ``None`` of earlier behaviour.
+                        desc = result_obj.get("description")
+                        result = desc if desc is not None else f"<non-serializable {result_obj.get('type', 'value')}>"
+                finally:
+                    if session:
+                        try:
+                            await session.detach()
+                        except Exception:
+                            pass
+            else:
+                result = await page.evaluate(code)
 
             if isinstance(result, bool):
                 result_str = "True" if result else "False"
@@ -3239,14 +3791,99 @@ Before you return the element ref, reason about the state and elements for a sen
     async def _is_text_visible_in_any_frame(
         self, page: "Page", text: str, exact: bool = False,
     ) -> bool:
-        """Check whether *text* is visible in any frame (main + all iframes)."""
+        """Check whether *text* is visible in any frame (main + all iframes).
+
+        In CDP borrowed mode, ``locator.count()`` and ``locator.is_visible()``
+        call into Playwright's ``_mainContext()`` which never resolves for
+        pre-existing tabs (see :meth:`_get_page_title` for the full explanation).
+        We bypass this by using a raw CDPSession ``Runtime.evaluate`` call that
+        queries ``document.body.innerText`` directly from Chrome — no Playwright
+        context tracking needed.
+        """
+        if self._is_cdp_borrowed and self._context:
+            # Iterate every frame (main + all iframes) to match the non-CDP path.
+            #
+            # ``new_cdp_session(child_frame)`` silently fails for same-process iframes
+            # (same-origin / file://) because they share the page's CDP target and have
+            # no separate Target to attach to.  Instead we use two CDP page-level calls:
+            #
+            #   1. ``Page.getFrameTree()``        — enumerate all frame IDs recursively
+            #   2. ``Page.createIsolatedWorld()`` — create a JS world IN that specific
+            #                                       frame (independent of Playwright's
+            #                                       _mainContext() tracking)
+            #   3. ``Runtime.evaluate()`` with ``contextId`` — run in the frame's world
+            #
+            # This avoids the ``_mainContext()`` hang because Page/Runtime CDP commands
+            # do not go through Playwright's context-tracking machinery.
+            session = None
+            try:
+                session = await self._context.new_cdp_session(page)
+                # Step 1: collect all frame IDs in document order.
+                frame_tree_result = await asyncio.wait_for(
+                    session.send("Page.getFrameTree"),
+                    timeout=5.0,
+                )
+                frame_ids: list[str] = []
+
+                def _collect_frame_ids(node: dict) -> None:
+                    fid = node.get("frame", {}).get("id")
+                    if fid:
+                        frame_ids.append(fid)
+                    for child in node.get("childFrames", []):
+                        _collect_frame_ids(child)
+
+                _collect_frame_ids(frame_tree_result.get("frameTree", {}))
+
+                needle = json.dumps(text if exact else text.lower())
+                expr = (
+                    "(function(){"
+                    "  var t = document.body ? document.body.innerText : '';"
+                    + ("  return t.includes(" + needle + ");}" if exact
+                       else "  return t.toLowerCase().includes(" + needle + ");}")
+                    + ")()"
+                )
+                # Step 2+3: for each frame, create an isolated world and evaluate.
+                for frame_id in frame_ids:
+                    try:
+                        world_result = await asyncio.wait_for(
+                            session.send("Page.createIsolatedWorld", {
+                                "frameId": frame_id,
+                                "worldName": "bridgic-text-search",
+                                "grantUniversalAccess": False,
+                            }),
+                            timeout=5.0,
+                        )
+                        ctx_id = world_result.get("executionContextId")
+                        if ctx_id is None:
+                            continue
+                        result = await asyncio.wait_for(
+                            session.send("Runtime.evaluate", {
+                                "expression": expr,
+                                "contextId": ctx_id,
+                                "returnByValue": True,
+                            }),
+                            timeout=5.0,
+                        )
+                        if bool(result.get("result", {}).get("value", False)):
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                return False
+            finally:
+                if session:
+                    try:
+                        await session.detach()
+                    except Exception:
+                        pass
+            return False
+
         for frame in page.frames:
             try:
                 locator = frame.get_by_text(text, exact=exact)
                 if await locator.count() > 0 and await locator.first.is_visible():
                     return True
             except Exception:
-                # Frame may have been detached or navigated away.
                 continue
         return False
 
@@ -3389,9 +4026,9 @@ Before you return the element ref, reason about the state and elements for a sen
         """Input text into a specific element identified by its snapshot ref.
 
         This is the primary text-input tool for interacting with form fields by
-        ref.  Unlike :meth:`type_text` and :meth:`insert_text` which type into
-        the currently focused element, this method targets the element directly
-        via its ref and handles both visible and hidden (shadow-DOM) inputs.
+        ref.  Unlike :meth:`type_text` which types into the currently focused
+        element, this method targets the element directly via its ref and
+        handles both visible and hidden (shadow-DOM) inputs.
 
         Comparison:
 
@@ -3400,8 +4037,6 @@ Before you return the element ref, reason about the state and elements for a sen
         - :meth:`type_text` — no ref; types into focused element
           character-by-character via ``keyboard.press``; triggers per-character
           ``keydown``/``keyup`` events (needed for autocomplete widgets).
-        - :meth:`insert_text` — no ref; pastes into focused element in one shot
-          without key events; fastest for long strings.
 
         Parameters
         ----------
@@ -3439,6 +4074,11 @@ Before you return the element ref, reason about the state and elements for a sen
             If text input fails.
         """
         try:
+            # Any prior prefetch points at the page as it was before this
+            # interaction. Input may trigger navigation (e.g. submit-on-enter),
+            # so invalidate it now rather than returning a stale snapshot.
+            self._cancel_prefetch()
+
             locator = await self.get_element_by_ref(ref)
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
@@ -3460,35 +4100,54 @@ Before you return the element ref, reason about the state and elements for a sen
                 "}"
             )
 
+            _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
+
             if clear:
                 if is_vis:
                     await locator.clear()
+                elif _cdp_ctx is not None:
+                    # CDP borrowed mode: locator.evaluate() (main world) hangs.
+                    # locator.fill("") clears via the utility world and also
+                    # dispatches input/change events — equivalent behaviour.
+                    logger.debug("[input_text_by_ref] CDP mode + is_visible()=False; clearing via locator.fill('')")
+                    await locator.fill("")
                 else:
                     logger.debug("[input_text_by_ref] is_visible()=False; clearing via JS")
-                    await locator.evaluate(
-                        "(el) => { if ('value' in el) el.value = ''; "
-                        "else if (el.isContentEditable) el.textContent = ''; }"
+                    await asyncio.wait_for(
+                        locator.evaluate(
+                            "(el) => { if ('value' in el) el.value = ''; "
+                            "else if (el.isContentEditable) el.textContent = ''; }"
+                        ),
+                        timeout=10.0,
                     )
 
             if slowly:
                 if is_vis:
                     await locator.focus()
                     await locator.type(text, delay=100)
+                elif _cdp_ctx is not None:
+                    logger.debug("[input_text_by_ref] CDP mode + is_visible()=False; using locator.fill() (slowly unavailable)")
+                    await locator.fill(text)
                 else:
                     logger.debug("[input_text_by_ref] is_visible()=False; setting value via JS (slowly mode unavailable)")
-                    await locator.evaluate("el => el.focus()")
-                    await locator.evaluate(_js_set_value, text)
+                    await locator.focus()
+                    await asyncio.wait_for(locator.evaluate(_js_set_value, text), timeout=10.0)
             else:
                 if is_vis and clear:
+                    await locator.fill(text)
+                elif _cdp_ctx is not None:
+                    # CDP borrowed mode: use fill() (utility world) for hidden elements too.
+                    if not is_vis:
+                        logger.debug("[input_text_by_ref] CDP mode + is_visible()=False; using locator.fill()")
                     await locator.fill(text)
                 else:
                     if not is_vis:
                         logger.debug("[input_text_by_ref] is_visible()=False; setting value via JS")
-                    await locator.evaluate(_js_set_value, text)
+                    await asyncio.wait_for(locator.evaluate(_js_set_value, text), timeout=10.0)
 
             if submit:
                 if not is_vis:
-                    await locator.evaluate("el => el.focus()")
+                    await locator.focus()
                 page = await self.get_current_page()
                 if page:
                     await page.keyboard.press("Enter")
@@ -3544,44 +4203,49 @@ Before you return the element ref, reason about the state and elements for a sen
             If the click fails.
         """
         try:
+            # A click frequently opens a new page / triggers navigation. Any
+            # prefetched snapshot from before the click now refers to the old
+            # page, so drop it before dispatching the action.
+            self._cancel_prefetch()
+
             locator = await self.get_element_by_ref(ref)
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
                 logger.warning(f'[click_element_by_ref] {msg}')
                 _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
-            bbox = await locator.bounding_box()
+            bbox, is_vis = await asyncio.gather(
+                locator.bounding_box(),
+                locator.is_visible(),
+            )
             if bbox is not None:
                 cx = bbox["x"] + bbox["width"] / 2
                 cy = bbox["y"] + bbox["height"] / 2
 
-                if not await locator.is_visible():
+                if not is_vis:
                     logger.debug(
                         "[click_element_by_ref] element has bbox but is_visible()=False "
                         "(likely shadow-DOM slot); using dispatch_event click"
                     )
                     await locator.dispatch_event("click")
                 else:
-                    covered = await locator.evaluate(
-                        f"(el) => {{ if (window.parent !== window) return false; "
-                        f"const t = document.elementFromPoint({cx}, {cy}); "
-                        f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
-                    )
+                    _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
+                    covered = await _check_element_covered(locator, cx, cy, cdp_context=_cdp_ctx)
                     if covered:
                         logger.debug("[click_element_by_ref] covered at (%.1f, %.1f), clicking intercepting element", cx, cy)
                         page = await self.get_current_page()
                         if page:
-                            await page.evaluate(f"document.elementFromPoint({cx}, {cy})?.click()")
+                            await _click_covering_element(page, locator, cx, cy, cdp_context=_cdp_ctx)
                         else:
-                            await locator.evaluate("el => el.click()")
+                            await locator.dispatch_event("click")
                     else:
-                        await locator.click()
+                        await _locator_action_with_fallback(locator, action="click")
             else:
-                if not await locator.is_visible():
+                if not is_vis:
                     logger.debug("[click_element_by_ref] bbox=None and is_visible()=False; using dispatch_event click")
                     await locator.dispatch_event("click")
                 else:
-                    await locator.click()
+                    await _locator_action_with_fallback(locator, action="click")
 
             msg = f'Clicked element {ref}'
             logger.info(f'[click_element_by_ref] {msg}')
@@ -3620,18 +4284,31 @@ Before you return the element ref, reason about the state and elements for a sen
                 _raise_state_error('This dropdown has no options', code='ELEMENT_STATE_ERROR')
 
             # Detect currently selected option(s)
-            selected_values = set()
-            try:
-                selected_values = set(await locator.evaluate(
-                    "el => el.tagName === 'SELECT' ? Array.from(el.selectedOptions).map(o => o.value) : []"
-                ))
-            except Exception:
+            selected_values: set = set()
+            _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
+            if _cdp_ctx is not None:
+                # CDP borrowed mode: locator.evaluate() hangs. Skip — callers
+                # get no [selected] markers, which is a minor cosmetic loss.
                 pass
+            else:
+                try:
+                    selected_values = set(await asyncio.wait_for(
+                        locator.evaluate(
+                            "el => el.tagName === 'SELECT' ? Array.from(el.selectedOptions).map(o => o.value) : []"
+                        ),
+                        timeout=10.0,
+                    ))
+                except Exception:
+                    pass
 
             option_texts = []
-            for i, option in enumerate(options):
-                text = await option.text_content()
-                value = await option.get_attribute("value")
+            # Fetch text and value for all options in parallel (two awaits per
+            # option reduced to one asyncio.gather per option).
+            _text_value_pairs = await asyncio.gather(
+                *(asyncio.gather(option.text_content(), option.get_attribute("value"))
+                  for option in options)
+            )
+            for i, (text, value) in enumerate(_text_value_pairs):
                 if text:
                     line = f"{i + 1}. {text.strip()}" + (f" (value: {value})" if value else "")
                     if value in selected_values:
@@ -3689,13 +4366,40 @@ Before you return the element ref, reason about the state and elements for a sen
             If no matching option is found or the click fails.
         """
         try:
+            # Selecting an option can submit the form or open a linked page,
+            # so any prefetched snapshot from before the selection is stale.
+            self._cancel_prefetch()
+
             locator = await self.get_element_by_ref(ref)
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
                 logger.warning(f'[select_dropdown_option_by_ref] {msg}')
                 _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
-            tag_name = await locator.evaluate("el => el.tagName.toLowerCase()")
+            _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
+            if _cdp_ctx is not None:
+                # CDP borrowed mode: locator.evaluate() (main world) hangs.
+                # locator.select_option() uses the utility world and works correctly.
+                # Try it first; if the element is not a native <select> it raises,
+                # and we fall through to the custom dropdown path (tag_name = "").
+                try:
+                    try:
+                        await locator.select_option(value=text)
+                    except Exception:
+                        await locator.select_option(label=text)
+                    msg = f'Selected option: {text}'
+                    logger.info(f'[select_dropdown_option_by_ref] {msg} (CDP native-select path)')
+                    return msg
+                except Exception:
+                    tag_name = ""  # not a native <select>; fall through to custom path
+            else:
+                try:
+                    tag_name = await asyncio.wait_for(
+                        locator.evaluate("el => el.tagName.toLowerCase()"),
+                        timeout=10.0,
+                    )
+                except Exception:
+                    tag_name = ""
 
             if tag_name == "select":
                 try:
@@ -3777,12 +4481,15 @@ Before you return the element ref, reason about the state and elements for a sen
                 logger.warning(f'[hover_element_by_ref] {msg}')
                 _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
-            bbox = await locator.bounding_box()
+            bbox, is_vis = await asyncio.gather(
+                locator.bounding_box(),
+                locator.is_visible(),
+            )
             if bbox is not None:
                 cx = bbox["x"] + bbox["width"] / 2
                 cy = bbox["y"] + bbox["height"] / 2
 
-                if not await locator.is_visible():
+                if not is_vis:
                     logger.debug(
                         "[hover_element_by_ref] element has bbox but is_visible()=False "
                         "(likely shadow-DOM slot); moving mouse to coordinates directly"
@@ -3793,11 +4500,8 @@ Before you return the element ref, reason about the state and elements for a sen
                     else:
                         await locator.hover(force=True)
                 else:
-                    covered = await locator.evaluate(
-                        f"(el) => {{ if (window.parent !== window) return false; "
-                        f"const t = document.elementFromPoint({cx}, {cy}); "
-                        f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
-                    )
+                    _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
+                    covered = await _check_element_covered(locator, cx, cy, cdp_context=_cdp_ctx)
                     if covered:
                         logger.debug("[hover_element_by_ref] covered at (%.1f, %.1f), moving mouse to coordinates", cx, cy)
                         page = await self.get_current_page()
@@ -3808,7 +4512,7 @@ Before you return the element ref, reason about the state and elements for a sen
                     else:
                         await locator.hover()
             else:
-                if not await locator.is_visible():
+                if not is_vis:
                     msg = (
                         f'Could not hover element {ref}: element is not visible and has '
                         'no screen coordinates'
@@ -3858,9 +4562,10 @@ Before you return the element ref, reason about the state and elements for a sen
             else:
                 logger.debug(
                     "[focus_element_by_ref] is_visible()=False (likely shadow-DOM slot); "
-                    "using el.focus() via evaluate to properly update document.activeElement"
+                    "using el.focus() via focus() to properly update document.activeElement"
                 )
-                await locator.evaluate("el => el.focus()")
+                # locator.focus() has a built-in timeout (unlike evaluate which has none).
+                await locator.focus()
 
             msg = f'Focused element ref {ref}'
             logger.info(f'[focus_element_by_ref] {msg}')
@@ -3897,7 +4602,38 @@ Before you return the element ref, reason about the state and elements for a sen
                 logger.warning(f'[evaluate_javascript_on_ref] {msg}')
                 _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
-            result = await locator.evaluate(code)
+            if self._is_cdp_borrowed and self._context:
+                # CDP borrowed mode: try native evaluate first (works on pages
+                # navigated via page.goto() — including iframe elements).
+                # Falls back to CDPSession bypass only on truly pre-existing
+                # tabs where _mainContext() hangs.
+                try:
+                    result = await asyncio.wait_for(locator.evaluate(code), timeout=5.0)
+                except Exception as native_err:
+                    if isinstance(native_err, asyncio.TimeoutError):
+                        logger.debug(
+                            f'[evaluate_javascript_on_ref] native evaluate timed out '
+                            f'(pre-existing tab?), falling back to CDPSession bypass'
+                        )
+                    else:
+                        logger.debug(
+                            f'[evaluate_javascript_on_ref] native evaluate failed: '
+                            f'{type(native_err).__name__}: {native_err}, '
+                            f'falling back to CDPSession bypass'
+                        )
+                    ref_data = self._last_snapshot.refs.get(ref) if self._last_snapshot else None
+                    if ref_data is not None and ref_data.frame_path:
+                        _raise_operation_error(
+                            f"eval-on does not support iframe elements on pre-existing "
+                            f"CDP tabs (ref={ref}, frame_path={ref_data.frame_path}). "
+                            f"Navigate to the page first with 'open', or use 'eval' with "
+                            f"contentDocument.querySelector() as a workaround.",
+                            code="IFRAME_EVAL_NOT_SUPPORTED",
+                        )
+                    page = await self.get_current_page()
+                    result = await _cdp_evaluate_on_element(self._context, page, locator, code)
+            else:
+                result = await asyncio.wait_for(locator.evaluate(code), timeout=30.0)
 
             if result is None:
                 result_str = "null"
@@ -3943,8 +4679,29 @@ Before you return the element ref, reason about the state and elements for a sen
                 logger.warning(f'[upload_file_by_ref] {msg}')
                 _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
-            tag_name = await locator.evaluate("el => el.tagName.toLowerCase()")
-            input_type = await locator.get_attribute("type") if tag_name == "input" else None
+            # Determine tag and type to verify this is a file input.
+            # In CDP borrowed mode use get_attribute() (utility world) instead of
+            # locator.evaluate() which hangs. get_attribute("type") works reliably
+            # because Playwright's attribute queries use the utility world.
+            if self._is_cdp_borrowed:
+                # get_attribute returns None for elements that don't have the attribute,
+                # and '' for elements that have it but with no value. A file input
+                # always has an explicit type="file" so a None/non-"file" result means
+                # this isn't a direct file input — fall through to nested-search path.
+                input_type_attr = await locator.get_attribute("type")
+                if input_type_attr and input_type_attr.lower() == "file":
+                    tag_name, input_type = "input", "file"
+                else:
+                    tag_name, input_type = "", None
+            else:
+                try:
+                    tag_name = await asyncio.wait_for(
+                        locator.evaluate("el => el.tagName.toLowerCase()"),
+                        timeout=10.0,
+                    )
+                except Exception:
+                    tag_name = ""
+                input_type = await locator.get_attribute("type") if tag_name == "input" else None
             if tag_name != "input" or input_type != "file":
                 nested = locator.locator("input[type='file']")
                 if await nested.count() > 0:
@@ -4057,6 +4814,10 @@ Before you return the element ref, reason about the state and elements for a sen
         try:
             logger.info(f'[check_checkbox_or_radio_by_ref] start ref={ref}')
 
+            # Check actions can trigger form-auto-submit flows; drop any stale
+            # prefetched snapshot before the interaction.
+            self._cancel_prefetch()
+
             locator = await self.get_element_by_ref(ref)
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
@@ -4070,42 +4831,43 @@ Before you return the element ref, reason about the state and elements for a sen
                 logger.info(f'[check_checkbox_or_radio_by_ref] {msg}')
                 return msg
 
-            bbox = await locator.bounding_box()
+            bbox, is_vis = await asyncio.gather(
+                locator.bounding_box(),
+                locator.is_visible(),
+            )
             if is_native:
                 if bbox is not None:
                     cx = bbox["x"] + bbox["width"] / 2
                     cy = bbox["y"] + bbox["height"] / 2
 
-                    if not await locator.is_visible():
+                    if not is_vis:
                         logger.debug(
                             "[check_checkbox_or_radio_by_ref] native input has bbox but is_visible()=False; "
                             "using dispatch_event click"
                         )
                         await locator.dispatch_event("click")
                     else:
-                        covered = await locator.evaluate(
-                            f"(el) => {{ if (window.parent !== window) return false; "
-                            f"const t = document.elementFromPoint({cx}, {cy}); "
-                            f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
-                        )
+                        _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
+                        covered = await _check_element_covered(locator, cx, cy, cdp_context=_cdp_ctx)
                         if covered:
                             logger.debug("[check_checkbox_or_radio_by_ref] covered at (%.1f, %.1f), clicking intercepting element", cx, cy)
                             page = await self.get_current_page()
                             if page:
-                                await page.evaluate(f"document.elementFromPoint({cx}, {cy})?.click()")
+                                await _click_covering_element(page, locator, cx, cy, cdp_context=_cdp_ctx)
                             else:
-                                await locator.check(force=True)
+                                await locator.check(force=True, timeout=_DEFAULT_CLICK_TIMEOUT_MS)
                         else:
-                            await locator.check()
+                            await _locator_action_with_fallback(locator, action="check")
                 else:
-                    if not await locator.is_visible():
+                    if not is_vis:
                         logger.debug("[check_checkbox_or_radio_by_ref] native input bbox=None and is_visible()=False; using dispatch_event click")
                         await locator.dispatch_event("click")
                     else:
-                        await locator.check()
+                        await _locator_action_with_fallback(locator, action="check")
             else:
+                _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
                 page = await self.get_current_page()
-                await _click_checkable_target(page, locator, bbox)
+                await _click_checkable_target(page, locator, bbox, cdp_context=_cdp_ctx)
 
             if not await _is_checked(locator):
                 msg = f'Failed to check element {ref}: state is still unchecked'
@@ -4154,6 +4916,8 @@ Before you return the element ref, reason about the state and elements for a sen
         try:
             logger.info(f'[uncheck_checkbox_by_ref] start ref={ref}')
 
+            self._cancel_prefetch()
+
             locator = await self.get_element_by_ref(ref)
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
@@ -4167,42 +4931,43 @@ Before you return the element ref, reason about the state and elements for a sen
                 logger.info(f'[uncheck_checkbox_by_ref] {msg}')
                 return msg
 
-            bbox = await locator.bounding_box()
+            bbox, is_vis = await asyncio.gather(
+                locator.bounding_box(),
+                locator.is_visible(),
+            )
             if is_native:
                 if bbox is not None:
                     cx = bbox["x"] + bbox["width"] / 2
                     cy = bbox["y"] + bbox["height"] / 2
 
-                    if not await locator.is_visible():
+                    if not is_vis:
                         logger.debug(
                             "[uncheck_checkbox_by_ref] native input has bbox but is_visible()=False; "
                             "using dispatch_event click"
                         )
                         await locator.dispatch_event("click")
                     else:
-                        covered = await locator.evaluate(
-                            f"(el) => {{ if (window.parent !== window) return false; "
-                            f"const t = document.elementFromPoint({cx}, {cy}); "
-                            f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
-                        )
+                        _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
+                        covered = await _check_element_covered(locator, cx, cy, cdp_context=_cdp_ctx)
                         if covered:
                             logger.debug("[uncheck_checkbox_by_ref] covered at (%.1f, %.1f), clicking intercepting element", cx, cy)
                             page = await self.get_current_page()
                             if page:
-                                await page.evaluate(f"document.elementFromPoint({cx}, {cy})?.click()")
+                                await _click_covering_element(page, locator, cx, cy, cdp_context=_cdp_ctx)
                             else:
-                                await locator.uncheck(force=True)
+                                await locator.uncheck(force=True, timeout=_DEFAULT_CLICK_TIMEOUT_MS)
                         else:
-                            await locator.uncheck()
+                            await _locator_action_with_fallback(locator, action="uncheck")
                 else:
-                    if not await locator.is_visible():
+                    if not is_vis:
                         logger.debug("[uncheck_checkbox_by_ref] native input bbox=None and is_visible()=False; using dispatch_event click")
                         await locator.dispatch_event("click")
                     else:
-                        await locator.uncheck()
+                        await _locator_action_with_fallback(locator, action="uncheck")
             else:
+                _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
                 page = await self.get_current_page()
-                await _click_checkable_target(page, locator, bbox)
+                await _click_checkable_target(page, locator, bbox, cdp_context=_cdp_ctx)
 
             is_native_radio = is_native and (await locator.get_attribute("type") or "").strip().lower() == "radio"
             if not is_native_radio and await _is_checked(locator):
@@ -4252,49 +5017,81 @@ Before you return the element ref, reason about the state and elements for a sen
         try:
             logger.info(f'[double_click_element_by_ref] start ref={ref}')
 
+            # Double-click can open modals, new tabs, or trigger navigation —
+            # any prefetched snapshot from before the action is stale.
+            self._cancel_prefetch()
+
             locator = await self.get_element_by_ref(ref)
             if locator is None:
                 msg = f'Element ref {ref} is not available - page may have changed. Please try refreshing browser state.'
                 logger.warning(f'[double_click_element_by_ref] {msg}')
                 _raise_state_error(msg, code="REF_NOT_AVAILABLE", details={"ref": ref})
 
-            bbox = await locator.bounding_box()
+            bbox, is_vis = await asyncio.gather(
+                locator.bounding_box(),
+                locator.is_visible(),
+            )
             if bbox is not None:
                 cx = bbox["x"] + bbox["width"] / 2
                 cy = bbox["y"] + bbox["height"] / 2
 
-                if not await locator.is_visible():
+                if not is_vis:
                     logger.debug(
                         "[double_click_element_by_ref] element has bbox but is_visible()=False "
                         "(likely shadow-DOM slot); using dispatch_event dblclick"
                     )
                     await locator.dispatch_event("dblclick")
                 else:
-                    covered = await locator.evaluate(
-                        f"(el) => {{ if (window.parent !== window) return false; "
-                        f"const t = document.elementFromPoint({cx}, {cy}); "
-                        f"return !!t && t !== el && !el.contains(t) && !t.contains(el); }}"
-                    )
+                    _cdp_ctx = self._context if (self._is_cdp_borrowed) else None
+                    covered = await _check_element_covered(locator, cx, cy, cdp_context=_cdp_ctx)
                     if covered:
                         logger.debug("[double_click_element_by_ref] covered at (%.1f, %.1f), dispatching dblclick on intercepting element", cx, cy)
                         page = await self.get_current_page()
                         if page:
-                            await page.evaluate(
+                            dblclick_expr = (
                                 f"(function(){{"
                                 f"const el=document.elementFromPoint({cx},{cy});"
                                 f"if(el)el.dispatchEvent(new MouseEvent('dblclick',{{bubbles:true,cancelable:true,view:window}}));"
                                 f"}})()"
                             )
+                            if _cdp_ctx is not None:
+                                session = None
+                                try:
+                                    session = await _cdp_ctx.new_cdp_session(page)
+                                    await asyncio.wait_for(
+                                        session.send("Runtime.evaluate", {"expression": dblclick_expr}),
+                                        timeout=5.0,
+                                    )
+                                except Exception:
+                                    await locator.dispatch_event("dblclick")
+                                finally:
+                                    if session:
+                                        try:
+                                            await session.detach()
+                                        except Exception:
+                                            pass
+                            else:
+                                try:
+                                    await asyncio.wait_for(
+                                        page.evaluate(dblclick_expr),
+                                        timeout=10.0,
+                                    )
+                                except Exception:
+                                    await locator.dispatch_event("dblclick")
                         else:
-                            await locator.dblclick(force=True)
+                            await locator.dblclick(force=True, timeout=_DEFAULT_CLICK_TIMEOUT_MS)
                     else:
-                        await locator.dblclick()
+                        await _locator_action_with_fallback(
+                            locator, action="dblclick", fallback_event="dblclick"
+                        )
             else:
-                if not await locator.is_visible():
+                if not is_vis:
                     logger.debug("[double_click_element_by_ref] bbox=None and is_visible()=False; using dispatch_event dblclick")
                     await locator.dispatch_event("dblclick")
                 else:
-                    await locator.dblclick()
+                    await _locator_action_with_fallback(
+                        locator, action="dblclick", fallback_event="dblclick"
+                    )
 
             msg = f'Double-clicked element {ref}'
             logger.info(f'[double_click_element_by_ref] {msg}')
@@ -4611,8 +5408,7 @@ Before you return the element ref, reason about the state and elements for a sen
 
         Each character fires ``keydown``, ``keypress``, and ``keyup`` events,
         which is required for fields with per-keystroke handlers such as
-        autocomplete widgets.  This is slower than :meth:`insert_text` for
-        long strings.
+        autocomplete widgets.
 
         An element must already be focused before calling this method (e.g.
         via :meth:`focus_element_by_ref` or by clicking a field first).
@@ -4623,8 +5419,6 @@ Before you return the element ref, reason about the state and elements for a sen
           hidden inputs; **preferred** for form filling.
         - ``type_text`` — no ref; requires a pre-focused element; fires per-
           character key events; use when those events are needed.
-        - :meth:`insert_text` — no ref; pastes in one shot without key events;
-          fastest for long strings.
 
         Parameters
         ----------
@@ -4648,6 +5442,10 @@ Before you return the element ref, reason about the state and elements for a sen
         """
         try:
             logger.info(f"[type_text] start text_len={len(text)} submit={submit}")
+
+            # type_text can submit (Enter) or trigger autocomplete navigation;
+            # drop any prior prefetch so the post-typing snapshot is fresh.
+            self._cancel_prefetch()
 
             page = await self.get_current_page()
             if page is None:
@@ -4833,57 +5631,6 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.error(f"[fill_form] {error_msg}")
             _raise_operation_error(error_msg)
 
-    async def insert_text(self, text: str) -> str:
-        """Insert text at the current cursor position without per-character key events.
-
-        Pastes the text directly into the currently focused element.  Unlike
-        :meth:`type_text`, no ``keydown``/``keyup`` events are fired per character,
-        so it is significantly faster for long strings but will not trigger
-        handlers that listen to individual keystrokes (e.g., autocomplete widgets
-        that react to ``onkeydown``).
-
-        An element must already be focused before calling this method (e.g.
-        via :meth:`focus_element_by_ref`).
-
-        Use :meth:`input_text_by_ref` to target a specific element by ref.
-        Use :meth:`type_text` when per-character key events must fire.
-
-        Parameters
-        ----------
-        text : str
-            Text to insert at the current cursor position.  Requires an element
-            to already be focused (e.g., via :meth:`focus_element_by_ref`).
-
-        Returns
-        -------
-        str
-            "Inserted text (<N> characters)".
-
-        Raises
-        ------
-        StateError
-            If no active page is available.
-        OperationError
-            If insertion fails.
-        """
-        try:
-            logger.info(f"[insert_text] start text_len={len(text)}")
-
-            page = await self.get_current_page()
-            if page is None:
-                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
-
-            await page.keyboard.insert_text(text)
-            result = f"Inserted text ({len(text)} characters)"
-            logger.info(f"[insert_text] done {result}")
-            return result
-        except BridgicBrowserError:
-            raise
-        except Exception as e:
-            error_msg = f"Failed to insert text: {str(e)}"
-            logger.error(f"[insert_text] {error_msg}")
-            _raise_operation_error(error_msg)
-
     # ==================== Screenshot and PDF Tools ====================
 
     async def take_screenshot(
@@ -4933,10 +5680,11 @@ Before you return the element ref, reason about the state and elements for a sen
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
-            screenshot_options = {
-                "type": type,
-                "full_page": full_page if ref is None else False,
-            }
+            # ``Locator.screenshot()`` rejects ``full_page`` — only ``Page.screenshot()``
+            # accepts it.  Omit the key entirely in the ref branch.
+            screenshot_options: Dict[str, Any] = {"type": type}
+            if ref is None:
+                screenshot_options["full_page"] = full_page
 
             if type == "jpeg" and quality is not None:
                 screenshot_options["quality"] = quality
@@ -5717,21 +6465,122 @@ Before you return the element ref, reason about the state and elements for a sen
             if cookies:
                 await context.add_cookies(cookies)
 
+            _skipped_ls_items: list[str] = []
             origins = state.get("origins", [])
-            for origin_data in origins:
-                origin = origin_data.get("origin", "")
-                local_storage = origin_data.get("localStorage", [])
+            origins_with_ls = [
+                o for o in origins
+                if o.get("origin") and o.get("localStorage")
+            ]
 
-                if local_storage and origin:
-                    for item in local_storage:
-                        name = item.get("name", "")
-                        value = item.get("value", "")
-                        if name:
-                            await page.evaluate(
-                                f"localStorage.setItem({json.dumps(name)}, {json.dumps(value)})"
+            if origins_with_ls and self._is_cdp_borrowed and self._context:
+                # CDP borrowed mode: page.evaluate() hangs. Use DOMStorage CDP
+                # protocol, which targets storage by securityOrigin rather than
+                # the currently loaded page.  setDOMStorageItem may fail with
+                # "Frame not found" when the target origin has no active frame
+                # — expected in CDP borrowed mode; collect failures and warn
+                # rather than hard-fail because cookies are already restored.
+                session = await self._context.new_cdp_session(page)
+                try:
+                    for origin_data in origins_with_ls:
+                        origin = origin_data["origin"]
+                        local_storage = origin_data["localStorage"]
+                        storage_id = {"storageId": {"securityOrigin": origin, "isLocalStorage": True}}
+                        for item in local_storage:
+                            name = item.get("name", "")
+                            value = item.get("value", "")
+                            if not name:
+                                continue
+                            try:
+                                await asyncio.wait_for(
+                                    session.send("DOMStorage.setDOMStorageItem", {
+                                        **storage_id,
+                                        "key": name,
+                                        "value": value,
+                                    }),
+                                    timeout=5.0,
+                                )
+                            except Exception as _ls_err:
+                                logger.debug(
+                                    "[restore_storage_state] localStorage item skipped "
+                                    "(origin=%s key=%s): %s",
+                                    origin, name, _ls_err,
+                                )
+                                _skipped_ls_items.append(f"{origin}/{name}")
+                finally:
+                    try:
+                        await session.detach()
+                    except Exception:
+                        pass
+            elif origins_with_ls:
+                # Non-CDP mode: open a dedicated temp page, intercept every
+                # request with a minimal HTML stub so navigation does not touch
+                # the network, then for each origin goto(origin) + evaluate
+                # setItem.  This scopes localStorage writes to the correct
+                # origin's storage area rather than the user's current page.
+                temp_page = await context.new_page()
+
+                async def _stub_route(route):
+                    try:
+                        await route.fulfill(
+                            status=200,
+                            content_type="text/html",
+                            body="<!doctype html><html></html>",
+                        )
+                    except Exception:
+                        try:
+                            await route.abort()
+                        except Exception:
+                            pass
+
+                try:
+                    await temp_page.route("**/*", _stub_route)
+                    for origin_data in origins_with_ls:
+                        origin = origin_data["origin"]
+                        local_storage = origin_data["localStorage"]
+                        items = [
+                            [it.get("name"), it.get("value", "")]
+                            for it in local_storage
+                            if it.get("name")
+                        ]
+                        if not items:
+                            continue
+                        try:
+                            await asyncio.wait_for(
+                                temp_page.goto(origin, wait_until="domcontentloaded"),
+                                timeout=10.0,
                             )
+                            await asyncio.wait_for(
+                                temp_page.evaluate(
+                                    "items => { for (const [k,v] of items) localStorage.setItem(k, v); }",
+                                    items,
+                                ),
+                                timeout=10.0,
+                            )
+                        except Exception as _origin_err:
+                            logger.debug(
+                                "[restore_storage_state] origin restore failed "
+                                "(origin=%s items=%d): %s",
+                                origin, len(items), _origin_err,
+                            )
+                            _skipped_ls_items.extend(
+                                f"{origin}/{name}" for name, _ in items
+                            )
+                finally:
+                    try:
+                        await temp_page.close()
+                    except Exception:
+                        pass
 
             result = f"Storage state restored from: {filename} ({len(cookies)} cookies)"
+            if _skipped_ls_items:
+                result += (
+                    f". Warning: {len(_skipped_ls_items)} localStorage item(s) could not be restored"
+                )
+                if self._is_cdp_borrowed:
+                    result += (
+                        " (CDP borrowed mode: navigate to the target origin first,"
+                        " then call storage-load again to apply localStorage)"
+                    )
             logger.info(f"[restore_storage_state] done {result}")
             return result
         except BridgicBrowserError:
@@ -6331,7 +7180,7 @@ Before you return the element ref, reason about the state and elements for a sen
             if page is None:
                 _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
 
-            actual_title = await page.title()
+            actual_title = await self._get_page_title(page)
 
             if exact:
                 matches = actual_title == expected_title
@@ -6469,90 +7318,319 @@ Before you return the element ref, reason about the state and elements for a sen
             logger.error(f"[stop_tracing] {error_msg}")
             _raise_operation_error(error_msg)
 
+    @staticmethod
+    def _allocate_video_temp_path() -> str:
+        """Generate a unique temp .webm path for one page's recording.
+
+        Uses ``tempfile.mkstemp`` (O_EXCL) so the path is guaranteed
+        unique even when many recorders are allocated within the same
+        second — a previous timestamp+random scheme had a non-zero
+        collision risk under burst multi-page start_video() calls.
+        We immediately remove the empty file because ffmpeg insists on
+        creating the output itself.
+        """
+        os.makedirs(BRIDGIC_TMP_DIR, exist_ok=True)
+        fd, path = tempfile.mkstemp(
+            prefix="video_", suffix=".webm", dir=str(BRIDGIC_TMP_DIR)
+        )
+        os.close(fd)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return path
+
+    async def _switch_video_to_page(self, new_page: "Page") -> None:
+        """If recording active, switch screencast to *new_page*. No-op otherwise."""
+        if self._video_recorder is None or self._video_session is None:
+            return
+        if self._video_recorder.current_page == new_page:
+            return
+        if new_page.is_closed():
+            return
+        try:
+            await self._video_recorder.switch_page(new_page)
+        except Exception as e:
+            logger.warning("[video] switch_page failed: %s", e)
+
+    async def _start_single_video_recorder(self, page: "Page") -> None:
+        """Start the single-stream recorder targeting *page*."""
+        if self._video_session is None or page.is_closed():
+            return
+        output_path = self._allocate_video_temp_path()
+        w = int(self._video_session["width"])
+        h = int(self._video_session["height"])
+        recorder = _video_recorder_mod.VideoRecorder(
+            page.context, page, output_path, (w, h),
+        )
+        await recorder.start()
+        self._video_recorder = recorder
+        logger.info("[start_video] recording active tab → %s", output_path)
+
     async def start_video(
         self,
         width: Optional[int] = None,
         height: Optional[int] = None,
     ) -> str:
-        """Mark the current page's video recording session as active.
+        """Start single-stream video recording on the active tab.
 
-        Video recording is always running — Playwright starts recording as soon
-        as a page is created (using the ``record_video_dir`` set at browser
-        creation, which defaults to ``~/.bridgic/bridgic-browser/tmp``).  This method simply
-        marks the session as "started" so that :meth:`stop_video` can later
-        register where to save the file.
-
-        Use ``stop_video(filename)`` to designate a save path; the actual file
-        is written when the browser closes.
+        One ffmpeg process records the currently active page. When the
+        user switches tabs (via ``switch_tab``, ``new_tab``, etc.) the
+        CDP screencast source is hot-swapped to the new page — ffmpeg
+        stays alive and the output is a single continuous .webm file.
 
         Parameters
         ----------
         width : Optional[int], optional
-            Accepted for API compatibility but **not used** — video resolution
-            is determined by ``record_video_size`` passed at ``Browser()``
-            creation time, not here.
+            Video width in pixels. Defaults to the current viewport width
+            (rounded down to an even number). Pass an explicit value to
+            override — e.g. to downscale a 4K viewport.
         height : Optional[int], optional
-            Accepted for API compatibility but **not used** — see ``width``.
+            Video height in pixels. Defaults to the current viewport height
+            (rounded down to an even number).
 
         Returns
         -------
         str
-            "Video recording started".
-
-        Raises
-        ------
-        StateError
-            If no active page is available, or if no video is attached to the
-            current page (should not occur under normal operation).
-        OperationError
-            If an unexpected error occurs.
+            "Video recording started (recording active tab)".
         """
+        logger.info(f"[start_video] start width={width} height={height}")
+
+        # Validation runs BEFORE any state mutation so that "already active" /
+        # "no active page" errors cannot trigger the rollback path below — that
+        # path would otherwise tear down the *previous* successful session.
+        page = await self.get_current_page()
+        if page is None:
+            _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
+
+        context = page.context
+        context_key = _get_context_key(context)
+
+        if self._video_session is not None or self._video_state.get(context_key):
+            _raise_state_error("Video recording already active", code="VIDEO_ALREADY_ACTIVE")
+
+        # Compute the recording size.
+        #
+        # NOTE: this intentionally diverges from Playwright's screencast.ts
+        # ``startScreencast()`` (lines 90-98), which caps the longest side at
+        # 800 px to keep encoder cost low. That cap is the dominant source of
+        # blur for bridgic recordings: with a typical 1280×800 viewport, Chrome
+        # downsamples to 800×500 *inside the browser* before frames ever reach
+        # ffmpeg, so no encoder tuning can recover the lost detail. Bridgic
+        # videos are usually replayed by humans inspecting an LLM session where
+        # legibility wins over a few extra MB of CPU and disk.
+        #
+        # Default policy: record at the page's actual CSS pixel dimensions.
+        # We query ``window.innerWidth/innerHeight`` directly instead of
+        # trusting ``page.viewport_size``:
+        #
+        #   - launch mode with explicit viewport: both agree
+        #   - launch mode without an explicit viewport: both agree
+        #   - CDP attach mode: ``page.viewport_size`` is ``None`` because
+        #     bridgic never called ``setViewportSize`` on the foreign Chrome.
+        #     Falling back to a hard-coded ``800×600`` is almost always wrong:
+        #     the real window is wider (typically 16:9), so Chrome downsamples
+        #     to fit within 800×600 and ffmpeg's ``scale`` filter stretches
+        #     the frame to the target size. Querying
+        #     ``window.innerWidth/innerHeight`` returns the true visible area
+        #     for any of the three modes.
+        # ``& ~1``: round down to an even number — VP8 requires even
+        # width and height.
+        viewport_width = _DEFAULT_VIDEO_WIDTH
+        viewport_height = _DEFAULT_VIDEO_HEIGHT
         try:
-            logger.info(f"[start_video] start width={width} height={height}")
-
-            page = await self.get_current_page()
-            if page is None:
-                _raise_state_error("No active page available", code="NO_ACTIVE_PAGE")
-
-            context = page.context
-            context_key = _get_context_key(context)
-
-            if page.video:
-                self._video_state[context_key] = True
-                result = "Video recording started"
-                logger.info(f"[start_video] done {result}")
-                return result
+            # Use CDP Page.getLayoutMetrics instead of page.evaluate() — avoids the
+            # Playwright _mainContext() hang on pre-existing tabs in CDP borrowed mode.
+            _session = await self._context.new_cdp_session(page)
+            try:
+                _metrics = await asyncio.wait_for(
+                    _session.send("Page.getLayoutMetrics"),
+                    timeout=5.0,
+                )
+            finally:
+                try:
+                    await _session.detach()
+                except Exception:
+                    pass
+            # Use cssVisualViewport (not cssLayoutViewport) because it
+            # represents the actual visible pixel area after pinch-zoom,
+            # matching what Chrome's screencast captures.
+            # get_page_size_info() uses cssLayoutViewport for scroll
+            # reporting — different purpose, both choices are intentional.
+            _vp = _metrics.get("cssVisualViewport", {})
+            qw = int(_vp.get("clientWidth") or 0)
+            qh = int(_vp.get("clientHeight") or 0)
+            if qw > 0 and qh > 0:
+                viewport_width = qw
+                viewport_height = qh
             else:
-                _raise_state_error("No video recording available for this page", code="NO_ACTIVE_RECORDING")
-        except BridgicBrowserError:
-            raise
+                raise ValueError(f"non-positive dimensions from CDP: {_vp}")
+        except Exception as exc:
+            # Fall back to viewport_size, then the hard default above. Logged
+            # but non-fatal so a hardened CSP page can still record.
+            logger.warning(
+                "[start_video] could not query window dimensions (%s); "
+                "falling back to page.viewport_size", exc,
+            )
+            vp = page.viewport_size
+            if vp:
+                viewport_width = int(vp["width"]) or viewport_width
+                viewport_height = int(vp["height"]) or viewport_height
+
+        w = (width or viewport_width) & ~1
+        h = (height or viewport_height) & ~1
+
+        # Build the session record up front so _start_single_video_recorder
+        # picks up the parameters. From this point on, any failure must
+        # roll back the partially-set-up session state.
+        self._video_session = {
+            "width": w,
+            "height": h,
+            "context": context,
+        }
+        self._video_recorder = None
+        self._video_state[context_key] = True
+
+        try:
+            # Single-stream: start one recorder on the active page.
+            await self._start_single_video_recorder(page)
+            if self._video_recorder is None:
+                raise RuntimeError("Failed to start video recorder on active page")
+
+            result = "Video recording started (recording active tab)"
+            logger.info("[start_video] %s", result)
+            return result
         except Exception as e:
+            # Rollback the session state we set up above so future
+            # start_video() calls are not blocked by a phantom session.
+            self._video_session = None
+            if self._video_recorder is not None:
+                try:
+                    await self._video_recorder.stop()
+                except Exception:
+                    pass
+                self._video_recorder = None
+            self._video_state.pop(context_key, None)
+            if isinstance(e, BridgicBrowserError):
+                raise
             error_msg = f"Failed to start video: {str(e)}"
             logger.error(f"[start_video] {error_msg}")
             _raise_operation_error(error_msg)
 
-    async def stop_video(self, filename: Optional[str] = None) -> str:
-        """Stop video recording.
+    @staticmethod
+    def _resolve_video_dest(filename: str) -> str:
+        """Resolve a user-supplied filename to an absolute path.
 
-        Marks the current recording session as stopped and registers the
-        destination path.  The actual video files are written by Playwright
-        when pages close, so saving is deferred to ``browser_close()`` /
-        ``close_tab()`` — no pages are touched here.
+        Three input shapes are accepted:
+          "demo.webm"   → cwd/demo.webm
+          "./videos/"   → ./videos/video_<timestamp>.webm  (auto-named)
+          "demo"        → cwd/demo.webm  (".webm" suffix auto-added)
+        """
+        if filename.endswith(os.sep) or filename.endswith("/") or os.path.isdir(filename):
+            import time as _time
+            dest_dir = os.path.abspath(filename)
+            resolved = os.path.join(dest_dir, f"video_{_time.strftime('%Y%m%d_%H%M%S')}.webm")
+        else:
+            if not filename.lower().endswith(".webm"):
+                filename = f"{filename}.webm"
+            resolved = os.path.abspath(filename)
+        dest_dir = os.path.dirname(resolved)
+        if dest_dir:
+            os.makedirs(dest_dir, exist_ok=True)
+        return resolved
+
+    @staticmethod
+    def _move_video_local(src: Path, dest: str) -> str:
+        """Move a video file locally (rename, falling back to copy).
+
+        Why we do not use Playwright's ``video.save_as()``:
+          save_as() streams the file across the Node RPC bridge in 1 MB
+          base64 chunks. Large recordings can take tens of seconds or
+          even time out. A local ``os.rename`` is O(1); even when we
+          fall back to copy2 (cross-device move), it is orders of
+          magnitude faster than the RPC stream.
+        """
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        try:
+            os.rename(str(src), dest)
+        except OSError:
+            import shutil
+            shutil.copy2(str(src), dest)
+            try:
+                src.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return os.path.abspath(dest)
+
+    @staticmethod
+    def _resolve_multi_video_dests(
+        filename: Optional[str], count: int,
+    ) -> Optional[List[str]]:
+        """Build N destination paths for ``count`` recorded video files.
+
+        Parameters
+        ----------
+        filename : Optional[str]
+            User-supplied destination.  ``None`` leaves files in temp dir.
+            A directory (``./videos/`` or existing dir) → each file keeps
+            its auto-generated basename inside that dir.
+            A file path (``./out.webm``) → first file uses the exact path,
+            subsequent files get ``-1``, ``-2``, … suffix inserted before
+            the extension.
+        count : int
+            Number of recorded videos.
+
+        Returns
+        -------
+        Optional[List[str]]
+            ``None`` when ``filename`` is ``None`` (keep temp paths),
+            otherwise a list of ``count`` destination paths.
+        """
+        if filename is None:
+            return None
+        if count == 0:
+            return []
+        is_dir = (
+            filename.endswith(os.sep)
+            or filename.endswith("/")
+            or os.path.isdir(filename)
+        )
+        if is_dir:
+            import time as _time
+            dest_dir = os.path.abspath(filename)
+            os.makedirs(dest_dir, exist_ok=True)
+            ts = _time.strftime("%Y%m%d_%H%M%S")
+            out: List[str] = []
+            for i in range(count):
+                name = f"video_{ts}.webm" if i == 0 else f"video_{ts}-{i}.webm"
+                out.append(os.path.join(dest_dir, name))
+            return out
+        # Single-file target: use as base name; append -N for extras.
+        base = filename if filename.lower().endswith(".webm") else f"{filename}.webm"
+        base_abs = os.path.abspath(base)
+        dest_dir = os.path.dirname(base_abs)
+        if dest_dir:
+            os.makedirs(dest_dir, exist_ok=True)
+        stem, ext = os.path.splitext(base_abs)
+        return [base_abs if i == 0 else f"{stem}-{i}{ext}" for i in range(count)]
+
+    async def stop_video(self, filename: Optional[str] = None) -> str:
+        """Stop video recording and save the file.
+
+        Files are saved immediately — no need to wait for browser close.
 
         Parameters
         ----------
         filename : Optional[str], optional
-            Destination path for the video file(s).  Accepts a file path
+            Destination for the video file.  Accepts a file path
             (``./videos/demo.webm``) or a directory (``./videos/``).
             The ``.webm`` extension is added automatically when missing.
-            If not provided, Playwright writes files to the temporary
-            recording directory automatically on page close.
+            If not provided, the file stays in the temporary directory.
 
         Returns
         -------
         str
-            Confirmation that recording was stopped and where files will be
-            saved (``Video will be saved to: <path> on browser close``).
+            Confirmation with the saved file path.
         """
         try:
             logger.info(f"[stop_video] start filename={filename}")
@@ -6561,46 +7639,58 @@ Before you return the element ref, reason about the state and elements for a sen
                 _raise_state_error("No context is open", code="NO_CONTEXT")
             context_key = _get_context_key(self._context)
 
-            if not self._video_state.get(context_key):
-                _raise_state_error("No active video recording. Use video-start first.", code="NO_ACTIVE_RECORDING")
+            if self._video_session is None and self._video_recorder is None:
+                _raise_state_error(
+                    "No active video recording. Use video-start first.",
+                    code="NO_ACTIVE_RECORDING",
+                )
 
-            # Resolve destination path now (before any context changes) and
-            # create the directory so the user gets an early error if the path
-            # is invalid.  Actual file writing is deferred to browser close.
-            resolved: Optional[str] = None
-            if filename:
-                if filename.endswith(os.sep) or filename.endswith("/") or os.path.isdir(filename):
-                    import time as _time
-                    dest_dir = os.path.abspath(filename)
-                    resolved = os.path.join(dest_dir, f"video_{_time.strftime('%Y%m%d_%H%M%S')}.webm")
-                else:
-                    if not filename.lower().endswith(".webm"):
-                        filename = f"{filename}.webm"
-                    resolved = os.path.abspath(filename)
-                dest_dir = os.path.dirname(resolved)
-                if dest_dir:
-                    os.makedirs(dest_dir, exist_ok=True)
+            # Detach page-creation listener so stopping recording in
+            # parallel with a tab open doesn't race into a switch.
+            if self._video_session is not None:
+                listener = self._video_session.get("page_listener")
+                if listener is not None:
+                    try:
+                        self._context.remove_listener("page", listener)
+                    except Exception:
+                        pass
 
-            # Defer the actual save; no pages are closed or navigated here.
-            self._pending_video_save_path[context_key] = resolved
+            # Snap the recorder to a local var so a concurrent close()
+            # won't also try to stop it.
+            recorder = self._video_recorder
+            self._video_recorder = None
+            self._video_session = None
             self._video_state[context_key] = False
 
-            if resolved:
-                dest_dir_display = os.path.dirname(resolved)
-                stem_display = os.path.splitext(os.path.basename(resolved))[0]
-                result = (
-                    f"Video recording stopped. "
-                    f"Files will be saved to {dest_dir_display}/ "
-                    f"as {stem_display}.webm (single tab) or "
-                    f"{stem_display}_1.webm, {stem_display}_2.webm, ... (multiple tabs) "
-                    f"when browser closes."
+            if recorder is None:
+                return "Video recording stopped (no recorder was active)"
+
+            # Stop the single recorder.
+            try:
+                temp_path: str = await asyncio.wait_for(
+                    recorder.stop(), timeout=30.0,
                 )
-            else:
-                result = (
-                    "Video recording stopped. "
-                    "Files will be auto-saved to the recording directory when browser closes."
-                )
-            logger.info(f"[stop_video] done (deferred) {result}")
+            except Exception as exc:
+                logger.warning("[stop_video] recorder stop failed: %s", exc)
+                return "Video recording stopped (file may be incomplete)"
+
+            if not temp_path or not os.path.isfile(temp_path):
+                return "Video recording stopped (no file was produced)"
+
+            # Move to user destination if requested.
+            if filename is not None:
+                dest = self._resolve_video_dest(filename)
+                try:
+                    self._move_video_local(Path(temp_path), dest)
+                    temp_path = dest
+                except Exception as move_err:
+                    logger.error(
+                        "[stop_video] move failed, file stays at: %s (%s)",
+                        temp_path, move_err,
+                    )
+
+            result = f"Video saved to: {temp_path}"
+            logger.info(f"[stop_video] done: {result}")
             return result
         except BridgicBrowserError:
             raise

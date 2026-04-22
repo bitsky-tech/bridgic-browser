@@ -90,6 +90,49 @@
 </div>
 
 <!-- ================================================================
+     SECTION 4: Shadow-select portal dropdown (Arco/Element Plus style)
+
+     Trigger hosts a hidden native <select> (for a11y / form posting) AND
+     exposes aria-controls pointing to a portalized [role='listbox']
+     in <body>. The shadow <option>s are NOT clickable; the real options
+     are the portal [role='option'] divs. Regression fixture for the
+     silent-no-op select bug.
+     ================================================================ -->
+<div class="section">
+    <h3>Section 4: Shadow-select portal dropdown</h3>
+
+    <label id="status-label">Appeal status:</label>
+    <div role="combobox" aria-controls="status-listbox" aria-expanded="false"
+         aria-label="Appeal status" data-testid="status-trigger"
+         tabindex="0"
+         style="border:1px solid #999; padding:6px 12px; display:inline-block; min-width:150px; cursor:pointer; margin-left:8px"
+         onclick="toggleShadowSelectDropdown(this)">
+        <span id="status-display">All</span>
+        <!-- Shadow native <select> used by Arco/Element Plus for a11y / form posting.
+             Its <option>s are hidden and clicking them is a no-op (the bug this fixture reproduces). -->
+        <select id="status-shadow-select" aria-hidden="true"
+                style="display:none; position:absolute; width:0; height:0;">
+            <option value="all" selected>All</option>
+            <option value="pending">Pending</option>
+        </select>
+    </div>
+</div>
+
+<!-- Portalized listbox — hidden until trigger is clicked. Contains the real options. -->
+<div id="status-listbox" role="listbox" aria-label="Appeal status"
+     style="display:none; position:absolute; border:1px solid #ccc;
+            background:#fff; z-index:10000; min-width:150px">
+    <div role="option" data-value="all" style="padding:4px 12px; cursor:pointer"
+         onclick="selectShadowOption(this, 'all', 'All')">All</div>
+    <div role="option" data-value="pending" style="padding:4px 12px; cursor:pointer"
+         onclick="selectShadowOption(this, 'pending', 'Pending')">Pending</div>
+    <div role="option" data-value="processing" style="padding:4px 12px; cursor:pointer"
+         onclick="selectShadowOption(this, 'processing', 'Processing')">Processing</div>
+    <div role="option" data-value="resolved" style="padding:4px 12px; cursor:pointer"
+         onclick="selectShadowOption(this, 'resolved', 'Resolved')">Resolved</div>
+</div>
+
+<!-- ================================================================
      SECTION 3: React + antd Select components
      ================================================================ -->
 <div class="section">
@@ -117,6 +160,30 @@ function selectPortalOption(optionEl, value, label) {
     trigger.setAttribute('aria-expanded', 'false');
     trigger.dataset.selectedValue = value;
     logMsg('portal-select → ' + label + ' (value=' + value + ')');
+}
+
+/* --- Shadow-select portal dropdown helpers (Section 4) --- */
+function toggleShadowSelectDropdown(trigger) {
+    var lb = document.getElementById('status-listbox');
+    var expanded = trigger.getAttribute('aria-expanded') === 'true';
+    lb.style.display = expanded ? 'none' : 'block';
+    trigger.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+    if (!expanded) {
+        var rect = trigger.getBoundingClientRect();
+        lb.style.left = rect.left + 'px';
+        lb.style.top = (rect.bottom + 2) + 'px';
+    }
+}
+function selectShadowOption(optionEl, value, label) {
+    document.getElementById('status-display').textContent = label;
+    document.getElementById('status-listbox').style.display = 'none';
+    var trigger = document.querySelector('[aria-controls="status-listbox"]');
+    trigger.setAttribute('aria-expanded', 'false');
+    trigger.dataset.selectedValue = value;
+    // Keep shadow <select> in sync (what Arco/Element Plus actually do)
+    var shadow = document.getElementById('status-shadow-select');
+    if (shadow) { shadow.value = value; }
+    logMsg('status-select → ' + label + ' (value=' + value + ')');
 }
 
 /* --- Logging --- */

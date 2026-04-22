@@ -9,6 +9,7 @@ If browser tests are disabled (SKIP_BROWSER_TESTS=1), the fixture will skip.
 
 from __future__ import annotations
 
+import os
 import re
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import quote
@@ -198,7 +199,7 @@ async def test_get_snapshot_text_file_name_format(tmp_path) -> None:
     match = re.search(r"saved to: (.+)", result)
     assert match is not None
     filepath = match.group(1).strip()
-    filename = filepath.split("/")[-1]
+    filename = os.path.basename(filepath)
     assert re.match(r"snapshot-\d{8}-\d{6}-[0-9a-f]{4}\.txt$", filename)
 
 

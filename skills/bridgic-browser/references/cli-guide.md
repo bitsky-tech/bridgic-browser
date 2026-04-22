@@ -9,8 +9,9 @@ Use this guide when the task should be executed directly from terminal commands 
 3. [Command Groups](#command-groups)
 4. [High-Frequency Examples](#high-frequency-examples)
 5. [Runtime and Configuration](#runtime-and-configuration)
-6. [Non-Obvious CLI Behavior](#non-obvious-cli-behavior)
-7. [When to Load Other References](#when-to-load-other-references)
+6. [CDP Mode (Connect to Existing Browser)](#cdp-mode-connect-to-existing-browser)
+7. [Non-Obvious CLI Behavior](#non-obvious-cli-behavior)
+8. [When to Load Other References](#when-to-load-other-references)
 
 ## Quick Start
 
@@ -120,13 +121,44 @@ Config precedence (low -> high):
 
 Environment variables and login state persistence are documented in `env-vars.md`.
 
+## CDP Mode (Connect to Existing Browser)
+
+Connect to a running Chrome instead of launching a new one:
+
+```bash
+# Start Chrome with remote debugging
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+    --remote-debugging-port=9222 --user-data-dir=/tmp/cdp-profile
+
+# Connect by port
+bridgic-browser open https://example.com --cdp 9222
+
+# Connect by WebSocket URL
+bridgic-browser open https://example.com --cdp ws://localhost:9222/devtools/browser/...
+
+# Connect to cloud service
+bridgic-browser open https://example.com --cdp wss://cloud.example.com/chromium?token=...
+
+# Auto-scan local Chrome/Chromium/Brave profiles (+ Canary variants)
+bridgic-browser open https://example.com --cdp auto
+```
+
+| Format | Description |
+|--------|-------------|
+| `9222` | Bare port -- queries `localhost:9222/json/version` |
+| `ws://...` / `wss://...` | Direct WebSocket URL, passed through as-is |
+| `http://host:port` | HTTP discovery endpoint |
+| `auto` | Scan local Chrome/Chromium/Brave profiles (+ Canary) for `DevToolsActivePort` |
+
+`close` disconnects from the remote browser but does **not** kill the Chrome process.
+
 ## Non-Obvious CLI Behavior
 
 - Refs come from the latest snapshot. If page changed, re-run `snapshot` before interaction.
 - When `snapshot` output exceeds `-l <limit>`, or `-s <path>` is provided, full content is saved to a file (auto-generated under `~/.bridgic/bridgic-browser/snapshot/` or the specified path).
 - `snapshot -i` returns only clickable/editable elements — use for action selection, not full-page inspection.
 - CLI uses a persistent daemon/browser. State survives across commands until `close`.
-- **`open` and `search` accept `--headed` and `--clear-user-data`** (startup flags only — ignored when a daemon is already running):
+- **`open` and `search` accept `--headed`, `--clear-user-data`, and `--cdp`** (startup flags only — ignored when a daemon is already running):
   - `bridgic-browser open --headed https://example.com` — start in headed mode
   - `bridgic-browser open --clear-user-data https://example.com` — start with ephemeral session (no persistent profile)
   - By default (no `--clear-user-data`), the browser uses a persistent profile saved at `~/.bridgic/bridgic-browser/user_data/`.

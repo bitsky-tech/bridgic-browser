@@ -124,10 +124,24 @@ def cli() -> None:
               help="Launch the browser in headed (visible) mode.")
 @click.option("--clear-user-data", is_flag=True, default=False,
               help="Start with a fresh browser profile (no persistent user data). Ignored if a session is already running.")
-def cmd_open(url: str, headed: bool, clear_user_data: bool) -> None:
+@click.option(
+    "--cdp", default=None, metavar="PORT_OR_URL",
+    help=(
+        "Connect to a running browser instead of launching a new one. "
+        "Accepts: port number (9222), ws:// or wss:// URL, http://host:port, "
+        "or 'auto' to scan local Chrome/Chromium/Brave (+ Canary variants) profiles."
+    ),
+)
+def cmd_open(url: str, headed: bool, clear_user_data: bool, cdp: str | None) -> None:
     """Navigate to URL (starts a browser session if needed)."""
+    # H02: pass the raw ``--cdp`` value through to the daemon. Resolving on
+    # the client side collapses bare-port / http / auto inputs into a ws URL
+    # that embeds the Chrome session UUID, so if Chrome later restarts the
+    # daemon is stuck with a dead UUID and auto-reconnect 404s forever.
+    # Keeping the raw form lets :meth:`Browser._start` re-resolve from
+    # scratch on each reconnect.
     try:
-        _ok(send_command("open", {"url": url}, headed=headed, clear_user_data=clear_user_data))
+        _ok(send_command("open", {"url": url}, headed=headed, clear_user_data=clear_user_data, cdp=cdp))
     except Exception as exc:
         _err(exc)
 
@@ -170,10 +184,20 @@ def cmd_reload() -> None:
               help="Launch the browser in headed (visible) mode.")
 @click.option("--clear-user-data", is_flag=True, default=False,
               help="Start with a fresh browser profile (no persistent user data). Ignored if a session is already running.")
-def cmd_search(query: str, engine: str, headed: bool, clear_user_data: bool) -> None:
+@click.option(
+    "--cdp", default=None, metavar="PORT_OR_URL",
+    help=(
+        "Connect to a running browser instead of launching a new one. "
+        "Accepts: port number (9222), ws:// or wss:// URL, http://host:port, "
+        "or 'auto' to scan local Chrome/Chromium/Brave (+ Canary variants) profiles."
+    ),
+)
+def cmd_search(query: str, engine: str, headed: bool, clear_user_data: bool, cdp: str | None) -> None:
     """Search the web using a search engine (starts a browser session if needed)."""
+    # See ``cmd_open`` for the rationale — raw ``--cdp`` forwarding keeps
+    # CDP auto-reconnect honest.
     try:
-        _ok(send_command("search", {"query": query, "engine": engine}, headed=headed, clear_user_data=clear_user_data))
+        _ok(send_command("search", {"query": query, "engine": engine}, headed=headed, clear_user_data=clear_user_data, cdp=cdp))
     except Exception as exc:
         _err(exc)
 
@@ -350,7 +374,12 @@ def cmd_upload(ref: str, path: str) -> None:
 @click.option("--submit", is_flag=True, default=False,
               help="Press Enter after filling the last field.")
 def cmd_fill_form(fields_json: str, submit: bool) -> None:
-    """Fill multiple form fields all at once. FIELDS_JSON is a JSON array like '[{"ref":"8d4a07a9","value":"hi"}]'."""
+    """Fill multiple form fields all at once.
+
+    FIELDS_JSON is a JSON array of {"ref": "REF", "value": "TEXT"} objects.
+    Example: '[{"ref":"8d4a07a9","value":"Alice"},{"ref":"9e5f18b0","value":"secret"}]'
+    Get refs from the 'snapshot' command.
+    """
     try:
         _ok(send_command("fill_form", {"fields": fields_json, "submit": submit}, start_if_needed=False))
     except Exception as exc:
@@ -362,7 +391,10 @@ def cmd_fill_form(fields_json: str, submit: bool) -> None:
 @cli.command("press", context_settings=CONTEXT_SETTINGS)
 @click.argument("key")
 def cmd_press(key: str) -> None:
-    """Press a keyboard key or combination (Enter, Control+A, Shift+Tab…)."""
+    """Press a keyboard key or combination (Enter, Control+A, Shift+Tab…).
+
+    On macOS use Meta for the Command key (e.g. Meta+A for select-all, Meta+C for copy).
+    """
     try:
         _ok(send_command("press", {"key": key}, start_if_needed=False))
     except Exception as exc:
@@ -461,7 +493,10 @@ def cmd_mouse_drag(x1: float, y1: float, x2: float, y2: float) -> None:
               type=click.Choice(["left", "right", "middle"], case_sensitive=False),
               help="Mouse button to press (default: left).")
 def cmd_mouse_down(button: str) -> None:
-    """Press and hold a mouse button."""
+    """Press and hold a mouse button at the current cursor position.
+
+    Call mouse-move first to position the cursor before pressing.
+    """
     try:
         _ok(send_command("mouse_down", {"button": button}, start_if_needed=False))
     except Exception as exc:
@@ -473,7 +508,10 @@ def cmd_mouse_down(button: str) -> None:
               type=click.Choice(["left", "right", "middle"], case_sensitive=False),
               help="Mouse button to release (default: left).")
 def cmd_mouse_up(button: str) -> None:
-    """Release a held mouse button."""
+    """Release a held mouse button at the current cursor position.
+
+    Call mouse-move first to position the cursor before releasing.
+    """
     try:
         _ok(send_command("mouse_up", {"button": button}, start_if_needed=False))
     except Exception as exc:
@@ -486,28 +524,36 @@ def cmd_mouse_up(button: str) -> None:
 @click.argument("seconds_or_text")
 @click.option("--gone", is_flag=True, default=False,
               help="Wait for SECONDS_OR_TEXT to disappear instead of appear.")
-def cmd_wait(seconds_or_text: str, gone: bool) -> None:
+@click.option("--timeout", "timeout_seconds", default=30.0, show_default=True, type=float,
+              help="Max seconds to wait for text to appear/disappear (ignored for numeric waits).")
+def cmd_wait(seconds_or_text: str, gone: bool, timeout_seconds: float) -> None:
     """Wait for N seconds (float) or until TEXT appears/disappears.
 
     \b
     SECONDS_OR_TEXT:
-      If a number  → wait exactly that many seconds (e.g. 2, 0.5). Max 60.
+      If a number  → wait exactly that many seconds (e.g. 2, 0.5).
                      NOTE: unit is SECONDS, not milliseconds.
-                     --gone is ignored when a number is given.
+                     --gone and --timeout are ignored when a number is given.
+                     Very long waits are bounded by the daemon response
+                     timeout (BRIDGIC_DAEMON_RESPONSE_TIMEOUT, default 90s,
+                     auto-extended via the arg value + buffer).
       If text      → wait until that text appears on the page.
                      Add --gone to wait until it disappears instead.
+                     Use --timeout to set a custom wait limit (default: 30s).
 
     \b
     Examples:
-        bridgic-browser wait 2                 # wait for 2 seconds
-        bridgic-browser wait 0.5               # wait for 0.5 senond
-        bridgic-browser wait "Submit"          # wait for text to appear
-        bridgic-browser wait --gone "Loading"  # wait for text to disappear
+        bridgic-browser wait 2                          # wait for 2 seconds
+        bridgic-browser wait 0.5                        # wait for 0.5 second
+        bridgic-browser wait "Submit"                   # wait for text to appear (30s limit)
+        bridgic-browser wait --timeout 5 "Submit"       # wait up to 5 seconds
+        bridgic-browser wait --gone "Loading"           # wait for text to disappear
+        bridgic-browser wait --gone --timeout 10 "Spinner"  # disappear within 10s
     """
     value = seconds_or_text
     try:
         # Try to parse as a number for time-based wait.
-        # --gone is irrelevant for numeric waits (no text to watch for).
+        # --gone and --timeout are irrelevant for numeric waits.
         try:
             seconds = float(value)
         except ValueError:
@@ -516,9 +562,9 @@ def cmd_wait(seconds_or_text: str, gone: bool) -> None:
         if seconds is not None:
             _ok(send_command("wait", {"seconds": seconds}, start_if_needed=False))
         elif gone:
-            _ok(send_command("wait", {"text_gone": value}, start_if_needed=False))
+            _ok(send_command("wait", {"text_gone": value, "timeout": timeout_seconds}, start_if_needed=False))
         else:
-            _ok(send_command("wait", {"text": value}, start_if_needed=False))
+            _ok(send_command("wait", {"text": value, "timeout": timeout_seconds}, start_if_needed=False))
     except Exception as exc:
         _err(exc)
 
@@ -934,7 +980,12 @@ def cmd_trace_chunk(title: str) -> None:
 @click.option("--width", default=None, type=int, help="Video width in pixels.")
 @click.option("--height", default=None, type=int, help="Video height in pixels.")
 def cmd_video_start(width: int | None, height: int | None) -> None:
-    """Start video recording."""
+    """Start single-stream video recording on the active tab.
+
+    Only one recorder is created. When the active tab changes, bridgic
+    hot-switches the CDP screencast source and keeps writing to the same
+    continuous ``.webm`` file.
+    """
     try:
         _ok(send_command("video_start", {"width": width, "height": height}, start_if_needed=False))
     except Exception as exc:
@@ -944,7 +995,13 @@ def cmd_video_start(width: int | None, height: int | None) -> None:
 @cli.command("video-stop", context_settings=CONTEXT_SETTINGS)
 @click.argument("path", required=False, default=None)
 def cmd_video_stop(path: str | None) -> None:
-    """Stop video recording and save to PATH (optional)."""
+    """Stop video recording and save one ``.webm`` file.
+
+    PATH is optional. When omitted, the recorded file stays in the temp
+    dir. When given, PATH may be either:
+      * a directory → bridgic auto-generates a single filename inside it
+      * a file path → bridgic saves exactly one recording to that path
+    """
     try:
         abs_path = os.path.abspath(path) if path else None
         _ok(send_command("video_stop", {"path": abs_path}, start_if_needed=False))

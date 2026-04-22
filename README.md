@@ -207,6 +207,75 @@ BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open 
 BRIDGIC_BROWSER_JSON='{"clear_user_data":true}' bridgic-browser open URL
 ```
 
+#### CDP Mode (Connect to Existing Browser)
+
+Instead of launching a new browser, `bridgic-browser` can connect to an already-running Chrome/Chromium instance via the [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/).
+
+There are two ways to start Chrome with a remote debugging endpoint exposed.
+
+**Option A — Chrome 144+ in-browser UI (no relaunch).** Open `chrome://inspect/#remote-debugging` in your everyday Chrome window and follow the dialog to allow incoming debugging connections. Chrome opens a local endpoint and writes the connection info to a `DevToolsActivePort` file at the root of the user data directory:
+
+| Platform | Path |
+|----------|------|
+| macOS    | `~/Library/Application Support/Google/Chrome/DevToolsActivePort` |
+| Linux    | `~/.config/google-chrome/DevToolsActivePort` |
+| Windows  | `%LOCALAPPDATA%\Google\Chrome\User Data\DevToolsActivePort` |
+
+The file is exactly two lines — port and browser-level WebSocket path:
+
+```
+9222
+/devtools/browser/f8632266-41b6-4eb8-8239-d48a86bb44b1
+```
+
+Because bridgic's `--cdp auto` already scans these standard profile directories for `DevToolsActivePort`, you can connect immediately with no extra arguments:
+
+```bash
+bridgic-browser open https://example.com --cdp auto
+```
+
+While the session is active Chrome shows a *"Chrome is being controlled by automated test software"* banner, and Chrome may prompt you to confirm each new debugging session. Sources: [Chrome DevTools MCP blog post](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session), [chrome-devtools-mcp README](https://github.com/ChromeDevTools/chrome-devtools-mcp/). See [`docs/CDP_MODE.md`](docs/CDP_MODE.md) for more.
+
+**Option B — launch flag (Chrome <144, or a dedicated profile).** Start Chrome with `--remote-debugging-port`:
+
+```bash
+# macOS
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+    --remote-debugging-port=9222 --user-data-dir=/tmp/cdp-profile
+
+# Linux
+google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/cdp-profile
+```
+
+Then connect with `--cdp`:
+
+```bash
+bridgic-browser open https://example.com --cdp 9222
+bridgic-browser open https://example.com --cdp ws://localhost:9222/devtools/browser/...
+bridgic-browser open https://example.com --cdp wss://cloud.example.com/chromium?token=...
+bridgic-browser open https://example.com --cdp auto
+```
+
+| Format | Description |
+|--------|-------------|
+| `9222` | Bare port number -- queries `localhost:9222/json/version` to discover the WebSocket URL |
+| `ws://...` / `wss://...` | Direct WebSocket URL (raw CDP or Playwright WS protocol), passed through as-is |
+| `http://host:port` | HTTP discovery endpoint -- queries `/json/version` on that host |
+| `auto` | Auto-scan local Chrome/Chromium/Brave profile directories (+ Canary variants) for an active `DevToolsActivePort` file |
+
+**Closing behavior:** `bridgic-browser close` disconnects from the remote browser but does **not** terminate the Chrome process. The browser keeps running and can be reconnected.
+
+**Use cases:**
+- Reuse an existing Chrome session with its login state and extensions
+- Connect to cloud browser services (Browserless, Steel.dev, etc.)
+- Automate Electron apps that expose a CDP port
+
+SDK equivalent:
+
+```python
+browser = Browser(cdp="ws://localhost:9222/devtools/browser/...")
+```
+
 #### Command List
 
 | Category | Commands |
@@ -485,6 +554,7 @@ browser = Browser(
 | `user_data_dir` | str/Path | None | Custom path for persistent profile (ignored when `clear_user_data=True`) |
 | `clear_user_data` | bool | False | If True, use ephemeral session (no profile); if False, use persistent profile |
 | `stealth` | bool/StealthConfig | True | Stealth mode configuration |
+| `cdp` | str | None | Connect to an existing Chrome via CDP (skips launch). Accepts port number, `ws://` / `wss://` URL, `http://host:port`, or `"auto"` — mirrors the CLI `--cdp` flag. |
 | `channel` | str | None | Browser channel (chrome, msedge, etc.) |
 | `proxy` | dict | None | Proxy settings |
 | `downloads_path` | str/Path | None | Download directory |
@@ -591,3 +661,4 @@ MIT License
 - [Browser Tools Guide](docs/BROWSER_TOOLS_GUIDE.md) – Tool selection, ref vs coordinate, wait strategies, patterns.
 - [Snapshot and Page State](docs/SNAPSHOT_AND_STATE.md) – SnapshotOptions, EnhancedSnapshot, get_snapshot_text, get_element_by_ref.
 - [API Summary](docs/API.md) – Session and DownloadManager API reference.
+- [Known Limitations](docs/KNOWN_LIMITATIONS.md) – Known issues and upstream bugs (e.g. Chrome "Show in Folder" not working).

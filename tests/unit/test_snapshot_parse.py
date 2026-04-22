@@ -12,8 +12,8 @@ Tests are organized by method/feature:
 from __future__ import annotations
 
 import re
-from typing import Dict, Optional, Tuple
-from unittest.mock import AsyncMock, Mock
+from typing import Any, Dict, Optional, Tuple
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 
@@ -755,7 +755,8 @@ class TestBatchGetElementsInfoRouting:
             check_viewport=False, viewport_width=1280, viewport_height=720,
         )
 
-        mock_page.evaluate.assert_called_once()
+        # Three-phase evaluate: build + 1 chunk + cleanup = 3 total calls.
+        assert mock_page.evaluate.call_count == 3
         assert "e1" in visible
 
     @pytest.mark.asyncio
@@ -779,7 +780,8 @@ class TestBatchGetElementsInfoRouting:
             check_viewport=False, viewport_width=1280, viewport_height=720,
         )
 
-        mock_page.evaluate.assert_called_once()
+        # Three-phase evaluate: build + 1 chunk + cleanup = 3 total calls.
+        assert mock_page.evaluate.call_count == 3
         assert "e1" in visible
 
 
@@ -991,6 +993,566 @@ class TestBatchErrorHandling:
 
 
 # ---------------------------------------------------------------------------
+# 2d. _batch_get_elements_info — chunking + event-loop yielding
+# ---------------------------------------------------------------------------
+
+class TestBatchChunking:
+    """Tests for the chunked page.evaluate() implementation.
+
+    A single call used to process N refs in one JS invocation, which blocks
+    the browser JS thread for multiple seconds on large pages. The chunked
+    implementation splits the batch into `_BATCH_INFO_CHUNK_SIZE` slices and
+    `await asyncio.sleep(0)` between slices so other daemon commands get
+    fair turns on the asyncio loop.
+    """
+
+    # ------------------------------------------------------------------
+    # Shared helper: dispatch mock evaluate by JS identity
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_dispatch_evaluate(chunk_result_factory=None):
+        """Return an async side_effect that routes calls by JS identity.
+
+        Phase 1 (_BUILD_ROLE_INDEX_JS) and Phase 3 (_CLEANUP_ROLE_INDEX_JS)
+        return None.  Phase 2 (_BATCH_INFO_JS) returns whatever
+        chunk_result_factory(payload) produces (defaults to empty dict).
+        """
+        from bridgic.browser.session._snapshot import (
+            _BATCH_INFO_JS, _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+
+        async def _dispatch(js, payload=None):
+            if js is _BUILD_ROLE_INDEX_JS or js is _CLEANUP_ROLE_INDEX_JS:
+                return None
+            # Phase 2 chunk call
+            if chunk_result_factory is not None:
+                return chunk_result_factory(payload)
+            return {}
+
+        return _dispatch
+
+    @pytest.mark.asyncio
+    async def test_uses_module_level_js_constants(self, gen: SnapshotGenerator) -> None:
+        """Phase 1 uses _BUILD_ROLE_INDEX_JS and Phase 2 uses _BATCH_INFO_JS."""
+        from bridgic.browser.session._snapshot import (
+            _BATCH_INFO_JS, _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(
+            side_effect=self._make_dispatch_evaluate(
+                chunk_result_factory=lambda p: {
+                    elem["ref"]: {
+                        "rect": {"x": 10, "y": 10, "right": 100, "bottom": 50},
+                        "isEditable": False,
+                        "isDisabled": False,
+                        "cursor": "pointer",
+                    }
+                    for elem in p["elements"]
+                }
+            )
+        )
+        refs_info = {"e1": ("button", "Go", 0)}
+        ref_suffixes = {"e1": "[ref=e1]"}
+
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        calls = mock_page.evaluate.call_args_list
+        assert len(calls) == 3  # build + 1 chunk + cleanup
+        assert calls[0].args[0] is _BUILD_ROLE_INDEX_JS
+        assert calls[1].args[0] is _BATCH_INFO_JS
+        assert calls[2].args[0] is _CLEANUP_ROLE_INDEX_JS
+
+    @pytest.mark.asyncio
+    async def test_sub_chunk_size_single_evaluate(self, gen: SnapshotGenerator) -> None:
+        """<= CHUNK_SIZE elements => exactly one Phase-2 (chunk) evaluate call."""
+        from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE, _BATCH_INFO_JS
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=self._make_dispatch_evaluate())
+
+        count = _BATCH_INFO_CHUNK_SIZE  # exactly at boundary -> still 1 chunk
+        refs_info = {f"e{i}": ("button", f"B{i}", 0) for i in range(count)}
+        ref_suffixes = {k: "[ref=x]" for k in refs_info}
+
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        # Total: 1 build + 1 chunk + 1 cleanup = 3
+        assert mock_page.evaluate.call_count == 3
+        phase2_calls = [c for c in mock_page.evaluate.call_args_list if c.args[0] is _BATCH_INFO_JS]
+        assert len(phase2_calls) == 1
+        assert len(phase2_calls[0].args[1]["elements"]) == count
+
+    @pytest.mark.asyncio
+    async def test_above_chunk_size_splits(self, gen: SnapshotGenerator) -> None:
+        """> CHUNK_SIZE elements => two Phase-2 calls with correct sizes."""
+        from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE, _BATCH_INFO_JS
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=self._make_dispatch_evaluate())
+
+        count = _BATCH_INFO_CHUNK_SIZE + 50  # two chunks expected
+        refs_info = {f"e{i}": ("button", f"B{i}", 0) for i in range(count)}
+        ref_suffixes = {k: "[ref=x]" for k in refs_info}
+
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        # Total: 1 build + 2 chunks + 1 cleanup = 4
+        assert mock_page.evaluate.call_count == 4
+        phase2_calls = [c for c in mock_page.evaluate.call_args_list if c.args[0] is _BATCH_INFO_JS]
+        assert len(phase2_calls) == 2
+        total = sum(len(c.args[1]["elements"]) for c in phase2_calls)
+        assert total == count
+        assert len(phase2_calls[0].args[1]["elements"]) == _BATCH_INFO_CHUNK_SIZE
+        assert len(phase2_calls[1].args[1]["elements"]) == 50
+
+    @pytest.mark.asyncio
+    async def test_yields_event_loop_between_chunks(self, gen: SnapshotGenerator) -> None:
+        """`asyncio.sleep(0)` is called between chunks (but not after the last)."""
+        import asyncio as _asyncio
+        from unittest.mock import patch
+        from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=self._make_dispatch_evaluate())
+
+        # 2 chunks => exactly 1 inter-chunk sleep(0)
+        count = _BATCH_INFO_CHUNK_SIZE + 10
+        refs_info = {f"e{i}": ("button", f"B{i}", 0) for i in range(count)}
+        ref_suffixes = {k: "[ref=x]" for k in refs_info}
+
+        original_sleep = _asyncio.sleep
+        sleep_zero_calls = 0
+
+        async def spy_sleep(delay, *args, **kwargs):
+            nonlocal sleep_zero_calls
+            if delay == 0:
+                sleep_zero_calls += 1
+            return await original_sleep(delay, *args, **kwargs)
+
+        with patch("bridgic.browser.session._snapshot.asyncio.sleep", spy_sleep):
+            await gen._batch_get_elements_info(
+                mock_page, refs_info, ref_suffixes,
+                check_viewport=False, viewport_width=1280, viewport_height=720,
+            )
+
+        assert sleep_zero_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_no_sleep_for_single_chunk(self, gen: SnapshotGenerator) -> None:
+        """Single-chunk payloads MUST NOT call asyncio.sleep(0) — keeps hot path clean."""
+        import asyncio as _asyncio
+        from unittest.mock import patch
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=self._make_dispatch_evaluate())
+
+        refs_info = {"e1": ("button", "Go", 0)}
+        ref_suffixes = {"e1": "[ref=e1]"}
+
+        original_sleep = _asyncio.sleep
+        sleep_zero_calls = 0
+
+        async def spy_sleep(delay, *args, **kwargs):
+            nonlocal sleep_zero_calls
+            if delay == 0:
+                sleep_zero_calls += 1
+            return await original_sleep(delay, *args, **kwargs)
+
+        with patch("bridgic.browser.session._snapshot.asyncio.sleep", spy_sleep):
+            await gen._batch_get_elements_info(
+                mock_page, refs_info, ref_suffixes,
+                check_viewport=False, viewport_width=1280, viewport_height=720,
+            )
+
+        assert sleep_zero_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_results_merged_across_chunks(self, gen: SnapshotGenerator) -> None:
+        """Results from multiple Phase-2 chunks are merged into the final output."""
+        from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE
+
+        def _chunk_result(payload):
+            return {
+                elem["ref"]: {
+                    "rect": {"x": 10, "y": 10, "right": 100, "bottom": 50},
+                    "isEditable": False,
+                    "isDisabled": False,
+                    "cursor": "pointer",
+                }
+                for elem in payload["elements"]
+            }
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(
+            side_effect=self._make_dispatch_evaluate(_chunk_result)
+        )
+
+        count = _BATCH_INFO_CHUNK_SIZE + 10
+        refs_info = {f"e{i}": ("button", f"B{i}", 0) for i in range(count)}
+        ref_suffixes = {k: "[ref=x]" for k in refs_info}
+
+        visible, _ = await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        # All refs from both chunks should end up visible.
+        for i in range(count):
+            assert f"e{i}" in visible
+
+    @pytest.mark.asyncio
+    async def test_role_index_built_once_regardless_of_chunks(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """_BUILD_ROLE_INDEX_JS is called exactly once no matter how many chunks."""
+        from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE, _BUILD_ROLE_INDEX_JS
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=self._make_dispatch_evaluate())
+
+        # 3 chunks
+        count = _BATCH_INFO_CHUNK_SIZE * 2 + 50
+        refs_info = {f"e{i}": ("button", f"B{i}", 0) for i in range(count)}
+        ref_suffixes = {k: "[ref=x]" for k in refs_info}
+
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        build_calls = [
+            c for c in mock_page.evaluate.call_args_list
+            if c.args[0] is _BUILD_ROLE_INDEX_JS
+        ]
+        assert len(build_calls) == 1, "Phase 1 must run exactly once"
+
+    @pytest.mark.asyncio
+    async def test_build_phase_receives_all_unique_roles(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Phase 1 args['roles'] contains all unique roles across all chunks."""
+        from bridgic.browser.session._snapshot import _BATCH_INFO_CHUNK_SIZE, _BUILD_ROLE_INDEX_JS
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=self._make_dispatch_evaluate())
+
+        # Mix button / link / textbox spread across two chunks
+        refs_info = {}
+        for i in range(_BATCH_INFO_CHUNK_SIZE + 10):
+            role = ["button", "link", "textbox"][i % 3]
+            refs_info[f"e{i}"] = (role, f"N{i}", 0)
+        ref_suffixes = {k: "[ref=x]" for k in refs_info}
+
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        build_call = next(
+            c for c in mock_page.evaluate.call_args_list
+            if c.args[0] is _BUILD_ROLE_INDEX_JS
+        )
+        roles_sent = set(build_call.args[1]["roles"])
+        assert roles_sent == {"button", "link", "textbox"}
+
+    @pytest.mark.asyncio
+    async def test_cleanup_is_last_evaluate_call(self, gen: SnapshotGenerator) -> None:
+        """_CLEANUP_ROLE_INDEX_JS is the very last evaluate() call."""
+        from bridgic.browser.session._snapshot import _CLEANUP_ROLE_INDEX_JS
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=self._make_dispatch_evaluate())
+
+        refs_info = {"e1": ("button", "Go", 0)}
+        ref_suffixes = {"e1": "[ref=e1]"}
+
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        last_call = mock_page.evaluate.call_args_list[-1]
+        assert last_call.args[0] is _CLEANUP_ROLE_INDEX_JS
+
+    @pytest.mark.asyncio
+    async def test_cleanup_runs_on_chunk_exception(self, gen: SnapshotGenerator) -> None:
+        """_CLEANUP_ROLE_INDEX_JS is called even when a Phase-2 chunk raises."""
+        from bridgic.browser.session._snapshot import (
+            _BATCH_INFO_JS, _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+
+        async def _raise_on_chunk(js, payload=None):
+            if js is _BUILD_ROLE_INDEX_JS or js is _CLEANUP_ROLE_INDEX_JS:
+                return None
+            # Phase 2: simulate page evaluate failure
+            raise RuntimeError("page evaluate failed")
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=_raise_on_chunk)
+
+        refs_info = {"e1": ("button", "Go", 0)}
+        ref_suffixes = {"e1": "[ref=e1]"}
+
+        # Should not propagate — fallback path handles it
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        cleanup_calls = [
+            c for c in mock_page.evaluate.call_args_list
+            if c.args[0] is _CLEANUP_ROLE_INDEX_JS
+        ]
+        assert len(cleanup_calls) == 1, "cleanup must run even when chunk loop raises"
+
+    @pytest.mark.asyncio
+    async def test_phase1_failure_does_not_prevent_phase2_or_cleanup(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Phase 1 (_BUILD_ROLE_INDEX_JS) failure must not abort the pipeline.
+
+        The JS-side ``findElement()`` has a defensive per-role QSA fallback
+        that kicks in when ``window.__bridgicRoleIndex_<gen>`` is missing, so
+        we keep chunking and cleanup even if the index could not be built.
+        This preserves correctness (just slower) instead of returning an
+        empty snapshot.
+        """
+        from bridgic.browser.session._snapshot import (
+            _BATCH_INFO_JS, _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+
+        async def _dispatch(js, payload=None):
+            if js is _BUILD_ROLE_INDEX_JS:
+                raise RuntimeError("simulated build failure")
+            if js is _CLEANUP_ROLE_INDEX_JS:
+                return None
+            # Phase 2: return visibility info for each ref
+            return {
+                elem["ref"]: {
+                    "rect": {"x": 10, "y": 10, "right": 100, "bottom": 50},
+                    "isEditable": False, "isDisabled": False, "cursor": "pointer",
+                }
+                for elem in payload["elements"]
+            }
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=_dispatch)
+
+        refs_info = {"e1": ("button", "Go", 0), "e2": ("button", "Stop", 0)}
+        ref_suffixes = {k: "[ref=x]" for k in refs_info}
+
+        visible, _ = await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        # Phase 2 must still execute even though Phase 1 raised.
+        phase2_calls = [
+            c for c in mock_page.evaluate.call_args_list
+            if c.args[0] is _BATCH_INFO_JS
+        ]
+        assert len(phase2_calls) >= 1, "Phase 2 must still run after Phase 1 failure"
+
+        # Cleanup must still run — the generation keys may or may not exist
+        # but the JS is a defensive delete either way.
+        cleanup_calls = [
+            c for c in mock_page.evaluate.call_args_list
+            if c.args[0] is _CLEANUP_ROLE_INDEX_JS
+        ]
+        assert len(cleanup_calls) == 1, "cleanup must run after Phase 1 failure"
+
+        # Results from Phase 2 should still land in visible set.
+        assert "e1" in visible and "e2" in visible
+
+    @pytest.mark.asyncio
+    async def test_cleanup_exception_is_silently_swallowed(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Phase 3's `except Exception: pass` is intentional.
+
+        A page that closed or navigated mid-snapshot will make the cleanup
+        evaluate() fail; that failure must not propagate out of
+        ``_batch_get_elements_info``. Correctness is guaranteed either way
+        (the old document's JS context is GC'd with its document).
+        """
+        from bridgic.browser.session._snapshot import (
+            _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+
+        async def _dispatch(js, payload=None):
+            if js is _CLEANUP_ROLE_INDEX_JS:
+                raise RuntimeError("page navigated during snapshot")
+            if js is _BUILD_ROLE_INDEX_JS:
+                return None
+            return {}
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=_dispatch)
+
+        refs_info = {"e1": ("button", "Go", 0)}
+        ref_suffixes = {"e1": "[ref=x]"}
+
+        # Must NOT raise — the cleanup error is swallowed by the finally.
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+    @pytest.mark.asyncio
+    async def test_generation_token_isolates_concurrent_snapshots(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Two concurrent snapshots on the same page must get DIFFERENT generation tokens.
+
+        Without generation isolation, Phase 3 cleanup of snapshot A would wipe
+        ``window.__bridgicRoleIndex_<B-gen>`` while snapshot B is still using
+        it — PR #21 keys every window global by a crypto-unique token.
+        """
+        from bridgic.browser.session._snapshot import _BUILD_ROLE_INDEX_JS
+
+        observed_generations: list[str] = []
+
+        async def _dispatch(js, payload=None):
+            if js is _BUILD_ROLE_INDEX_JS:
+                # Capture the generation passed in Phase 1
+                observed_generations.append(payload["generation"])
+            return None
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=_dispatch)
+
+        refs_info = {"e1": ("button", "A", 0)}
+        ref_suffixes = {"e1": "[ref=x]"}
+
+        # Two sequential calls (concurrent would race the mock, but sequential
+        # is enough to prove each call generates a fresh token).
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        assert len(observed_generations) == 2
+        assert observed_generations[0] != observed_generations[1], (
+            "each _batch_get_elements_info call must generate a unique token"
+        )
+        # secrets.token_hex(8) → 16 hex chars
+        for gen_tok in observed_generations:
+            assert len(gen_tok) == 16
+            int(gen_tok, 16)  # valid hex
+
+    @pytest.mark.asyncio
+    async def test_all_three_phases_share_same_generation_token(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Phases 1/2/3 within a single call use the SAME generation token.
+
+        If they diverged, Phase 2 would read from a key Phase 1 didn't write,
+        and Phase 3 would leak Phase 1's keys on ``window``.
+        """
+        from bridgic.browser.session._snapshot import (
+            _BATCH_INFO_JS, _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+
+        phase_generations: dict[str, list[str]] = {"build": [], "batch": [], "cleanup": []}
+
+        async def _dispatch(js, payload=None):
+            g = payload["generation"]
+            if js is _BUILD_ROLE_INDEX_JS:
+                phase_generations["build"].append(g)
+            elif js is _BATCH_INFO_JS:
+                phase_generations["batch"].append(g)
+            elif js is _CLEANUP_ROLE_INDEX_JS:
+                phase_generations["cleanup"].append(g)
+            return None
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=_dispatch)
+
+        refs_info = {f"e{i}": ("button", f"B{i}", 0) for i in range(3)}
+        ref_suffixes = {k: "[ref=x]" for k in refs_info}
+
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        all_gens = (
+            phase_generations["build"]
+            + phase_generations["batch"]
+            + phase_generations["cleanup"]
+        )
+        assert len(set(all_gens)) == 1, (
+            f"all three phases must share one generation; got {all_gens}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_phase2_payload_includes_generation_viewport_checkviewport(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Phase 2 payload shape: must include generation, viewport, checkViewport, elements."""
+        from bridgic.browser.session._snapshot import _BATCH_INFO_JS
+
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=self._make_dispatch_evaluate())
+
+        refs_info = {"e1": ("button", "Go", 0)}
+        ref_suffixes = {"e1": "[ref=x]"}
+
+        await gen._batch_get_elements_info(
+            mock_page, refs_info, ref_suffixes,
+            check_viewport=True, viewport_width=1280, viewport_height=720,
+        )
+
+        phase2_call = next(
+            c for c in mock_page.evaluate.call_args_list
+            if c.args[0] is _BATCH_INFO_JS
+        )
+        payload = phase2_call.args[1]
+        assert set(payload.keys()) >= {
+            "elements", "viewportWidth", "viewportHeight", "checkViewport", "generation"
+        }
+        assert payload["viewportWidth"] == 1280
+        assert payload["viewportHeight"] == 720
+        assert payload["checkViewport"] is True
+
+    @pytest.mark.asyncio
+    async def test_empty_refs_skips_pipeline_entirely(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Empty refs_info must short-circuit BEFORE calling Phase 1 / 2 / 3.
+
+        Correct behaviour both saves a CDP round-trip and avoids dirtying
+        ``window`` with a generation key that no Phase-2 chunk needs.
+        """
+        mock_page = AsyncMock()
+        mock_page.evaluate = AsyncMock(side_effect=self._make_dispatch_evaluate())
+
+        visible, interactive_map = await gen._batch_get_elements_info(
+            mock_page, {}, {},
+            check_viewport=False, viewport_width=1280, viewport_height=720,
+        )
+
+        assert visible == set()
+        assert interactive_map == {}
+        mock_page.evaluate.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # 3. _process_page_snapshot_for_ai — enhanced tree building
 # ---------------------------------------------------------------------------
 
@@ -1072,6 +1634,23 @@ class TestProcessPageSnapshotForAI:
         result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
 
         assert "Double-click me!" in result
+        assert "Plain label" not in result
+
+    def test_interactive_mode_missing_map_entry_falls_back_to_suffix_heuristics(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Missing interactive_map entry should not force a false negative."""
+        raw = (
+            '- generic "Clickable card" [ref=e1] [cursor=pointer]\n'
+            '- generic "Plain label" [ref=e2]'
+        )
+        refs: Dict[str, RefData] = {}
+        options = SnapshotOptions(interactive=True, full_page=True)
+        interactive_map = {"e2": False}
+
+        result = gen._process_page_snapshot_for_ai(raw, refs, options, interactive_map)
+
+        assert "Clickable card" in result
         assert "Plain label" not in result
 
     def test_interactive_mode_flattened_output(self, gen: SnapshotGenerator) -> None:
@@ -2230,8 +2809,9 @@ class TestIframeHandling:
             check_viewport=False, viewport_width=1280, viewport_height=720,
         )
 
-        # evaluate must be called (batch path, not suffix-only)
-        mock_page.evaluate.assert_called_once()
+        # evaluate must be called (batch path, not suffix-only).
+        # Three-phase: build + 1 chunk + cleanup = 3 total calls.
+        assert mock_page.evaluate.call_count == 3
         assert "e5" in visible
 
     @pytest.mark.asyncio
@@ -2476,6 +3056,391 @@ class TestIframeHandling:
         assert "Above" in filtered
         assert "Below" in filtered
 
+    # ------------------------------------------------------------------
+    # _pre_filter_raw_snapshot: interactive pre-filtering
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_interactive_mode_pre_filters_refs_to_interactive_roles(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """In -i mode, INTERACTIVE_ROLES and STRUCTURAL_NOISE_ROLES refs are sent to
+        _batch_get_elements_info (the latter may carry event handlers / tabindex
+        that require JS inspection). Other non-interactive refs (heading,
+        paragraph, text, etc.) bypass batch JS."""
+        from bridgic.browser.session._snapshot import (
+            _BATCH_INFO_JS, _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+        evaluate_payloads: list = []
+
+        async def _capture_evaluate(js, payload=None):
+            if js is _BUILD_ROLE_INDEX_JS or js is _CLEANUP_ROLE_INDEX_JS:
+                return None
+            evaluate_payloads.append(payload)
+            # Return info for whichever refs were sent
+            return {
+                elem["ref"]: {
+                    "rect": {"x": 0, "y": 10, "right": 100, "bottom": 50},
+                    "tagName": "button",
+                    "cursor": "pointer",
+                    "isEditable": False, "isDisabled": False, "hasEventHandler": False,
+                    "tabindex": None, "classAndId": "", "dataAction": None,
+                    "ariaRequired": False, "ariaAutocomplete": None,
+                    "ariaKeyshortcuts": None, "ariaHidden": False,
+                    "ariaDisabled": False, "isContentEditable": False, "role": None,
+                }
+                for elem in payload["elements"]
+            }
+
+        raw = (
+            '- button "Go" [ref=e1] [cursor=pointer]\n'
+            '- heading "Title" [ref=e2]\n'
+            '- paragraph [ref=e3]\n'
+            '- link "Home" [ref=e4] [cursor=pointer]\n'
+            '- generic "Box" [ref=e5]\n'
+        )
+        mock_page = AsyncMock()
+        mock_page.viewport_size = {"width": 1280, "height": 720}
+        mock_page.evaluate = AsyncMock(side_effect=_capture_evaluate)
+
+        options = SnapshotOptions(interactive=True, full_page=True)
+        _, imap = await gen._pre_filter_raw_snapshot(raw, mock_page, options)
+
+        # Only one batch call (Phase 2) should have occurred
+        assert len(evaluate_payloads) == 1
+        batched_refs = {elem["ref"] for elem in evaluate_payloads[0]["elements"]}
+        # button and link are INTERACTIVE_ROLES → sent to batch
+        assert "e1" in batched_refs
+        assert "e4" in batched_refs
+        # heading, paragraph are NOT interactive roles → NOT sent to batch
+        assert "e2" not in batched_refs
+        assert "e3" not in batched_refs
+        # named generic may carry event handlers → MUST be sent to batch
+        assert "e5" in batched_refs
+
+    @pytest.mark.asyncio
+    async def test_non_interactive_refs_assumed_in_viewport_and_marked_false(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Non-interactive refs are added to visible_refs and marked False in interactive_map."""
+        from bridgic.browser.session._snapshot import (
+            _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+
+        async def _evaluate(js, payload=None):
+            if js is _BUILD_ROLE_INDEX_JS or js is _CLEANUP_ROLE_INDEX_JS:
+                return None
+            return {
+                elem["ref"]: {
+                    "rect": {"x": 0, "y": 10, "right": 100, "bottom": 50},
+                    "tagName": "button", "cursor": "pointer",
+                    "isEditable": False, "isDisabled": False, "hasEventHandler": False,
+                    "tabindex": None, "classAndId": "", "dataAction": None,
+                    "ariaRequired": False, "ariaAutocomplete": None,
+                    "ariaKeyshortcuts": None, "ariaHidden": False,
+                    "ariaDisabled": False, "isContentEditable": False, "role": None,
+                }
+                for elem in payload["elements"]
+            }
+
+        raw = (
+            '- button "Go" [ref=e1] [cursor=pointer]\n'
+            '- heading "Title" [ref=e2]\n'
+        )
+        mock_page = AsyncMock()
+        mock_page.viewport_size = {"width": 1280, "height": 720}
+        mock_page.evaluate = AsyncMock(side_effect=_evaluate)
+
+        options = SnapshotOptions(interactive=True, full_page=True)
+        _, imap = await gen._pre_filter_raw_snapshot(raw, mock_page, options)
+
+        # heading (non-interactive) must be in interactive_map and marked False
+        # (it appears in snapshot output as a raw_snapshot key via _extract_original_refs_from_raw)
+        # The stable ref key is hashed, so we check via role lookup on imap values
+        assert False in imap.values(), "At least one ref should be marked non-interactive"
+        # All imap values for non-interactive roles must be False
+        interactive_trues = [v for v in imap.values() if v is True]
+        # Only 'button' ref should be True (cursor=pointer + INTERACTIVE_ROLES)
+        assert len(interactive_trues) >= 1
+
+    @pytest.mark.asyncio
+    async def test_non_interactive_mode_sends_all_refs_to_batch(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Non -i mode: ALL refs (including non-interactive roles) go to batch JS."""
+        from bridgic.browser.session._snapshot import (
+            _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+        evaluate_payloads: list = []
+
+        async def _capture_evaluate(js, payload=None):
+            if js is _BUILD_ROLE_INDEX_JS or js is _CLEANUP_ROLE_INDEX_JS:
+                return None
+            evaluate_payloads.append(payload)
+            return {
+                elem["ref"]: {
+                    "rect": {"x": 0, "y": 10, "right": 100, "bottom": 50},
+                    "tagName": "div", "cursor": "default",
+                    "isEditable": False, "isDisabled": False, "hasEventHandler": False,
+                    "tabindex": None, "classAndId": "", "dataAction": None,
+                    "ariaRequired": False, "ariaAutocomplete": None,
+                    "ariaKeyshortcuts": None, "ariaHidden": False,
+                    "ariaDisabled": False, "isContentEditable": False, "role": None,
+                }
+                for elem in payload["elements"]
+            }
+
+        raw = (
+            '- button "Go" [ref=e1] [cursor=pointer]\n'
+            '- heading "Title" [ref=e2]\n'
+            '- link "Home" [ref=e3] [cursor=pointer]\n'
+        )
+        mock_page = AsyncMock()
+        mock_page.viewport_size = {"width": 1280, "height": 720}
+        mock_page.evaluate = AsyncMock(side_effect=_capture_evaluate)
+
+        options = SnapshotOptions(interactive=False, full_page=True)
+        await gen._pre_filter_raw_snapshot(raw, mock_page, options)
+
+        # full_page=True + interactive=False → early return (no filtering needed)
+        # The evaluate should NOT have been called at all.
+        assert len(evaluate_payloads) == 0, (
+            "full_page=True + interactive=False should early-return without calling evaluate"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cursor_pointer_non_role_element_sent_to_batch_in_interactive_mode(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """[cursor=pointer] on a non-INTERACTIVE_ROLES element (e.g. img) must still
+        go through batch JS in -i mode, not be assumed non-interactive."""
+        from bridgic.browser.session._snapshot import (
+            _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+        evaluate_payloads: list = []
+
+        async def _capture_evaluate(js, payload=None):
+            if js is _BUILD_ROLE_INDEX_JS or js is _CLEANUP_ROLE_INDEX_JS:
+                return None
+            evaluate_payloads.append(payload)
+            return {
+                elem["ref"]: {
+                    "rect": {"x": 0, "y": 10, "right": 100, "bottom": 50},
+                    "tagName": "img", "cursor": "pointer",
+                    "isEditable": False, "isDisabled": False, "hasEventHandler": True,
+                    "tabindex": None, "classAndId": "", "dataAction": None,
+                    "ariaRequired": False, "ariaAutocomplete": None,
+                    "ariaKeyshortcuts": None, "ariaHidden": False,
+                    "ariaDisabled": False, "isContentEditable": False, "role": None,
+                }
+                for elem in payload["elements"]
+            }
+
+        raw = (
+            '- img "Photo" [ref=e1] [cursor=pointer]\n'
+            '- paragraph [ref=e2]\n'
+        )
+        mock_page = AsyncMock()
+        mock_page.viewport_size = {"width": 1280, "height": 720}
+        mock_page.evaluate = AsyncMock(side_effect=_capture_evaluate)
+
+        options = SnapshotOptions(interactive=True, full_page=True)
+        await gen._pre_filter_raw_snapshot(raw, mock_page, options)
+
+        assert len(evaluate_payloads) == 1
+        batched_refs = {elem["ref"] for elem in evaluate_payloads[0]["elements"]}
+        # img with [cursor=pointer] must go through batch
+        assert "e1" in batched_refs
+        # paragraph (no cursor=pointer, not INTERACTIVE_ROLES) must NOT
+        assert "e2" not in batched_refs
+
+
+# ---------------------------------------------------------------------------
+# 7b. Viewport container pre-filter (snapshot -F optimisation)
+# ---------------------------------------------------------------------------
+
+class TestViewportContainerPrefilter:
+    """Tests for the container-only viewport check in non-interactive viewport mode.
+
+    snapshot -F (full_page=False, interactive=False) previously checked every
+    ref via the full JS batch (~43 s on large pages).  The optimisation sends
+    only VIEWPORT_CONTAINER_ROLES to the batch and assumes all other refs are
+    in-viewport, relying on invisible_depth propagation to exclude children of
+    off-viewport containers.
+    """
+
+    # ------------------------------------------------------------------ helpers
+
+    async def _run_pre_filter(
+        self,
+        gen: SnapshotGenerator,
+        raw: str,
+        options: SnapshotOptions,
+        batch_return_factory=None,
+    ):
+        """Run _pre_filter_raw_snapshot with a mock page that captures evaluate calls."""
+        from bridgic.browser.session._snapshot import (
+            _BUILD_ROLE_INDEX_JS, _CLEANUP_ROLE_INDEX_JS,
+        )
+        captured_batch_payloads: list = []
+
+        async def _fake_evaluate(js, payload=None):
+            if js is _BUILD_ROLE_INDEX_JS or js is _CLEANUP_ROLE_INDEX_JS:
+                return None
+            captured_batch_payloads.append(payload)
+            if batch_return_factory:
+                return batch_return_factory(payload)
+            # Default: return all elements as in-viewport, non-interactive
+            return {
+                elem["ref"]: {
+                    "rect": {"x": 0, "y": 10, "right": 100, "bottom": 50,
+                             "width": 100, "height": 40},
+                    "tagName": "div", "cursor": "auto",
+                    "isEditable": False, "isDisabled": False,
+                    "hasEventHandler": False, "tabindex": None,
+                    "classAndId": "", "dataAction": None,
+                    "ariaRequired": False, "ariaAutocomplete": None,
+                    "ariaKeyshortcuts": None, "ariaHidden": False,
+                    "ariaDisabled": False, "isContentEditable": False,
+                    "role": None,
+                }
+                for elem in payload["elements"]
+            }
+
+        mock_page = AsyncMock()
+        mock_page.viewport_size = {"width": 1280, "height": 720}
+        mock_page.evaluate = AsyncMock(side_effect=_fake_evaluate)
+
+        filtered, imap = await gen._pre_filter_raw_snapshot(raw, mock_page, options)
+        return filtered, imap, captured_batch_payloads
+
+    # ------------------------------------------------------------------ tests
+
+    async def test_viewport_only_non_interactive_checks_only_container_roles(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """In snapshot -F mode only VIEWPORT_CONTAINER_ROLES are sent to batch JS."""
+        raw = (
+            '- main [ref=eMain]\n'
+            '  - navigation "Primary" [ref=eNav]\n'
+            '    - link "Home" [ref=eLink]\n'
+            '  - list [ref=eList]\n'
+            '    - listitem [ref=eLi1]\n'
+            '    - listitem [ref=eLi2]\n'
+            '  - heading "Title" [ref=eH]\n'
+        )
+        options = SnapshotOptions(interactive=False, full_page=False)
+        _, _, payloads = await self._run_pre_filter(gen, raw, options)
+
+        batched_refs: set = set()
+        for p in payloads:
+            batched_refs.update(elem["ref"] for elem in p["elements"])
+
+        # Container roles must be checked
+        assert "eMain" in batched_refs
+        assert "eNav" in batched_refs
+        assert "eList" in batched_refs
+        # Controls leaf roles (INTERACTIVE_ROLES) are visibility-checked
+        assert "eLink" in batched_refs
+        assert "eLi1" not in batched_refs
+        assert "eLi2" not in batched_refs
+        assert "eH" not in batched_refs
+
+    async def test_leaf_refs_assumed_in_viewport_for_viewport_only_non_interactive(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Leaf refs (heading, link, listitem) are added to visible_refs without JS."""
+        raw = (
+            '- main [ref=eMain]\n'
+            '  - heading "Title" [ref=eH]\n'
+            '  - link "Click" [ref=eLink]\n'
+        )
+        options = SnapshotOptions(interactive=False, full_page=False)
+        filtered, imap, _ = await self._run_pre_filter(gen, raw, options)
+
+        # All refs must survive (all assumed in-viewport)
+        assert "eH" in filtered
+        assert "eLink" in filtered
+
+    async def test_invisible_depth_excludes_leaf_children_of_off_viewport_container(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Children of an off-viewport container are excluded even if assumed in-viewport.
+
+        invisible_depth propagation in the filtering pass ensures that when a
+        VIEWPORT_CONTAINER_ROLES element is found off-viewport its subtree is
+        removed from the snapshot regardless of what visible_refs contains.
+        """
+        raw = (
+            '- main [ref=eMain]\n'
+            '  - list [ref=eList]\n'
+            '    - listitem [ref=eLi1]\n'
+            '    - listitem [ref=eLi2]\n'
+        )
+
+        def _off_viewport_factory(payload):
+            """Return off-viewport rect for any element."""
+            return {
+                elem["ref"]: {
+                    "rect": {"x": 0, "y": 2000, "right": 100, "bottom": 2040,
+                             "width": 100, "height": 40},
+                    "tagName": "ul", "cursor": "auto",
+                    "isEditable": False, "isDisabled": False,
+                    "hasEventHandler": False, "tabindex": None,
+                    "classAndId": "", "dataAction": None,
+                    "ariaRequired": False, "ariaAutocomplete": None,
+                    "ariaKeyshortcuts": None, "ariaHidden": False,
+                    "ariaDisabled": False, "isContentEditable": False,
+                    "role": None,
+                }
+                for elem in payload["elements"]
+            }
+
+        options = SnapshotOptions(interactive=False, full_page=False)
+        filtered, _, _ = await self._run_pre_filter(
+            gen, raw, options, batch_return_factory=_off_viewport_factory
+        )
+
+        # All containers were off-viewport → their leaf children must be excluded
+        assert "eLi1" not in filtered
+        assert "eLi2" not in filtered
+
+    async def test_full_page_non_interactive_hits_early_return_no_batch(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """snapshot (full_page=True, interactive=False) must skip batch entirely."""
+        raw = (
+            '- main [ref=eMain]\n'
+            '  - link "Home" [ref=eLink]\n'
+        )
+        options = SnapshotOptions(interactive=False, full_page=True)
+        _, _, payloads = await self._run_pre_filter(gen, raw, options)
+
+        # Early return at line 1885 — zero batch JS calls
+        assert payloads == []
+
+    async def test_interactive_full_page_bypasses_viewport_container_logic(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """snapshot -i (interactive=True) uses the interactive pre-filter, not container filter."""
+        raw = (
+            '- main [ref=eMain]\n'
+            '  - button "Go" [ref=eBtn]\n'
+            '  - heading "Title" [ref=eH]\n'
+        )
+        options = SnapshotOptions(interactive=True, full_page=True)
+        _, _, payloads = await self._run_pre_filter(gen, raw, options)
+
+        batched_refs: set = set()
+        for p in payloads:
+            batched_refs.update(elem["ref"] for elem in p["elements"])
+
+        # Interactive pre-filter: only button (INTERACTIVE_ROLES) goes to batch
+        assert "eBtn" in batched_refs
+        # main and heading are non-interactive → NOT in batch
+        assert "eMain" not in batched_refs
+        assert "eH" not in batched_refs
+
 
 # ---------------------------------------------------------------------------
 # 8. Stable ref system
@@ -2697,3 +3662,246 @@ class TestPlaywrightRefStorage:
         row_data = next((d for d in refs.values() if d.role == "row"), None)
         assert row_data is not None, "row element should be tracked in refs"
         assert row_data.playwright_ref == "e175"
+
+
+# ---------------------------------------------------------------------------
+# _fallback_accessibility_snapshot — private-API absent degradation path
+# ---------------------------------------------------------------------------
+# When Playwright's internal ``snapshotForAI`` is unavailable (pinned version
+# drift, upstream rename), ``page_snapshot_for_ai`` falls back to
+# ``page.accessibility.snapshot()`` and YAML-renders the tree. The output
+# carries no ``[ref=<playwright_ref>]`` suffix, which means the aria-ref fast
+# path is disabled for the rest of the session — this is a documented
+# degradation, not a bug, but the rendering itself must still be correct.
+
+class TestFallbackAccessibilitySnapshot:
+    """Tests for ``SnapshotGenerator._fallback_accessibility_snapshot``."""
+
+    @pytest.mark.asyncio
+    async def test_empty_tree_returns_empty_string(self, gen: SnapshotGenerator) -> None:
+        page = MagicMock()
+        page.accessibility = MagicMock()
+        page.accessibility.snapshot = AsyncMock(return_value=None)
+
+        result = await gen._fallback_accessibility_snapshot(page)
+
+        assert result == ""
+
+    @pytest.mark.asyncio
+    async def test_snapshot_exception_returns_empty_string(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """accessibility.snapshot() raising is a graceful-degradation path too."""
+        page = MagicMock()
+        page.accessibility = MagicMock()
+        page.accessibility.snapshot = AsyncMock(side_effect=RuntimeError("boom"))
+
+        result = await gen._fallback_accessibility_snapshot(page)
+
+        assert result == ""
+
+    @pytest.mark.asyncio
+    async def test_simple_tree_renders_role_and_name(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        page = MagicMock()
+        page.accessibility = MagicMock()
+        page.accessibility.snapshot = AsyncMock(return_value={
+            "role": "WebArea",
+            "name": "Home",
+            "children": [
+                {"role": "button", "name": "Submit", "children": []},
+                {"role": "link", "name": "About", "children": []},
+            ],
+        })
+
+        result = await gen._fallback_accessibility_snapshot(page)
+
+        # Match the snapshotForAI YAML shape: ``- role "name"`` lines.
+        assert '- WebArea "Home"' in result
+        assert '- button "Submit"' in result
+        assert '- link "About"' in result
+        # Children are indented under the root.
+        lines = result.split("\n")
+        assert lines[0] == '- WebArea "Home"'
+        assert lines[1].startswith("  - ")
+
+    @pytest.mark.asyncio
+    async def test_nameless_node_renders_role_only(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """When ``name`` is missing/empty, emit ``- role`` without quotes."""
+        page = MagicMock()
+        page.accessibility = MagicMock()
+        page.accessibility.snapshot = AsyncMock(return_value={
+            "role": "generic",
+            "children": [
+                {"role": "paragraph", "children": []},
+            ],
+        })
+
+        result = await gen._fallback_accessibility_snapshot(page)
+
+        assert "- generic" in result
+        assert "- paragraph" in result
+        # No accidental empty quotes.
+        assert 'generic ""' not in result
+
+    @pytest.mark.asyncio
+    async def test_missing_role_defaults_to_generic(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Nodes without a ``role`` key should not crash — default to ``generic``."""
+        page = MagicMock()
+        page.accessibility = MagicMock()
+        page.accessibility.snapshot = AsyncMock(return_value={
+            "name": "orphan", "children": [],
+        })
+
+        result = await gen._fallback_accessibility_snapshot(page)
+
+        assert '- generic "orphan"' in result
+
+    @pytest.mark.asyncio
+    async def test_deeply_nested_indentation_scales(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Each level adds two spaces of indent — matches snapshotForAI output."""
+        page = MagicMock()
+        page.accessibility = MagicMock()
+        # 4-deep tree
+        tree: Dict[str, Any] = {"role": "A", "children": [
+            {"role": "B", "children": [
+                {"role": "C", "children": [
+                    {"role": "D", "children": []},
+                ]},
+            ]},
+        ]}
+        page.accessibility.snapshot = AsyncMock(return_value=tree)
+
+        result = await gen._fallback_accessibility_snapshot(page)
+        lines = result.split("\n")
+
+        assert lines[0].lstrip() == "- A"
+        assert lines[0].startswith("- ")              # depth 0
+        assert lines[1].startswith("  - ")            # depth 1
+        assert lines[2].startswith("    - ")          # depth 2
+        assert lines[3].startswith("      - ")        # depth 3
+
+    @pytest.mark.asyncio
+    async def test_no_playwright_ref_suffix_emitted(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """The fallback MUST NOT emit ``[ref=...]`` — that signal only comes
+        from Playwright's private snapshotForAI API. The docstring loudly
+        documents that this degrades get_element_by_ref to the CSS-rebuild
+        path; this test pins the absence of ``[ref=`` to catch future regressions.
+        """
+        page = MagicMock()
+        page.accessibility = MagicMock()
+        page.accessibility.snapshot = AsyncMock(return_value={
+            "role": "button", "name": "Go", "children": [],
+        })
+
+        result = await gen._fallback_accessibility_snapshot(page)
+
+        assert "[ref=" not in result
+
+
+# ---------------------------------------------------------------------------
+# _resolve_viewport_size — page.viewport_size / CDP Page.getLayoutMetrics
+# ---------------------------------------------------------------------------
+# PR #21 added a CDP fallback so that --cdp borrowed mode (where Playwright's
+# own viewport_size is often None) can still run viewport-filtered snapshots.
+
+
+class TestResolveViewportSize:
+    """Tests for ``SnapshotGenerator._resolve_viewport_size``."""
+
+    @pytest.mark.asyncio
+    async def test_uses_playwright_viewport_size_when_available(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        page = MagicMock()
+        page.viewport_size = {"width": 1440, "height": 900}
+
+        width, height = await gen._resolve_viewport_size(page)
+
+        assert (width, height) == (1440, 900)
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_cdp_when_viewport_is_none(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """CDP borrowed tabs often return None; we use Page.getLayoutMetrics."""
+        page = MagicMock()
+        page.viewport_size = None
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(return_value={
+            "cssVisualViewport": {"clientWidth": 1920, "clientHeight": 1080},
+        })
+        fake_session.detach = AsyncMock()
+        page.context = MagicMock()
+        page.context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        width, height = await gen._resolve_viewport_size(page)
+
+        assert (width, height) == (1920, 1080)
+        fake_session.send.assert_awaited_once_with("Page.getLayoutMetrics")
+        fake_session.detach.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_when_viewport_has_zero_dimension(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """``{"width": 0, "height": 0}`` is as useless as None — same CDP fallback."""
+        page = MagicMock()
+        page.viewport_size = {"width": 0, "height": 0}
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(return_value={
+            "cssVisualViewport": {"clientWidth": 1024, "clientHeight": 768},
+        })
+        fake_session.detach = AsyncMock()
+        page.context = MagicMock()
+        page.context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        width, height = await gen._resolve_viewport_size(page)
+
+        assert (width, height) == (1024, 768)
+
+    @pytest.mark.asyncio
+    async def test_cdp_session_failure_returns_none_none(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Non-Chromium / restricted targets may not support CDP at all."""
+        page = MagicMock()
+        page.viewport_size = None
+
+        page.context = MagicMock()
+        page.context.new_cdp_session = AsyncMock(side_effect=RuntimeError("no CDP"))
+
+        width, height = await gen._resolve_viewport_size(page)
+
+        assert (width, height) == (None, None)
+
+    @pytest.mark.asyncio
+    async def test_cdp_empty_layout_returns_none_none(
+        self, gen: SnapshotGenerator
+    ) -> None:
+        """Malformed Page.getLayoutMetrics with zero dims → (None, None)."""
+        page = MagicMock()
+        page.viewport_size = None
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(return_value={
+            "cssVisualViewport": {"clientWidth": 0, "clientHeight": 0},
+        })
+        fake_session.detach = AsyncMock()
+        page.context = MagicMock()
+        page.context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        width, height = await gen._resolve_viewport_size(page)
+
+        assert (width, height) == (None, None)

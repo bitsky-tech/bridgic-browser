@@ -206,6 +206,75 @@ BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open 
 BRIDGIC_BROWSER_JSON='{"clear_user_data":true}' bridgic-browser open URL
 ```
 
+#### CDP 模式（连接已有浏览器）
+
+`bridgic-browser` 可以通过 [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) 连接到已经运行的 Chrome/Chromium 实例，而非启动新浏览器。
+
+开启远程调试端点有两种方式。
+
+**方式一 —— Chrome 144+ 浏览器内 UI 启用（无需重启 Chrome）。** 在你日常使用的 Chrome 中打开 `chrome://inspect/#remote-debugging`，按对话框提示**允许**远程调试连接即可。Chrome 会在本地开启调试端点，并把连接信息写入 user data 目录根部的 `DevToolsActivePort` 文件：
+
+| 平台 | 路径 |
+|------|------|
+| macOS   | `~/Library/Application Support/Google/Chrome/DevToolsActivePort` |
+| Linux   | `~/.config/google-chrome/DevToolsActivePort` |
+| Windows | `%LOCALAPPDATA%\Google\Chrome\User Data\DevToolsActivePort` |
+
+文件总共两行 —— 端口号 + 浏览器级 WebSocket 路径：
+
+```
+9222
+/devtools/browser/f8632266-41b6-4eb8-8239-d48a86bb44b1
+```
+
+由于 bridgic 的 `--cdp auto` 本身就会扫描这些标准 profile 目录里的 `DevToolsActivePort`，你无需任何额外参数即可直接连接：
+
+```bash
+bridgic-browser open https://example.com --cdp auto
+```
+
+会话激活期间 Chrome 会在顶部显示 *"Chrome 正在受到自动测试软件的控制"* 横幅，并可能在每次新建调试会话时再次弹出确认对话框。来源：[Chrome DevTools MCP 博客](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session)、[chrome-devtools-mcp README](https://github.com/ChromeDevTools/chrome-devtools-mcp/)。完整说明见 [`docs/CDP_MODE.md`](docs/CDP_MODE.md)。
+
+**方式二 —— 启动参数（Chrome <144 或需要独立 profile 时）。** 使用 `--remote-debugging-port` 启动 Chrome：
+
+```bash
+# macOS
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+    --remote-debugging-port=9222 --user-data-dir=/tmp/cdp-profile
+
+# Linux
+google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/cdp-profile
+```
+
+然后使用 `--cdp` 连接：
+
+```bash
+bridgic-browser open https://example.com --cdp 9222
+bridgic-browser open https://example.com --cdp ws://localhost:9222/devtools/browser/...
+bridgic-browser open https://example.com --cdp wss://cloud.example.com/chromium?token=...
+bridgic-browser open https://example.com --cdp auto
+```
+
+| 格式 | 说明 |
+|--------|-------------|
+| `9222` | 端口号 -- 向 `localhost:9222/json/version` 查询 WebSocket URL |
+| `ws://...` / `wss://...` | 直接 WebSocket URL（原始 CDP 或 Playwright WS 协议），原样传递 |
+| `http://host:port` | HTTP 发现端点 -- 向该主机的 `/json/version` 查询 |
+| `auto` | 自动扫描本地 Chrome/Chromium/Brave 配置目录（含 Canary 变体），查找活跃的 `DevToolsActivePort` 文件 |
+
+**关闭行为：** `bridgic-browser close` 会断开与远程浏览器的连接，但**不会**终止 Chrome 进程。浏览器继续运行，可以重新连接。
+
+**使用场景：**
+- 复用已有 Chrome 会话及其登录状态和扩展
+- 连接云端浏览器服务（Browserless、Steel.dev 等）
+- 自动化开放 CDP 端口的 Electron 应用
+
+SDK 等效用法：
+
+```python
+browser = Browser(cdp="ws://localhost:9222/devtools/browser/...")
+```
+
 #### 命令列表
 
 | 类别 | 命令 |
@@ -484,6 +553,7 @@ browser = Browser(
 | `user_data_dir` | str/Path | None | 持久化 profile 自定义路径（`clear_user_data=True` 时忽略） |
 | `clear_user_data` | bool | False | True 时使用临时会话（无 profile）；False 时使用持久化 profile |
 | `stealth` | bool/StealthConfig | True | 隐身模式配置 |
+| `cdp` | str | None | 通过 CDP 连接已有 Chrome（跳过启动）。接受端口号、`ws://` / `wss://` URL、`http://host:port`、`"auto"` —— 与 CLI `--cdp` 一致 |
 | `channel` | str | None | 浏览器通道（chrome、msedge 等） |
 | `proxy` | dict | None | 代理设置 |
 | `downloads_path` | str/Path | None | 下载目录 |
@@ -590,3 +660,4 @@ MIT 许可证
 - [浏览器工具指南](docs/BROWSER_TOOLS_GUIDE.md) — 工具选择、ref 与坐标、等待策略、常见模式。
 - [快照与页面状态](docs/SNAPSHOT_AND_STATE.md) — SnapshotOptions、EnhancedSnapshot、get_snapshot_text、get_element_by_ref。
 - [API 摘要](docs/API.md) — Session 与 DownloadManager API 说明。
+- [已知限制](docs/KNOWN_LIMITATIONS.md) — 已知问题与上游 bug（如 Chrome「在文件夹中打开」不可用）。

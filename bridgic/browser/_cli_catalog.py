@@ -78,11 +78,11 @@ CLI_ALL_COMMANDS: list[str] = [
 
 # command_name -> (ToolCategory, one-line description)
 CLI_COMMAND_META: dict[str, tuple[ToolCategory, str]] = {
-    "open": (ToolCategory.NAVIGATION, "Navigate to URL (starts a browser session if needed) [--headed] [--clear-user-data]"),
+    "open": (ToolCategory.NAVIGATION, "Navigate to URL (starts a browser session if needed) [--headed] [--clear-user-data] [--cdp PORT_OR_URL]"),
     "back": (ToolCategory.NAVIGATION, "Go back to the previous page"),
     "forward": (ToolCategory.NAVIGATION, "Go forward to the next page"),
     "reload": (ToolCategory.NAVIGATION, "Reload the current page"),
-    "search": (ToolCategory.NAVIGATION, "Search the web using a search engine (starts a browser session if needed) [--headed] [--clear-user-data] [--engine duckduckgo|google|bing]"),
+    "search": (ToolCategory.NAVIGATION, "Search the web using a search engine (starts a browser session if needed) [--headed] [--clear-user-data] [--cdp PORT_OR_URL] [--engine duckduckgo|google|bing]"),
     "info": (ToolCategory.NAVIGATION, "Show current page URL, title, viewport, scroll position"),
     "snapshot": (ToolCategory.SNAPSHOT, "Get accessibility tree of the current page (full-page by default) with refs [-i] [-F viewport-only] [-l LIMIT] [-s FILE]"),
     "click": (ToolCategory.ELEMENT_INTERACTION, "Click an element by ref (@80365bf7 or 80365bf7)"),
@@ -97,8 +97,8 @@ CLI_COMMAND_META: dict[str, tuple[ToolCategory, str]] = {
     "drag": (ToolCategory.ELEMENT_INTERACTION, "Drag from START_REF to END_REF"),
     "options": (ToolCategory.ELEMENT_INTERACTION, "Get all available options for a dropdown element by ref"),
     "upload": (ToolCategory.ELEMENT_INTERACTION, "Upload a file at PATH to a file input element by ref"),
-    "fill-form": (ToolCategory.ELEMENT_INTERACTION, "Fill multiple form fields via JSON array [--submit]"),
-    "press": (ToolCategory.KEYBOARD, "Press a key or combination (Enter, Control+A, ...)"),
+    "fill-form": (ToolCategory.ELEMENT_INTERACTION, "Fill multiple form fields [--submit]; FIELDS_JSON: '[{\"ref\":\"REF\",\"value\":\"TEXT\"}]'"),
+    "press": (ToolCategory.KEYBOARD, "Press a key or combination (Enter, Control+A, ...); macOS: use Meta for Cmd (Meta+A, Meta+C)"),
     "type": (ToolCategory.KEYBOARD, "Type TEXT into the focused element character-by-character (use 'click'/'focus' first) [--submit]"),
     "key-down": (ToolCategory.KEYBOARD, "Press and hold a keyboard key"),
     "key-up": (ToolCategory.KEYBOARD, "Release a held keyboard key"),
@@ -106,13 +106,13 @@ CLI_COMMAND_META: dict[str, tuple[ToolCategory, str]] = {
     "mouse-move": (ToolCategory.MOUSE, "Move the mouse to viewport-pixel coordinates (X Y from top-left)"),
     "mouse-click": (ToolCategory.MOUSE, "Click mouse at viewport-pixel coordinates (X Y) [--button left|right|middle] [--count N]"),
     "mouse-drag": (ToolCategory.MOUSE, "Drag mouse from viewport-pixel (X1 Y1) to (X2 Y2)"),
-    "mouse-down": (ToolCategory.MOUSE, "Press and hold a mouse button [--button left]"),
-    "mouse-up": (ToolCategory.MOUSE, "Release a held mouse button [--button left]"),
-    "wait": (ToolCategory.WAIT, "Wait N seconds (unit: SECONDS not ms) or until TEXT appears; TEXT --gone waits for disappearance"),
+    "mouse-down": (ToolCategory.MOUSE, "Press and hold a mouse button at current position [--button left]; call mouse-move first"),
+    "mouse-up": (ToolCategory.MOUSE, "Release a held mouse button at current position [--button left]; call mouse-move first"),
+    "wait": (ToolCategory.WAIT, "Wait N seconds (unit: SECONDS not ms) or until TEXT appears [--timeout S]; TEXT --gone waits for disappearance"),
     "tabs": (ToolCategory.TABS, "List all open tabs"),
     "new-tab": (ToolCategory.TABS, "Open a new tab [URL]"),
-    "switch-tab": (ToolCategory.TABS, "Switch to a tab by page_id"),
-    "close-tab": (ToolCategory.TABS, "Close a tab by page_id (or current tab if omitted)"),
+    "switch-tab": (ToolCategory.TABS, "Switch to a tab by page_id; run 'tabs' first to list available page IDs"),
+    "close-tab": (ToolCategory.TABS, "Close a tab by page_id (or current tab if omitted); run 'tabs' first to list page IDs"),
     "screenshot": (ToolCategory.CAPTURE, "Save a screenshot to PATH [--full-page]"),
     "pdf": (ToolCategory.CAPTURE, "Save the current page as PDF"),
     "console-start": (ToolCategory.DEVELOPER, "Start capturing browser console output"),
@@ -144,8 +144,8 @@ CLI_COMMAND_META: dict[str, tuple[ToolCategory, str]] = {
     "trace-start": (ToolCategory.DEVELOPER, "Start browser tracing [--no-screenshots] [--no-snapshots]"),
     "trace-stop": (ToolCategory.DEVELOPER, "Stop tracing and save to PATH (.zip)"),
     "trace-chunk": (ToolCategory.DEVELOPER, "Add a named chunk marker to the current trace"),
-    "video-start": (ToolCategory.DEVELOPER, "Start video recording [--width W] [--height H]"),
-    "video-stop": (ToolCategory.DEVELOPER, "Stop video recording [PATH]"),
+    "video-start": (ToolCategory.DEVELOPER, "Start single-stream video recording on the active tab [--width W] [--height H]"),
+    "video-stop": (ToolCategory.DEVELOPER, "Stop video recording and save one .webm [PATH]"),
     "close": (ToolCategory.LIFECYCLE, "Close the browser session"),
     "resize": (ToolCategory.LIFECYCLE, "Resize the browser viewport to WIDTH x HEIGHT"),
 }
@@ -261,6 +261,13 @@ def _find_duplicates(values: Sequence[str]) -> list[str]:
     return sorted(value for value, count in counts.items() if count > 1)
 
 
+# Populated by `_validate_catalog()` at import time. If consistency checks
+# fail we remember the first error here instead of raising — that way simply
+# `import bridgic.browser` (used by CLI auto-completion, IDE tooling, etc.)
+# never crashes. `main()` inspects this and exits with a clear message.
+CATALOG_VALIDATION_ERROR: Exception | None = None
+
+
 def _validate_catalog() -> None:
     """Fail fast when catalog constants become inconsistent."""
     help_command_duplicates = _find_duplicates(CLI_ALL_COMMANDS)
@@ -339,4 +346,7 @@ def _validate_catalog() -> None:
             )
 
 
-_validate_catalog()
+try:
+    _validate_catalog()
+except Exception as _exc:  # noqa: BLE001 — remember; surface on CLI entry
+    CATALOG_VALIDATION_ERROR = _exc

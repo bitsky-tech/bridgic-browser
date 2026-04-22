@@ -6,7 +6,9 @@ Short reference for the main session and download APIs. For tool lists and selec
 
 | Method / property | Description |
 |------------------|-------------|
-| `Browser(...)` | Constructor. Key args: `headless`, `viewport`, `user_data_dir`, `clear_user_data`, `stealth`, `channel`, `proxy`, `downloads_path`, etc. |
+| `Browser(...)` | Constructor. Key args: `headless`, `viewport`, `user_data_dir`, `clear_user_data`, `stealth`, `cdp`, `channel`, `proxy`, `downloads_path`, etc. When `cdp` is set, connects to an existing Chrome via CDP (`connect_over_cdp`) instead of launching a new browser. Accepts the same inputs as the CLI `--cdp` flag: port number (`"9222"`), `ws://`/`wss://` URL, `http://host:port`, or `"auto"` (scan local Chrome profiles). **The constructor never performs network I/O** — values are stored as-is and resolved to a `ws://` URL lazily inside `await browser._start()` (safe to call from within an event loop). A malformed `cdp` value therefore surfaces as `InvalidInputError` on first use, not at construction. |
+| `find_cdp_url(mode, port, host, ...)` | Resolve a Chrome CDP WebSocket URL. `mode`: `"port"` (HTTP `/json/version`), `"file"` (read `DevToolsActivePort`), `"scan"` (auto-discover running Chrome/Chromium/Brave), `"service"` (return `ws_endpoint` as-is). Returns `ws://` URL. |
+| `resolve_cdp_input(value)` | Normalize user-supplied CDP input to a `ws://` URL. Accepts: bare port (`"9222"`), `ws://`/`wss://` URL, `http://host:port`, or `"auto"`/`"scan"`. |
 | `await browser._start()` | Launch browser and create context. Called automatically by `navigate_to` / `search` (lazy start); call directly only when you need explicit startup before any navigation. |
 | `await browser.close()` | Stop the browser, auto-cleans active capture listeners. No-op if never started. |
 | `await browser.navigate_to(url, wait_until="domcontentloaded", timeout=None)` | Navigate to URL with optional auto-prefix when missing protocol. `wait_until`: `"domcontentloaded"` (default), `"load"`, `"networkidle"`, or `"commit"`. `timeout` in seconds. |
@@ -26,6 +28,8 @@ Short reference for the main session and download APIs. For tool lists and selec
 | `browser.stealth_enabled` | `bool` — whether stealth mode is active. |
 | `browser.stealth_config` | `StealthConfig` or `None` — current stealth configuration. |
 | `browser.use_persistent_context` | `bool` — `True` when using `launch_persistent_context` (`clear_user_data=False`); `False` when using ephemeral `launch`+`new_context` (`clear_user_data=True`). |
+| `browser.last_close_artifacts` | `dict` — trace and video paths produced by the most recent `close()` call. Shape: `{"trace": [str, ...], "video": [str, ...]}`. Empty lists before the first close, or when no tracing/video was active. Returns a fresh shallow copy on every access — mutating it does not affect the browser's internal state. |
+| `browser.last_close_errors` | `list[str]` — warnings/errors collected during the most recent `close()` call (e.g. trace-stop timeouts, video-finalize failures). Empty list before the first close, or on a clean shutdown. Returns a fresh copy on every access. |
 
 ## DownloadManager
 

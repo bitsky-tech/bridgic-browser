@@ -10,9 +10,10 @@ Use this guide when the output should be Python automation code (`bridgic.browse
 4. [Snapshot and Ref Rules](#snapshot-and-ref-rules)
 5. [Frequent SDK Methods](#frequent-sdk-methods)
 6. [Tool Set Builder (for Agent Integration)](#tool-set-builder-for-agent-integration)
-7. [Non-Obvious SDK Behavior](#non-obvious-sdk-behavior)
-8. [SDK Error Handling](#sdk-error-handling)
-9. [When to Load Other References](#when-to-load-other-references)
+7. [CDP Mode (Connect to Existing Browser)](#cdp-mode-connect-to-existing-browser)
+8. [Non-Obvious SDK Behavior](#non-obvious-sdk-behavior)
+9. [SDK Error Handling](#sdk-error-handling)
+10. [When to Load Other References](#when-to-load-other-references)
 
 ## Installation and Imports
 
@@ -123,6 +124,29 @@ builder2 = BrowserToolSetBuilder.for_tool_names(browser, "verify_url")
 tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 ```
 
+## CDP Mode (Connect to Existing Browser)
+
+To connect to an already-running Chrome instead of launching a new one, pass `cdp`:
+
+```python
+browser = Browser(cdp="ws://localhost:9222/devtools/browser/...")
+```
+
+`Browser(cdp=...)` accepts the same inputs as CLI `--cdp` — port number, `ws://`/`wss://` URL, `http://host:port`, or `"auto"` — and resolves them lazily on first use:
+
+```python
+browser = Browser(cdp="9222")       # port → resolved on _start()
+browser = Browser(cdp="auto")       # scan local Chrome/Chromium/Brave profiles
+browser = Browser(cdp="http://host:9222")
+```
+
+`resolve_cdp_input()` is also still exported for the rare case where you want to normalise the value up front.
+
+Notes:
+- Stealth launch args are **not** applied (the Chrome process is already running), but the JS init script is still registered for new pages.
+- `close()` disconnects from the remote browser but does **not** terminate the Chrome process.
+- The daemon auto-reconnects once if the CDP session drops (useful for cloud browser session timeouts).
+
 ## Non-Obvious SDK Behavior
 
 - `wait_for` uses seconds for all time parameters:
@@ -132,7 +156,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `take_screenshot(filename=None)` returns base64 data URL string.
 - `take_screenshot(filename="path.png")` writes file and returns a status string.
 - `verify_element_visible` uses `(role, accessible_name)` rather than ref.
-- `start_video` must run before `stop_video`; `stop_video` registers the destination path but does **not** close any pages. The actual `.webm` file is written by Playwright when pages close (via `close()` or `close_tab()`).
+- `start_video` must run before `stop_video`; `stop_video` stops the recorder and saves the `.webm` file immediately — no page close is needed.
 
 ## SDK Error Handling
 

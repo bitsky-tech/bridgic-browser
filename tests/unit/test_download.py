@@ -260,6 +260,52 @@ class TestDownloadManagerAttach:
         # Should attempt to remove page-level listener
         mock_page.remove_listener.assert_called()
 
+    @pytest.mark.asyncio
+    async def test_detach_from_page_cancels_in_flight_download_tasks(
+        self, temp_downloads_dir
+    ):
+        """Detach must cancel in-flight download processing tasks.
+
+        Without this, detach/close could let the background task finish and
+        write files after the caller thought the handler was gone.
+        """
+        manager = DownloadManager(downloads_path=temp_downloads_dir)
+
+        page = MagicMock()
+        page.url = "https://example.com"
+        page.on = MagicMock()
+        page.remove_listener = MagicMock()
+
+        manager.attach_to_page(page)
+
+        # Grab the page-scoped "download" handler registered by attach_to_page().
+        handler = page.on.call_args[0][1]
+
+        started = asyncio.Event()
+        never_finishes = asyncio.Event()
+
+        async def _save_as(_path: str) -> None:
+            started.set()
+            await never_finishes.wait()
+
+        download = MagicMock()
+        download.url = "https://example.com/file.pdf"
+        download.suggested_filename = "document.pdf"
+        download.save_as = AsyncMock(side_effect=_save_as)
+        download.failure = AsyncMock(return_value="Network error")
+
+        # Trigger download processing: this schedules _handle_download().
+        handler(download)
+        await asyncio.wait_for(started.wait(), timeout=0.5)
+
+        # Detach must cancel the task while it's mid-save_as().
+        manager.detach_from_page(page)
+        await asyncio.sleep(0)
+
+        assert manager.downloaded_files == []
+        assert manager._pending_downloads == {}
+        download.failure.assert_not_called()
+
 
 class TestDownloadManagerHandleDownload:
     """Tests for DownloadManager download handling."""
@@ -453,3 +499,75 @@ class TestDownloadManagerFilenameHelpers:
         """Test file type extraction for hidden file with extension."""
         # Hidden files can have extensions, e.g., .config.json
         assert DownloadManager._get_file_type(".config.json") == "json"
+
+
+class TestSanitizeFilename:
+    """Tests for _sanitize_filename, including Windows reserved-name guard."""
+
+    def test_plain_filename_unchanged(self) -> None:
+        assert DownloadManager._sanitize_filename("report.pdf") == "report.pdf"
+
+    def test_traversal_stripped(self) -> None:
+        assert (
+            DownloadManager._sanitize_filename("../../etc/passwd") == "passwd"
+        )
+
+    def test_illegal_chars_replaced(self) -> None:
+        assert (
+            DownloadManager._sanitize_filename('bad:name"?.pdf')
+            == "bad_name__.pdf"
+        )
+
+    def test_empty_falls_back_to_download(self) -> None:
+        assert DownloadManager._sanitize_filename("") == "download"
+        assert DownloadManager._sanitize_filename("   ...   ") == "download"
+
+    def test_windows_reserved_con(self) -> None:
+        assert DownloadManager._sanitize_filename("CON.pdf") == "_CON.pdf"
+
+    def test_windows_reserved_com1(self) -> None:
+        assert DownloadManager._sanitize_filename("COM1.txt") == "_COM1.txt"
+
+    def test_windows_reserved_bare(self) -> None:
+        # No extension: still reserved on Windows.
+        assert DownloadManager._sanitize_filename("NUL") == "_NUL"
+
+    def test_windows_reserved_case_insensitive(self) -> None:
+        # Windows matches device names case-insensitively.
+        assert DownloadManager._sanitize_filename("aux.log") == "_aux.log"
+
+    def test_non_reserved_prefix_unchanged(self) -> None:
+        # CONsole.pdf is NOT reserved — only the exact device name.
+        assert (
+            DownloadManager._sanitize_filename("CONsole.pdf") == "CONsole.pdf"
+        )
+
+
+class TestGetUniqueFilenameFallback:
+    """Tests for _get_unique_filename 10000-collision fallback path."""
+
+    def test_collision_fallback_returns_non_existent_name(
+        self, temp_downloads_dir
+    ) -> None:
+        """After 9999 collisions the timestamp-suffix name must not clash.
+
+        Pre-create 9999 ``file (N).pdf`` entries plus the original ``file.pdf``
+        so the counter loop exhausts and we take the timestamp branch. The
+        returned name must (a) carry the ``file (...)`` shape and (b) not
+        already exist in the directory.
+        """
+        (temp_downloads_dir / "file.pdf").touch()
+        for i in range(1, 10000):
+            (temp_downloads_dir / f"file ({i}).pdf").touch()
+
+        result = DownloadManager._get_unique_filename(
+            temp_downloads_dir,
+            "file.pdf",
+            overwrite=False,
+        )
+
+        # The counter loop is exhausted — the fallback branch is the only
+        # way we still return a name here.
+        assert result.startswith("file (")
+        assert result.endswith(").pdf")
+        assert not (temp_downloads_dir / result).exists()
