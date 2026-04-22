@@ -82,7 +82,16 @@ def _is_browser_closed_error(exc: BaseException) -> bool:
     if _PlaywrightError is not None and isinstance(exc, _PlaywrightError):
         if any(pat in msg for pat in _BROWSER_CLOSED_PATTERNS):
             return True
-    return any(pat in msg for pat in _BROWSER_CLOSED_PATTERNS)
+    if any(pat in msg for pat in _BROWSER_CLOSED_PATTERNS):
+        return True
+    # BridgicBrowserError wrappers scrub the Playwright call-log prefix before
+    # re-raising, which can swallow the telltale substrings. When the SDK
+    # chains the original via ``raise ... from current_exc`` we still have the
+    # original in ``__cause__``; recurse one (or more) level to find it.
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and cause is not exc:
+        return _is_browser_closed_error(cause)
+    return False
 
 
 # Re-export the shared redaction helper under the legacy name so that the
@@ -674,6 +683,23 @@ async def _cdp_reconnect(browser: "Browser") -> bool:
             browser._context = None
             browser._page = None
 
+            # H02: clear the cached ws URL so ``_start()`` re-runs
+            # ``resolve_cdp_input(_cdp_raw)``. Without this, a remote Chrome
+            # that restarted between the two reconnect calls still points at
+            # the old browser UUID and ``connect_over_cdp`` 404s indefinitely.
+            # When ``_cdp_raw`` is a bare port / http / auto form, resolve
+            # picks up the new UUID; when it is already a full ws URL,
+            # resolve is idempotent and the failure surfaces cleanly instead
+            # of being hidden by the stale cache.
+            browser._cdp_resolved = None  # type: ignore[attr-defined]
+
+            # ``browser.close()`` sets ``_closing = True`` as a sentinel so
+            # dispatcher rejects post-close commands. For reconnect we are
+            # deliberately re-opening the same Browser object, so the sentinel
+            # must be cleared — otherwise the next command short-circuits to
+            # BROWSER_CLOSED (see _dispatch_inner's C2 guard at ~L796).
+            browser._closing = False  # type: ignore[attr-defined]
+
             try:
                 await browser._start()
                 logger.info("[daemon] cdp_reconnect: reconnected successfully")
@@ -1199,13 +1225,18 @@ def _resolve_cdp_url_from_env(cdp_input: Optional[str]) -> Optional[str]:
 async def run_daemon() -> None:
     from bridgic.browser.session._browser import Browser
 
-    # Resolve CDP connection if requested via env var.
-    cdp: Optional[str] = _resolve_cdp_url_from_env(os.environ.get("BRIDGIC_CDP"))
+    # Probe / validate CDP env at startup (stale ws:// endpoint → fail fast,
+    # bare port / auto → ConnectionError if no reachable Chrome). The resolved
+    # URL is discarded on purpose: H02 requires that the raw user input reach
+    # ``Browser._cdp_raw`` so auto-reconnect can re-run ``resolve_cdp_input``
+    # after Chrome restarts and pick up a fresh session UUID.
+    _raw_cdp_env = os.environ.get("BRIDGIC_CDP")
+    _resolve_cdp_url_from_env(_raw_cdp_env)
 
     # Browser.__init__ auto-loads config from files and env vars.
     kwargs: Dict[str, Any] = {}
-    if cdp:
-        kwargs["cdp"] = cdp
+    if _raw_cdp_env:
+        kwargs["cdp"] = _raw_cdp_env
 
     # Auto-enable downloads in daemon mode.
     # SDK users are unaffected (they control downloads_path explicitly).

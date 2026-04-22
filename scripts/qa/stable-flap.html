@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>QA: stable-flap (enabled + visible but position jitters → dispatch fallback)</title>
+<style>
+  body { font-family: sans-serif; padding: 2em; }
+  #flap {
+    padding: 12px 24px;
+    font-size: 16px;
+    transition: transform 50ms linear;
+    transform: translateX(0px);
+  }
+</style>
+<h1>Stable-flap button</h1>
+<p>Button is enabled and visible, but every 50 ms it jitters 2 px.
+   Expected: click() times out on Playwright's stable bbox check,
+   then fallback via dispatch_event succeeds.</p>
+<button id="flap"
+        onclick="window._clicked = true; document.title='CLICKED';">Go</button>
+<p id="state">not yet</p>
+<script>
+  let dx = 0;
+  setInterval(() => {
+    dx = dx === 0 ? 2 : 0;
+    document.getElementById('flap').style.transform = `translateX(${dx}px)`;
+  }, 50);
+  new MutationObserver(() => {
+    document.getElementById('state').textContent =
+      window._clicked ? 'CLICKED ✓' : 'not yet';
+  }).observe(document.querySelector('title'), { childList: true });
+</script>

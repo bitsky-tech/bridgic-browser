@@ -176,3 +176,19 @@ The SDK default and the CLI daemon default are the same 10 s. Raise it via
 ``BRIDGIC_CLICK_TIMEOUT`` when a test needs to accommodate a slow-starting
 SPA; lower it for tighter bail-out.
 """
+
+FALLBACK_DISPATCH_TIMEOUT_MS: int = int(
+    _float_env("BRIDGIC_FALLBACK_DISPATCH_TIMEOUT_MS", 2000.0)
+)
+"""Ceiling for ``locator.dispatch_event`` when used as a click-timeout fallback.
+
+Playwright's default for ``dispatch_event`` is 30 s. For continuously
+animating elements (e.g. CSS ``@keyframes shake``) the fallback itself can
+saturate that full 30 s, defeating the :data:`CLICK_S` hard-ceiling guarantee
+and turning a nominally 10 s click into a 40 s hang (QA finding H03).
+
+Bounded at 2 s: resolving a locator and firing a synthetic DOM event takes
+milliseconds in practice; anything slower means the fallback itself is stuck
+and should fail fast so the caller sees a clean timeout. Override via
+``BRIDGIC_FALLBACK_DISPATCH_TIMEOUT_MS`` when a slow CI needs more headroom.
+"""

@@ -119,6 +119,65 @@ class TestFindCdpUrlLivenessProbe:
 
         assert result == "ws://localhost:9999/devtools/browser/alive"
 
+    def test_scan_refreshes_uuid_via_http_when_port_live(self, tmp_path: Path) -> None:
+        """Scan must prefer /json/version over DevToolsActivePort's cached UUID.
+
+        DevToolsActivePort can outlive the Chrome session that wrote it (a new
+        Chrome binding the same port, or a relaunch without re-writing the file),
+        leaving the file's UUID stale while the port is alive. connect_over_cdp
+        then 404s opaquely. Scan should consult /json/version and return the
+        current UUID, not the file's.
+        """
+        p = tmp_path / "only_profile"
+        p.mkdir()
+        # File UUID is stale (Chrome replaced the session after writing it).
+        (p / "DevToolsActivePort").write_text("9999\n/devtools/browser/stale-uuid\n")
+
+        fresh_url = "ws://localhost:9999/devtools/browser/fresh-uuid"
+        fake_resp = _mock_version_response(fresh_url)
+        patched_dirs = {"darwin": [("Only", str(p))]}
+
+        with patch.object(sys, "platform", "darwin"):
+            with patch.dict(_CDP_SCAN_DIRS, patched_dirs, clear=True):
+                with patch(
+                    "bridgic.browser.session._cdp_discovery._probe_cdp_alive",
+                    return_value=True,
+                ):
+                    with patch("urllib.request.build_opener") as mock_opener:
+                        mock_opener.return_value.open.return_value = fake_resp
+                        result = find_cdp_url(mode="scan")
+
+        assert result == fresh_url, (
+            "scan must return the /json/version UUID, not the stale file UUID"
+        )
+
+    def test_scan_falls_back_to_file_url_when_http_unreachable(self, tmp_path: Path) -> None:
+        """Chrome 144+ chrome://inspect writes DevToolsActivePort but may block
+        /json/ via DNS-rebinding protection. Scan must still succeed using the
+        file URL when HTTP discovery fails.
+        """
+        import urllib.error
+
+        p = tmp_path / "only_profile"
+        p.mkdir()
+        file_url = "ws://localhost:9999/devtools/browser/file-uuid"
+        (p / "DevToolsActivePort").write_text("9999\n/devtools/browser/file-uuid\n")
+
+        patched_dirs = {"darwin": [("Only", str(p))]}
+        with patch.object(sys, "platform", "darwin"):
+            with patch.dict(_CDP_SCAN_DIRS, patched_dirs, clear=True):
+                with patch(
+                    "bridgic.browser.session._cdp_discovery._probe_cdp_alive",
+                    return_value=True,
+                ):
+                    with patch(
+                        "urllib.request.build_opener",
+                        side_effect=urllib.error.URLError("blocked"),
+                    ):
+                        result = find_cdp_url(mode="scan")
+
+        assert result == file_url
+
     def test_scan_raises_when_all_candidates_stale(self, tmp_path: Path) -> None:
         p = tmp_path / "only_profile"
         p.mkdir()

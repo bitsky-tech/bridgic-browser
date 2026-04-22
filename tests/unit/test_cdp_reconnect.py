@@ -4,7 +4,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from bridgic.browser.cli._daemon import _cdp_reconnect, _dispatch_inner
+from bridgic.browser.cli._daemon import (
+    _cdp_reconnect,
+    _dispatch_inner,
+    _is_browser_closed_error,
+)
 
 
 @pytest.fixture
@@ -24,6 +28,8 @@ def browser_stub() -> MagicMock:
     b._browser = object()
     b._context = object()
     b._page = object()
+    b._cdp_raw = "9222"
+    b._cdp_resolved = "ws://127.0.0.1:9222/devtools/browser/OLD-UUID"
     return b
 
 
@@ -155,6 +161,85 @@ class TestCdpReconnect:
         assert observed["br"] is None
         assert observed["ctx"] is None
         assert observed["pg"] is None
+
+    @pytest.mark.asyncio
+    async def test_clears_cdp_resolved_before_start(
+        self, browser_stub: MagicMock,
+    ) -> None:
+        """H02 fix: ``_cdp_resolved`` must be cleared before ``_start`` runs.
+
+        Browser._start only re-runs ``resolve_cdp_input(_cdp_raw)`` when
+        ``_cdp_resolved`` is falsy. If we leave the stale ws URL (containing an
+        old browser UUID) in place, reconnect reuses it and 404s against the
+        restarted Chrome. Snapshot ``_cdp_resolved`` at the exact moment
+        ``_start()`` is entered to prove the reset happened first.
+        """
+        observed: dict = {}
+
+        async def snapshot_on_start(*_a, **_k) -> None:
+            observed["resolved"] = browser_stub._cdp_resolved
+            # Raw should survive so _start can re-resolve.
+            observed["raw"] = browser_stub._cdp_raw
+
+        browser_stub._start.side_effect = snapshot_on_start
+
+        ok = await _cdp_reconnect(browser_stub)
+        assert ok is True
+        assert observed["resolved"] is None, (
+            "reconnect must clear _cdp_resolved before _start to force re-resolve"
+        )
+        assert observed["raw"] == "9222", (
+            "raw user input must survive reconnect so resolve_cdp_input can re-run"
+        )
+
+
+class TestIsBrowserClosedErrorUnwrap:
+    """H02: ``_is_browser_closed_error`` must walk the ``__cause__`` chain so a
+    ``BridgicBrowserError`` wrapper (whose message has had the Playwright
+    "Call log:" scrubbed away) still classifies as BROWSER_CLOSED when the
+    underlying cause is a ``TargetClosedError``."""
+
+    def test_unwraps_target_closed_from_operation_error_cause(self) -> None:
+        from playwright._impl._errors import TargetClosedError
+
+        from bridgic.browser.errors import OperationError
+
+        inner = TargetClosedError(
+            "Target page, context or browser has been closed"
+        )
+        wrapped = OperationError("Failed to get snapshot: something")
+        wrapped.__cause__ = inner
+
+        assert _is_browser_closed_error(wrapped) is True
+
+    def test_unwraps_through_multiple_cause_levels(self) -> None:
+        """Nested wrappers: cause chain depth > 1 still detected."""
+        from playwright._impl._errors import TargetClosedError
+
+        from bridgic.browser.errors import OperationError, StateError
+
+        inner = TargetClosedError("browser has been closed")
+        middle = StateError("state check failed")
+        middle.__cause__ = inner
+        outer = OperationError("op failed")
+        outer.__cause__ = middle
+
+        assert _is_browser_closed_error(outer) is True
+
+    def test_no_cause_falls_through(self) -> None:
+        """Sanity: wrapper with no cause and benign message is not closed."""
+        from bridgic.browser.errors import OperationError
+
+        exc = OperationError("some unrelated failure")
+        assert _is_browser_closed_error(exc) is False
+
+    def test_self_referencing_cause_does_not_recurse_infinitely(self) -> None:
+        """Guard against a cyclic ``__cause__`` (exc is its own cause)."""
+        from bridgic.browser.errors import OperationError
+
+        exc = OperationError("loop")
+        exc.__cause__ = exc
+        assert _is_browser_closed_error(exc) is False
 
 
 class TestDispatchDetectsPlaywrightClose:

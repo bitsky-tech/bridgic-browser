@@ -368,6 +368,36 @@ async def test_cdp_evaluate_javascript_on_preopened_tab(cdp_browser):
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "expr,expected",
+    [
+        ('() => "hello"', "hello"),
+        ('() => 42', "42"),
+        ('(x => x * 2)(3)', "6"),
+        ('1 + 1', "2"),
+        ('typeof document', "object"),
+    ],
+    ids=["arrow-str", "arrow-int", "applied-arrow", "literal", "typeof"],
+)
+async def test_cdp_eval_arrow_fn_parity(cdp_browser, expr, expected):
+    """M01: arrow-fn literals must round-trip under CDP like under ``page.evaluate``.
+
+    Before the fix ``() => "hello"`` returned ``"{}"`` because raw
+    ``Runtime.evaluate`` resolved it to the function object itself, which JSON
+    round-trips to an empty object.
+    """
+    await _switch_to_url(cdp_browser, "example.com")
+
+    result = await asyncio.wait_for(
+        cdp_browser.evaluate_javascript(expr), timeout=15.0,
+    )
+    assert str(result).strip() == expected, (
+        f"CDP eval parity failed for {expr!r}: got {result!r}, want {expected!r}"
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_cdp_verify_url_on_preopened_tab(cdp_browser):
     """verify_url on pre-existing tab must work without hanging."""
     await _switch_to_url(cdp_browser, "example.com")

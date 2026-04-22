@@ -15,6 +15,7 @@ import pytest_asyncio
 from bridgic.browser.errors import InvalidInputError, OperationError, StateError
 from bridgic.browser.session import Browser, StealthConfig
 import bridgic.browser.session._browser as _browser_module
+from bridgic.browser import _timeouts as _bridgic_timeouts
 
 
 @pytest.fixture(autouse=True)
@@ -2726,7 +2727,9 @@ class TestLocatorActionWithFallback:
         )
 
         locator.click.assert_awaited_once()
-        locator.dispatch_event.assert_awaited_once_with("click")
+        locator.dispatch_event.assert_awaited_once_with(
+            "click", timeout=_bridgic_timeouts.FALLBACK_DISPATCH_TIMEOUT_MS
+        )
 
     @pytest.mark.asyncio
     async def test_dblclick_fallback_event(self):
@@ -2740,7 +2743,9 @@ class TestLocatorActionWithFallback:
             locator, action="dblclick", fallback_event="dblclick"
         )
 
-        locator.dispatch_event.assert_awaited_once_with("dblclick")
+        locator.dispatch_event.assert_awaited_once_with(
+            "dblclick", timeout=_bridgic_timeouts.FALLBACK_DISPATCH_TIMEOUT_MS
+        )
 
     @pytest.mark.asyncio
     async def test_non_timeout_error_not_swallowed(self):
@@ -2777,7 +2782,48 @@ class TestLocatorActionWithFallback:
             locator, action="check", fallback_event="click"
         )
 
-        locator.dispatch_event.assert_awaited_once_with("click")
+        locator.dispatch_event.assert_awaited_once_with(
+            "click", timeout=_bridgic_timeouts.FALLBACK_DISPATCH_TIMEOUT_MS
+        )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_fallback_has_bounded_timeout(self):
+        """H03: fallback dispatch_event must pass an explicit timeout.
+
+        Without it, continuously-animating elements inherit Playwright's 30 s
+        default and the outer 10 s click cap is meaningless (observed in QA:
+        shake-button total 40 s).
+        """
+        locator = self._make_locator(visible=True, enabled=True)
+        locator.click = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("timeout")
+        )
+
+        await _browser_module._locator_action_with_fallback(locator, action="click")
+
+        (_, kwargs) = locator.dispatch_event.await_args
+        assert "timeout" in kwargs, "fallback must not inherit Playwright's 30 s default"
+        assert kwargs["timeout"] == _bridgic_timeouts.FALLBACK_DISPATCH_TIMEOUT_MS
+
+    @pytest.mark.asyncio
+    async def test_dispatch_fallback_timeout_propagates(self):
+        """H03: if dispatch_event itself times out, the error surfaces to the caller."""
+        locator = self._make_locator(visible=True, enabled=True)
+        locator.click = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError(
+                "locator.click: Timeout 10000ms"
+            )
+        )
+        locator.dispatch_event = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError(
+                "Locator.dispatch_event: Timeout 2000ms exceeded."
+            )
+        )
+
+        with pytest.raises(_browser_module.PlaywrightTimeoutError):
+            await _browser_module._locator_action_with_fallback(locator, action="click")
+
+        locator.dispatch_event.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_timeout_on_disabled_element_re_raises(self):
@@ -3613,7 +3659,9 @@ class TestClickIntegrationUsesFallbackGate:
 
         assert "Clicked" in result
         # Fallback dispatch actually fired (visible + enabled = eligible).
-        locator.dispatch_event.assert_awaited_once_with("click")
+        locator.dispatch_event.assert_awaited_once_with(
+            "click", timeout=_bridgic_timeouts.FALLBACK_DISPATCH_TIMEOUT_MS
+        )
 
     @pytest.mark.asyncio
     async def test_click_on_aria_disabled_element_raises(self):
@@ -3639,3 +3687,39 @@ class TestClickIntegrationUsesFallbackGate:
 
         # Crucially: dispatch_event was NEVER called — the gate rejected it.
         locator.dispatch_event.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# M01: _maybe_wrap_arrow_fn — CDP Runtime.evaluate arrow-fn auto-unwrap
+# ---------------------------------------------------------------------------
+
+class TestMaybeWrapArrowFn:
+    """QA finding M01: ``() => "x"`` must return ``"x"`` under CDP borrowed
+    mode (parity with ``page.evaluate`` in non-CDP mode), not ``{}``.
+
+    The helper wraps arrow-function literals as IIFEs before handing them to
+    raw ``Runtime.evaluate``. Non-arrow expressions pass through unchanged.
+    """
+
+    @pytest.mark.parametrize(
+        "src,expected",
+        [
+            ('() => "hi"', '(() => "hi")()'),
+            ('()=>"hi"', '(()=>"hi")()'),
+            ('(x) => x+1', '((x) => x+1)()'),
+            ('async () => 1', '(async () => 1)()'),
+            ('x => x*2', '(x => x*2)()'),
+            ('  () => 42  ', '(() => 42)()'),
+            # Non-arrow expressions pass through unchanged.
+            ('document.title', 'document.title'),
+            ('42', '42'),
+            ('typeof document', 'typeof document'),
+            ('window.innerWidth', 'window.innerWidth'),
+            # A string literal containing '=>' does not start with an arrow.
+            ('"x => y"', '"x => y"'),
+            # Named function expression is not an arrow literal.
+            ('function () { return 1 }', 'function () { return 1 }'),
+        ],
+    )
+    def test_wrap_parametrized(self, src, expected):
+        assert _browser_module._maybe_wrap_arrow_fn(src) == expected

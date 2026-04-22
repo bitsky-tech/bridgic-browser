@@ -167,4 +167,15 @@ The CDP WebSocket connection can be lost due to:
 - Network interruption
 - Cloud browser service timeout (Browserless, Steel.dev, etc.)
 
-The CLI daemon automatically attempts **one reconnect** when a command fails with a connection error. After reconnect the session starts fresh (about:blank) — previous page state is lost. If the remote browser is gone, the reconnect fails and the error is reported to the user.
+The CLI daemon automatically attempts **one reconnect** when a command fails with a connection error. Reconnect re-resolves the CDP URL from scratch, so restarting Chrome on the same debugging port (new session UUID) is transparent to bridgic — the next command just works. After reconnect the session starts fresh (about:blank); previous page state is lost.
+
+If the remote browser is gone (port no longer accepting), the reconnect fails and the error is reported to the client as `BROWSER_CLOSED`.
+
+**Tip — pick a CDP input form that supports reconnect**
+
+| Form | Reconnects across Chrome restart? |
+|---|---|
+| `--cdp 9222` (bare port) | ✅ resolves fresh UUID on reconnect |
+| `--cdp http://localhost:9222` | ✅ resolves fresh UUID on reconnect |
+| `--cdp auto` | ✅ rescans localhost on reconnect |
+| `--cdp ws://.../devtools/browser/<UUID>` | ❌ UUID is frozen; reconnect 404s |

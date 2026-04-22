@@ -328,6 +328,12 @@ async def _locator_action_with_fallback(
     The probe itself has a 1 s wall-clock budget; if the probe hangs (e.g.
     a CDP-borrowed tab with a wedged context) we treat the element as
     non-actionable and re-raise, which is the conservative choice.
+
+    The fallback ``dispatch_event`` call itself is bounded by
+    :data:`bridgic.browser._timeouts.FALLBACK_DISPATCH_TIMEOUT_MS` (2 s).
+    Without it a continuously-animating element would inherit Playwright's
+    30 s default, turning the ``timeout_ms`` hard-ceiling into a soft
+    suggestion and freezing the CLI for ~40 s.
     """
     method = getattr(locator, action)
     try:
@@ -367,7 +373,10 @@ async def _locator_action_with_fallback(
             "Underlying: %s",
             action, timeout_ms, fallback_event, e,
         )
-        await locator.dispatch_event(fallback_event)
+        await locator.dispatch_event(
+            fallback_event,
+            timeout=_timeouts.FALLBACK_DISPATCH_TIMEOUT_MS,
+        )
 
 
 async def _check_element_covered(locator, cx: float, cy: float, cdp_context=None) -> bool:

@@ -51,12 +51,15 @@ def _raise_state_error(
     details: Optional[Dict[str, Any]] = None,
     retryable: bool = True,
 ) -> NoReturn:
+    current_exc = sys.exc_info()[1]
+    if isinstance(current_exc, BridgicBrowserError):
+        raise current_exc
     raise StateError(
         message,
         code=code,
         details=details,
         retryable=retryable,
-    )
+    ) from current_exc
 
 
 def _raise_operation_error(
@@ -71,12 +74,17 @@ def _raise_operation_error(
         raise current_exc
 
     message = _strip_playwright_call_log(message)
+    # ``raise ... from current_exc`` preserves the original Playwright
+    # TargetClosedError / Error on ``__cause__`` so the CLI daemon's
+    # ``_is_browser_closed_error`` can unwrap and classify correctly.
+    # Without it, the scrubbed message loses the telltale substrings and
+    # every post-crash command gets ``OPERATION_FAILED`` (QA H02).
     raise OperationError(
         message,
         code=code,
         details=details,
         retryable=retryable,
-    )
+    ) from current_exc
 
 
 def _raise_verification_error(
@@ -96,4 +104,4 @@ def _raise_verification_error(
         code=code,
         details=details,
         retryable=retryable,
-    )
+    ) from current_exc

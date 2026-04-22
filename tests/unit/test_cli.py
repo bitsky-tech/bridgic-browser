@@ -435,7 +435,12 @@ class TestCliCommandRouting:
         sc.assert_called_once_with("open", {"url": "https://example.com"}, headed=False, clear_user_data=True, cdp=None)
 
     def test_open_cdp_ws_url_passthrough(self):
-        """--cdp ws://... passes through without resolution."""
+        """--cdp ws://... passes through to the daemon unchanged.
+
+        Since H02, the client no longer resolves any ``--cdp`` form before
+        sending; the raw value lands on ``Browser._cdp_raw`` so the daemon
+        can re-resolve on each auto-reconnect.
+        """
         with patch("bridgic.browser.session._cdp_discovery.find_cdp_url") as mock_find:
             _, sc = invoke(["open", "--cdp", "ws://localhost:9222/devtools/browser/abc", "https://example.com"])
         mock_find.assert_not_called()
@@ -444,34 +449,34 @@ class TestCliCommandRouting:
             headed=False, clear_user_data=False, cdp="ws://localhost:9222/devtools/browser/abc",
         )
 
-    def test_open_cdp_port_number(self):
-        """--cdp 9222 calls find_cdp_url(mode='port', host='localhost', port=9222)."""
-        with patch("bridgic.browser.session._cdp_discovery.find_cdp_url", return_value="ws://localhost:9222/devtools/browser/xyz") as mock_find:
+    def test_open_cdp_port_number_passthrough(self):
+        """--cdp 9222 is forwarded raw — daemon resolves on startup."""
+        with patch("bridgic.browser.session._cdp_discovery.find_cdp_url") as mock_find:
             _, sc = invoke(["open", "--cdp", "9222", "https://example.com"])
-        mock_find.assert_called_once_with(mode="port", host="localhost", port=9222)
+        mock_find.assert_not_called()
         sc.assert_called_once_with(
             "open", {"url": "https://example.com"},
-            headed=False, clear_user_data=False, cdp="ws://localhost:9222/devtools/browser/xyz",
+            headed=False, clear_user_data=False, cdp="9222",
         )
 
-    def test_open_cdp_http_url(self):
-        """--cdp http://host:port calls find_cdp_url(mode='port', host=..., port=...)."""
-        with patch("bridgic.browser.session._cdp_discovery.find_cdp_url", return_value="ws://1.2.3.4:9222/devtools/browser/xyz") as mock_find:
+    def test_open_cdp_http_url_passthrough(self):
+        """--cdp http://host:port forwards raw; daemon resolves."""
+        with patch("bridgic.browser.session._cdp_discovery.find_cdp_url") as mock_find:
             _, sc = invoke(["open", "--cdp", "http://1.2.3.4:9222", "https://example.com"])
-        mock_find.assert_called_once_with(mode="port", host="1.2.3.4", port=9222)
+        mock_find.assert_not_called()
         sc.assert_called_once_with(
             "open", {"url": "https://example.com"},
-            headed=False, clear_user_data=False, cdp="ws://1.2.3.4:9222/devtools/browser/xyz",
+            headed=False, clear_user_data=False, cdp="http://1.2.3.4:9222",
         )
 
-    def test_open_cdp_auto(self):
-        """--cdp auto calls find_cdp_url(mode='scan')."""
-        with patch("bridgic.browser.session._cdp_discovery.find_cdp_url", return_value="ws://localhost:57234/devtools/browser/auto") as mock_find:
+    def test_open_cdp_auto_passthrough(self):
+        """--cdp auto forwards raw; daemon scans for a live Chrome."""
+        with patch("bridgic.browser.session._cdp_discovery.find_cdp_url") as mock_find:
             _, sc = invoke(["open", "--cdp", "auto", "https://example.com"])
-        mock_find.assert_called_once_with(mode="scan")
+        mock_find.assert_not_called()
         sc.assert_called_once_with(
             "open", {"url": "https://example.com"},
-            headed=False, clear_user_data=False, cdp="ws://localhost:57234/devtools/browser/auto",
+            headed=False, clear_user_data=False, cdp="auto",
         )
 
     def test_open_cdp_wss_url_passthrough(self):
@@ -485,12 +490,18 @@ class TestCliCommandRouting:
             headed=False, clear_user_data=False, cdp=wss_url,
         )
 
-    def test_open_cdp_invalid_format_shows_error(self):
-        """--cdp with unrecognized format prints an error and does NOT call send_command."""
-        result, sc = invoke(["open", "--cdp", "not-a-valid-cdp", "https://example.com"])
-        sc.assert_not_called()
-        assert result.exit_code == 1  # _err() calls sys.exit(1)
-        assert "Invalid --cdp value" in result.output
+    def test_open_cdp_invalid_format_defers_to_daemon(self):
+        """--cdp with unrecognized format is no longer rejected on the client.
+
+        Validation / resolution moves to the daemon (``_resolve_cdp_url_from_env``
+        + ``Browser._start``'s ``resolve_cdp_input``). The client-side
+        forwarding is blind — errors surface via the daemon response.
+        """
+        _, sc = invoke(["open", "--cdp", "not-a-valid-cdp", "https://example.com"])
+        sc.assert_called_once_with(
+            "open", {"url": "https://example.com"},
+            headed=False, clear_user_data=False, cdp="not-a-valid-cdp",
+        )
 
     def test_back(self):
         _, sc = invoke(["back"])

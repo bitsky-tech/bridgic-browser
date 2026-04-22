@@ -134,16 +134,14 @@ def cli() -> None:
 )
 def cmd_open(url: str, headed: bool, clear_user_data: bool, cdp: str | None) -> None:
     """Navigate to URL (starts a browser session if needed)."""
-    resolved_cdp: str | None = None
-    if cdp:
-        from bridgic.browser.session._browser import resolve_cdp_input
-        try:
-            resolved_cdp = resolve_cdp_input(cdp)
-        except Exception as exc:
-            _err(exc)
-            return
+    # H02: pass the raw ``--cdp`` value through to the daemon. Resolving on
+    # the client side collapses bare-port / http / auto inputs into a ws URL
+    # that embeds the Chrome session UUID, so if Chrome later restarts the
+    # daemon is stuck with a dead UUID and auto-reconnect 404s forever.
+    # Keeping the raw form lets :meth:`Browser._start` re-resolve from
+    # scratch on each reconnect.
     try:
-        _ok(send_command("open", {"url": url}, headed=headed, clear_user_data=clear_user_data, cdp=resolved_cdp))
+        _ok(send_command("open", {"url": url}, headed=headed, clear_user_data=clear_user_data, cdp=cdp))
     except Exception as exc:
         _err(exc)
 
@@ -196,16 +194,10 @@ def cmd_reload() -> None:
 )
 def cmd_search(query: str, engine: str, headed: bool, clear_user_data: bool, cdp: str | None) -> None:
     """Search the web using a search engine (starts a browser session if needed)."""
-    resolved_cdp: str | None = None
-    if cdp:
-        from bridgic.browser.session._browser import resolve_cdp_input
-        try:
-            resolved_cdp = resolve_cdp_input(cdp)
-        except Exception as exc:
-            _err(exc)
-            return
+    # See ``cmd_open`` for the rationale — raw ``--cdp`` forwarding keeps
+    # CDP auto-reconnect honest.
     try:
-        _ok(send_command("search", {"query": query, "engine": engine}, headed=headed, clear_user_data=clear_user_data, cdp=resolved_cdp))
+        _ok(send_command("search", {"query": query, "engine": engine}, headed=headed, clear_user_data=clear_user_data, cdp=cdp))
     except Exception as exc:
         _err(exc)
 

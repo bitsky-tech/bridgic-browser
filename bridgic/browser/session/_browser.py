@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -101,6 +102,38 @@ _DEFAULT_VIDEO_HEIGHT = 720
 ``Page.getLayoutMetrics`` and ``page.viewport_size`` fail to report usable
 values. 1280x720 is a common default that keeps frames legible without being
 wasteful. VP8 requires even width/height, and both values are already even."""
+
+
+# ---------------------------------------------------------------------------
+# M01: arrow-function literal auto-wrap for CDP ``Runtime.evaluate``
+# ---------------------------------------------------------------------------
+
+_ARROW_FN_RE = re.compile(r"^\s*(async\s+)?(\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>")
+"""Match a top-level arrow-function literal (e.g. ``() => 1``, ``x => x+1``,
+``async () => 2``). Used to wrap such expressions as an IIFE before sending
+them through raw CDP ``Runtime.evaluate``.
+
+Intentionally conservative: the expression must *start* with the arrow form.
+String literals containing ``=>`` are not matched because they can't start
+the expression without a leading quote.
+"""
+
+
+def _maybe_wrap_arrow_fn(expr: str) -> str:
+    """Wrap a lone arrow-function literal as an IIFE.
+
+    Playwright's ``page.evaluate(str)`` auto-unwraps arrow-function literals
+    (invoking them and returning the result). Raw CDP ``Runtime.evaluate``
+    does not: it evaluates the expression as-is, so ``() => "x"`` returns
+    the function object and the JSON round-trip loses the body (``{}``).
+    Wrapping to ``(() => "x")()`` restores parity with the non-CDP path.
+
+    Non-arrow expressions (``document.title``, ``42``, ``typeof document``)
+    are returned unchanged — the CDP path already handles those correctly.
+    """
+    if _ARROW_FN_RE.match(expr):
+        return f"({expr.strip()})()"
+    return expr
 
 
 # Type aliases for Playwright types
@@ -2958,7 +2991,22 @@ Before you return the element ref, reason about the state and elements for a sen
                 _get_title(),
                 return_exceptions=True,
             )
-            if isinstance(snapshot, BaseException) or snapshot is None:
+            if isinstance(snapshot, BaseException):
+                # `gather(return_exceptions=True)` yields the exception as a
+                # value — sys.exc_info() is empty, so re-raising it first
+                # primes the context so _raise_operation_error can chain via
+                # ``from current_exc``. Without this, a TargetClosedError
+                # during snapshot prefetch would surface as OPERATION_FAILED
+                # at the daemon (H02) because the closed-browser substring
+                # is stripped from the outer message and there is no cause
+                # to unwrap.
+                if isinstance(snapshot, BridgicBrowserError):
+                    raise snapshot
+                try:
+                    raise snapshot
+                except BaseException:
+                    _raise_operation_error("Failed to get snapshot")
+            if snapshot is None:
                 _raise_operation_error("Failed to get snapshot")
             if isinstance(page_title, BaseException):
                 page_title = ""
@@ -3434,7 +3482,10 @@ Before you return the element ref, reason about the state and elements for a sen
                     raw = await asyncio.wait_for(
                         session.send(
                             "Runtime.evaluate",
-                            {"expression": code, "returnByValue": True},
+                            {
+                                "expression": _maybe_wrap_arrow_fn(code),
+                                "returnByValue": True,
+                            },
                         ),
                         timeout=30.0,
                     )

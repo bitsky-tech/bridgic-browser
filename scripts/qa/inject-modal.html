@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>QA: modal covering Submit button (covered-check regression)</title>
+<style>
+  body { font-family: sans-serif; padding: 2em; }
+  #submit { padding: 12px 24px; font-size: 16px; }
+  .backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+    display: flex; justify-content: center; align-items: center; z-index: 999;
+  }
+  .modal { background: white; padding: 2em; border-radius: 8px; min-width: 240px; }
+  .modal button { margin-top: 1em; }
+</style>
+<h1>Covered Submit</h1>
+<button id="submit"
+        onclick="window._submitClicked = true; document.title='SUBMIT';">Submit</button>
+
+<div id="backdrop" class="backdrop">
+  <div class="modal">
+    <p>Please confirm before submitting.</p>
+    <button id="ok" onclick="document.getElementById('backdrop').remove(); document.title='MODAL-CLOSED';">OK</button>
+  </div>
+</div>
+
+<p id="state">state: <span id="s">modal-up</span></p>
+<script>
+  new MutationObserver(() => {
+    const modalGone = !document.getElementById('backdrop');
+    document.getElementById('s').textContent =
+      (window._submitClicked ? 'SUBMIT-LEAKED ' : '') +
+      (modalGone ? 'modal-closed' : 'modal-up');
+  }).observe(document.querySelector('title'), { childList: true });
+</script>

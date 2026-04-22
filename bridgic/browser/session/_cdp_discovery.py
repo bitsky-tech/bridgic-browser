@@ -228,6 +228,28 @@ def find_cdp_url(
                     label, base,
                 )
                 continue
+            # DevToolsActivePort can outlive the Chrome session that wrote it:
+            # a second Chrome instance binding the same port, or Chrome being
+            # relaunched without re-writing the file, leaves the file's UUID
+            # stale while the port is still alive. A stale UUID makes
+            # connect_over_cdp return an opaque 404. Prefer /json/version to
+            # get the current UUID; fall back to the file URL only when HTTP
+            # is unreachable (Chrome 144+ chrome://inspect mode writes the
+            # file but blocks /json/ via DNS-rebinding protection).
+            port = urlparse(ws_url).port
+            if port is not None:
+                try:
+                    fresh = find_cdp_url(mode="port", host="localhost", port=port)
+                    logger.info(
+                        "find_cdp_url(scan): found active CDP via %s (%s), UUID refreshed via /json/version",
+                        label, base,
+                    )
+                    return fresh
+                except (ConnectionError, ValueError) as exc:
+                    logger.debug(
+                        "find_cdp_url(scan): %s /json/version unreachable, using file URL as-is: %s",
+                        label, exc,
+                    )
             logger.info("find_cdp_url(scan): found active CDP port via %s (%s)", label, base)
             return ws_url
         _browsers = ", ".join(label for label, _ in candidates)

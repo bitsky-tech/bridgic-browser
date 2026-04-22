@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>QA: disabled button (must NOT be silently dispatched)</title>
+<style>
+  body { font-family: sans-serif; padding: 2em; }
+  button, [role="button"] { padding: 12px 24px; font-size: 16px; margin-right: 12px; }
+  [role="button"] { display: inline-block; border: 1px solid #888; background: #eee; cursor: default; }
+  [aria-disabled="true"] { opacity: 0.5; }
+</style>
+<h1>Disabled buttons</h1>
+
+<button id="native" disabled
+        onclick="window._nativeClicked = true">Native-disabled</button>
+
+<div id="aria" role="button" aria-disabled="true"
+     onclick="window._ariaClicked = true">aria-disabled</div>
+
+<p id="state">native: <span id="n">?</span> | aria: <span id="a">?</span></p>
+<script>
+  setInterval(() => {
+    document.getElementById('n').textContent = window._nativeClicked ? 'LEAKED' : 'ok';
+    document.getElementById('a').textContent = window._ariaClicked ? 'LEAKED' : 'ok';
+  }, 100);
+</script>
