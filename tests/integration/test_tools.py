@@ -47,7 +47,7 @@ import pytest_asyncio
 
 pytestmark = pytest.mark.integration
 
-from bridgic.browser.errors import VerificationError
+from bridgic.browser.errors import BridgicBrowserError, VerificationError
 from bridgic.browser.session import Browser
 
 # ==================== Constants ====================
@@ -153,6 +153,28 @@ class TestNavigationTools:
         assert "Searched on Duckduckgo" in result
         info = await browser.get_current_page_info()
         assert "duckduckgo.com" in info
+
+    @pytest.mark.asyncio
+    async def test_ref_invalidated_after_go_back(self, browser):
+        """task.md §8.1: go_back drops the snapshot cache; a stale ref must
+        raise instead of silently resolving to a wrong same-role element."""
+        snapshot = await browser.get_snapshot_text(interactive=True, full_page=True)
+        refs = extract_refs_from_snapshot(snapshot)
+        assert refs, f"test page must yield at least one ref:\n{snapshot}"
+        stale_ref = next(iter(refs))
+
+        page = await browser.get_current_page()
+        await page.click("#link-form")
+        await asyncio.sleep(0.2)
+        await browser.go_back()
+
+        with pytest.raises(BridgicBrowserError) as exc_info:
+            await browser.click_element_by_ref(stale_ref)
+        code = getattr(exc_info.value, "code", "")
+        assert (
+            code in {"REF_NOT_AVAILABLE", "NOT_FOUND", "INVALID_REF"}
+            or "ref" in str(exc_info.value).lower()
+        ), f"expected ref-invalidation error, got code={code!r} message={exc_info.value}"
 
 # ==================== 2. Page & Tab Tools (9 tools) ====================
 
@@ -393,6 +415,27 @@ class TestActionTools:
             btn_ref, "el => el.textContent",
         )
         assert "Primary" in result
+
+    @pytest.mark.asyncio
+    async def test_click_disabled_button_raises_without_firing_handler(self, browser):
+        """task.md §5.2: <button disabled> click must fail (not silently "succeed"),
+        and the onclick handler must NOT fire via a dispatch_event fallback — the
+        2s dispatch budget from M01 prevents the fallback from pressing a disabled
+        element on Playwright's behalf."""
+        fixture = Path(__file__).resolve().parents[2] / "scripts/qa/disabled-button.html"
+        await browser.navigate_to(fixture.absolute().as_uri())
+        snapshot = await browser.get_snapshot_text(interactive=True, full_page=True)
+        refs = extract_refs_from_snapshot(snapshot)
+        btn_ref = find_ref_by_type_and_name(refs, "button", "Native-disabled")
+        assert btn_ref is not None, f"disabled button ref missing from snapshot:\n{snapshot}"
+
+        with pytest.raises(BridgicBrowserError):
+            await browser.click_element_by_ref(btn_ref)
+
+        leaked = await browser.evaluate_javascript("() => window._nativeClicked === true")
+        assert str(leaked).lower() != "true", (
+            "disabled button onclick fired — dispatch_event fallback regression (M01)"
+        )
 
 # ==================== 5. Mouse Tools (6 tools) ====================
 

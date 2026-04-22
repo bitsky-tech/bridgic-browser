@@ -13,7 +13,11 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import socket
 import subprocess
+import time
+import urllib.request
+from pathlib import Path
 
 
 def find_chrome_binary() -> str | None:
@@ -169,6 +173,78 @@ def _scan_mac_app_bundles(base: str, results: list[str]) -> None:
         results.append(os.path.join(
             sub_path, "Chromium.app", "Contents", "MacOS", "Chromium",
         ))
+
+
+# ── CDP Chrome process helpers (shared by lifecycle integration tests) ──────
+
+
+def pick_free_port() -> int:
+    """Bind to port 0, return the assigned port, then release it."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def wait_for_chrome(port: int, timeout: float = 20.0) -> None:
+    """Block until Chrome's /json/version endpoint on *port* is reachable."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/version", timeout=3
+            ):
+                return
+        except Exception:
+            time.sleep(0.4)
+    raise RuntimeError(f"Chrome did not start on port {port}")
+
+
+def launch_chrome(
+    chrome_bin: str,
+    port: int,
+    user_data_dir: Path,
+    *,
+    extra_args: list[str] | None = None,
+) -> subprocess.Popen:
+    """Launch a headless Chrome bound to *port* and wait until CDP is live."""
+    args = [
+        chrome_bin,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={user_data_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions",
+        "--disable-sync",
+        "--headless=new",
+        "about:blank",
+    ]
+    if os.name != "nt":
+        args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
+    if extra_args:
+        args.extend(extra_args)
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        wait_for_chrome(port, timeout=25.0)
+    except Exception:
+        proc.kill()
+        raise
+    return proc
+
+
+def kill_chrome(proc: subprocess.Popen) -> None:
+    """Terminate the Chrome process *proc* and reap it."""
+    proc.kill()
+    try:
+        proc.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _is_viable_browser_binary(path: str) -> bool:
