@@ -14,7 +14,7 @@ This guide helps you choose the right tools for different browser automation sce
 | Keyboard | 4 | Keyboard typing and key state |
 | Mouse | 6 | Coordinate-based pointer control |
 | Wait | 1 | Time/text/selector waits |
-| Capture | 2 | Screenshot and PDF |
+| Capture | 4 | Screenshot, PDF, and file download tracking |
 | Network | 4 | Request capture and network idle waits |
 | Dialog | 3 | Alert/confirm/prompt handling |
 | Storage | 5 | Cookies and storage state |
@@ -352,7 +352,7 @@ builder = BrowserToolSetBuilder.for_categories(
 )
 tools = builder.build()["tool_specs"]
 
-# Full access (all 67 tools)
+# Full access (all 69 tools)
 builder = BrowserToolSetBuilder.for_categories(browser, ToolCategory.ALL)
 tools = builder.build()["tool_specs"]
 ```
@@ -426,6 +426,25 @@ await browser.select_dropdown_option_by_ref("8d4b03a9", "a")
 
 ```python
 await browser.upload_file_by_ref("e10", "/path/to/file.pdf")
+```
+
+### File Download
+
+Click (or otherwise trigger) the download, then immediately await `wait_for_next_download`. Downloads are always saved to `~/Downloads` unless `downloads_path` is configured.
+
+```python
+# Trigger the download
+await browser.click_element_by_ref("8d4b03a9")
+
+# Block until the file is saved (timeout in seconds)
+result = await browser.wait_for_next_download(timeout=30.0)
+# result: "Download complete: report.pdf — 261.0 KB — /home/user/Downloads/report.pdf"
+#         or "No download completed within 30s timeout."
+
+# Inspect all downloads in the session
+files = browser.downloaded_files  # List[DownloadedFile]
+for f in files:
+    print(f.file_name, f.file_size, f.path)
 ```
 
 ### Handling Dialogs

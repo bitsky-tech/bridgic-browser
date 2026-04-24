@@ -49,7 +49,7 @@ bridgic-browser close
 | Keyboard | `press`, `type`, `key-down`, `key-up` |
 | Mouse | `scroll`, `mouse-click`, `mouse-move`, `mouse-drag`, `mouse-down`, `mouse-up` |
 | Wait | `wait` |
-| Capture | `screenshot`, `pdf` |
+| Capture | `screenshot`, `pdf`, `downloads`, `wait-download` |
 | Network | `network-start`, `network`, `network-stop`, `wait-network` |
 | Dialog | `dialog-setup`, `dialog`, `dialog-remove` |
 | Storage | `cookies`, `cookie-set`, `cookies-clear`, `storage-save`, `storage-load` |
@@ -103,6 +103,11 @@ bridgic-browser dialog-setup --action accept
 bridgic-browser open https://example.com    # any alert triggered will be auto-accepted
 bridgic-browser dialog-remove
 
+# File download workflow — click the trigger, then wait
+bridgic-browser click @37015433          # click a download button/link
+bridgic-browser wait-download 30         # block until download completes (default 30s)
+bridgic-browser downloads                # list all downloads in this session
+
 # Close the browser when everything is done
 bridgic-browser close
 ```
@@ -142,6 +147,7 @@ Environment variables and login state persistence are documented in `env-vars.md
   - `bridgic-browser wait --gone "Loading"` — wait until "Loading" disappears (`--gone` only works with a text argument)
 - **`type` requires a focused element**: `type` sends keystrokes at the current cursor position. Run `bridgic-browser click @<ref>` or `bridgic-browser focus @<ref>` on the target input first.
 - **`mouse-move`, `mouse-click`, `mouse-drag` use viewport pixel coordinates** measured from the top-left corner of the browser viewport. Example: `bridgic-browser mouse-click 500 300`.
+- **File downloads require two commands**: `click` (or whatever triggers the download) followed immediately by `wait-download [SECONDS]`. `wait-download` blocks until the browser signals completion and returns the file name, size, and path. After that, `downloads` lists all files saved in the session. Downloads are always saved to `~/Downloads` unless a `downloads_path` is set in config.
 - **`eval-on` CODE must be an arrow or named function** that accepts the element as its argument:
   - `bridgic-browser eval-on @8d4b03a9 "(el) => el.textContent"` ✓
   - `bridgic-browser eval-on @8d4b03a9 "el.textContent"` ✗ (not a function)

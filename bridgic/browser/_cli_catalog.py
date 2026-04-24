@@ -43,7 +43,7 @@ CLI_HELP_SECTION_SPECS: list[tuple[ToolCategory, list[str]]] = [
     (ToolCategory.KEYBOARD, ["type", "press", "key-down", "key-up"]),
     (ToolCategory.MOUSE, ["scroll", "mouse-click", "mouse-move", "mouse-drag", "mouse-down", "mouse-up"]),
     (ToolCategory.WAIT, ["wait"]),
-    (ToolCategory.CAPTURE, ["screenshot", "pdf"]),
+    (ToolCategory.CAPTURE, ["screenshot", "pdf", "downloads", "wait-download"]),
     (ToolCategory.NETWORK, ["network-start", "network", "network-stop", "wait-network"]),
     (ToolCategory.DIALOG, ["dialog-setup", "dialog", "dialog-remove"]),
     (ToolCategory.STORAGE, ["cookies", "cookie-set", "cookies-clear", "storage-save", "storage-load"]),
@@ -115,6 +115,8 @@ CLI_COMMAND_META: dict[str, tuple[ToolCategory, str]] = {
     "close-tab": (ToolCategory.TABS, "Close a tab by page_id (or current tab if omitted)"),
     "screenshot": (ToolCategory.CAPTURE, "Save a screenshot to PATH [--full-page]"),
     "pdf": (ToolCategory.CAPTURE, "Save the current page as PDF"),
+    "downloads": (ToolCategory.CAPTURE, "List all files downloaded in this session"),
+    "wait-download": (ToolCategory.CAPTURE, "Wait up to SECONDS for the next download to complete (default: 30)"),
     "console-start": (ToolCategory.DEVELOPER, "Start capturing browser console output"),
     "console-stop": (ToolCategory.DEVELOPER, "Stop capturing browser console output"),
     "console": (ToolCategory.DEVELOPER, "Get captured console messages [--filter TYPE] [--no-clear]"),
@@ -219,6 +221,8 @@ CLI_COMMAND_TO_TOOL_METHOD: Dict[str, str] = {
     "video-stop": "stop_video",
     "close": "close",
     "resize": "browser_resize",
+    "downloads": "get_downloaded_files_text",
+    "wait-download": "wait_for_next_download",
 }
 
 # CLI commands that are informational and not backed by Browser tool methods.

@@ -74,6 +74,8 @@ This model is the foundation of all correspondence in this guide.
 | `wait` | `wait_for` |
 | `screenshot` | `take_screenshot` |
 | `pdf` | `save_pdf` |
+| `downloads` | `get_downloaded_files_text` |
+| `wait-download` | `wait_for_next_download` |
 | `network-start` | `start_network_capture` |
 | `network` | `get_network_requests` |
 | `network-stop` | `stop_network_capture` |
@@ -137,6 +139,8 @@ This model is the foundation of all correspondence in this guide.
 - `pdf path.pdf` -> `save_pdf(filename="path.pdf")`
   - SDK-only params: `display_header_footer`, `print_background`, `scale`, `paper_width`, `paper_height`, `margin_top`, `margin_bottom`, `margin_left`, `margin_right`, `landscape`
 - `video-stop path.webm` -> `stop_video(filename="path.webm")`
+- `downloads` -> `get_downloaded_files_text()` — returns a numbered human-readable list of all files downloaded in the session, or `"No downloads in this session."` if none
+- `wait-download [SECONDS]` -> `wait_for_next_download(timeout=30.0)` — **unit is SECONDS** (default 30); blocks until the next download completes and returns a one-line summary (`"Download complete: filename — size — path"`), or a timeout message if no download arrives within the limit. Call immediately after the action that triggers the download.
 - `type TEXT [--submit]` -> `type_text(text, submit=False)` — **requires a focused element**; call `focus_element_by_ref` or `click_element_by_ref` on the target before `type`
 - `eval-on REF CODE` -> `evaluate_javascript_on_ref(ref, code)` — **CODE must be an arrow or named function** that accepts the element:
   - `"(el) => el.textContent"` ✓
@@ -196,6 +200,7 @@ These CLI behaviors have no direct SDK equivalent or work differently:
 | `fill-form` input format | JSON string on command line | Python list of dicts |
 | `take_screenshot` return value | CLI always writes to a file path | SDK: `filename=None` returns base64 data URL; `filename="path.png"` writes file |
 | Video file write timing | `video-stop` registers path; file is written when daemon/browser closes | Same for SDK: `.webm` is written when page closes via `close()` or `close_tab()` |
+| Download workflow | `click @ref` then `wait-download [s]` as separate commands; `downloads` to list all | SDK: call `await browser.wait_for_next_download(timeout=30.0)` after the action that triggers the download; `browser.downloaded_files` for the full list |
 
 ## Practical Rule for Mixed Tasks
 

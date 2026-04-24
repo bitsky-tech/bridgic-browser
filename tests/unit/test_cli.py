@@ -170,6 +170,8 @@ CLI_COMMAND_SAMPLE_ARGS: dict[str, list[str]] = {
     # Capture
     "screenshot": ["screenshot", "out.png"],
     "pdf": ["pdf", "out.pdf"],
+    "downloads": ["downloads"],
+    "wait-download": ["wait-download"],
     # Network
     "network-start": ["network-start"],
     "network": ["network"],
