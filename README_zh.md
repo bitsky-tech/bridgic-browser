@@ -8,7 +8,7 @@
 
 ### 特性
 
-- **完善的 CLI 工具** — 67 个工具分为 15 类；可与各类 AI 智能体集成
+- **完善的 CLI 工具** — 69 个工具分为 15 类；可与各类 AI 智能体集成
 - **基于 Python 的工具** — 用于智能体 / 工作流代码生成；更易与 [Bridgic](https://github.com/bitsky-tech/bridgic) 集成
 - **语义不变的快照** — 基于无障碍树与专门设计的 ref 生成算法，保证元素 ref 在页面重载后仍可对应同一元素
 - **Skills** — 用于引导探索与代码生成；兼容多数编程类智能体
@@ -168,7 +168,7 @@ if __name__ == "__main__":
 
 ### CLI 工具
 
-`bridgic-browser` 提供命令行界面，用于在终端控制浏览器（67 个工具、15 类）。持久化 daemon 进程持有浏览器实例；每次 CLI 调用通过 Unix 域套接字连接后立即退出。
+`bridgic-browser` 提供命令行界面，用于在终端控制浏览器（69 个工具、15 类）。持久化 daemon 进程持有浏览器实例；每次 CLI 调用通过 Unix 域套接字连接后立即退出。
 
 #### 配置
 
@@ -218,7 +218,7 @@ BRIDGIC_BROWSER_JSON='{"clear_user_data":true}' bridgic-browser open URL
 | 等待 | `wait [SECONDS] [TEXT] [--gone]` |
 | 标签页 | `tabs`, `new-tab`, `switch-tab`, `close-tab` |
 | 执行 | `eval`, `eval-on` |
-| 捕获 | `screenshot`, `pdf` |
+| 捕获 | `screenshot`, `pdf`, `downloads`, `wait-download` |
 | 网络 | `network-start`, `network-stop`, `network`, `wait-network` |
 | 对话框 | `dialog-setup`, `dialog`, `dialog-remove` |
 | 存储 | `storage-save`, `storage-load`, `cookies-clear`, `cookies`, `cookie-set` |
@@ -235,7 +235,7 @@ bridgic-browser scroll -h
 
 ### Python 工具
 
-Bridgic Browser 提供 67 个工具，分为 15 类。使用 `BrowserToolSetBuilder` 按类别/名称选择，以适配不同场景。
+Bridgic Browser 提供 69 个工具，分为 15 类。使用 `BrowserToolSetBuilder` 按类别/名称选择，以适配不同场景。
 
 #### 按类别选择
 
@@ -341,9 +341,11 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 **等待（1 个工具）：**
 - `wait_for(time_seconds, text, text_gone, selector, state, timeout)` - 等待条件
 
-**捕获（2 个工具）：**
+**捕获（4 个工具）：**
 - `take_screenshot(filename=None, ref=None, full_page=False, type="png")` - 截图
 - `save_pdf(filename)` - 将页面保存为 PDF
+- `get_downloaded_files_text()` - 返回本次会话所有已下载文件的编号列表
+- `wait_for_next_download(timeout=30.0)` - 等待下一个下载完成；返回单行摘要或超时提示
 
 **网络（4 个工具）：**
 - `start_network_capture()` / `stop_network_capture()` / `get_network_requests()` - 网络监控
@@ -417,6 +419,8 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 | `wait` | `wait_for` |
 | `screenshot` | `take_screenshot` |
 | `pdf` | `save_pdf` |
+| `downloads` | `get_downloaded_files_text` |
+| `wait-download` | `wait_for_next_download` |
 | `network-start` | `start_network_capture` |
 | `network` | `get_network_requests` |
 | `network-stop` | `stop_network_capture` |
@@ -508,14 +512,22 @@ browser = Browser(stealth=config, headless=False)
 
 #### DownloadManager
 
-处理文件下载，正确保留文件名：
+`Browser` 始终创建 `DownloadManager` 并自动接受下载。文件保存至 `downloads_path`（若已配置），否则默认保存到 `~/Downloads`。
 
 ```python
-# 将 downloads_path 传给 Browser — 它会内部创建并管理 DownloadManager
+# 可选：配置自定义下载目录
 browser = Browser(downloads_path="./downloads", headless=True)
 await browser.navigate_to("https://example.com")  # 懒加载，首次导航时自动启动
 
-# 通过内置管理器访问已下载的文件
+# 触发下载，然后等待其完成
+await browser.click_element_by_ref("8d4b03a9")
+result = await browser.wait_for_next_download(timeout=30.0)
+# "Download complete: report.pdf — 261.0 KB — /home/user/Downloads/report.pdf"
+
+# 列出本次会话的所有下载记录
+print(await browser.get_downloaded_files_text())
+
+# 或直接访问原始列表
 for file in browser.download_manager.downloaded_files:
     print(f"已下载：{file.file_name}（{file.file_size} 字节）")
 ```

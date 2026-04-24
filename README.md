@@ -8,7 +8,7 @@
 
 ### Features
 
-- **Comprehensive CLI Tools** - 67 tools organized into 15 categories; Designed to integrate with any AI agent
+- **Comprehensive CLI Tools** - 69 tools organized into 15 categories; Designed to integrate with any AI agent
 - **Python-based Tools** - Used for agent / workflow code generation; Easier integration with [Bridgic](https://github.com/bitsky-tech/bridgic) 
 - **Snapshot with Semantic Invariance** - A representation of page snapshot based on accessibility tree and a specially designed ref-generation algorithm that ensures element refs remain unchanged across page reloads
 - **Skills** - Used for guided exploration and code generation; Compatible with most of coding agents
@@ -168,7 +168,7 @@ if __name__ == "__main__":
 
 ### CLI Tools
 
-`bridgic-browser` ships with a command-line interface for controlling a browser from the terminal (67 tools organized into 15 categories). A persistent daemon process holds a browser instance; each CLI invocation connects over a Unix domain socket and exits immediately.
+`bridgic-browser` ships with a command-line interface for controlling a browser from the terminal (69 tools organized into 15 categories). A persistent daemon process holds a browser instance; each CLI invocation connects over a Unix domain socket and exits immediately.
 
 #### Configuration
 
@@ -219,7 +219,7 @@ BRIDGIC_BROWSER_JSON='{"clear_user_data":true}' bridgic-browser open URL
 | Wait | `wait [SECONDS] [TEXT] [--gone]` |
 | Tabs | `tabs`, `new-tab`, `switch-tab`, `close-tab` |
 | Evaluate | `eval`, `eval-on` |
-| Capture | `screenshot`, `pdf` |
+| Capture | `screenshot`, `pdf`, `downloads`, `wait-download` |
 | Network | `network-start`, `network-stop`, `network`, `wait-network` |
 | Dialog | `dialog-setup`, `dialog`, `dialog-remove` |
 | Storage | `storage-save`, `storage-load`, `cookies-clear`, `cookies`, `cookie-set` |
@@ -236,7 +236,7 @@ bridgic-browser scroll -h
 
 ### Python Tools
 
-Bridgic Browser provides 67 tools organized into 15 categories. Use `BrowserToolSetBuilder` with category/name selection for scenario-focused tool sets.
+Bridgic Browser provides 69 tools organized into 15 categories. Use `BrowserToolSetBuilder` with category/name selection for scenario-focused tool sets.
 
 #### Category-based Selection
 
@@ -342,9 +342,11 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 **Wait (1 tool):**
 - `wait_for(time_seconds, text, text_gone, selector, state, timeout)` - Wait for conditions
 
-**Capture (2 tools):**
+**Capture (4 tools):**
 - `take_screenshot(filename=None, ref=None, full_page=False, type="png")` - Capture screenshot
 - `save_pdf(filename)` - Save page as PDF
+- `get_downloaded_files_text()` - Numbered list of all files downloaded in this session
+- `wait_for_next_download(timeout=30.0)` - Block until next download completes; returns a one-line summary or a timeout message
 
 **Network (4 tools):**
 - `start_network_capture()` / `stop_network_capture()` / `get_network_requests()` - Network monitoring
@@ -418,6 +420,8 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 | `wait` | `wait_for` |
 | `screenshot` | `take_screenshot` |
 | `pdf` | `save_pdf` |
+| `downloads` | `get_downloaded_files_text` |
+| `wait-download` | `wait_for_next_download` |
 | `network-start` | `start_network_capture` |
 | `network` | `get_network_requests` |
 | `network-stop` | `stop_network_capture` |
@@ -509,14 +513,22 @@ browser = Browser(stealth=config, headless=False)
 
 #### DownloadManager
 
-Handle file downloads with proper filename preservation:
+`Browser` always creates a `DownloadManager` and always accepts downloads. Files are saved to `downloads_path` if configured, or `~/Downloads` by default.
 
 ```python
-# Pass downloads_path to Browser — it creates and manages the DownloadManager internally
+# Optional: configure a custom download directory
 browser = Browser(downloads_path="./downloads", headless=True)
 await browser.navigate_to("https://example.com")  # lazy start triggers here
 
-# Access downloaded files via the built-in manager
+# Trigger a download, then wait for it to complete
+await browser.click_element_by_ref("8d4b03a9")
+result = await browser.wait_for_next_download(timeout=30.0)
+# "Download complete: report.pdf — 261.0 KB — /home/user/Downloads/report.pdf"
+
+# List all downloads in the session
+print(await browser.get_downloaded_files_text())
+
+# Or access the raw list
 for file in browser.download_manager.downloaded_files:
     print(f"Downloaded: {file.file_name} ({file.file_size} bytes)")
 ```

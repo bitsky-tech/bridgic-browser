@@ -952,6 +952,32 @@ def cmd_video_stop(path: str | None) -> None:
         _err(exc)
 
 
+# ── Downloads ─────────────────────────────────────────────────────────────────
+
+@cli.command("downloads", context_settings=CONTEXT_SETTINGS)
+def cmd_downloads() -> None:
+    """List all files downloaded in this browser session."""
+    try:
+        _ok(send_command("downloads", {}, start_if_needed=False))
+    except Exception as exc:
+        _err(exc)
+
+
+@cli.command("wait-download", context_settings=CONTEXT_SETTINGS)
+@click.argument("seconds", type=float, required=False, default=30.0)
+def cmd_wait_download(seconds: float) -> None:
+    """Wait up to SECONDS for the next download to complete (default: 30).
+
+    Run this immediately after clicking a download link or button.
+    Returns the file name, size, and path when the download finishes,
+    or an error message if the timeout expires with no download.
+    """
+    try:
+        _ok(send_command("wait_download", {"timeout": seconds}, start_if_needed=False))
+    except Exception as exc:
+        _err(exc)
+
+
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 @cli.command("close", context_settings=CONTEXT_SETTINGS)

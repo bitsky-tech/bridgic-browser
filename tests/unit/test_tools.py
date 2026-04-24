@@ -1630,7 +1630,7 @@ class TestBrowserToolSetBuilder:
         from bridgic.browser.tools import BrowserToolSetBuilder, ToolCategory
 
         browser = MagicMock()
-        for name in ("take_screenshot", "save_pdf"):
+        for name in ("take_screenshot", "save_pdf", "get_downloaded_files_text", "wait_for_next_download"):
             method = MagicMock()
             method.__name__ = name
             method.__doc__ = f"Mock {name} method."
@@ -1638,7 +1638,7 @@ class TestBrowserToolSetBuilder:
 
         builder = BrowserToolSetBuilder.for_categories(browser, ToolCategory.CAPTURE)
         names = {spec.to_tool().name for spec in builder.build()["tool_specs"]}
-        assert names == {"take_screenshot", "save_pdf"}
+        assert names == {"take_screenshot", "save_pdf", "get_downloaded_files_text", "wait_for_next_download"}
 
     def test_for_categories_accepts_string_aliases(self):
         """String aliases should map to ToolCategory values."""

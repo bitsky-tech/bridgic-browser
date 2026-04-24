@@ -16,8 +16,10 @@ Short reference for the main session and download APIs. For tool lists and selec
 | `await browser.get_current_page_title()` | Get current page title string, or `None` if no page is open. |
 | `browser.get_current_page_url()` | Get current page URL string, or `None` if no page is open. (sync) |
 | `browser.get_config()` | Return dict of all current browser configuration options. |
-| `browser.download_manager` | `DownloadManager` instance (after `start()`), or `None` if `downloads_path` not set. |
-| `browser.downloaded_files` | Shortcut for `browser.download_manager.downloaded_files`. Returns `[]` if no download manager. |
+| `await browser.get_downloaded_files_text()` | Numbered list of all files downloaded in this session, or `"No downloads in this session."` if none. Each line: `[N] filename — size — /path/to/file`. |
+| `await browser.wait_for_next_download(timeout=30.0)` | Block until the next download completes and return a one-line summary, or a timeout message. **Call immediately after the action that triggers the download.** Timeout unit is seconds. |
+| `browser.download_manager` | Always-created `DownloadManager` instance. Defaults to `~/Downloads` when `downloads_path` is not configured. |
+| `browser.downloaded_files` | Shortcut for `browser.download_manager.downloaded_files`. |
 | `browser.headless` | `bool` — whether the browser runs in headless mode. |
 | `browser.viewport` | `dict` or `None` — current viewport size configuration. |
 | `browser.channel` | `str` or `None` — browser distribution channel. |
@@ -29,12 +31,13 @@ Short reference for the main session and download APIs. For tool lists and selec
 
 ## DownloadManager
 
-`Browser` creates and manages a `DownloadManager` automatically when `downloads_path` is provided. Access it via `browser.download_manager` after the browser has started (via `navigate_to()`, `search()`, or `_start()`).
+`Browser` always creates a `DownloadManager`. It saves files to the configured `downloads_path`, or `~/Downloads` by default. Access it via `browser.download_manager` after the browser has started.
 
 | Method / property | Description |
 |------------------|-------------|
-| `browser.download_manager` | The auto-created `DownloadManager` (None if `downloads_path` not set). |
+| `browser.download_manager` | The `DownloadManager` instance. Always non-`None` after `__init__`. |
 | `browser.download_manager.downloaded_files` | List of `DownloadedFile` (`.url`, `.path`, `.file_name`, `.file_size`). |
+| `await browser.download_manager.wait_for_next_download(timeout=30.0)` | Wait up to *timeout* seconds for the next download to complete. Returns `DownloadedFile` or `None` on timeout. |
 
 ## Snapshot and state (see SNAPSHOT_AND_STATE.md)
 

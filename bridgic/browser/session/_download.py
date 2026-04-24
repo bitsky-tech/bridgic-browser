@@ -124,6 +124,8 @@ class DownloadManager:
         # Track handlers for cleanup
         self._page_handlers: Dict[str, Callable] = {}
         self._context_handlers: Dict[str, Callable] = {}
+        # Queue populated after each successful save; drained by wait_for_next_download()
+        self._completed_queue: asyncio.Queue[DownloadedFile] = asyncio.Queue()
 
     @property
     def downloads_path(self) -> Path:
@@ -202,8 +204,13 @@ class DownloadManager:
         # Remove old handler if exists
         self._detach_from_page(page)
 
+        def _on_task_done(task: asyncio.Task) -> None:
+            if not task.cancelled() and task.exception() is not None:
+                logger.error(f"Download handler raised an unhandled exception: {task.exception()}")
+
         def handle_download(download):
-            asyncio.create_task(self._handle_download(download))
+            task = asyncio.create_task(self._handle_download(download))
+            task.add_done_callback(_on_task_done)
 
         page.on("download", handle_download)
         self._page_handlers[page_key] = handle_download
@@ -292,6 +299,7 @@ class DownloadManager:
             )
 
             self._downloaded_files.append(downloaded_file)
+            self._completed_queue.put_nowait(downloaded_file)
             logger.info(f"Download saved: {target_path} ({file_size} bytes)")
 
             # Call complete callback if configured
@@ -462,6 +470,16 @@ class DownloadManager:
             return None
         finally:
             self._config.on_download_complete = original_callback
+
+    async def wait_for_next_download(self, timeout: float = 30.0) -> Optional[DownloadedFile]:
+        """Wait up to *timeout* seconds for the next download to complete.
+
+        Returns the DownloadedFile when one arrives, or None on timeout.
+        """
+        try:
+            return await asyncio.wait_for(self._completed_queue.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
 
     def clear_history(self) -> None:
         """Clear the download history."""

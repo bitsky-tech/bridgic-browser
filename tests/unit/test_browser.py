@@ -155,11 +155,11 @@ class TestBrowserInitialization:
             assert browser.download_manager is not None
             assert browser.download_manager.downloads_path == Path(tmpdir)
 
-    def test_no_downloads_path_no_manager(self):
-        """Test that no downloads_path means no download manager."""
+    def test_no_downloads_path_uses_default_manager(self):
+        """Download manager is always created; defaults to ~/Downloads when no path given."""
         browser = Browser()
 
-        assert browser.download_manager is None
+        assert browser.download_manager is not None
         assert browser.downloaded_files == []
 
     def test_get_config(self):
