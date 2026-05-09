@@ -229,6 +229,30 @@ BRIDGIC_HOME=/tmp/b2 bridgic-browser close
 
 For SDK multi-instance isolation within the same process, use `Browser(user_data_dir=...)` per instance. For full process-level isolation, set `BRIDGIC_HOME` before spawning a subprocess. See `skills/bridgic-browser/references/env-vars.md` for details.
 
+#### Storage State (Cross-Instance Login Sharing)
+
+Export cookies and localStorage from one browser instance and import them into another — useful for sharing login sessions across instances or persisting auth state for later runs:
+
+```bash
+# 1. Log into a website in instance A
+bridgic-browser open https://github.com --headed
+# ... complete login in the browser ...
+
+# 2. Export storage state (cookies + localStorage)
+bridgic-browser storage-save /tmp/github-login.json
+
+# 3. Import into another instance (even with a different BRIDGIC_HOME)
+BRIDGIC_HOME=/tmp/b2 bridgic-browser open https://github.com --headed
+BRIDGIC_HOME=/tmp/b2 bridgic-browser storage-load /tmp/github-login.json
+BRIDGIC_HOME=/tmp/b2 bridgic-browser reload   # apply the imported cookies
+
+# Instance B is now logged in with the same session as instance A
+```
+
+The exported JSON file contains all cookies (including HttpOnly / Secure) and localStorage entries for every origin the browser has visited. The same file can be imported into the SDK via `Browser.restore_storage_state(path)`.
+
+The storage state file is **cross-mode compatible** — you can export from a headed session and import into a headless one (or vice versa), and the login session will carry over. This is especially useful for automating workflows that require authentication: log in once in headed mode where you can interact with CAPTCHAs and 2FA prompts, export the storage state, and then reuse it in headless automation runs.
+
 #### CDP Mode (Connect to Existing Browser)
 
 Instead of launching a new browser, `bridgic-browser` can connect to an already-running Chrome/Chromium instance via the [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/).

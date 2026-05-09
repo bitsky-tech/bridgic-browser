@@ -228,6 +228,30 @@ BRIDGIC_HOME=/tmp/b2 bridgic-browser close
 
 SDK 同进程多实例隔离使用 `Browser(user_data_dir=...)` 为每个实例指定不同的 profile 路径。完全的进程级隔离则在启动子进程前设置 `BRIDGIC_HOME` 环境变量。详见 `skills/bridgic-browser/references/env-vars.md`。
 
+#### 存储状态（跨实例共享登录态）
+
+将一个浏览器实例的 cookies 和 localStorage 导出，导入到另一个实例中——适用于跨实例共享登录会话，或将认证状态持久化以便后续运行复用：
+
+```bash
+# 1. 在实例 A 中登录目标网站
+bridgic-browser open https://github.com --headed
+# ... 在浏览器中完成登录 ...
+
+# 2. 导出存储状态（cookies + localStorage）
+bridgic-browser storage-save /tmp/github-login.json
+
+# 3. 在另一个实例中导入（可以使用不同的 BRIDGIC_HOME）
+BRIDGIC_HOME=/tmp/b2 bridgic-browser open https://github.com --headed
+BRIDGIC_HOME=/tmp/b2 bridgic-browser storage-load /tmp/github-login.json
+BRIDGIC_HOME=/tmp/b2 bridgic-browser reload   # 刷新页面以应用导入的 cookies
+
+# 实例 B 现在已使用与实例 A 相同的会话完成登录
+```
+
+导出的 JSON 文件包含浏览器访问过的所有域的全部 cookies（包括 HttpOnly / Secure 属性的）和 localStorage 条目。同一个文件也可以通过 SDK 的 `Browser.restore_storage_state(path)` 导入。
+
+存储状态文件**跨模式兼容**——可以从 headed 会话导出后导入到 headless 会话中使用（反之亦然），登录态会完整保留。这在需要认证的自动化场景中特别实用：先在 headed 模式下手动登录（处理验证码、2FA 等交互），导出存储状态，之后在 headless 自动化运行中直接复用。
+
 #### CDP 模式（连接已有浏览器）
 
 `bridgic-browser` 可以通过 [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) 连接到已经运行的 Chrome/Chromium 实例，而非启动新浏览器。
