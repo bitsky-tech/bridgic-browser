@@ -968,6 +968,8 @@ class Browser:
             logger.warning("Playwright has already been started")
             return
 
+        self._closing = False
+
         logger.info("Starting playwright")
         if self.stealth_enabled:
             logger.info("Stealth mode enabled")

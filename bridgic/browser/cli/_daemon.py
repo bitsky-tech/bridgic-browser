@@ -76,21 +76,23 @@ def _is_browser_closed_error(exc: BaseException) -> bool:
     # is gone. isinstance is robust against Playwright tweaking the message text
     # between releases. We also accept any playwright.async_api.Error whose
     # message matches the known closed-browser substrings.
-    if _TargetClosedError is not None and isinstance(exc, _TargetClosedError):
-        return True
-    msg = str(exc).lower()
-    if _PlaywrightError is not None and isinstance(exc, _PlaywrightError):
+    #
+    # Walk the __cause__ chain iteratively (not recursively) to handle
+    # BridgicBrowserError wrappers that scrub the Playwright call-log prefix.
+    # A ``seen`` set guards against circular exception chains.
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _TargetClosedError is not None and isinstance(current, _TargetClosedError):
+            return True
+        msg = str(current).lower()
+        if _PlaywrightError is not None and isinstance(current, _PlaywrightError):
+            if any(pat in msg for pat in _BROWSER_CLOSED_PATTERNS):
+                return True
         if any(pat in msg for pat in _BROWSER_CLOSED_PATTERNS):
             return True
-    if any(pat in msg for pat in _BROWSER_CLOSED_PATTERNS):
-        return True
-    # BridgicBrowserError wrappers scrub the Playwright call-log prefix before
-    # re-raising, which can swallow the telltale substrings. When the SDK
-    # chains the original via ``raise ... from current_exc`` we still have the
-    # original in ``__cause__``; recurse one (or more) level to find it.
-    cause = getattr(exc, "__cause__", None)
-    if cause is not None and cause is not exc:
-        return _is_browser_closed_error(cause)
+        current = getattr(current, "__cause__", None)
     return False
 
 
