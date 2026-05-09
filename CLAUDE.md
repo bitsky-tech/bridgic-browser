@@ -131,7 +131,8 @@ Key behaviors:
 - **Config flags**: `--headed` merges `{"headless": false}` into `BRIDGIC_BROWSER_JSON`; `--clear-user-data` merges `{"clear_user_data": true}`; `--cdp` resolves CDP input via `resolve_cdp_input()` on the client side and passes the `ws://` URL to the daemon via `BRIDGIC_CDP` env var.
 - **Close fast-path**: daemon pre-allocates artifact paths, responds immediately, then runs `browser.close()` after the client disconnects. `close-report.json` records status and artifact paths.
 - **Cleanup ownership guard**: after close, the daemon compares the run-info `pid` to `os.getpid()` before deleting the socket — prevents a new daemon's socket from being deleted by an old daemon still shutting down.
-- **Socket path**: `BRIDGIC_SOCKET` env var (default `~/.bridgic/bridgic-browser/run/bridgic-browser.sock`), directory created with `0o700` permissions.
+- **Socket path**: `BRIDGIC_SOCKET` env var (default `$BRIDGIC_HOME/bridgic-browser/run/bridgic-browser.sock`), directory created with `0o700` permissions.
+- **Home directory**: `BRIDGIC_HOME` env var (default `~/.bridgic`). All daemon state paths (run info, socket, logs, tmp, user config, user data) derive from this. Set different values to run multiple independent daemon instances.
 For detailed implementation notes on client/daemon/commands, see [`docs/INTERNALS.md` — CLI Architecture](docs/INTERNALS.md#cli-architecture--detailed-implementation).
 
 ## Ref System Internals

@@ -62,9 +62,10 @@ reset_bridgic() {
   # Kill any remaining daemon
   pkill -f "bridgic.browser daemon" 2>/dev/null || true
   sleep 1
-  rm -rf "$HOME/.bridgic/bridgic-browser/run" \
-         "$HOME/.bridgic/bridgic-browser/snapshot" \
-         "$HOME/.bridgic/bridgic-browser/tmp"
+  local _bh="${BRIDGIC_HOME:-$HOME/.bridgic}"
+  rm -rf "$_bh/bridgic-browser/run" \
+         "$_bh/bridgic-browser/snapshot" \
+         "$_bh/bridgic-browser/tmp"
 }
 
 reset_qa_chrome() {

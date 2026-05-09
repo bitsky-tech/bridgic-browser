@@ -48,7 +48,7 @@ Notes:
 - `async with Browser(...)` calls `_start()` in `__aenter__` and `close()` in `__aexit__` automatically.
 - Without the context manager, the browser starts lazily: `navigate_to(...)` and `search(...)` call `_ensure_started()` on first invocation.
 - `get_snapshot(...)` returns `EnhancedSnapshot` (never `None`); raises `StateError` if no active page, `OperationError` if generation fails.
-- **Default session is persistent**: `Browser()` (no args) saves the browser profile to `~/.bridgic/bridgic-browser/user_data/`. Use `Browser(clear_user_data=True)` for an ephemeral session with no saved profile. Use `Browser(user_data_dir="./my-profile")` to specify a custom profile path.
+- **Default session is persistent**: `Browser()` (no args) saves the browser profile to `$BRIDGIC_HOME/bridgic-browser/user_data/` (default `~/.bridgic/bridgic-browser/user_data/`). Use `Browser(clear_user_data=True)` for an ephemeral session with no saved profile. Use `Browser(user_data_dir="./my-profile")` to specify a custom profile path.
 
 ## API Division: Raw Methods vs Tool Methods
 
@@ -157,6 +157,7 @@ Notes:
 - `take_screenshot(filename="path.png")` writes file and returns a status string.
 - `verify_element_visible` uses `(role, accessible_name)` rather than ref.
 - `start_video` must run before `stop_video`; `stop_video` stops the recorder and saves the `.webm` file immediately — no page close is needed.
+- **Multi-instance isolation**: use `user_data_dir` to give each `Browser` its own persistent profile. Internal paths (tmp, snapshot) are shared but collision-free (all filenames use `mkstemp` or timestamp+random). For full process-level isolation (separate config, logs, socket), set `BRIDGIC_HOME` env var before spawning a subprocess — see `env-vars.md`.
 
 ## SDK Error Handling
 

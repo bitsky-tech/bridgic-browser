@@ -6,6 +6,7 @@ Use this reference when the task needs environment variable behavior or login st
 
 | Variable | Applies to | Default | Purpose |
 |---|---|---|---|
+| `BRIDGIC_HOME` | SDK + CLI | `~/.bridgic` | Root directory for all Bridgic state. All daemon paths (run info, socket, logs, tmp, config, user data) derive from this. Set different values to run multiple independent daemon instances. |
 | `BRIDGIC_LOG_LEVEL` | SDK + CLI | `INFO` | Log level for the `bridgic.browser` logger. |
 | `BRIDGIC_BROWSER_JSON` | SDK + CLI | unset | JSON string to override Browser constructor kwargs. Loaded by `Browser()` and CLI daemon. |
 | `BRIDGIC_CDP` | CLI daemon | unset | Connect to an existing Chrome via CDP. Accepts: port (`9222`), `ws://`/`wss://` URL, `http://host:port`, or `auto` (scan local profiles). Resolved at daemon startup. Also set internally by the CLI client (as an already-resolved `ws://` URL) when `--cdp` is passed, so the flag overrides any value inherited from the shell. |
@@ -14,8 +15,58 @@ Use this reference when the task needs environment variable behavior or login st
 | `BRIDGIC_DAEMON_STOP_TIMEOUT` | CLI daemon | `300` | Seconds to wait for daemon shutdown (safety net; individual cleanup steps have shorter timeouts). |
 | `SKIP_BROWSER_TESTS` | Tests | unset | If `1/true/yes`, skip browser tests. |
 
+### Multi-Instance Isolation (`BRIDGIC_HOME`)
+
+Set `BRIDGIC_HOME` to run multiple independent daemon instances in parallel. Each instance gets its own run info, socket, logs, tmp, config, and user data — zero shared state.
+
+```bash
+# Instance 1 (default)
+bridgic-browser open https://site-a.com
+
+# Instance 2 (separate home)
+BRIDGIC_HOME=/tmp/b2 bridgic-browser open https://site-b.com
+
+# Each instance operates independently
+bridgic-browser snapshot                        # site-a snapshot
+BRIDGIC_HOME=/tmp/b2 bridgic-browser snapshot   # site-b snapshot
+
+# Close each instance separately (close only targets the matching BRIDGIC_HOME)
+bridgic-browser close                           # closes instance 1 only
+BRIDGIC_HOME=/tmp/b2 bridgic-browser close      # closes instance 2 only
+```
+
+Derived paths per instance:
+
+| Path | Purpose |
+|---|---|
+| `$BRIDGIC_HOME/bridgic-browser/run/daemon.json` | Daemon run info |
+| `$BRIDGIC_HOME/bridgic-browser/run/bridgic-browser.sock` | Unix socket (POSIX) |
+| `$BRIDGIC_HOME/bridgic-browser/logs/daemon.log` | Daemon log |
+| `$BRIDGIC_HOME/bridgic-browser/tmp/` | Temporary files (video, close reports) |
+| `$BRIDGIC_HOME/bridgic-browser/user_data/` | Persistent browser profile |
+| `$BRIDGIC_HOME/bridgic-browser/snapshot/` | Snapshot overflow files |
+| `$BRIDGIC_HOME/bridgic-browser/bridgic-browser.json` | User config |
+
+SDK isolation:
+
+```python
+# Same-process multi-instance: use user_data_dir (no BRIDGIC_HOME needed)
+b1 = Browser(user_data_dir="/tmp/profile-1")
+b2 = Browser(user_data_dir="/tmp/profile-2")
+# tmp/snapshot dirs are shared but collision-free (unique filenames via mkstemp/random)
+
+# Full process-level isolation: set env var before spawning a worker
+import subprocess, os
+subprocess.Popen(
+    ["python", "worker.py"],
+    env={**os.environ, "BRIDGIC_HOME": "/tmp/b2"},
+)
+```
+
+`BRIDGIC_HOME` is a **process-level** setting (read once at module import). Within a single process, use `user_data_dir` / `downloads_path` for per-instance isolation — internal paths (tmp, snapshot) use unique filenames and never collide.
+
 Notes:
-- Config file precedence (SDK + CLI, lowest -> highest): defaults, `~/.bridgic/bridgic-browser/bridgic-browser.json`, `./bridgic-browser.json`, `BRIDGIC_BROWSER_JSON`.
+- Config file precedence (SDK + CLI, lowest -> highest): defaults, `$BRIDGIC_HOME/bridgic-browser/bridgic-browser.json`, `./bridgic-browser.json`, `BRIDGIC_BROWSER_JSON`.
 - To start the daemon in headed mode, pass `--headed` to `bridgic-browser open` / `bridgic-browser search`, or set `{"headless": false}` in `BRIDGIC_BROWSER_JSON`.
 - To start with an ephemeral (no persistent profile) session, pass `--clear-user-data` to `bridgic-browser open` / `bridgic-browser search`, or set `{"clear_user_data": true}` in `BRIDGIC_BROWSER_JSON`. These flags are only meaningful when starting a new daemon; they are ignored if a session is already running.
 - To connect to an existing Chrome via CDP, pass `--cdp` to `bridgic-browser open` or `bridgic-browser search`, or set the `BRIDGIC_CDP` env var. The `--cdp` flag accepts a port number, `ws://`/`wss://` URL, `http://host:port`, or `auto`.
@@ -23,7 +74,7 @@ Notes:
 
 ### Config Files and `BRIDGIC_BROWSER_JSON` Values
 
-`~/.bridgic/bridgic-browser/bridgic-browser.json`, `./bridgic-browser.json`, and `BRIDGIC_BROWSER_JSON` all accept the **same JSON shape**: any `Browser(...)` constructor parameter plus the supported `**kwargs` listed below. Unknown keys are ignored.
+`$BRIDGIC_HOME/bridgic-browser/bridgic-browser.json` (default `~/.bridgic/bridgic-browser/bridgic-browser.json`), `./bridgic-browser.json`, and `BRIDGIC_BROWSER_JSON` all accept the **same JSON shape**: any `Browser(...)` constructor parameter plus the supported `**kwargs` listed below. Unknown keys are ignored.
 
 #### Top-level Browser parameters (direct)
 
@@ -32,7 +83,7 @@ Notes:
 | `headless` | `true | false` | Default `true`. If `devtools=true`, headless is forced to `false`. |
 | `viewport` | `{ "width": int, "height": int }` or `null` | Default `1600x900` when `no_viewport` is not set. |
 | `user_data_dir` | string (path) | Custom path for persistent profile. Ignored when `clear_user_data=true`. |
-| `clear_user_data` | `true | false` | Default `false`. If `true`, use ephemeral session (`launch`+`new_context`, no profile saved). If `false`, use persistent profile (defaults to `~/.bridgic/bridgic-browser/user_data/`). |
+| `clear_user_data` | `true | false` | Default `false`. If `true`, use ephemeral session (`launch`+`new_context`, no profile saved). If `false`, use persistent profile (defaults to `$BRIDGIC_HOME/bridgic-browser/user_data/`). |
 | `cdp` | string | Connect to existing Chrome via CDP instead of launching. Accepts any format supported by `resolve_cdp_input()` (port, `ws://`/`wss://` URL, `http://host:port`, `auto`); non-WebSocket values are auto-resolved at startup. Can be set via config JSON, `BRIDGIC_CDP` env var, or `--cdp` CLI flag. |
 | `stealth` | `true | false` or object | Object uses the StealthConfig keys below. |
 | `channel` | string | Examples: `"chrome"`, `"msedge"`, `"chromium"`. |
@@ -106,7 +157,7 @@ Notes:
 
 Examples:
 
-Config file (`~/.bridgic/bridgic-browser/bridgic-browser.json` or `./bridgic-browser.json`):
+Config file (`$BRIDGIC_HOME/bridgic-browser/bridgic-browser.json` or `./bridgic-browser.json`):
 ```json
 {
   "headless": false,
@@ -141,4 +192,4 @@ Details:
 - Requires an active page.
 - LocalStorage is applied to the current page origin; multi-origin storage may require navigating per origin before restore.
 - Playwright can include IndexedDB in storage state, but the wrapper does not expose that flag.
-- For long-lived login across restarts, the default `Browser()` already saves state persistently to `~/.bridgic/bridgic-browser/user_data/`. Use `Browser(user_data_dir="./my-profile")` to choose a custom profile path, or `Browser(clear_user_data=True)` to opt out of persistence.
+- For long-lived login across restarts, the default `Browser()` already saves state persistently to `$BRIDGIC_HOME/bridgic-browser/user_data/` (default `~/.bridgic/bridgic-browser/user_data/`). Use `Browser(user_data_dir="./my-profile")` to choose a custom profile path, or `Browser(clear_user_data=True)` to opt out of persistence.

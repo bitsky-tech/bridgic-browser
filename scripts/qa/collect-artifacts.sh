@@ -31,9 +31,10 @@ if [[ -f "$BRIDGIC_DAEMON_LOG_FILE" ]]; then
   cp "$BRIDGIC_DAEMON_LOG_FILE" "$DEST/daemon.log" 2>/dev/null || true
 fi
 
-# 2. Everything under ~/.bridgic/bridgic-browser/run and tmp and logs
+# 2. Everything under $BRIDGIC_HOME/bridgic-browser/run and tmp and logs
+_BH="${BRIDGIC_HOME:-$HOME/.bridgic}"
 for d in run tmp logs; do
-  src="$HOME/.bridgic/bridgic-browser/$d"
+  src="$_BH/bridgic-browser/$d"
   if [[ -d "$src" ]]; then
     mkdir -p "$DEST/bridgic-$d"
     (cd "$src" && find . -type f -size -100M -print0 2>/dev/null | \
@@ -53,7 +54,7 @@ done
   lsof -nP -iTCP:9222 -iTCP:9223 2>/dev/null
   echo
   echo "## ls run/ ##"
-  ls -la "$HOME/.bridgic/bridgic-browser/run" 2>/dev/null
+  ls -la "$_BH/bridgic-browser/run" 2>/dev/null
 } > "$DEST/process-snapshot.txt" 2>&1
 
 # 4. Versions

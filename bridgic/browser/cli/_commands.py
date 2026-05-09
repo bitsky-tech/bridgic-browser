@@ -221,7 +221,7 @@ def cmd_info() -> None:
 @click.option("-l", "--limit", default=10000, type=click.IntRange(min=1),
               help="Maximum number of characters to return (default: 10000).")
 @click.option("-s", "--file", default=None, type=click.Path(),
-              help="File path to save full snapshot. When provided, snapshot is always saved to this file. Default: auto-generated in ~/.bridgic/bridgic-browser/snapshot/ (only when over limit).")
+              help="File path to save full snapshot. When provided, snapshot is always saved to this file. Default: auto-generated in $BRIDGIC_HOME/bridgic-browser/snapshot/ (only when over limit).")
 def cmd_snapshot(interactive: bool, full_page: bool, limit: int, file: str | None) -> None:
     """Get an accessibility tree representation of the current page with refs (like 37edb785, 07eabf1e)."""
     try:
