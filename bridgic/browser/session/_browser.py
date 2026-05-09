@@ -3199,11 +3199,15 @@ Before you return the element ref, reason about the state and elements for a sen
                 # pre-existing tabs. Use CDPSession to navigate directly.
                 await self._cdp_navigate_history(page, delta=-1)
             else:
+                url_before = page.url
                 response = await asyncio.wait_for(
                     page.go_back(wait_until="domcontentloaded"),
                     timeout=20.0,
                 )
-                if response is None:
+                # response is None for same-document navigations (e.g. anchor
+                # hash changes) AND when there is genuinely no history entry.
+                # Distinguish the two by checking whether the URL changed.
+                if response is None and page.url == url_before:
                     _raise_state_error(
                         "Cannot navigate back: no previous page in history",
                         code="NO_HISTORY_ENTRY",
@@ -3247,11 +3251,12 @@ Before you return the element ref, reason about the state and elements for a sen
             if self._is_cdp_borrowed and self._context:
                 await self._cdp_navigate_history(page, delta=+1)
             else:
+                url_before = page.url
                 response = await asyncio.wait_for(
                     page.go_forward(wait_until="domcontentloaded"),
                     timeout=20.0,
                 )
-                if response is None:
+                if response is None and page.url == url_before:
                     _raise_state_error(
                         "Cannot navigate forward: no forward page in history",
                         code="NO_HISTORY_ENTRY",
