@@ -248,9 +248,32 @@ BRIDGIC_HOME=/tmp/b2 bridgic-browser reload   # 刷新页面以应用导入的 c
 # 实例 B 现在已使用与实例 A 相同的会话完成登录
 ```
 
-导出的 JSON 文件包含浏览器访问过的所有域的全部 cookies（包括 HttpOnly / Secure 属性的）和 localStorage 条目。同一个文件也可以通过 SDK 的 `Browser.restore_storage_state(path)` 导入。
+导出的 JSON 文件包含浏览器访问过的所有域的全部 cookies（包括 HttpOnly / Secure 属性的）和 localStorage 条目。
 
 存储状态文件**跨模式兼容**——可以从 headed 会话导出后导入到 headless 会话中使用（反之亦然），登录态会完整保留。这在需要认证的自动化场景中特别实用：先在 headed 模式下手动登录（处理验证码、2FA 等交互），导出存储状态，之后在 headless 自动化运行中直接复用。
+
+**SDK 用法：**
+
+```python
+import asyncio
+from bridgic.browser import Browser
+
+async def main():
+    # 1. 导出：在有头模式下交互登录，然后保存存储状态
+    async with Browser(headless=False) as browser:
+        await browser.navigate_to("https://github.com")
+        # ... 在浏览器中完成登录 ...
+        await browser.save_storage_state("/tmp/github-login.json")
+
+    # 2. 导入：在新的（无头）实例中复用登录会话
+    async with Browser(headless=True, user_data_dir="/tmp/sdk-profile") as browser:
+        await browser.restore_storage_state("/tmp/github-login.json")
+        await browser.navigate_to("https://github.com")
+        snap = await browser.get_snapshot(interactive=True)
+        print(snap.tree)  # Dashboard — 已登录
+
+asyncio.run(main())
+```
 
 #### CDP 模式（连接已有浏览器）
 

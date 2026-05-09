@@ -249,9 +249,32 @@ BRIDGIC_HOME=/tmp/b2 bridgic-browser reload   # apply the imported cookies
 # Instance B is now logged in with the same session as instance A
 ```
 
-The exported JSON file contains all cookies (including HttpOnly / Secure) and localStorage entries for every origin the browser has visited. The same file can be imported into the SDK via `Browser.restore_storage_state(path)`.
+The exported JSON file contains all cookies (including HttpOnly / Secure) and localStorage entries for every origin the browser has visited.
 
 The storage state file is **cross-mode compatible** — you can export from a headed session and import into a headless one (or vice versa), and the login session will carry over. This is especially useful for automating workflows that require authentication: log in once in headed mode where you can interact with CAPTCHAs and 2FA prompts, export the storage state, and then reuse it in headless automation runs.
+
+**SDK usage:**
+
+```python
+import asyncio
+from bridgic.browser import Browser
+
+async def main():
+    # 1. Export: log in interactively, then save storage state
+    async with Browser(headless=False) as browser:
+        await browser.navigate_to("https://github.com")
+        # ... complete login in the browser ...
+        await browser.save_storage_state("/tmp/github-login.json")
+
+    # 2. Import: reuse the login session in a new (headless) instance
+    async with Browser(headless=True, user_data_dir="/tmp/sdk-profile") as browser:
+        await browser.restore_storage_state("/tmp/github-login.json")
+        await browser.navigate_to("https://github.com")
+        snap = await browser.get_snapshot(interactive=True)
+        print(snap.tree)  # Dashboard — logged in
+
+asyncio.run(main())
+```
 
 #### CDP Mode (Connect to Existing Browser)
 
