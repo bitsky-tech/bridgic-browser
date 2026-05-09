@@ -13,7 +13,7 @@
 - **语义不变的快照** — 基于无障碍树与专门设计的 ref 生成算法，保证元素 ref 在页面重载后仍可对应同一元素
 - **Skills** — 用于引导探索与代码生成；兼容多数编程类智能体
 - **隐身模式（默认开启）** — 模式感知反检测策略：headless 模式使用 50+ Chrome 参数 + JS 补丁；headed 模式仅使用 ~11 个最小 flag，与真实 Chrome 指纹一致
-- **持久化与临时会话** — 默认持久化 profile（`~/.bridgic/bridgic-browser/user_data/`）；传入 `clear_user_data=True` 可开启临时会话（无 profile）
+- **持久化与临时会话** — 默认持久化 profile（`$BRIDGIC_HOME/bridgic-browser/user_data/`，默认 `~/.bridgic/...`）；传入 `clear_user_data=True` 可开启临时会话（无 profile）
 - **嵌套 iframe 支持** — 支持在多层嵌套 iframe 内对 DOM 元素进行操作
 
 ### 快速开始
@@ -394,7 +394,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `go_back()` / `go_forward()` - 浏览器历史导航
 
 **快照（1 个工具）：**
-- `get_snapshot_text(limit=10000, interactive=False, full_page=True, file=None)` - 获取供 LLM 使用的页面状态字符串（带 ref 的无障碍树）。**limit**（默认 10000）控制最多返回的字符数。当快照超过 limit 或显式提供了 **file** 时，完整内容会保存到 **file**（若为 `None` 且超限则自动生成至 `~/.bridgic/bridgic-browser/snapshot/`），仅返回包含文件路径的提示。**interactive** 与 **full_page** 与 `get_snapshot` 一致（仅交互元素或默认全页）。
+- `get_snapshot_text(limit=10000, interactive=False, full_page=True, file=None)` - 获取供 LLM 使用的页面状态字符串（带 ref 的无障碍树）。**limit**（默认 10000）控制最多返回的字符数。当快照超过 limit 或显式提供了 **file** 时，完整内容会保存到 **file**（若为 `None` 且超限则自动生成至 `$BRIDGIC_HOME/bridgic-browser/snapshot/`），仅返回包含文件路径的提示。**interactive** 与 **full_page** 与 `get_snapshot` 一致（仅交互元素或默认全页）。
 
 **元素交互（13 个工具）- 通过 ref：**
 - `click_element_by_ref(ref)` - 点击元素
@@ -546,7 +546,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 ```python
 from bridgic.browser.session import Browser
 
-# 持久化会话（默认 — profile 保存至 ~/.bridgic/bridgic-browser/user_data/）
+# 持久化会话（默认 — profile 保存至 $BRIDGIC_HOME/bridgic-browser/user_data/）
 browser = Browser(
     headless=True,
     viewport={"width": 1600, "height": 900},

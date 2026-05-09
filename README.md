@@ -13,7 +13,7 @@
 - **Snapshot with Semantic Invariance** - A representation of page snapshot based on accessibility tree and a specially designed ref-generation algorithm that ensures element refs remain unchanged across page reloads
 - **Skills** - Used for guided exploration and code generation; Compatible with most of coding agents
 - **Stealth Mode (Enabled by Default)** - Mode-aware anti-detection: 50+ Chrome args + JS patches in headless mode; minimal ~11 flags in headed mode to match real Chrome fingerprint
-- **Persistent & Ephemeral Sessions** - Persistent profile by default (`~/.bridgic/bridgic-browser/user_data/`); pass `clear_user_data=True` for an ephemeral session with no profile
+- **Persistent & Ephemeral Sessions** - Persistent profile by default (`$BRIDGIC_HOME/bridgic-browser/user_data/`, default `~/.bridgic/...`); pass `clear_user_data=True` for an ephemeral session with no profile
 - **Nested iframe Support** - Supports DOM element operations within multi-level nested iframes
 
 ### Quick Start
@@ -395,7 +395,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `go_back()` / `go_forward()` - Browser history navigation
 
 **Snapshot (1 tool):**
-- `get_snapshot_text(limit=10000, interactive=False, full_page=True, file=None)` - Get page state string for LLM (accessibility tree with refs). **limit** (default 10000) controls the maximum characters returned. When the snapshot exceeds limit or **file** is explicitly provided, full content is saved to **file** (auto-generated under `~/.bridgic/bridgic-browser/snapshot/` if `None` and over limit) and only a notice with the file path is returned. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default).
+- `get_snapshot_text(limit=10000, interactive=False, full_page=True, file=None)` - Get page state string for LLM (accessibility tree with refs). **limit** (default 10000) controls the maximum characters returned. When the snapshot exceeds limit or **file** is explicitly provided, full content is saved to **file** (auto-generated under `$BRIDGIC_HOME/bridgic-browser/snapshot/` if `None` and over limit) and only a notice with the file path is returned. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default).
 
 **Element Interaction (13 tools) - by ref:**
 - `click_element_by_ref(ref)` - Click element
@@ -547,7 +547,7 @@ The main class for browser automation with automatic launch mode selection:
 ```python
 from bridgic.browser.session import Browser
 
-# Persistent session (default — profile saved to ~/.bridgic/bridgic-browser/user_data/)
+# Persistent session (default — profile saved to $BRIDGIC_HOME/bridgic-browser/user_data/)
 browser = Browser(
     headless=True,
     viewport={"width": 1600, "height": 900},
