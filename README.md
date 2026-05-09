@@ -177,7 +177,7 @@ Browser options are automatically loaded from the following sources (both CLI da
 | Source | Example |
 |--------|---------|
 | Defaults | `headless=True`, `clear_user_data=False` (persistent profile) |
-| `~/.bridgic/bridgic-browser/bridgic-browser.json` | User-level persistent config |
+| `$BRIDGIC_HOME/bridgic-browser/bridgic-browser.json` | User-level persistent config (default `~/.bridgic/...`) |
 | `./bridgic-browser.json` | Project-local config (in cwd at daemon start) |
 | Environment variables | See `skills/bridgic-browser/references/env-vars.md` |
 
@@ -206,6 +206,28 @@ BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open 
 # One-shot ephemeral session (no persistent profile)
 BRIDGIC_BROWSER_JSON='{"clear_user_data":true}' bridgic-browser open URL
 ```
+
+#### Multi-Instance Isolation (`BRIDGIC_HOME`)
+
+By default all state lives under `~/.bridgic`. Set `BRIDGIC_HOME` to run multiple independent daemon instances in parallel — each gets its own socket, logs, user data, and config:
+
+```bash
+# Instance 1 (default)
+bridgic-browser open https://site-a.com
+
+# Instance 2 (separate home)
+BRIDGIC_HOME=/tmp/b2 bridgic-browser open https://site-b.com
+
+# Each instance operates independently
+bridgic-browser snapshot                        # site-a snapshot
+BRIDGIC_HOME=/tmp/b2 bridgic-browser snapshot   # site-b snapshot
+
+# Close each instance separately
+bridgic-browser close
+BRIDGIC_HOME=/tmp/b2 bridgic-browser close
+```
+
+For SDK multi-instance isolation within the same process, use `Browser(user_data_dir=...)` per instance. For full process-level isolation, set `BRIDGIC_HOME` before spawning a subprocess. See `skills/bridgic-browser/references/env-vars.md` for details.
 
 #### CDP Mode (Connect to Existing Browser)
 

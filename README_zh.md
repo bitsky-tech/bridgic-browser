@@ -177,7 +177,7 @@ if __name__ == "__main__":
 | 来源 | 示例 |
 |--------|---------|
 | 默认值 | `headless=True`，`clear_user_data=False`（持久化 profile） |
-| `~/.bridgic/bridgic-browser/bridgic-browser.json` | 用户级持久配置 |
+| `$BRIDGIC_HOME/bridgic-browser/bridgic-browser.json` | 用户级持久配置（默认 `~/.bridgic/...`） |
 | `./bridgic-browser.json` | 项目本地配置（daemon 启动时的工作目录） |
 | 环境变量 | 见 `skills/bridgic-browser/references/env-vars.md` |
 
@@ -205,6 +205,28 @@ BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open 
 # 单次临时会话（无持久化 profile）
 BRIDGIC_BROWSER_JSON='{"clear_user_data":true}' bridgic-browser open URL
 ```
+
+#### 多实例隔离（`BRIDGIC_HOME`）
+
+默认所有状态存储在 `~/.bridgic` 下。设置 `BRIDGIC_HOME` 可同时运行多个独立的 daemon 实例——各自拥有独立的 socket、日志、用户数据和配置：
+
+```bash
+# 实例 1（默认）
+bridgic-browser open https://site-a.com
+
+# 实例 2（独立 home 目录）
+BRIDGIC_HOME=/tmp/b2 bridgic-browser open https://site-b.com
+
+# 各实例独立操作
+bridgic-browser snapshot                        # site-a 快照
+BRIDGIC_HOME=/tmp/b2 bridgic-browser snapshot   # site-b 快照
+
+# 分别关闭各实例
+bridgic-browser close
+BRIDGIC_HOME=/tmp/b2 bridgic-browser close
+```
+
+SDK 同进程多实例隔离使用 `Browser(user_data_dir=...)` 为每个实例指定不同的 profile 路径。完全的进程级隔离则在启动子进程前设置 `BRIDGIC_HOME` 环境变量。详见 `skills/bridgic-browser/references/env-vars.md`。
 
 #### CDP 模式（连接已有浏览器）
 
