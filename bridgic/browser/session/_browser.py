@@ -947,12 +947,18 @@ class Browser:
         """
         if not self.stealth_enabled or page is None:
             return
+        _dbg = None
         try:
             _dbg = await context.new_cdp_session(page)
             await _dbg.send("Debugger.setSkipAllPauses", {"skip": True})
-            await _dbg.detach()
         except Exception:
             logger.debug("Failed to set Debugger.setSkipAllPauses", exc_info=True)
+        finally:
+            if _dbg is not None:
+                try:
+                    await _dbg.detach()
+                except Exception:
+                    pass
 
     async def _start(self) -> None:
         """Start the browser.
@@ -3193,10 +3199,16 @@ Before you return the element ref, reason about the state and elements for a sen
                 # pre-existing tabs. Use CDPSession to navigate directly.
                 await self._cdp_navigate_history(page, delta=-1)
             else:
-                await asyncio.wait_for(
+                response = await asyncio.wait_for(
                     page.go_back(wait_until="domcontentloaded"),
                     timeout=20.0,
                 )
+                if response is None:
+                    _raise_state_error(
+                        "Cannot navigate back: no previous page in history",
+                        code="NO_HISTORY_ENTRY",
+                        retryable=False,
+                    )
             result = f"Navigated back to: {page.url}"
             logger.info(f"[go_back] done {result}")
             return result
@@ -3205,10 +3217,6 @@ Before you return the element ref, reason about the state and elements for a sen
         except Exception as e:
             error_msg = f"Failed to navigate back: {str(e)}"
             logger.error(f"[go_back] {error_msg}")
-            if "Cannot navigate" in str(e) or "no previous entry" in str(e):
-                result = "Cannot navigate back: no previous page in history"
-                logger.info(f"[go_back] {result}")
-                _raise_state_error(result, code="NO_HISTORY_ENTRY", retryable=False)
             _raise_operation_error(error_msg)
 
     async def go_forward(self) -> str:
@@ -3239,10 +3247,16 @@ Before you return the element ref, reason about the state and elements for a sen
             if self._is_cdp_borrowed and self._context:
                 await self._cdp_navigate_history(page, delta=+1)
             else:
-                await asyncio.wait_for(
+                response = await asyncio.wait_for(
                     page.go_forward(wait_until="domcontentloaded"),
                     timeout=20.0,
                 )
+                if response is None:
+                    _raise_state_error(
+                        "Cannot navigate forward: no forward page in history",
+                        code="NO_HISTORY_ENTRY",
+                        retryable=False,
+                    )
             result = f"Navigated forward to: {page.url}"
             logger.info(f"[go_forward] done {result}")
             return result
@@ -3504,6 +3518,13 @@ Before you return the element ref, reason about the state and elements for a sen
                         ),
                         timeout=30.0,
                     )
+                    if raw.get("exceptionDetails"):
+                        exc_desc = raw.get("result", {}).get("description", "")
+                        exc_text = raw["exceptionDetails"].get("text", "")
+                        _raise_operation_error(
+                            f"JavaScript error: {exc_desc or exc_text}",
+                            code="JS_EXCEPTION",
+                        )
                     result_obj = raw.get("result", {})
                     if "value" in result_obj:
                         result = result_obj["value"]
@@ -7443,7 +7464,7 @@ Before you return the element ref, reason about the state and elements for a sen
         try:
             # Use CDP Page.getLayoutMetrics instead of page.evaluate() — avoids the
             # Playwright _mainContext() hang on pre-existing tabs in CDP borrowed mode.
-            _session = await self._context.new_cdp_session(page)
+            _session = await page.context.new_cdp_session(page)
             try:
                 _metrics = await asyncio.wait_for(
                     _session.send("Page.getLayoutMetrics"),

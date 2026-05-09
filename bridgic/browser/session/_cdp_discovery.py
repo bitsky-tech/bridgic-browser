@@ -13,6 +13,8 @@ import sys
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, urlunparse
 
+from bridgic.browser import _timeouts
+
 logger = logging.getLogger(__name__)
 
 
@@ -72,7 +74,7 @@ def _read_devtools_active_port(base: str) -> Optional[str]:
     return None
 
 
-def _probe_cdp_alive(ws_url: str, timeout: float = 2.0) -> bool:
+def _probe_cdp_alive(ws_url: str, timeout: float = _timeouts.CDP_PROBE_S) -> bool:
     """Return True if the CDP port behind ``ws_url`` is accepting TCP connections.
 
     Chrome normally removes its DevToolsActivePort file on graceful exit, but a

@@ -1253,7 +1253,7 @@ class TestInvalidatePageState:
         browser = Browser()
         fake_page = MagicMock()
         fake_page.url = "https://example.com/prev"
-        fake_page.go_back = AsyncMock(return_value=None)
+        fake_page.go_back = AsyncMock(return_value=MagicMock())
         browser._page = fake_page
         browser._context = MagicMock()
 
@@ -1272,7 +1272,7 @@ class TestInvalidatePageState:
         browser = Browser()
         fake_page = MagicMock()
         fake_page.url = "https://example.com/next"
-        fake_page.go_forward = AsyncMock(return_value=None)
+        fake_page.go_forward = AsyncMock(return_value=MagicMock())
         browser._page = fake_page
         browser._context = MagicMock()
 

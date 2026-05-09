@@ -165,7 +165,7 @@ async def test_start_video_uses_window_inner_dimensions_not_viewport_size():
         "cssVisualViewport": {"clientWidth": 1366, "clientHeight": 768},
     })
     fake_cdp_session.detach = AsyncMock()
-    browser._context.new_cdp_session = AsyncMock(return_value=fake_cdp_session)
+    fake_context.new_cdp_session = AsyncMock(return_value=fake_cdp_session)
 
     # Mock the recorder startup — this test only verifies dimension computation.
     async def _fake_start(page):
@@ -174,8 +174,8 @@ async def test_start_video_uses_window_inner_dimensions_not_viewport_size():
 
     await browser.start_video()
 
-    # CDP session was used to query dimensions.
-    browser._context.new_cdp_session.assert_awaited_once()
+    # CDP session was used to query dimensions (via page.context).
+    fake_context.new_cdp_session.assert_awaited_once()
     fake_cdp_session.send.assert_awaited_once_with("Page.getLayoutMetrics")
 
     # Recording size matches the queried dimensions, NOT the 800×600

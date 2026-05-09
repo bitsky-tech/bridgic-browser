@@ -523,6 +523,7 @@ class DownloadManager:
         self._pending_waiters.append(waiter)
 
         try:
+            deadline = asyncio.get_running_loop().time() + timeout / 1000
             # Start waiting for download
             async with page.expect_download(timeout=timeout):
                 # Perform the action that triggers download
@@ -531,7 +532,8 @@ class DownloadManager:
                     await action_result
 
             # Wait for our handler to process it and fulfil the Future.
-            return await asyncio.wait_for(waiter, timeout=timeout / 1000)
+            remaining = max(0.1, deadline - asyncio.get_running_loop().time())
+            return await asyncio.wait_for(waiter, timeout=remaining)
 
         except asyncio.TimeoutError:
             logger.warning("Download wait timed out")
