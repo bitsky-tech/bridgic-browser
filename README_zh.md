@@ -377,6 +377,8 @@ bridgic-browser open https://example.com --cdp auto
 | `http://host:port` | HTTP 发现端点 -- 向该主机的 `/json/version` 查询 |
 | `auto` | 自动扫描本地 Chrome/Chromium/Brave 配置目录（含 Canary 变体），查找活跃的 `DevToolsActivePort` 文件 |
 
+**Tab 可见性：** 连接到用户已在运行的 Chrome 后，bridgic 只看得到自己打开的页面 —— 连接时自动创建的初始空白页、`new-tab` 新建的标签，以及由这些页面派生出来的弹窗（在 `<a target="_blank">` 上**普通左键点击**、或 JavaScript `window.open()`，通过 `Page.opener()` 自动归属）。**用户用 Cmd+click（macOS）/ Ctrl+click（Win/Linux）/ 中键点击 / Cmd+T / 地址栏新开的标签*不会*被采纳** —— Cmd/Ctrl/中键点击会走 Chromium 的"背景 tab 导航"路径，opener 在 browser 进程层被剥离；Cmd+T 和地址栏开 tab 则**根本就没有** opener 关系。两种情况 bridgic 都看不到。**用户其它已存在的标签对 bridgic 的 `tabs` / `switch-tab` / `close-tab` 也是不可见的。** 这是一条隐私边界，避免 LLM 驱动的 bridgic 误切到或关闭用户的私人工作 tab。如需操作已打开的页面，请通过 bridgic 重新导航到该 URL。默认情况下，bridgic 当前 tab 派生的弹窗会自动接管为新的活动 tab（`auto_follow_popups=True`）；如需保持活动指针不动，可用 `Browser(auto_follow_popups=False)`。完整采纳对照表见 [`docs/CDP_MODE.md#tab-ownership-in-cdp-mode`](docs/CDP_MODE.md#tab-ownership-in-cdp-mode)。
+
 **关闭行为：** `bridgic-browser close` 会断开与远程浏览器的连接，但**不会**终止 Chrome 进程。浏览器继续运行，可以重新连接。
 
 **使用场景：**
@@ -669,6 +671,7 @@ browser = Browser(
 | `clear_user_data` | bool | False | True 时使用临时会话（无 profile）；False 时使用持久化 profile |
 | `stealth` | bool/StealthConfig | True | 隐身模式配置 |
 | `cdp` | str | None | 通过 CDP 连接已有 Chrome（跳过启动）。接受端口号、`ws://` / `wss://` URL、`http://host:port`、`"auto"` —— 与 CLI `--cdp` 一致 |
+| `auto_follow_popups` | bool | True | 当 bridgic 拥有的页面派生出弹窗（`<a target="_blank">` 点击、`window.open()`）时，是否自动把 `self._page` 切到弹窗。设为 False 时弹窗仍会被纳入 owned 集合，只是活动指针不动 |
 | `channel` | str | None | 浏览器通道（chrome、msedge 等） |
 | `proxy` | dict | None | 代理设置 |
 | `downloads_path` | str/Path | None | 下载目录 |

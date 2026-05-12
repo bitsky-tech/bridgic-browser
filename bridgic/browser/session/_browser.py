@@ -10,7 +10,7 @@ import tempfile
 import time
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Set, Union
 
 if TYPE_CHECKING:
     try:
@@ -306,6 +306,14 @@ class Browser:
         # running Chrome. The input is stored raw and resolved to a
         # ``ws://`` URL lazily inside ``_start()``.
         cdp: Optional[str] = None,
+        # === Owned-page tracking ===
+        # When True (default), popups spawned by bridgic-owned pages (via
+        # window.open or <a target="_blank"> clicks) are automatically
+        # adopted as owned, and `self._page` follows the popup when its
+        # opener is the current page. Set False to keep `self._page` fixed
+        # after click — popups are still adopted into the owned set but the
+        # active-page pointer is not moved.
+        auto_follow_popups: Optional[bool] = None,
         # === Browser launch parameters (commonly used) ===
         channel: Optional[str] = None,
         executable_path: Optional[Union[str, Path]] = None,
@@ -335,6 +343,10 @@ class Browser:
         # Always pop named-param keys from _cfg so they don't leak into
         # _extra_kwargs (which would corrupt get_config() and Playwright options).
         cdp = cdp if cdp is not None else _cfg.pop('cdp', None)
+        auto_follow_popups = (
+            auto_follow_popups if auto_follow_popups is not None
+            else _cfg.pop('auto_follow_popups', True)
+        )
         # NOTE: we no longer run resolve_cdp_input() here. It can hit the
         # network (/json/version probes for port/http/auto inputs), which
         # would make `Browser(cdp="9222")` block the constructor —
@@ -365,11 +377,12 @@ class Browser:
         color_scheme = color_scheme if color_scheme is not None else _cfg.pop('color_scheme', None)
         # Remove any named-param keys that were skipped above (explicit value won)
         for _named_key in (
-            'cdp', 'headless', 'stealth', 'viewport', 'user_data_dir',
-            'clear_user_data', 'channel', 'executable_path', 'proxy', 'timeout',
-            'slow_mo', 'args', 'ignore_default_args', 'downloads_path', 'devtools',
-            'user_agent', 'locale', 'timezone_id', 'ignore_https_errors',
-            'extra_http_headers', 'offline', 'color_scheme',
+            'cdp', 'auto_follow_popups', 'headless', 'stealth', 'viewport',
+            'user_data_dir', 'clear_user_data', 'channel', 'executable_path',
+            'proxy', 'timeout', 'slow_mo', 'args', 'ignore_default_args',
+            'downloads_path', 'devtools', 'user_agent', 'locale',
+            'timezone_id', 'ignore_https_errors', 'extra_http_headers',
+            'offline', 'color_scheme',
         ):
             _cfg.pop(_named_key, None)
 
@@ -434,6 +447,28 @@ class Browser:
         # Whether bridgic created the CDP context (vs borrowing an existing one).
         # When True, close() will close the context; when False it only disconnects.
         self._cdp_context_owned = False
+
+        # Owned-page tracking.
+        # `_owned_pages` holds the set of pages bridgic considers part of its
+        # working tree: pages it created via `_new_page()` plus popups whose
+        # opener chain leads back to such a page. All public tab operations
+        # (`get_pages`, `get_tabs`, `switch_tab`, `close_tab`, fallback after
+        # close) filter through this set so that, in CDP-borrowed mode, the
+        # user's private tabs are invisible to bridgic / the LLM.
+        #
+        # In non-CDP modes (launch / persistent / CDP owned), the start path
+        # seeds every page in the context into this set, so the filter
+        # degenerates to identity and behaviour matches pre-refactor semantics.
+        self._owned_pages: Set[Page] = set()
+        # LRU stack of recently-focused owned pages. Most recently focused at
+        # the tail. Used as a fallback selector when `_close_page` closes the
+        # current page and the closed page's `opener()` is unavailable. Stale
+        # entries are pruned by `_on_owned_page_close` when pages die.
+        self._focus_stack: List[Page] = []
+        # Constructor opt-in for popup follow behaviour. When True, a popup
+        # whose `opener() is self._page` becomes the new `self._page`. Set to
+        # False to keep `self._page` fixed (popups still join `_owned_pages`).
+        self._auto_follow_popups: bool = bool(auto_follow_popups)
 
         # Browser launch parameters
         self._channel = channel
@@ -1190,6 +1225,16 @@ class Browser:
                 # this is a no-op cost.
                 existing_count = len(self._context.pages)
                 self._page = await self._context.new_page()
+                # Mark bridgic's tab as owned. In borrowed mode, the
+                # pre-existing user tabs (the `existing_count` set) are
+                # deliberately NOT marked — they stay invisible to bridgic's
+                # public tab API. In owned-context mode there are no
+                # pre-existing tabs, so only this new page enters ownership.
+                self._mark_owned(self._page)
+                # Listen for popups so children of owned tabs get adopted
+                # automatically (e.g. clicking a `<a target=_blank>` in
+                # bridgic's tab spawns a popup whose `opener()` is our tab).
+                self._context.on("page", self._on_new_page)
                 logger.info(
                     "[CDP] connected; created new bridgic tab "
                     "(borrowed_context=%s, preserved_existing_tabs=%d)",
@@ -1272,6 +1317,16 @@ class Browser:
                 self._page = pages[0]
             else:
                 self._page = await self._context.new_page()
+
+            # Seed ownership: in non-CDP modes (launch / persistent) bridgic
+            # owns the whole browser, so every page in the context — including
+            # the initial auto-opened one from launch_persistent_context — is
+            # marked owned. New popups registered via the listener below
+            # inherit ownership only if their opener is already owned, which
+            # for these modes is always the case.
+            for _p in self._context.pages:
+                self._mark_owned(_p)
+            self._context.on("page", self._on_new_page)
 
             # R1 + R3 are headless-only — see `_apply_r1_ua_cleanup` and
             # `_arm_worker_stealth` docstrings for why we never touch UA / worker
@@ -1592,6 +1647,17 @@ class Browser:
         # below any `await`.
         self._closing = True
 
+        # Detach the owned-page tracking listener early so any popup that
+        # attaches during shutdown does not schedule an adoption task that
+        # could reverse-overwrite `self._page` after we null it below.
+        # Matches the precedent set by the video page_listener cleanup later
+        # in this method.
+        if self._context is not None:
+            try:
+                self._context.remove_listener("page", self._on_new_page)
+            except Exception:
+                pass
+
         # Ensure a close session directory exists so trace/video artifacts are
         # grouped together (e.g. close-{ts}-{rand}/trace.zip, video_1.webm).
         # The CLI daemon calls inspect_pending_close_artifacts() before close(),
@@ -1774,6 +1840,20 @@ class Browser:
         # own handle — no dispatch can mistake this for a "not yet started"
         # state because `_closing` has been True since the very top.
         self._page = None
+        # Clear owned-page tracking now that every page is closed. Mirrors
+        # the `self._page = None` reset above. Without this, a re-`_start()`
+        # on the same Browser instance would start with stale Page references
+        # in `_owned_pages` / `_focus_stack`.
+        #
+        # Note: per-page `_on_owned_page_close` listeners (registered by
+        # `_mark_owned`) are NOT explicitly removed here. They will fire once
+        # as each page closes — `set.discard()` is a no-op on an empty set,
+        # and `list.remove()` ValueError is caught by `_on_owned_page_close`.
+        # Walking owned_pages here to remove listeners would race with the
+        # batched `page.close()` above (each close may already have fired the
+        # listener); keep the simpler clear() + post-fire-no-op pattern.
+        self._owned_pages.clear()
+        self._focus_stack.clear()
 
         # Close context.
         # - Launch / persistent: close context (auto-closes browser).
@@ -2034,9 +2114,7 @@ class Browser:
 
             if not self._page:
                 # All tabs were closed (e.g. via close_tab); _context is still alive.
-                logger.info("No page is open, creating a new page in existing context")
-                self._page = await self._context.new_page()
-                await self._switch_video_to_page(self._page)
+                await self._recover_page_in_existing_context()
 
             kwargs: Dict[str, Any] = {"wait_until": wait_until}
             if timeout is not None:
@@ -2074,6 +2152,26 @@ class Browser:
             logger.error(f"[navigate_to] {error_msg}")
             _raise_operation_error(error_msg)
 
+    async def _recover_page_in_existing_context(self) -> None:
+        """Re-create `self._page` after a full close-all in the same context.
+
+        Called by `navigate_to` when `self._page is None` but `self._context`
+        is alive (typical post-`close_tab` state when all owned tabs were
+        closed). Must register the new page as owned — without this the page
+        is invisible to `tabs` / `switch_tab` (they filter by `_owned_pages`)
+        while `close_tab` (which reads `self._page` directly) still sees it,
+        leaving a confusing "ghost page" state. The `context.on("page")`
+        listener does NOT rescue this: `_maybe_adopt_page` only adopts pages
+        whose `opener()` is already owned, and `_context.new_page()` produces
+        `opener() is None`.
+        """
+        if self._context is None:
+            return
+        logger.info("No page is open, creating a new page in existing context")
+        self._page = await self._context.new_page()
+        self._mark_owned(self._page)
+        await self._switch_video_to_page(self._page)
+
     async def _new_page(
         self,
         url: Optional[str] = None,
@@ -2086,6 +2184,10 @@ class Browser:
                 code="NO_BROWSER_CONTEXT",
             )
         self._page = await self._context.new_page()
+        # Pages bridgic creates directly are unconditionally owned. This is
+        # the primary path that makes `new_tab` work — `_on_new_page` will
+        # also fire from the context listener, but `_mark_owned` is idempotent.
+        self._mark_owned(self._page)
         await self._switch_video_to_page(self._page)
         if url:
             await self.navigate_to(url, wait_until=wait_until, timeout=timeout)
@@ -2205,17 +2307,211 @@ class Browser:
         results = await asyncio.gather(*(_safe_desc(p) for p in pages))
         return [d for d in results if d is not None]
 
-    def get_pages(self) -> List[Page]:
-        """Return all pages in the current browser context.
+    # ─────────────────────────────────────────────────────────────────────
+    # Owned-page tracking (see plan: _owned_pages + _focus_stack)
+    # ─────────────────────────────────────────────────────────────────────
 
-        In CDP mode bridgic operates as a guest on the remote browser, so all
-        tabs — including pre-existing user tabs and pop-ups spawned by pages
-        bridgic was driving — are part of the session and are reachable via
-        ``get_tabs`` / ``switch_tab``.
+    def _mark_owned(self, page: Optional[Page]) -> None:
+        """Register *page* as owned by bridgic.
+
+        Idempotent: re-marking an already-owned page is a no-op. Attaches a
+        page-close listener so the page is automatically removed from the
+        owned set / focus stack when it dies.
+        """
+        if page is None or page in self._owned_pages:
+            return
+        self._owned_pages.add(page)
+        self._focus_stack.append(page)
+        try:
+            page.on("close", self._on_owned_page_close)
+        except Exception:
+            # Best-effort: if listener registration fails (page already gone,
+            # mock with no `on`), we still leave it tracked — _select_fallback
+            # will gracefully skip closed pages via is_closed() checks.
+            pass
+
+    def _on_owned_page_close(self, page: Page) -> None:
+        """Page-close callback: prune `_owned_pages` and `_focus_stack`.
+
+        We intentionally do NOT touch ``self._page`` here even if it matches
+        the closed page. The explicit `_close_page` path is responsible for
+        choosing a fallback target — handling it twice (once via this listener
+        and once in `_close_page`) would cause double video/download swaps.
+        """
+        self._owned_pages.discard(page)
+        try:
+            self._focus_stack.remove(page)
+        except ValueError:
+            pass
+
+    def _on_new_page(self, page: Page) -> None:
+        """Synchronous `context.on("page")` listener.
+
+        Cannot itself await `page.opener()`, so it schedules an async task to
+        evaluate ownership. The listener returns immediately; the actual
+        decision happens in `_maybe_adopt_page`.
+        """
+        # Race guard: `close()` sets `self._closing` synchronously before any
+        # await. A popup attached just as shutdown begins must not be adopted
+        # (the task would run after `self._page = None`, then follow-switch
+        # could reverse-overwrite it).
+        if self._closing:
+            return
+        try:
+            asyncio.create_task(self._maybe_adopt_page(page))
+        except RuntimeError:
+            # No running loop — should not happen in normal Playwright flow
+            # but possible during shutdown. Drop silently.
+            pass
+
+    async def _maybe_adopt_page(self, page: Page) -> None:
+        """Decide whether a newly-attached page belongs in `_owned_pages`.
+
+        Adopts a page iff its `opener()` is already owned. This is the
+        identity-based check validated by `tests/integration/test_opener_api_probe.py`:
+        popups from owned pages have `opener()` identical to the owning Page
+        object; user-spawned popups (in CDP-borrowed mode) have an opener
+        outside the owned set; pre-existing user tabs have `opener() == None`.
+
+        If `_auto_follow_popups` is on and the opener is the current page,
+        the active page pointer is moved to the new popup (mirroring Chrome
+        UX where the just-spawned tab becomes the foreground tab).
+        """
+        # `_on_new_page` already guarded on `_closing`, but this coroutine may
+        # be scheduled before close() flipped the flag and then resume after.
+        # Re-check here so the adoption never races shutdown.
+        if self._closing:
+            return
+        if page in self._owned_pages:
+            return  # Already adopted by `_new_page()`; nothing more to do.
+        try:
+            opener = await page.opener()
+        except Exception:
+            opener = None
+        # opener() awaited — re-check the flag once more before mutating state.
+        if self._closing:
+            return
+        if opener is None or opener not in self._owned_pages:
+            return
+        self._mark_owned(page)
+        if self._auto_follow_popups and opener is self._page:
+            try:
+                await self._switch_self_page_to(page)
+            except Exception as e:
+                logger.debug("[_maybe_adopt_page] follow-switch failed: %s", e)
+
+    async def _switch_self_page_to(self, new_page: Page) -> None:
+        """Move `self._page` to *new_page*, keeping side-effects in sync.
+
+        Updates focus stack, invalidates snapshot/prefetch caches, hands the
+        video recorder over to the new page, and (in CDP-borrowed mode where
+        the download manager is page-scoped) migrates the download handlers.
+        """
+        # Shutdown guard — consistent with `_on_new_page` / `_maybe_adopt_page`.
+        # Without this, a race between adoption and `close()` could leave a
+        # dangling `_download_manager.attach_to_page(new_page)` call running
+        # after `close()` has already detached the manager.
+        if self._closing:
+            return
+        old = self._page
+        if new_page is old:
+            return
+        # Refuse to land on a dead page — extreme race where popup closes
+        # between attach and adoption. Caller treats this as a no-op; the
+        # existing `self._page` (possibly None) stays put, and the next
+        # `navigate_to` will re-establish a working page.
+        try:
+            if new_page.is_closed():
+                return
+        except Exception:
+            return
+        self._page = new_page
+        # Refresh LRU position
+        try:
+            self._focus_stack.remove(new_page)
+        except ValueError:
+            pass
+        self._focus_stack.append(new_page)
+        # Drop snapshot / prefetch caches that referred to the previous page.
+        self._invalidate_page_state()
+        # Hand the (optional) single-stream video recorder over.
+        try:
+            await self._switch_video_to_page(new_page)
+        except Exception as e:
+            logger.debug("[_switch_self_page_to] video switch failed: %s", e)
+        # CDP-borrowed mode attaches DownloadManager per-page (not per-context)
+        # to avoid hijacking the user's private downloads. Migrate handlers so
+        # downloads triggered from the followed popup still land in bridgic's
+        # downloads_path.
+        if self._is_cdp_borrowed and self._download_manager and old is not None:
+            try:
+                self._download_manager.detach_from_page(old)
+            except Exception:
+                pass
+            try:
+                self._download_manager.attach_to_page(new_page)
+            except Exception as e:
+                logger.debug(
+                    "[_switch_self_page_to] download manager re-attach failed: %s", e
+                )
+
+    async def _select_fallback_page(self, closed_page: Page) -> Optional[Page]:
+        """Pick the next `self._page` after `closed_page` is closed.
+
+        Order (first match wins):
+          1. ``closed_page.opener()`` — if still owned and alive.
+          2. Top-of-stack `_focus_stack` entry that is owned and alive.
+          3. First entry of ``get_pages()`` that is alive (in `context.pages` order).
+          4. None — caller sets `self._page = None`; next `navigate_to` will
+             create a fresh page automatically (see `navigate_to` "all tabs
+             closed" branch).
+        """
+        # 1) opener
+        opener: Optional[Page] = None
+        try:
+            opener = await closed_page.opener()
+        except Exception:
+            opener = None
+        if (
+            opener is not None
+            and opener in self._owned_pages
+            and not opener.is_closed()
+        ):
+            return opener
+        # 2) focus stack (LRU, most-recent first). Defensive copy: a
+        # concurrent page.on("close") listener could mutate `_focus_stack`
+        # during iteration (Playwright fires close events on the same loop).
+        for cand in reversed(list(self._focus_stack)):
+            if cand is closed_page:
+                continue
+            if cand in self._owned_pages and not cand.is_closed():
+                return cand
+        # 3) owned-first by context order
+        for p in self.get_pages():
+            if p is closed_page or p.is_closed():
+                continue
+            return p
+        # 4) none
+        return None
+
+    def get_pages(self) -> List[Page]:
+        """Return all bridgic-owned pages in the current context.
+
+        In non-CDP modes every page in the context is seeded as owned at
+        `_start()` time, so this is effectively equivalent to
+        ``self._context.pages``.
+
+        In CDP-borrowed mode, pre-existing user tabs are deliberately NOT
+        owned, so they are filtered out — the LLM / CLI only sees pages
+        bridgic itself opened, plus popups spawned from those pages.
+
+        Order is preserved from ``self._context.pages`` (Chromium target
+        attach order), so callers iterating for "first owned tab" get a
+        stable result.
         """
         if not self._context:
             return []
-        return self._context.pages
+        return [p for p in self._context.pages if p in self._owned_pages]
 
     async def switch_to_page(self, page_id: str) -> tuple[bool, str]:
         """Switch to a page by its page_id.
@@ -2240,6 +2536,12 @@ class Browser:
             return False, f"Page with page_id '{page_id}' not found"
         await page.bring_to_front()
         self._page = page
+        # Refresh LRU focus position so close-fallback prefers this tab next.
+        try:
+            self._focus_stack.remove(page)
+        except ValueError:
+            pass
+        self._focus_stack.append(page)
         await self._switch_video_to_page(page)
         # Clear snapshot cache after switching pages
         self._invalidate_page_state()
@@ -2276,32 +2578,61 @@ class Browser:
             logger.warning("Page is None, can't close")
             return False, "Page is None, can't close"
 
-        # If the page being closed is the one currently recorded,
-        # switch the single-stream recorder to a remaining page BEFORE
-        # closing — the CDP session is bound to this page and will die
-        # once the page is gone.
+        # Resolve the successor page BEFORE closing — `closed_page.opener()`
+        # is reliable while the page is still alive, and we want video +
+        # self._page to land on the SAME target (consistency over divergence).
+        is_current_page = self._page == page
+        candidate = (
+            await self._select_fallback_page(page) if is_current_page else None
+        )
+
+        # If the page being closed is the one currently recorded, hand the
+        # single-stream recorder over (or detach if no successor exists).
+        # CDP session is bound to this page and dies once the page is gone,
+        # so this must happen BEFORE `page.close()`.
+        #
+        # The video target tracks where `self._page` ends up *after* this
+        # close completes: `candidate` if the closed page IS the current one,
+        # otherwise the unchanged `self._page` (closing some other owned tab
+        # like a popup must not stop the recording on the page the user is
+        # actually driving).
         if (
             self._video_recorder is not None
             and not self._video_recorder.is_stopped
             and self._video_recorder.current_page == page
         ):
-            remaining = [p for p in self.get_pages() if p != page and not p.is_closed()]
-            if remaining:
+            video_target: Optional[Page]
+            if is_current_page:
+                video_target = candidate
+            else:
+                video_target = (
+                    self._page if self._page is not None and not self._page.is_closed()
+                    else None
+                )
+            if video_target is not None and not video_target.is_closed():
                 try:
-                    await self._video_recorder.switch_page(remaining[0])
-                    logger.debug("[_close_page] video switched to remaining page")
+                    await self._video_recorder.switch_page(video_target)
+                    logger.debug("[_close_page] video switched to successor page")
                 except Exception as e:
                     logger.debug("[_close_page] video switch error: %s", e)
             else:
-                # Last page — stop screencast but keep ffmpeg alive for finalize.
+                # No successor — stop screencast but keep ffmpeg alive for finalize.
                 await self._video_recorder.detach_screencast()
 
         await page.close()
 
-        # If the closed page is the current page, switch to another.
-        if self._page == page:
-            pages = self.get_pages()
-            self._page = pages[0] if pages else None
+        # Prune ownership / focus bookkeeping. The page.on("close") listener
+        # registered by `_mark_owned` will also fire, but it can race with the
+        # block below — discard explicitly here for determinism.
+        self._owned_pages.discard(page)
+        try:
+            self._focus_stack.remove(page)
+        except ValueError:
+            pass
+
+        # If the closed page was the current page, install the successor.
+        if is_current_page:
+            self._page = candidate
             # Clear snapshot cache
             self._invalidate_page_state()
 
@@ -3820,6 +4151,12 @@ Before you return the element ref, reason about the state and elements for a sen
         str
             Newline-separated list of tab info strings, each containing
             page_id, url, and title. The active tab is marked with "(active)".
+            In CDP-borrowed mode, when the connected browser has tabs that
+            bridgic does not own, a leading `# Note: ...` line followed by a
+            blank line is prepended to explain the hidden count — only in
+            that scenario, never in launch / persistent / CDP-owned modes.
+            The note is placed first so an LLM reading the output linearly
+            sees the privacy boundary before parsing tab rows.
         """
         try:
             logger.info(f"[get_tabs] start")
@@ -3833,10 +4170,34 @@ Before you return the element ref, reason about the state and elements for a sen
                 if desc.page_id == current_id:
                     line += " (active)"
                 lines.append(line)
-            logger.info(f"[get_tabs] done tabs={len(lines)}")
-            if not lines:
-                return "No open tabs"
-            return "\n".join(lines)
+            # CDP-borrowed hint: only emit when ownership actually filters
+            # something out. The diff `context.pages - get_pages()` is the
+            # number of pages the user has open that bridgic deliberately
+            # hides. Anything else (non-CDP, owned-context CDP, fresh attach
+            # with no user tabs) silently shows the full list.
+            hidden = 0
+            if self._is_cdp_borrowed and self._context is not None:
+                hidden = max(0, len(self._context.pages) - len(self.get_pages()))
+            logger.info(f"[get_tabs] done tabs={len(lines)} hidden={hidden}")
+            tabs_text = "\n".join(lines) if lines else "No open tabs"
+            if hidden > 0:
+                if lines:
+                    note = (
+                        f"# Note: {hidden} other tab(s) in the connected "
+                        "browser are not controlled by bridgic-browser and are "
+                        "hidden from this list."
+                    )
+                else:
+                    note = (
+                        f"# Note: the connected browser has {hidden} tab(s), "
+                        "but none are controlled by bridgic-browser. Use "
+                        "'open <url>' or 'new-tab <url>' to start."
+                    )
+                # Note first + blank line separator: an LLM reading top-to-
+                # bottom sees the privacy boundary BEFORE the tab rows, so it
+                # won't try to switch_tab into a tab it can't see anyway.
+                return f"{note}\n\n{tabs_text}"
+            return tabs_text
         except BridgicBrowserError:
             raise
         except Exception as e:

@@ -542,3 +542,83 @@ The daemon calls `browser.inspect_pending_close_artifacts()` to pre-allocate a s
 
 ### Daemon cleanup ownership guard
 After `browser.close()` finishes, `run_daemon()` reads the run-info file and compares its `pid` field to `os.getpid()` before calling `transport.cleanup()` / `remove_run_info()`. This prevents the outgoing daemon from deleting the new daemon's socket when a `close` is followed immediately by a new command (which starts a new daemon before the old one's shutdown completes). If the run-info is gone (`None`) the old daemon is still the owner and cleans up normally.
+
+## Owned-page Tracking
+
+`Browser` maintains an internal `_owned_pages: Set[Page]` plus a parallel LRU `_focus_stack: List[Page]`. Every public tab operation (`get_pages`, `get_tabs`, `switch_tab`, `close_tab`, `_close_page` fallback) filters through this set, so callers — including the LLM/CLI — never see tabs that bridgic does not own.
+
+### Ownership rules
+
+- **CDP borrowed mode** (connected via `connect_over_cdp` into a context that already exists): only pages bridgic *creates* are owned. The pre-existing user tabs stay invisible.
+- **All other modes** (CDP-owned-context fallback, persistent, ephemeral): every page in the context at `_start()` time is seeded as owned (`for _p in self._context.pages: self._mark_owned(_p)`). bridgic owns the browser, so this is effectively `_owned_pages == set(context.pages)` and the filter degenerates to identity.
+- **Popups** are adopted iff `await new_page.opener()` is already owned. The mechanism: a `context.on("page", self._on_new_page)` listener schedules an async task that queries `opener()`. Identity-based check (`opener in self._owned_pages`) — validated by `tests/integration/test_opener_api_probe.py` to be reliable in both launch and CDP-borrowed modes. Whether `opener()` returns the parent or `None` is itself decided by Chromium's navigation disposition, not by who triggered the click — see [Adoption truth table](#adoption-truth-table-cdp-borrowed-mode) below for the full matrix.
+- **Auto-follow**: when `_auto_follow_popups=True` (default) AND the popup's opener is `self._page`, `self._page` is moved to the popup. This mirrors Chrome's UX where a just-spawned tab takes the foreground.
+
+### `_close_page` fallback order
+
+When `self._page` is closed, `_select_fallback_page` returns the first match from:
+
+1. `await closed_page.opener()` if still owned and alive (Chrome's natural "go back to the spawner" semantics).
+2. Top-down scan of `_focus_stack` for an owned & alive page.
+3. First entry of `get_pages()` in `context.pages` order.
+4. `None` — caller sets `self._page = None`; next `navigate_to` auto-creates a fresh page (existing branch in `navigate_to`).
+
+### Lifecycle wiring
+
+- `_mark_owned(page)` is idempotent: it adds to set + stack, then registers a `page.on("close", self._on_owned_page_close)` callback for automatic pruning.
+- `_on_owned_page_close` only prunes bookkeeping; it deliberately does NOT touch `self._page` — the `_close_page` flow handles that, and double-handling would cause double video/download swaps.
+- `_switch_self_page_to(new_page)` consolidates "move self._page" side effects: focus stack push, `_invalidate_page_state()`, `_switch_video_to_page()`, and (in CDP-borrowed mode only) `DownloadManager.detach_from_page(old) + attach_to_page(new)` so popups don't leak downloads into the user's Chrome default path.
+
+### Adoption truth table (CDP borrowed mode)
+
+Adoption requires **both** conditions:
+
+1. `Page.opener()` returns a non-`None` parent — i.e. Chromium's CDP `Target.attachedToTarget.openerId` was populated at attach time.
+2. That parent is already in `_owned_pages`.
+
+Condition (2) is the "opener-in-owned" rule from the [Ownership rules](#ownership-rules) above and filters out any popup spawned from a user tab. Condition (1) is what the truth table below characterizes — it depends entirely on **how the tab was opened**, not on origin, `rel`, or any HTML attribute, **and not on who triggered the click**. Chromium routes mouse events by their `modifiers` bitmask, not by the actor that produced them, so a Playwright-dispatched click with `modifiers=['Meta']` is indistinguishable from a real user Cmd+click.
+
+Verified by manual test on Chrome 147 (file:// fixture + cross-origin and same-origin targets). Each row below assumes the popup is spawned from an owned page (so condition (2) is satisfied) — rows that end in ❌ fail condition (1) and therefore are not adopted. Standalone tabs (Cmd+T / address bar / history) are listed for completeness; they have no opener at all, so they also fail (1) and are never adopted regardless of which page is "active":
+
+| How the popup was triggered | Chromium path | openerId at attach | Adopted |
+|---|---|:-:|:-:|
+| `bridgic-browser click <ref>` on `<a target=_blank>` | foreground tab | populated | ✅ |
+| Programmatic `await page.click(...)` from Playwright | foreground tab | populated | ✅ |
+| User **plain left-click** on `<a target=_blank>` in an owned page | foreground tab | populated | ✅ |
+| User left-click on `<a href="javascript:window.open(...)">` | foreground tab | populated | ✅ |
+| User **Cmd+click** (macOS) / **Ctrl+click** (Win/Linux) / **middle-click** | background tab | empty | ❌ |
+| **`bridgic-browser key-down Meta && click <ref> && key-up Meta`** (Playwright keyboard state propagates the modifier into `Input.dispatchMouseEvent`) | background tab | empty | ❌ |
+| Equivalent `locator.click(modifiers=['Meta'])` Playwright call | background tab | empty | ❌ |
+| User opens a new tab via Cmd+T / address bar / Chrome history | background tab / standalone | empty | ❌ |
+| `<a target=_blank rel="noopener">` / `rel="noreferrer"` / `window.open(...,'noopener')` — under any click above | (same as the underlying path — `rel=noopener` does not clear `openerId`) | (same) | (same) |
+| JavaScript-initiated `el.click()` / `window.open()` without a user gesture | n/a — popup blocker fires, no new tab attaches | n/a | n/a |
+
+**Two observations from the table**:
+
+1. **Role-agnostic, behavior-driven.** Chromium does not know or care whether a click came from a human or from Playwright/CDP. The deciding variable is the mouse event's `modifiers` field plus the navigation disposition derived from it (`NEW_FOREGROUND_TAB` vs `NEW_BACKGROUND_TAB`). bridgic inherits this exact line.
+2. **bridgic can deliberately open tabs it cannot see.** Holding `Meta` (or any modifier that triggers the background-tab path) while clicking causes bridgic to lose adoption for the popup it just spawned. This is a real but rarely-useful capability — it leaves an "orphan" tab in the user's Chrome that bridgic has no handle on. Do not rely on it as an API; if you ever need "spawn an orphan tab" semantics, prefer an explicit mechanism rather than `key-down Meta` + `click`.
+
+The asymmetry between left-click and Cmd-click is **Chromium behavior, not a bridgic decision**. See "Why Cmd-click strips openerId" below.
+
+### Why Cmd-click strips openerId
+
+Chromium routes new-tab creation through two different code paths inside the browser process, and they treat the parent-tab linkage differently:
+
+| Path | Disposition | New WebContents `opener_` | Resulting `TargetInfo.openerId` |
+|---|---|---|---|
+| Plain left-click on `<a target=_blank>` (or `window.open()` with user gesture) | `NEW_FOREGROUND_TAB` (or `NEW_POPUP`) via renderer's `CreateNewWindow` IPC | set to the spawner's `WebContents*` | populated |
+| Cmd/Ctrl+click, middle-click, "Open Link in New Tab" menu | `NEW_BACKGROUND_TAB` handled directly in the browser process; since Chrome 88 also forces a fresh `BrowsingInstance` | `nullptr` | empty |
+
+The background-tab path is intentionally treated as "user explicitly wanted a detached new tab" — Chromium severs the opener relationship at the browser-process level (not just `window.opener` at the renderer level) so the new tab can be sited in a different process group without security ambiguity. This matters because:
+
+1. `rel="noopener"` / `rel="noreferrer"` / the `'noopener'` feature in `window.open()` only suppress the renderer-level `window.opener` reference. The browser process still records the `opener_` field for its own bookkeeping, and CDP exposes that via `openerId`. So **`rel=noopener` does NOT prevent bridgic adoption** — bridgic operates at the CDP/browser level, below where `rel=noopener` takes effect.
+2. Cmd+click clears the opener at the **browser-process** level, which is the same level CDP reads. Hence `openerId` is genuinely empty and bridgic has no signal to adopt.
+
+For bridgic this is convenient: it means the adoption rule double-serves as a permission boundary — when the user *explicitly* opens a tab as "detached" (Cmd+click, Cmd+T, address bar), Chromium itself classifies it as non-bridgic territory, and bridgic naturally inherits that classification.
+
+### Tradeoffs / known limitations
+
+- In CDP-borrowed mode bridgic cannot distinguish a popup that bridgic itself spawned (via `click <ref>`) from one the user spawned by plain left-clicking the same link — both go through the foreground-tab path and both carry `openerId`. By design both are adopted; the popup is in bridgic's working tree either way.
+- Conversely, a Cmd+click popup *from* the bridgic-owned tab is invisible to bridgic, even though it is conceptually "spawned by bridgic's page". This is acceptable: Cmd+click is the user's explicit gesture for "detached new tab", and the user can still see/close it in Chrome.
+- The popup-follow listener uses `asyncio.create_task` because `context.on("page")` is synchronous but `page.opener()` is async. There is a small window between the new page attaching and adoption finishing; tests use `expect_page` + a short poll loop to bridge it.
+- `_close_page` deliberately resolves the fallback target *before* calling `page.close()`, so `closed_page.opener()` is queried while the closed page is still alive.

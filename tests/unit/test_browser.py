@@ -766,7 +766,14 @@ class TestBrowserStartStop:
             second_page.title = AsyncMock(return_value="Page 2")
             second_page.close = AsyncMock()
             second_page.is_closed = MagicMock(return_value=False)
+            second_page.opener = AsyncMock(return_value=None)
             context.pages = [page, second_page]
+            # Owned-page tracking: the helper-style ownership seed only ran
+            # against the initial `page` during `_start()`. Mark `second_page`
+            # owned manually so the new fallback selector treats it as a valid
+            # successor.
+            browser._owned_pages.add(second_page)
+            browser._focus_stack.append(second_page)
 
             # Set up mock recorder recording the current page
             mock_recorder = MagicMock()

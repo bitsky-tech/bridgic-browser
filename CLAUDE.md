@@ -92,6 +92,16 @@ bridgic/browser/
 
 4. **Tools** are bound async methods on the `Browser` class. Pass them to an LLM agent via `BrowserToolSetBuilder`.
 
+### Owned-page tracking
+
+`Browser` maintains an internal `_owned_pages` set + `_focus_stack` so all public tab operations (`get_pages` / `get_tabs` / `switch_tab` / `close_tab`) only see pages bridgic created or adopted. In **CDP borrowed mode** (`connect_over_cdp` against a user's running Chrome) pre-existing user tabs stay invisible to bridgic; in **non-CDP modes** every page in the context is seeded as owned at start, so the filter degenerates to identity and behaviour matches pre-refactor semantics.
+
+- **Adoption**: `context.on("page")` listener calls `_maybe_adopt_page` → adopts iff `await page.opener()` is already owned. Pages bridgic creates via `_new_page()` are owned unconditionally. *Whether `opener()` returns a parent depends on Chromium's navigation disposition, not on who clicked: foreground-tab navigations (programmatic click, user plain left-click, `window.open()` with user gesture) preserve `openerId`; background-tab navigations (Cmd/Ctrl+click, middle-click, Cmd+T, address bar) clear it at the browser-process level. `rel="noopener"` only suppresses JS-level `window.opener` and does NOT prevent adoption. bridgic itself can bypass adoption by holding `Meta` via `key-down` before click (CDP `Input.dispatchMouseEvent.modifiers` propagates the held key) — role-agnostic, behavior-driven. Full matrix in [`docs/INTERNALS.md#adoption-truth-table-cdp-borrowed-mode`](docs/INTERNALS.md#adoption-truth-table-cdp-borrowed-mode).*
+- **Popup follow**: when `auto_follow_popups=True` (default) and the popup's opener is `self._page`, `self._page` moves to the popup (mirrors Chrome's "new tab takes foreground" UX). Disable by passing `auto_follow_popups=False` to the constructor or via the same key in the config file.
+- **Close fallback**: `_close_page` resolves a successor via `_select_fallback_page` in four tiers — `closed_page.opener()` → `_focus_stack` top — `get_pages()[0]` → `None`. `closed_page.opener()` is queried *before* `page.close()` is awaited so the opener relationship is still resolvable.
+
+See [`docs/INTERNALS.md` — Owned-page Tracking](docs/INTERNALS.md#owned-page-tracking) for the full design and tradeoffs.
+
 ### Tool selection
 
 `BrowserToolSetBuilder` selects tools by category or name (combinable):

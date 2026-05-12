@@ -156,16 +156,31 @@ You can also set `"cdp": "..."` inside `bridgic-browser.json` or `BRIDGIC_BROWSE
 
 ## Tab Ownership
 
-After connecting via CDP, bridgic **always opens its own brand-new tab** in the borrowed browser context. **Your existing tabs are never navigated, refreshed, or closed.**
+After connecting via CDP, bridgic **always opens its own brand-new tab** in the borrowed browser context. **Your existing tabs are never navigated, refreshed, or closed — nor are they visible to bridgic.**
 
-- All tabs in the context — pre-existing user tabs, plus any pop-ups (`target=_blank`, `window.open()`) spawned by pages bridgic is driving — are fully visible via `get_tabs` / `switch_tab` / `close_tab`.
-- When `close()` runs (or the daemon shuts down), bridgic **only disconnects** — no tabs are closed. The remote Chrome continues running exactly as the user left it.
+bridgic maintains an internal "owned pages" set:
+
+- The brand-new tab bridgic opens at attach time is owned.
+- Any tab bridgic creates afterwards via `new_tab` / `new-tab` is owned.
+- A pop-up spawned **from an owned page** is auto-adopted iff Chromium reports it as opener-linked at attach time (detected via `Page.opener()`). The trigger path matters:
+  - ✅ **Adopted**: bridgic-initiated click, programmatic `page.click()`, **user plain left-click** on `<a target="_blank">` or `window.open()`. `rel="noopener"` / `rel="noreferrer"` / `window.open(...,'noopener')` do not disable this — they suppress JS-level `window.opener` but not the CDP-level opener relationship.
+  - ❌ **Not adopted**: user **Cmd+click** (macOS) / **Ctrl+click** (Win/Linux) / **middle-click** on a link, or any tab the user opens via Cmd+T / address bar / history. Chromium severs the opener at the browser-process level for these "background tab" navigations, so the CDP `openerId` is genuinely empty and bridgic cannot see them.
+
+Only owned pages appear in `get_tabs` / `switch_tab` / `close_tab`. The user's pre-existing tabs — and any pop-ups they trigger via Cmd-click or open via Cmd+T / address bar — remain invisible to bridgic. This is a privacy boundary: it prevents the LLM / CLI from inadvertently switching to, reading, or closing the user's private work tabs.
+
+If you need to operate on a page the user already has open, navigate to it through bridgic instead (`bridgic-browser navigate-to <url>` or `new-tab <url>`). bridgic cannot reach across into the user's existing tab.
+
+When `close()` runs (or the daemon shuts down), bridgic **only disconnects** — no tabs are closed. The remote Chrome continues running exactly as the user left it.
 
 The daemon log records which Chrome instance was joined and how many user tabs were preserved — useful with `--cdp auto` to confirm you attached to the expected browser:
 
 ```
 [CDP] connected; created new bridgic tab (borrowed_context=True, preserved_existing_tabs=3)
 ```
+
+### Popup-follow behavior
+
+By default, when a popup is spawned from `self._page` (the tab bridgic is currently driving), bridgic's active page automatically follows the popup — mirroring Chrome's UX where the just-spawned tab takes the foreground. To keep `self._page` fixed on the original tab, pass `auto_follow_popups=False` to the `Browser(...)` constructor (or the same key in your config file). The popup is still adopted into the owned set; only the active-page pointer is unaffected.
 
 ## Behavior Limitations in CDP Mode
 

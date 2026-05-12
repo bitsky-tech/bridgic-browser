@@ -383,6 +383,8 @@ bridgic-browser open https://example.com --cdp auto
 | `http://host:port` | HTTP discovery endpoint -- queries `/json/version` on that host |
 | `auto` | Auto-scan local Chrome/Chromium/Brave profile directories (+ Canary variants) for an active `DevToolsActivePort` file |
 
+**Tab visibility:** when attached to a user's running Chrome, bridgic only sees pages it itself opens — the brand-new tab created at attach time, anything spawned via `new-tab`, and popups triggered from those pages by a plain left-click on a `<a target="_blank">` link or by a JavaScript `window.open()` call (adopted via `Page.opener()`). **Tabs the user opens with Cmd+click (macOS) / Ctrl+click (Win/Linux) / middle-click / Cmd+T / address bar are *not* adopted** — for Cmd/Ctrl/middle-click Chromium clears the opener at the browser-process level (the "background tab" navigation path); Cmd+T and the address bar have no opener relationship to begin with. Either way bridgic cannot see them. **Your other tabs are deliberately invisible to bridgic's `tabs` / `switch-tab` / `close-tab`.** This is a privacy boundary that prevents an LLM driving bridgic from switching to or closing your private work tabs. To work with a page you already have open, navigate to that URL through bridgic instead. By default a popup whose opener is bridgic's current tab becomes the new active tab (`auto_follow_popups=True`); set `Browser(auto_follow_popups=False)` to keep the active pointer fixed. See [`docs/CDP_MODE.md#tab-ownership-in-cdp-mode`](docs/CDP_MODE.md#tab-ownership-in-cdp-mode) for the full adoption truth table.
+
 **Closing behavior:** `bridgic-browser close` disconnects from the remote browser but does **not** terminate the Chrome process. The browser keeps running and can be reconnected.
 
 **Use cases:**
@@ -675,6 +677,7 @@ browser = Browser(
 | `clear_user_data` | bool | False | If True, use ephemeral session (no profile); if False, use persistent profile |
 | `stealth` | bool/StealthConfig | True | Stealth mode configuration |
 | `cdp` | str | None | Connect to an existing Chrome via CDP (skips launch). Accepts port number, `ws://` / `wss://` URL, `http://host:port`, or `"auto"` — mirrors the CLI `--cdp` flag. |
+| `auto_follow_popups` | bool | True | When a bridgic-owned page spawns a popup (`<a target="_blank">` click, `window.open()`), automatically move `self._page` to the popup. Set False to keep the active-page pointer fixed; the popup is still adopted into the owned set. |
 | `channel` | str | None | Browser channel (chrome, msedge, etc.) |
 | `proxy` | dict | None | Proxy settings |
 | `downloads_path` | str/Path | None | Download directory |

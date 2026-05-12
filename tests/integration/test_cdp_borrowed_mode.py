@@ -44,6 +44,24 @@ from bridgic.browser.session import Browser
 from ._chrome_utils import find_chrome_binary
 
 
+# Owned-page tracking refactor (see plan: jaunty-snacking-rossum.md) changed
+# the CDP-borrowed contract: user tabs that pre-exist at attach time are NO
+# LONGER reachable through `tabs` / `switch_tab` / `close_tab` (privacy
+# boundary). Every test below operates on a pre-opened user tab and therefore
+# violates the new policy. They are skipped at the module level with a
+# pointer to the replacement coverage in `test_owned_pages.py`. A future
+# pass should rewrite the ones still worth keeping (e.g. the no-hang
+# regression for `_get_page_title`) so they exercise a bridgic-owned tab
+# instead of a user-owned tab.
+pytestmark = pytest.mark.skip(
+    reason=(
+        "API contract changed under owned-page refactor — user tabs are no "
+        "longer accessible via bridgic. See tests/integration/test_owned_pages.py "
+        "for new-semantics coverage."
+    )
+)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
