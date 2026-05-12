@@ -51,21 +51,31 @@ Report: `$QA_DIR/mode-matrix/mode-matrix-report.md`. Per-variant semantics and e
 bridgic/browser/
 ├── __main__.py       # Entry point: routes `daemon` subcommand vs CLI
 ├── _config.py        # Config file loading (shared by SDK + CLI daemon)
+├── _cli_catalog.py   # CLI_COMMAND_TO_TOOL_METHOD + CLI_HELP_SECTION_SPECS (SSoT for command/category mapping)
+├── _constants.py     # ToolCategory enum + path constants (BRIDGIC_BROWSER_HOME, etc.)
+├── _timeouts.py      # Shared timeout budgets + env-var-overridable knobs
+├── _redact.py        # Log redaction helpers
+├── errors.py         # Public BridgicBrowserError hierarchy
 ├── session/          # Core browser session
-│   ├── _browser.py       # Browser class – main entry point
-│   ├── _snapshot.py      # SnapshotGenerator + EnhancedSnapshot + RefData
-│   ├── _stealth.py       # StealthConfig + StealthArgsBuilder (50+ Chrome args)
-│   ├── _download.py      # DownloadManager
+│   ├── _browser.py        # Browser class – main entry point (all 67 tool methods live here)
+│   ├── _browser_model.py  # Data models
+│   ├── _snapshot.py       # SnapshotGenerator + EnhancedSnapshot + RefData
+│   ├── _stealth.py        # StealthConfig + StealthArgsBuilder (50+ Chrome args)
+│   ├── _download.py       # DownloadManager
 │   ├── _video_recorder.py # VideoRecorder (CDP screencast → ffmpeg)
-│   └── _browser_model.py # Data models
+│   ├── _cdp_discovery.py  # find_cdp_url + resolve_cdp_input (port / file / scan / service modes)
+│   ├── _launch.py         # launch-mode helpers (retriable_launch, etc.)
+│   ├── _locator_utils.py  # _click_checkable_target and other locator helpers
+│   └── _errors.py         # session-internal error types
 ├── tools/            # 67 automation tools (all implemented in _browser.py)
 │   ├── _browser_tool_set_builder.py  # BrowserToolSetBuilder (category/name selection)
 │   └── _browser_tool_spec.py         # BrowserToolSpec (wraps tool for agents)
 └── cli/              # CLI tool (bridgic-browser command)
-    ├── __init__.py       # Exports main()
-    ├── _commands.py      # Click command definitions (68 commands incl. utility metadata command, SectionedGroup)
-    ├── _client.py        # Socket client: send_command(), ensure_daemon_running()
-    └── _daemon.py        # Daemon: asyncio Unix socket server + Browser instance
+    ├── __init__.py    # Exports main()
+    ├── _commands.py   # Click command definitions (67 commands, SectionedGroup)
+    ├── _client.py     # Socket client: send_command(), ensure_daemon_running()
+    ├── _daemon.py     # Daemon: asyncio Unix socket server + Browser instance
+    └── _transport.py  # Unix-socket transport layer (used by client and daemon)
 ```
 
 ### Core data flow
@@ -110,7 +120,31 @@ Key decisions and constraints:
 - **JS init script is headless-only**: skipped in headed mode because `add_init_script()` runs in ALL frames including Cloudflare Turnstile's challenge iframe — patching `window.chrome`/`navigator.permissions.query`/WebGL inside it causes detectable inconsistencies that fail the challenge.
 - **Anti-toString (`_mkNative`)**: all patched functions return `"function name() { [native code] }"` via intercepted `Function.prototype.toString` to defeat DataDome/PerimeterX/Cloudflare `.toString()` probing.
 
-For the full list of patched navigator/window properties, see [`docs/INTERNALS.md` — Stealth JS Init Script](docs/INTERNALS.md#stealth-js-init-script--patched-properties).
+#### Iframe-safety rule (CRITICAL)
+
+> **Any patch that can propagate into a cross-origin iframe MUST be gated to `self._headless`.**
+
+The Cloudflare Turnstile / hCaptcha challenge runs inside a cross-origin iframe (`challenges.cloudflare.com`). When a patch leaks into that iframe, the challenge worker sees navigator/Worker/UA values that don't match Cloudflare's edge-server expectation → instant bot signal → challenge fails silently.
+
+The currently gated mechanisms are:
+
+| Mechanism | Headless | Headed | Why |
+|---|---|---|---|
+| Main `_STEALTH_INIT_SCRIPT_TEMPLATE` (webdriver, plugins, chrome obj, WebGL, …) | ✅ injected | ❌ skipped | `add_init_script` runs in all frames |
+| **R1 — Context `user_agent` fallback + CDP `Emulation.setUserAgentOverride`** | ✅ active | ❌ skipped | CDP UA override propagates to all frames in the target |
+| **R3 — `page.on('worker')` worker stealth injection** | ✅ active | ❌ skipped | `page.workers` includes workers spawned by cross-origin iframes |
+| Anti-devtools-detector script | ✅ injected | ✅ injected (with `if (window !== window.top) return;` guard inside) | Self-gates to top frame |
+| **R3 — `Worker` / `SharedWorker` / `serviceWorker.register` constructor wrap** (in main init script) | ✅ wrapped | ❌ (whole script skipped) | Wrapped section has its own `if (window === window.top)` guard so even if main script runs in iframes, this part doesn't |
+
+#### Iframe-safe checklist (run before merging any new stealth patch)
+
+1. Does the patch live in `_STEALTH_INIT_SCRIPT_TEMPLATE` (runs in all frames)? If yes, ask: would patching this in a cross-origin Cloudflare iframe create an inconsistency vs. what Cloudflare's server logged for the parent page request?
+2. Does the patch use a CDP override (`Emulation.*`, `Network.*`, `Page.*`)? CDP overrides apply to the whole target including all its frames. Gate to `self._headless` unless you've verified iframe consistency.
+3. Does the patch hook `page.on('worker')` / `context.on('serviceworker')`? Workers can be spawned by any frame in the page tree — same rule.
+4. Does the patch wrap a global constructor like `Worker`, `WebSocket`, `RTCPeerConnection`? Wrap inside `if (window === window.top) { ... }` if the wrap result is observably different from the original.
+5. Run the 3-site headed verification (`bash scripts/qa/...` or manual): `https://chat-auto-team.pages.dev/redeem` (Cloudflare), `https://x.com` (server-side detection), `https://blog.aepkill.com/demos/devtools-detector/` (devtools probe). Any of these breaking is a hard block.
+
+For the full list of patched navigator/window properties, see [`docs/INTERNALS.md` — Stealth JS Init Script](docs/INTERNALS.md#stealth-js-init-script--patched-properties). For the design rationale of mode-aware stealth, see [`docs/INTERNALS.md` — Mode-aware stealth design](docs/INTERNALS.md#mode-aware-stealth-design). For known capability boundaries, see [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md).
 
 ### CLI architecture
 

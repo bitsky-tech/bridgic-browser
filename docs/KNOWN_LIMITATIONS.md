@@ -67,3 +67,145 @@ triggered by the CDP `setDownloadBehavior` command, not a bridgic-browser issue.
 - [Puppeteer #11871 — Original bug report with reproduction steps](https://github.com/puppeteer/puppeteer/issues/11871)
 - [Playwright #19885 — Playwright maintainer confirms setDownloadBehavior as the cause](https://github.com/microsoft/playwright/issues/19885)
 - [Playwright Downloads Documentation](https://playwright.dev/python/docs/downloads)
+
+---
+
+## Stealth: TLS Fingerprint Cannot Be Matched in Headless Mode
+
+### Symptom
+
+Sites that perform server-side TLS fingerprinting (JA3 / JA4 / Akamai) — most
+visibly `demo.fingerprint.com/web-scraping` — block requests from headless mode
+with messages like `Malicious bot detected, access denied.`, even with stealth
+fully enabled. The same site loads normally in headed mode.
+
+### Root Cause
+
+bridgic's stealth layer operates at the **JavaScript + CDP layer** (navigator
+overrides, UA rewrite via `Emulation.setUserAgentOverride`, worker injection).
+TLS fingerprint is computed by the OS / Chromium TLS stack at TCP handshake
+time — **before any JS or CDP message can intervene**.
+
+Playwright's bundled "Chrome for Testing" Chromium binary has a slightly
+different CipherSuite ordering and HTTP/2 frame layout than real Chrome, so
+its TLS fingerprint does not match what server-side detectors expect from a
+real Chrome user.
+
+### Workaround
+
+Use **headed mode** (`Browser(headless=False)` or `--headed` on the CLI). In
+headed mode bridgic auto-switches to the real system Chrome binary
+(`channel="chrome"`), whose TLS stack is identical to a normal Chrome user.
+
+### Verification
+
+This was confirmed against `demo.fingerprint.com/web-scraping`:
+
+| Mode | Result |
+|---|---|
+| Headless (Playwright Chromium 143) | `Malicious bot detected, access denied.` |
+| Headed (system Chrome 147) | Flight data renders normally |
+
+See the [Anti-Detection benchmark](../README.md#anti-detection) in the project
+README for the current benchmark matrix.
+
+### References
+
+- [JA3 fingerprinting](https://github.com/salesforce/ja3) — the canonical TLS
+  fingerprint algorithm used by Akamai, Cloudflare, and Fingerprint.com.
+
+---
+
+## Stealth: `isAutomatedWithCDPInWebWorker` Detected in Headed Mode
+
+### Symptom
+
+`deviceandbrowserinfo.com/are_you_a_bot` reports `isBot: true` in headed mode,
+with the single triggered flag being `isAutomatedWithCDPInWebWorker` (the
+main-thread `isAutomatedWithCDP` flag is clean). The same site reports
+`isBot: false` in headless mode.
+
+### Root Cause
+
+The detector spawns a Web Worker and inside it calls `console.log(error)` with
+an `Error` object that has a getter trap on `error.stack`. When a CDP session
+is attached to the worker target, `Runtime.consoleAPICalled` serializes the
+arguments, which triggers the `error.stack` getter — that's the bot signal.
+
+In **headless mode** bridgic neutralizes this via the R5-lite patch
+(pre-stringify any `Error` argument before it hits `console.*`). The worker
+patch is delivered through `page.on('worker')` + `worker.evaluate`, which
+patches *every* worker the page spawns.
+
+In **headed mode** this patch is intentionally *disabled* — see
+[CLAUDE.md → Iframe-safety rule](../CLAUDE.md#stealth) and
+`_arm_worker_stealth` in `_browser.py`. Patching workers spawned by a
+cross-origin Cloudflare Turnstile iframe would alter their navigator/console
+behavior and trip Cloudflare's bot signal.
+
+### Workaround
+
+This is a deliberate trade-off, not a bug:
+
+- **If you only need to bypass `deviceandbrowserinfo`-style worker CDP probes**
+  and you are not using Cloudflare Turnstile, you can manually re-enable
+  `_arm_worker_stealth` for headed mode (remove the `not self._headless` guard
+  in `_browser.py`). Test against your Cloudflare site afterwards.
+- **A proper fix** would be same-origin filtering in `_arm_worker_stealth`:
+  only patch workers whose origin matches the top frame, skipping
+  cross-origin iframe workers. This is feasible (~0.5–1 day of work) but not
+  yet implemented.
+
+### Verification
+
+| Mode | `isBot` | Triggered flags |
+|---|---|---|
+| Headless | `false` | none |
+| Headed | `true` | `isAutomatedWithCDPInWebWorker` only |
+
+---
+
+## Stealth: `Worker` Constructor Is Wrapped in Headless Mode
+
+### Symptom
+
+In headless mode with stealth enabled, `Worker.toString()` reports the wrapped
+function rather than the native `Worker`. Code that does
+`Worker.toString().includes('[native code]')` will fail unless they call
+`Function.prototype.toString.call(Worker)` (which our `_mkNative` covers).
+
+More importantly, the script source passed to `new Worker(scriptURL)` is
+wrapped via `importScripts(scriptURL)` inside a generated blob URL — the
+worker's *initial source line* runs our stealth patches before any user code.
+Special-purpose workers that depend on synchronous behavior at the very first
+instruction may observe a tiny additional latency.
+
+### Root Cause
+
+By design (R3 race-proof patch). `page.on('worker') + worker.evaluate()` loses
+the race against detector code that synchronously postMessages navigator props
+back to the main thread. The constructor wrap is the only way to inject our
+worker-stealth code *before* the worker's first instruction.
+
+### Constraints
+
+- Only active in **headless mode + top frame** (gated by both `self._headless`
+  and `if (window === window.top)` in the wrapped section).
+- Falls through transparently for non-string scriptURL or anything that throws
+  during URL re-wrap.
+- **Same-origin filter** — to avoid breaking cross-origin workers (we observed
+  this with reCAPTCHA v3's worker on `gstatic.com`, which hung indefinitely
+  because our blob worker's `importScripts(crossOriginURL)` failed CORS), the
+  wrap is gated by origin: only `blob:`, `data:`, and same-origin `scriptURL`s
+  are wrapped. Cross-origin worker URLs are passed through to the original
+  `Worker` constructor unchanged. Cross-origin workers therefore do not
+  receive the worker stealth patch — but detector libraries always build
+  workers from inline `URL.createObjectURL(new Blob([code]))` (which is
+  `blob:` and same-origin), so the filter has no real coverage cost.
+
+### Workaround
+
+Disable stealth (`Browser(stealth=False)`) or pass an explicit `user_agent`
+(disables R1 + the implicit gating side-effects but keeps other patches).
+
+---

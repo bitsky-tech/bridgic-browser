@@ -12,7 +12,7 @@
 - **Python-based Tools** - Used for agent / workflow code generation; Easier integration with [Bridgic](https://github.com/bitsky-tech/bridgic) 
 - **Snapshot with Semantic Invariance** - A representation of page snapshot based on accessibility tree and a specially designed ref-generation algorithm that ensures element refs remain unchanged across page reloads
 - **Skills** - Used for guided exploration and code generation; Compatible with most of coding agents
-- **Stealth Mode (Enabled by Default)** - Mode-aware anti-detection: 50+ Chrome args + JS patches in headless mode; minimal ~11 flags in headed mode to match real Chrome fingerprint
+- **Stealth Mode (Enabled by Default)** - Mode-aware anti-detection covering 24+ JS/CDP fingerprint vectors. Verified against the public bot-detection benchmark suite — see [Anti-Detection](#anti-detection) below
 - **Persistent & Ephemeral Sessions** - Persistent profile by default (`$BRIDGIC_HOME/bridgic-browser/user_data/`, default `~/.bridgic/...`); pass `clear_user_data=True` for an ephemeral session with no profile
 - **Nested iframe Support** - Supports DOM element operations within multi-level nested iframes
 
@@ -188,6 +188,57 @@ To override, set:
 - `channel`: e.g. `”chrome”`, `”msedge”`
 - `executable_path`: absolute path to a browser binary
 
+### Anti-Detection
+
+bridgic includes an industrial-grade stealth layer that defeats most
+JS-fingerprint-based bot detection without a custom Chromium binary, proxy,
+or CAPTCHA solver. The strategy is **mode-aware** — headed mode leverages
+the real system Chrome's TLS authenticity, headless mode applies a fuller JS
++ CDP patch suite. See [`docs/INTERNALS.md#mode-aware-stealth-design`](docs/INTERNALS.md#mode-aware-stealth-design)
+for the architecture.
+
+#### Benchmark
+
+Last verified 2026-05-12 (Playwright Chromium 143 / system Chrome 147 on macOS).
+
+| Site | bridgic Result |
+|---|---|
+| `bot.sannysoft.com` | 0 / 57 fail (both modes) |
+| `bot.incolumitas.com` | 0 fail (both modes) |
+| `browserscan.net/bot-detection` | 0 abnormal / 19 normal (both modes) |
+| `demo.fingerprint.com/web-scraping` | Pass (headed mode) |
+| `recaptcha-demo.appspot.com` (reCAPTCHA v3) | score = 0.9 (both modes) |
+
+#### Coverage
+
+24+ detection vectors patched at the JS + CDP layer:
+
+- **Anti-introspection foundation** — `Function.prototype.toString`
+  interception defeats `.toString()` probes
+- **navigator** — `webdriver` (deleted from `Navigator.prototype` to match
+  `--disable-blink-features=AutomationControlled` semantics; `'webdriver' in
+  navigator` returns `false`), `plugins` & `mimeTypes` (with native
+  `PluginArray` / `MimeTypeArray` prototypes; `item(i)` truncates `i` to
+  uint32 per Web IDL §3.2.4), `languages`, `deviceMemory`,
+  `hardwareConcurrency`, `connection`, `permissions.query`
+- **window / document** — `chrome` (`runtime`/`csi`/`loadTimes`),
+  `outerWidth/Height`, `hasFocus`/`hidden`/`visibilityState`,
+  `Notification.permission`
+- **WebGL** — UNMASKED_VENDOR / UNMASKED_RENDERER (replaces SwiftShader /
+  generic-vendor leaks)
+- **UA / Sec-CH-UA** (headless-only via CDP `Emulation.setUserAgentOverride`)
+  — `navigator.userAgent`, `userAgentData.brands`
+- **Web Worker / SharedWorker / Service Worker** (race-proof injection via
+  constructor wrap + `importScripts`) — main↔worker consistency for
+  `deviceMemory`, `languages`, `vendor`, `productSub`, `vendorSub`, WebGL
+- **CDP-attach detection** — `Debugger.setSkipAllPauses`, `console.*` `Error`
+  pre-stringify (blocks `error.stack` getter probes)
+- **Anti devtools-detector** — `console.table` timing neutralization,
+  `devtoolsFormatters` lockout, `Function`-constructor `debugger` strip
+
+Per-vector implementation details:
+[`docs/INTERNALS.md#stealth-js-init-script--patched-properties`](docs/INTERNALS.md#stealth-js-init-script--patched-properties).
+
 The JSON sources accept any `Browser` constructor parameter:
 
 ```json
@@ -257,7 +308,7 @@ The storage state file is **cross-mode compatible** — you can export from a he
 
 ```python
 import asyncio
-from bridgic.browser import Browser
+from bridgic.browser.session import Browser
 
 async def main():
     # 1. Export: log in interactively, then save storage state
@@ -500,7 +551,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 **Verify (6 tools):**
 - `verify_text_visible(text)` - Check text visibility
 - `verify_element_visible(role, accessible_name)` - Check element visibility by role and accessible name
-- `verify_url(pattern)` / `verify_title(pattern)` - URL/title verification
+- `verify_url(expected_url, exact=False)` / `verify_title(expected_title, exact=False)` - URL/title verification
 - `verify_element_state(ref, state)` - Check element state
 - `verify_value(ref, value)` - Check element value
 
@@ -664,8 +715,8 @@ for file in browser.download_manager.downloaded_files:
 
 Stealth mode is **enabled by default** and includes:
 
-- **Headless mode**: 50+ Chrome args + JS init script patching `navigator.webdriver`, `window.chrome`, WebGL, `document.hasFocus()`, `visibilityState`, and more. All patched functions spoof `Function.prototype.toString` to return `[native code]`.
-- **Headed mode**: minimal ~11 flags only (matching real Chrome); JS patches are skipped entirely so third-party challenge iframes (e.g. Cloudflare Turnstile) see unmodified native APIs.
+- **Headless mode**: 50+ Chrome args + JS init script + Web/Service/Shared Worker injection + CDP UA-CH override. See [Anti-Detection](#anti-detection) for the full coverage list.
+- **Headed mode**: minimal ~11 flags + system Chrome (`channel="chrome"`) for real TLS authenticity. The main JS init script is skipped entirely so cross-origin iframes (e.g. Cloudflare Turnstile) see unmodified native APIs. See [Anti-Detection](#anti-detection).
 
 ```python
 # Stealth is ON by default

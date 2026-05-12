@@ -80,7 +80,13 @@ from pydantic import BaseModel
 
 from ._snapshot import EnhancedSnapshot, SnapshotGenerator, SnapshotOptions
 from ._browser_model import FullPageInfo, PageDesc, PageInfo, PageSizeInfo
-from ._stealth import StealthConfig, StealthArgsBuilder
+from ._stealth import (
+    StealthConfig,
+    StealthArgsBuilder,
+    build_ua_metadata,
+    clean_headless_ua,
+    get_fallback_real_chrome_ua,
+)
 from ._download import DownloadManager, DownloadedFile
 from . import _video_recorder as _video_recorder_mod
 from ..utils import find_page_by_id, generate_page_id, model_to_llm_string
@@ -860,6 +866,22 @@ class Browser:
             options["viewport"] = self._viewport
         if self._user_agent is not None:
             options["user_agent"] = self._user_agent
+        elif (
+            self._stealth_builder
+            and self._stealth_builder.config.enabled
+            and self._headless
+        ):
+            # R1: replace Playwright's default `HeadlessChrome/...` UA at the
+            # context level so HTTP UA header + navigator.userAgent are clean
+            # for the very first request. UA-CH brands are still patched via
+            # CDP Emulation.setUserAgentOverride after the page is created.
+            #
+            # **Headless-only**: in headed mode bridgic uses real system Chrome
+            # whose UA already lacks `Headless`. Forcing a fallback UA there
+            # would drift from the binary's actual version and create a
+            # version mismatch with CDP-probed metadata — a Cloudflare bot
+            # signal in cross-origin Turnstile iframes.
+            options["user_agent"] = get_fallback_real_chrome_ua()
         if self._locale is not None:
             options["locale"] = self._locale
         if self._timezone_id is not None:
@@ -959,6 +981,121 @@ class Browser:
                     await _dbg.detach()
                 except Exception:
                     pass
+
+    def _arm_worker_stealth(self, page: "Page") -> None:
+        """R3: inject worker stealth into every Web/Service Worker spawned by
+        ``page``. Idempotent — replays for current workers and listens for new ones.
+
+        Note: Playwright's `page.on('worker')` fires after the worker is created,
+        so a worker that synchronously reads navigator before our `evaluate`
+        completes will see unpatched values. For most fingerprinters this is
+        fine because they wait for postMessage round-trips (CDP latency >> our
+        evaluate latency).
+
+        **Headless-only**: in headed mode patching workers spawned by a
+        cross-origin iframe (e.g. Cloudflare Turnstile) would alter the
+        challenge worker's navigator and trip Cloudflare's bot signal. The
+        same-mode rule applied to the main init script applies here.
+        """
+        if not self.stealth_enabled or page is None or not self._headless:
+            return
+        worker_script = self._stealth_builder.get_worker_init_script(locale=self._locale) if self._stealth_builder else None
+        if not worker_script:
+            return
+
+        async def _patch(worker: "Worker") -> None:
+            try:
+                await worker.evaluate(worker_script)
+            except Exception:
+                logger.debug("worker stealth inject failed", exc_info=True)
+
+        for w in page.workers:
+            asyncio.create_task(_patch(w))
+        page.on("worker", lambda w: asyncio.create_task(_patch(w)))
+
+    def _arm_r6_webdriver_delete(self, page: "Page") -> None:
+        """R6: in headed mode, delete `Navigator.prototype.webdriver` from the
+        *main frame* so `'webdriver' in navigator` returns false.
+
+        The headless main init script already does this (see _stealth.py
+        webdriver section). Headed mode skips that script to keep cross-origin
+        Cloudflare iframes pristine.
+
+        We deliberately avoid `context.add_init_script` here because that runs
+        in every frame — including cross-origin Cloudflare Turnstile iframes.
+        Instead we `page.evaluate` on the main frame only (per-frame JS
+        execution context), and re-apply on every main-frame navigation since
+        each navigation creates a fresh JS context.
+        """
+        if not self.stealth_enabled or page is None or self._headless:
+            return
+        snippet = (
+            "(function () {"
+            " try {"
+            "  var d = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver');"
+            "  if (d && d.configurable) { delete Navigator.prototype.webdriver; }"
+            " } catch (_) {}"
+            "})();"
+        )
+
+        async def _apply() -> None:
+            try:
+                await page.evaluate(snippet)
+            except Exception:
+                logger.debug("R6 evaluate failed", exc_info=True)
+
+        asyncio.create_task(_apply())
+
+        def _on_nav(frame) -> None:
+            if frame == page.main_frame:
+                asyncio.create_task(_apply())
+
+        page.on("framenavigated", _on_nav)
+
+    async def _apply_r1_ua_cleanup(self, page: "Page") -> None:
+        """R1: rewrite Sec-CH-UA brands so `HeadlessChromium` / `Chromium` don't leak.
+
+        The UA *string* is already cleaned at context creation via the
+        ``user_agent`` option (see ``_get_context_options``). This method only
+        handles ``navigator.userAgentData.brands`` and the matching
+        ``Sec-CH-UA`` HTTP headers, which the context option doesn't cover.
+
+        Skipped when:
+          * user supplied an explicit ``user_agent`` (don't second-guess)
+          * **headed mode** — bridgic uses real system Chrome with a clean UA;
+            CDP override would propagate to cross-origin Turnstile iframes and
+            create a UA/version mismatch detectable by Cloudflare.
+
+        Note: `Emulation.setUserAgentOverride` is scoped to the CDP session
+        that set it — detaching the session reverts the override on the next
+        navigation. We keep the session alive (anchored on ``page``) for the
+        page's lifetime.
+        """
+        if (
+            not self.stealth_enabled
+            or page is None
+            or self._user_agent is not None
+            or not self._headless
+        ):
+            return
+        try:
+            sess = await self._context.new_cdp_session(page)
+            ver = await sess.send("Browser.getVersion")
+            product = ver.get("product", "Chrome/143.0.0.0")
+            chrome_ver = product.split("/")[-1] if "/" in product else "143.0.0.0"
+            ua = clean_headless_ua(ver.get("userAgent") or get_fallback_real_chrome_ua())
+            # Emulation.setUserAgentOverride is the modern entry point — Network's
+            # variant accepts the same params but silently drops userAgentMetadata
+            # in current Chromium, leaving Sec-CH-UA brands at their default.
+            await sess.send("Emulation.setUserAgentOverride", {
+                "userAgent": ua,
+                "userAgentMetadata": build_ua_metadata(chrome_ver),
+            })
+            # Anchor the session on the page object so it lives until the page
+            # closes. Don't detach — see method docstring.
+            setattr(page, "_bridgic_uad_cdp", sess)
+        except Exception:
+            logger.debug("R1 UA cleanup failed", exc_info=True)
 
     async def _start(self) -> None:
         """Start the browser.
@@ -1135,6 +1272,29 @@ class Browser:
                 self._page = pages[0]
             else:
                 self._page = await self._context.new_page()
+
+            # R1 + R3 are headless-only — see `_apply_r1_ua_cleanup` and
+            # `_arm_worker_stealth` docstrings for why we never touch UA / worker
+            # internals in headed mode (Cloudflare iframe contamination).
+            if self.stealth_enabled and self._headless:
+                await self._apply_r1_ua_cleanup(self._page)
+                if self._user_agent is None:
+                    self._context.on(
+                        "page",
+                        lambda p: asyncio.create_task(self._apply_r1_ua_cleanup(p)),
+                    )
+                self._arm_worker_stealth(self._page)
+                self._context.on(
+                    "page",
+                    lambda p: self._arm_worker_stealth(p),
+                )
+
+            # R6 — headed-only — delete `Navigator.prototype.webdriver` from the
+            # main frame on every navigation. Per-frame execution context, so
+            # cross-origin iframes are not affected.
+            if self.stealth_enabled and not self._headless:
+                self._arm_r6_webdriver_delete(self._page)
+                self._context.on("page", lambda p: self._arm_r6_webdriver_delete(p))
 
             # Anti devtools-detector: skip all debugger-statement pauses.
             # Playwright enables the Debugger domain internally; debugger

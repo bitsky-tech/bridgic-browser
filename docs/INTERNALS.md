@@ -336,7 +336,7 @@ Function.prototype.toString = _mkNative(function toString() {
 ### Patched properties
 
 - `navigator.webdriver` → **conditionally** `undefined`; checks `Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver')` first and patches the prototype descriptor. Falls back to instance property only if the prototype has no descriptor but the value is non-undefined. Avoids creating an own-property (which makes `'webdriver' in navigator` = true — detectable in real Chrome where the property is absent).
-- `navigator.plugins` / `navigator.mimeTypes` → realistic PDF Viewer entries (5 plugins, 2 MIME types); each plugin holds its own per-plugin mime copies so `enabledPlugin` refs are correct
+- `navigator.plugins` / `navigator.mimeTypes` → realistic PDF Viewer entries (5 plugins, 2 MIME types); each plugin holds its own per-plugin mime copies so `enabledPlugin` refs are correct. The `item(i)` accessor truncates `i` to uint32 via `i >>> 0` to match Web IDL §3.2.4 indexed-property semantics — without this `plugins.item(4294967296)` returns `null` instead of `plugins[0]`, which `incolumitas` `overflowTest` flags.
 - `navigator.languages` → derived from `Browser(locale=...)` to keep `navigator.language === navigator.languages[0]` (e.g. `["zh-CN", "zh", "en"]` for `locale="zh-CN"`); defaults to `["en-US", "en"]`
 - `window.chrome` → complete object with `runtime`, `csi()`, `loadTimes()` (all wrapped with `_mkNative`)
 - `navigator.permissions.query` → returns `"default"` for notifications (not `"denied"`); wrapped with `_mkNative`
@@ -349,8 +349,168 @@ Function.prototype.toString = _mkNative(function toString() {
 - `document.hidden` → always `false` (via `Object.defineProperty`)
 - `document.visibilityState` → always `'visible'` (via `Object.defineProperty`); headless tabs default to `'hidden'` which is a strong bot signal
 - `Notification.permission` → guarded: only patched if `Notification` exists and its permission is `'denied'`; returns `'default'`
+- `navigator.plugins` / `navigator.mimeTypes` **prototype identity** (R2): after the array is built, `Object.setPrototypeOf(_pluginList, PluginArray.prototype)` and `_plugins.forEach(p => Object.setPrototypeOf(p, Plugin.prototype))` (same for `MimeTypeArray` / `MimeType`). Without this, `Object.getPrototypeOf(navigator.plugins).constructor.name === 'Array'` and `navigator.plugins instanceof PluginArray` is `false` — sannysoft and incolumitas both probe these.
+- `navigator.webdriver` **deleted from `Navigator.prototype`** (R4 + R6): when `Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver')` returns a `configurable: true` descriptor (the typical case under Web IDL §3.7.6), we `delete Navigator.prototype.webdriver` outright — matching the state real Chrome reaches with `--disable-blink-features=AutomationControlled` working correctly. After the delete: `'webdriver' in navigator === false`, `navigator.webdriver === undefined`, `Object.keys(navigator)` excludes it. Fallbacks: non-configurable descriptor → undefined-getter with `enumerable: false`; sub-frame edge case where the property is on the instance not the prototype → undefined-getter on instance.
+- **`Worker` / `SharedWorker` / `navigator.serviceWorker.register` constructor wrap** (R3): top-frame-only (gated by `if (window === window.top)`). Each new worker's `scriptURL` is wrapped via:
+  ```javascript
+  const wrapper = "<inlined worker stealth body>;importScripts(<originalURL>);";
+  return new OrigWorker(URL.createObjectURL(new Blob([wrapper])), options);
+  ```
+  This wins the race against detector code that synchronously postMessages `navigator.*` from inside the worker — our patches run before any user line of the worker. The wrap falls through transparently for non-string `scriptURL` or any error during URL construction.
 
-`get_init_script(locale=None)` accepts the locale and performs the `__BRIDGIC_LANGS__` substitution before returning the script. Called from `_browser.py:_start()` with `self._locale` only when `self._headless=True`.
+### console.* `Error` pre-stringify (R5-lite)
+
+In the anti-devtools-detector script (which has its own `if (window !== window.top) return;` top-frame guard), every `console.{log, debug, info, warn, error, trace}` is wrapped to coerce any `Error` argument to a plain string (`name + ": " + message`) before forwarding to the original method:
+
+```javascript
+['log', 'debug', 'info', 'warn', 'error', 'trace'].forEach((m) => {
+  const _orig = console[m];
+  console[m] = _mkNative(function () {
+    const args = Array.from(arguments).map(a => a instanceof Error ? `${a.name}: ${a.message}` : a);
+    return _orig.apply(console, args);
+  }, m);
+});
+```
+
+This blocks the well-known CDP-attach detection where a detector installs a getter trap on `error.stack` and calls `console.log(error)` — when CDP is attached, `Runtime.consoleAPICalled` serializes args (calling the trapped getter) and the detector observes the trap firing. Pre-stringifying the `Error` defeats the entire class.
+
+`get_init_script(locale=None)` accepts the locale and performs three substitutions before returning the script:
+- `__BRIDGIC_LANGS__` → `JSON.stringify([locale, lang, "en"])` for both main-thread `navigator.languages` and the inlined worker stealth body.
+- `"__BRIDGIC_WORKER_STEALTH__"` → JSON-encoded full worker stealth body (used by the `Worker` constructor wrap to inject via `importScripts`).
+
+Called from `_browser.py:_start()` with `self._locale` only when `self._headless=True`.
+
+---
+
+## Mode-aware Stealth Design
+
+bridgic's stealth layer is intentionally **bimodal**. Headless and headed mode apply different sets of patches because they exploit different strengths and have different risks.
+
+### The core invariant
+
+> Any patch that can propagate into a cross-origin iframe MUST be gated to `self._headless`.
+
+The Cloudflare Turnstile / hCaptcha challenge runs inside a cross-origin iframe (`challenges.cloudflare.com`). When a patch leaks into that iframe, the challenge worker sees navigator/Worker/UA values that don't match Cloudflare's edge-server expectation → bot signal → silent fail.
+
+### Per-mode patch matrix
+
+| Mechanism | Headless | Headed | Iframe-propagating? |
+|---|---|---|---|
+| Chrome launch args (`CHROME_STEALTH_ARGS_HEADED` ~10 flags / `CHROME_STEALTH_ARGS` ~50 flags) | full | minimal | n/a (process-level) |
+| `--headless=new` redirect | yes | n/a | n/a |
+| Auto-switch to system Chrome (`channel="chrome"`) | n/a | yes | n/a |
+| `_STEALTH_INIT_SCRIPT_TEMPLATE` (webdriver / plugins / chrome / WebGL / …) | injected | **skipped** | yes — `add_init_script` runs in all frames |
+| `_ANTI_DEVTOOLS_DETECTOR_SCRIPT` | injected | injected | **no** — self-gated to top frame inside the script |
+| **R1 — context `user_agent` fallback (`Chrome/143`)** | active | **skipped** | yes — context option applies to all requests in all frames |
+| **R1 — CDP `Emulation.setUserAgentOverride` + UA-CH brands** | active | **skipped** | yes — CDP override propagates to all frames in target |
+| **R3 — `Worker` / `SharedWorker` / SW.register constructor wrap** (in main init script) | active | **skipped** (whole script is) | self-gated to top frame |
+| **R3 — `page.on('worker')` post-spawn injection** | active | **skipped** | yes — `page.workers` includes workers spawned by cross-origin iframes |
+| **R6 — main-frame `delete Navigator.prototype.webdriver`** via `page.evaluate` + `framenavigated` re-apply | covered by main init script | active | **no** — JS execution contexts are per-frame, so cross-origin iframes are untouched |
+| Anchored CDP session for UA override (`setattr(page, "_bridgic_uad_cdp", sess)`) | yes | **skipped** | n/a (lifecycle) |
+| `Debugger.setSkipAllPauses` | active | active | no — per-target CDP session |
+
+### Why the trade-offs work
+
+**Headed mode** (`Browser(headless=False)`):
+- Wins on **L1 (TCP/TLS) + L2 (browser process behavior)**: real system Chrome, TLS fingerprint matches a normal user, navigator/window are already realistic.
+- Loses on **L3 (CDP-side detection in workers)**: we cannot patch worker `console.*` without also patching the Cloudflare iframe's worker — so `deviceandbrowserinfo` `isAutomatedWithCDPInWebWorker` stays detected.
+
+**Headless mode** (`Browser(headless=True)`):
+- Loses on **L1 (TLS) + L2 (`HeadlessChrome` UA leak)**: Playwright Chromium's TLS fingerprint and default UA are detectable; we cover the UA leak via R1, but TLS is unreachable from JS/CDP.
+- Wins on **L3**: the full R1+R2+R3+R4+R5-lite suite runs without the iframe-safety constraint, so `deviceandbrowserinfo` and worker-side CDP detection both pass.
+
+### Decision flow when adding a new patch
+
+```
+new patch
+    │
+    ▼
+runs in all frames (init script, CDP override,
+context option, page.on('worker'), …)?
+    │
+   ┌┴┐
+   no  yes
+   │    │
+   │    ▼
+   │  could it create an inconsistency vs. what
+   │  Cloudflare's edge-server logged for the
+   │  parent page request?
+   │    │
+   │   ┌┴┐
+   │   no  yes
+   │   │    │
+   │   │    ▼
+   │   │  gate to `self._headless`
+   │   │    │
+   │   ▼    ▼
+   ▼  ship safely
+   ship safely
+```
+
+### CDP UA cleanup gotchas (R1)
+
+These took multiple iterations to discover and are not obvious from CDP docs:
+
+1. **Use `Emulation.setUserAgentOverride`, not `Network.setUserAgentOverride`.** In Chromium 145+ the `Network` variant silently drops the `userAgentMetadata` field, so Sec-CH-UA brands keep their default values (`Chromium`, `Not A(Brand`) even after the call returns success. The `Emulation` variant is the modern entry point and properly applies metadata.
+
+2. **The CDP session must stay attached for the override to persist.** `Emulation.setUserAgentOverride` is scoped to the CDP session that issued it. If you call `await sess.detach()` after issuing the override, the next page navigation reverts `navigator.userAgentData.brands` to the Chromium defaults. bridgic anchors the session on the page object via `setattr(page, "_bridgic_uad_cdp", sess)` so it survives until the page closes.
+
+3. **The override is per-target.** A new page in the same context needs its own override. We register a `context.on("page", lambda p: asyncio.create_task(self._apply_r1_ua_cleanup(p)))` listener (also gated to headless).
+
+4. **Context-level `user_agent` option is a separate, independent layer.** It controls the HTTP UA header and `navigator.userAgent` for the very first request (before any CDP override has been issued). The CDP `Emulation.setUserAgentOverride` then takes over for both navigator + Sec-CH-UA. Both layers should agree on the UA string to avoid intra-session UA changes that detectors may flag.
+
+### Worker stealth via constructor wrap (R3)
+
+The naive approach — `page.on('worker', w => w.evaluate(stealth))` — loses a race against real-world detection libraries:
+
+```
+detector code (sync):           bridgic (async):
+  new Worker(blobURL)
+  worker boots
+  worker reads navigator.*       page.on('worker') event fires
+  worker postMessage(props)      we await session.send(...)
+  main onmessage handler runs    we await worker.evaluate(stealth)
+  detector compares → BOT        ← worker already shipped!
+```
+
+The constructor wrap fixes the race by injecting our patch at *worker construction* time, not after spawn. The wrap detects string/URL `scriptURL` and replaces it with a blob URL whose first instruction is our stealth body, followed by `importScripts(originalURL)`:
+
+```
+new Worker(externalURL)
+   │
+   ▼
+construct trap intercepts
+   │
+   ▼
+build wrapper = `<stealth body>;importScripts("<externalURL>");`
+   │
+   ▼
+new Worker(URL.createObjectURL(new Blob([wrapper])))
+   │
+   ▼
+worker first executes stealth body → patches navigator.deviceMemory,
+                                     vendor, productSub, vendorSub,
+                                     languages, WebGL, console.debug
+then importScripts the original code → detector runs on patched values
+```
+
+The wrap is gated by both `self._headless` (R1/R3 mode gate) **and** `if (window === window.top)` (so even if the main script accidentally runs in an iframe, the wrap doesn't). Falls through transparently on non-string `scriptURL` or any throw.
+
+**Same-origin filter** (added after a reCAPTCHA v3 regression). The wrap only intercepts `blob:`, `data:`, and same-origin `scriptURL`s. Cross-origin URLs (e.g. `https://www.gstatic.com/recaptcha/...js`) pass through to the original `Worker` constructor unchanged.
+
+Why this is necessary: our wrapper does `importScripts(originalURL)` from inside a same-origin blob worker. For a cross-origin `originalURL` this fails CORS unless the cross-origin host serves `Access-Control-Allow-Origin: *` — most don't. A failed `importScripts` silently kills the worker, so any library that depends on a token / message from that worker hangs forever (reCAPTCHA v3's `grecaptcha.execute()` Promise never resolves, observed during headless verification).
+
+Coverage cost is zero in practice: detector libraries (`incolumitas`, `fpscanner`, etc.) all build workers from inline `URL.createObjectURL(new Blob([code]))` — which is `blob:` and same-origin — so the filter still wraps everything we care about for fingerprint defense.
+
+```javascript
+const _bridgicWorkerWrapSafe = (scriptURL) => {
+  try {
+    const u = String(scriptURL);
+    if (u.startsWith('blob:') || u.startsWith('data:')) return true;
+    return new URL(u, location.href).origin === location.origin;
+  } catch (_) { return false; }
+};
+```
 
 ---
 

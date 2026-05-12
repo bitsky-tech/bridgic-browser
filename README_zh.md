@@ -12,7 +12,7 @@
 - **基于 Python 的工具** — 用于智能体 / 工作流代码生成；更易与 [Bridgic](https://github.com/bitsky-tech/bridgic) 集成
 - **语义不变的快照** — 基于无障碍树与专门设计的 ref 生成算法，保证元素 ref 在页面重载后仍可对应同一元素
 - **Skills** — 用于引导探索与代码生成；兼容多数编程类智能体
-- **隐身模式（默认开启）** — 模式感知反检测策略：headless 模式使用 50+ Chrome 参数 + JS 补丁；headed 模式仅使用 ~11 个最小 flag，与真实 Chrome 指纹一致
+- **隐身模式（默认开启）** — 模式感知反检测，覆盖 24+ 项 JS/CDP 指纹向量。已在公开 bot 检测基准套件上验证通过，详见下方 [反检测](#反检测) 章节
 - **持久化与临时会话** — 默认持久化 profile（`$BRIDGIC_HOME/bridgic-browser/user_data/`，默认 `~/.bridgic/...`）；传入 `clear_user_data=True` 可开启临时会话（无 profile）
 - **嵌套 iframe 支持** — 支持在多层嵌套 iframe 内对 DOM 元素进行操作
 
@@ -186,6 +186,52 @@ if __name__ == "__main__":
 若需覆盖此行为，请设置：
 - `channel`：例如 `”chrome”`、`”msedge”`
 - `executable_path`：浏览器可执行文件的绝对路径
+
+### 反检测
+
+bridgic 内置工业级隐身层，在不依赖定制 Chromium 二进制、代理、CAPTCHA 解算器
+的前提下，绕过绝大多数基于 JavaScript 指纹的 bot 检测。设计**模式感知**：有头
+模式利用真实系统 Chrome 的 TLS 真实性，无头模式应用更完整的 JS + CDP 补丁集合。
+架构详情见 [`docs/INTERNALS.md#mode-aware-stealth-design`](docs/INTERNALS.md#mode-aware-stealth-design)。
+
+#### Benchmark
+
+最近一次验证：2026-05-12（Playwright Chromium 143 / 系统 Chrome 147，macOS）。
+
+| 站点 | bridgic 结果 |
+|---|---|
+| `bot.sannysoft.com` | 0 / 57 fail（两种模式） |
+| `bot.incolumitas.com` | 0 fail（两种模式） |
+| `browserscan.net/bot-detection` | 0 abnormal / 19 normal（两种模式） |
+| `demo.fingerprint.com/web-scraping` | 通过（有头模式） |
+| `recaptcha-demo.appspot.com` (reCAPTCHA v3) | 评分 = 0.9（两种模式） |
+
+#### 覆盖范围
+
+24+ 项检测向量，在 JS + CDP 层完成补丁：
+
+- **反内省基础设施** — `Function.prototype.toString` 拦截，挫败 `.toString()` 探测
+- **navigator** — `webdriver`（从 `Navigator.prototype` 上整体 delete，与
+  `--disable-blink-features=AutomationControlled` 语义一致；`'webdriver' in
+  navigator` 返回 `false`）、`plugins` 和 `mimeTypes`（继承原生
+  `PluginArray` / `MimeTypeArray` prototype；`item(i)` 按 Web IDL §3.2.4
+  做 uint32 截断）、`languages`、`deviceMemory`、`hardwareConcurrency`、
+  `connection`、`permissions.query`
+- **window / document** — `chrome`（完整 `runtime`/`csi`/`loadTimes`）、
+  `outerWidth/Height`、`hasFocus`/`hidden`/`visibilityState`、`Notification.permission`
+- **WebGL** — UNMASKED_VENDOR / UNMASKED_RENDERER（替换 SwiftShader / 通用厂商泄漏）
+- **UA / Sec-CH-UA**（无头模式独占，通过 CDP `Emulation.setUserAgentOverride`）
+  — `navigator.userAgent`、`userAgentData.brands`
+- **Web Worker / SharedWorker / Service Worker**（通过构造器 wrap + `importScripts`
+  实现 race-proof 注入）— 主线程↔worker 一致性，涵盖 `deviceMemory`、`languages`、
+  `vendor`、`productSub`、`vendorSub`、WebGL
+- **CDP attach 检测** — `Debugger.setSkipAllPauses`、`console.*` 对 `Error` 实参的
+  pre-stringify 包裹（阻断 `error.stack` getter 探测）
+- **devtools-detector 库对抗** — `console.table` 计时归一化、`devtoolsFormatters`
+  锁定、`Function` 构造器 `debugger` 关键字剥除
+
+逐向量实现细节见
+[`docs/INTERNALS.md#stealth-js-init-script--patched-properties`](docs/INTERNALS.md#stealth-js-init-script--patched-properties)。
 
 JSON 来源支持任意 `Browser` 构造参数：
 
@@ -663,8 +709,8 @@ for file in browser.download_manager.downloaded_files:
 
 隐身模式**默认启用**，包括：
 
-- **Headless 模式**：50+ Chrome 参数 + JS init script，修补 `navigator.webdriver`、`window.chrome`、WebGL、`document.hasFocus()`、`visibilityState` 等。所有被修补的函数均通过 `Function.prototype.toString` 欺骗返回 `[native code]`。
-- **Headed 模式**：仅使用 ~11 个最小 flag（与真实 Chrome 一致），完全跳过 JS 补丁注入，确保 Cloudflare Turnstile 等第三方 challenge iframe 看到未经修改的原生 API。
+- **Headless 模式**：50+ Chrome 参数 + JS init script + Web/Service/Shared Worker 注入 + CDP UA-CH 覆写。完整覆盖向量见 [反检测](#反检测) 章节。
+- **Headed 模式**：仅使用 ~11 个最小 flag + 系统 Chrome（`channel="chrome"`），保证 TLS 真实性。主 JS init script 完全跳过注入，确保 Cloudflare Turnstile 等跨域 challenge iframe 看到未经修改的原生 API。详见 [反检测](#反检测) 章节。
 
 ```python
 # 隐身默认开启
