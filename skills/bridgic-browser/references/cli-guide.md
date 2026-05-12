@@ -126,31 +126,15 @@ Environment variables and login state persistence are documented in `env-vars.md
 Connect to a running Chrome instead of launching a new one:
 
 ```bash
-# Start Chrome with remote debugging
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-    --remote-debugging-port=9222 --user-data-dir=/tmp/cdp-profile
-
-# Connect by port
-bridgic-browser open https://example.com --cdp 9222
-
-# Connect by WebSocket URL
-bridgic-browser open https://example.com --cdp ws://localhost:9222/devtools/browser/...
-
-# Connect to cloud service
-bridgic-browser open https://example.com --cdp wss://cloud.example.com/chromium?token=...
-
-# Auto-scan local Chrome/Chromium/Brave profiles (+ Canary variants)
-bridgic-browser open https://example.com --cdp auto
+bridgic-browser open https://example.com --cdp 9222           # bare port
+bridgic-browser open https://example.com --cdp auto           # scan local Chromium-family profiles (Chrome / Canary / Beta / Chromium / Brave / Edge)
+bridgic-browser open https://example.com --cdp "ws://..."     # explicit WebSocket URL
+bridgic-browser open https://example.com --cdp "wss://cloud.example.com/?token=..."
 ```
 
-| Format | Description |
-|--------|-------------|
-| `9222` | Bare port -- queries `localhost:9222/json/version` |
-| `ws://...` / `wss://...` | Direct WebSocket URL, passed through as-is |
-| `http://host:port` | HTTP discovery endpoint |
-| `auto` | Scan local Chrome/Chromium/Brave profiles (+ Canary) for `DevToolsActivePort` |
+`--cdp` is a startup-only flag (accepted by `open` and `search`; ignored after the daemon is running). `close` disconnects from the remote browser but does **not** kill the Chrome process.
 
-`close` disconnects from the remote browser but does **not** kill the Chrome process.
+For how to enable CDP on the target Chrome (Chrome 144+ `chrome://inspect/#remote-debugging` UI vs. legacy `--remote-debugging-port` launch flag), the full input-format table, behavior limitations (stealth, viewport, `close()`), and reconnect strategy, read [`cdp-mode.md`](cdp-mode.md).
 
 ## Non-Obvious CLI Behavior
 
@@ -183,3 +167,4 @@ bridgic-browser open https://example.com --cdp auto
 - Need Python code instead of CLI commands: read `sdk-guide.md`.
 - Need CLI and SDK mapping / migration (for example, CLI steps -> Python code generation): read `cli-sdk-api-mapping.md`.
 - Need environment variables or login state persistence details: read `env-vars.md`.
+- Need to connect to an existing Chrome instance (chrome://inspect, `--remote-debugging-port`, cloud browser, Electron), or want the full CDP limitation / reconnect reference: read `cdp-mode.md`.

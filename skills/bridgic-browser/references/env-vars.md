@@ -9,10 +9,15 @@ Use this reference when the task needs environment variable behavior or login st
 | `BRIDGIC_HOME` | SDK + CLI | `~/.bridgic` | Root directory for all Bridgic state. All daemon paths (run info, socket, logs, tmp, config, user data) derive from this. Set different values to run multiple independent daemon instances. |
 | `BRIDGIC_LOG_LEVEL` | SDK + CLI | `INFO` | Log level for the `bridgic.browser` logger. |
 | `BRIDGIC_BROWSER_JSON` | SDK + CLI | unset | JSON string to override Browser constructor kwargs. Loaded by `Browser()` and CLI daemon. |
-| `BRIDGIC_CDP` | CLI daemon | unset | Connect to an existing Chrome via CDP. Accepts: port (`9222`), `ws://`/`wss://` URL, `http://host:port`, or `auto` (scan local profiles). Resolved at daemon startup. Also set internally by the CLI client (as an already-resolved `ws://` URL) when `--cdp` is passed, so the flag overrides any value inherited from the shell. |
+| `BRIDGIC_CDP` | CLI daemon | unset | Connect to an existing Chrome via CDP. Accepts: port (`9222`), `ws://`/`wss://` URL, `http://host:port`, or `auto` (scan local profiles). Resolved at daemon startup. Also set internally by the CLI client (as an already-resolved `ws://` URL) when `--cdp` is passed, so the flag overrides any value inherited from the shell. Full enablement steps (Chrome 144+ `chrome://inspect` UI vs. `--remote-debugging-port`), limitation matrix, and reconnect tips: see `cdp-mode.md`. |
 | `BRIDGIC_SOCKET` | CLI (Unix only) | platform default | Override Unix socket path for the daemon client/transport. |
 | `BRIDGIC_DAEMON_RESPONSE_TIMEOUT` | CLI client | `90` | Seconds to wait for a daemon response. |
-| `BRIDGIC_DAEMON_STOP_TIMEOUT` | CLI daemon | `300` | Seconds to wait for daemon shutdown (safety net; individual cleanup steps have shorter timeouts). |
+| `BRIDGIC_DAEMON_RESPONSE_TIMEOUT_BUFFER` | CLI client | `30` | Extra client-side wait above any arg-supplied `--timeout` (so the client does not abort while the daemon is still working on a long command). |
+| `BRIDGIC_DAEMON_READY_TIMEOUT` | CLI client | `30` | Seconds the client waits for a freshly spawned daemon to emit its `BRIDGIC_DAEMON_READY` line. |
+| `BRIDGIC_DAEMON_STOP_TIMEOUT` | CLI daemon | `60` | Global safety-net budget for `browser.close()` inside the daemon. Watchdog only — per-step shutdown budgets already cap at ≤ 30s; raise this if a legitimately slow close (e.g. multi-gigabyte video finalize on a slow disk) needs more headroom. |
+| `BRIDGIC_CLICK_TIMEOUT` | SDK + CLI daemon | `10` | Hard ceiling (seconds) for a single `locator.click / dblclick / check / uncheck`. Caps Playwright's 30s retry loop so SPAs with sticky/animated headers don't block other CLI commands on the daemon. |
+| `BRIDGIC_FALLBACK_DISPATCH_TIMEOUT_MS` | SDK + CLI daemon | `2000` | Ceiling (milliseconds) for the `locator.dispatch_event` click fallback. Prevents continuously animating elements from saturating Playwright's 30s default and defeating `BRIDGIC_CLICK_TIMEOUT`. |
+| `BRIDGIC_CDP_PROBE_TIMEOUT` | CLI daemon | `1.5` | Per-probe TCP connect budget (seconds) for the CDP `/json/version` health check before reconnecting. |
 | `SKIP_BROWSER_TESTS` | Tests | unset | If `1/true/yes`, skip browser tests. |
 
 ### Multi-Instance Isolation (`BRIDGIC_HOME`)
@@ -69,7 +74,7 @@ Notes:
 - Config file precedence (SDK + CLI, lowest -> highest): defaults, `$BRIDGIC_HOME/bridgic-browser/bridgic-browser.json`, `./bridgic-browser.json`, `BRIDGIC_BROWSER_JSON`.
 - To start the daemon in headed mode, pass `--headed` to `bridgic-browser open` / `bridgic-browser search`, or set `{"headless": false}` in `BRIDGIC_BROWSER_JSON`.
 - To start with an ephemeral (no persistent profile) session, pass `--clear-user-data` to `bridgic-browser open` / `bridgic-browser search`, or set `{"clear_user_data": true}` in `BRIDGIC_BROWSER_JSON`. These flags are only meaningful when starting a new daemon; they are ignored if a session is already running.
-- To connect to an existing Chrome via CDP, pass `--cdp` to `bridgic-browser open` or `bridgic-browser search`, or set the `BRIDGIC_CDP` env var. The `--cdp` flag accepts a port number, `ws://`/`wss://` URL, `http://host:port`, or `auto`.
+- To connect to an existing Chrome via CDP, pass `--cdp` to `bridgic-browser open` or `bridgic-browser search`, or set the `BRIDGIC_CDP` env var. The `--cdp` flag accepts a port number, `ws://`/`wss://` URL, `http://host:port`, or `auto`. Full enablement and behavior reference: `cdp-mode.md`.
 - When `headless=false` (headed mode) with stealth enabled and neither `channel` nor `executable_path` is specified, the daemon **auto-switches to system Chrome** (`channel=”chrome”`) if detected on the machine. This avoids Playwright’s bundled “Chrome for Testing” which is blocked by Google OAuth and shows a “test” label in the macOS Dock. If system Chrome is not installed, it falls back to Chrome for Testing.
 
 ### Config Files and `BRIDGIC_BROWSER_JSON` Values
@@ -84,7 +89,7 @@ Notes:
 | `viewport` | `{ "width": int, "height": int }` or `null` | Default `1600x900` when `no_viewport` is not set. |
 | `user_data_dir` | string (path) | Custom path for persistent profile. Ignored when `clear_user_data=true`. |
 | `clear_user_data` | `true | false` | Default `false`. If `true`, use ephemeral session (`launch`+`new_context`, no profile saved). If `false`, use persistent profile (defaults to `$BRIDGIC_HOME/bridgic-browser/user_data/`). |
-| `cdp` | string | Connect to existing Chrome via CDP instead of launching. Accepts any format supported by `resolve_cdp_input()` (port, `ws://`/`wss://` URL, `http://host:port`, `auto`); non-WebSocket values are auto-resolved at startup. Can be set via config JSON, `BRIDGIC_CDP` env var, or `--cdp` CLI flag. |
+| `cdp` | string | Connect to existing Chrome via CDP instead of launching. Accepts any format supported by `resolve_cdp_input()` (port, `ws://`/`wss://` URL, `http://host:port`, `auto`); non-WebSocket values are auto-resolved at startup. Can be set via config JSON, `BRIDGIC_CDP` env var, or `--cdp` CLI flag. Full enablement and behavior reference: `cdp-mode.md`. |
 | `stealth` | `true | false` or object | Object uses the StealthConfig keys below. |
 | `channel` | string | Examples: `"chrome"`, `"msedge"`, `"chromium"`. |
 | `executable_path` | string (path) | Custom browser binary path. |

@@ -6,9 +6,9 @@ Use this guide when the output should be Python automation code (`bridgic.browse
 
 1. [Installation and Imports](#installation-and-imports)
 2. [Preferred Lifecycle Pattern](#preferred-lifecycle-pattern)
-3. [Core SDK Decision: Raw Methods vs Tool Methods](#core-sdk-decision-raw-methods-vs-tool-methods)
-4. [Snapshot and Ref Rules](#snapshot-and-ref-rules)
-5. [Frequent SDK Methods](#frequent-sdk-methods)
+3. [API Division: Raw Methods vs Tool Methods](#api-division-raw-methods-vs-tool-methods)
+4. [Tool Methods](#tool-methods)
+5. [Snapshot and Ref Rules](#snapshot-and-ref-rules)
 6. [Tool Set Builder (for Agent Integration)](#tool-set-builder-for-agent-integration)
 7. [CDP Mode (Connect to Existing Browser)](#cdp-mode-connect-to-existing-browser)
 8. [Non-Obvious SDK Behavior](#non-obvious-sdk-behavior)
@@ -129,23 +129,21 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 To connect to an already-running Chrome instead of launching a new one, pass `cdp`:
 
 ```python
+browser = Browser(cdp="9222")       # bare port, resolved lazily on _start()
+browser = Browser(cdp="auto")       # scan local Chromium-family profiles (Chrome / Canary / Beta / Chromium / Brave / Edge)
+browser = Browser(cdp="http://host:9222")
 browser = Browser(cdp="ws://localhost:9222/devtools/browser/...")
 ```
 
-`Browser(cdp=...)` accepts the same inputs as CLI `--cdp` — port number, `ws://`/`wss://` URL, `http://host:port`, or `"auto"` — and resolves them lazily on first use:
+`Browser(cdp=...)` accepts the same inputs as CLI `--cdp` and resolves them lazily on first use, so `Browser(cdp="auto")` is safe to construct inside a running event loop. A malformed value raises `InvalidInputError` on first use, not at construction time.
 
-```python
-browser = Browser(cdp="9222")       # port → resolved on _start()
-browser = Browser(cdp="auto")       # scan local Chrome/Chromium/Brave profiles
-browser = Browser(cdp="http://host:9222")
-```
-
-`resolve_cdp_input()` is also still exported for the rare case where you want to normalise the value up front.
-
-Notes:
-- Stealth launch args are **not** applied (the Chrome process is already running), but the JS init script is still registered for new pages.
+Quick notes (full details in [`cdp-mode.md`](cdp-mode.md)):
+- Many `Browser(...)` parameters are ignored in CDP mode (`headless`, `args`, `proxy`, `channel`, `viewport`, `user_agent`, `locale`, …) because the browser is already running and the context is borrowed.
+- Stealth launch args are **not** applied (browser already running). The main JS init script (navigator / webdriver / WebGL / plugins patches) is **headless-only** — it is skipped in CDP + headed mode. Only the anti-devtools timing script is registered in headed mode.
 - `close()` disconnects from the remote browser but does **not** terminate the Chrome process.
-- The daemon auto-reconnects once if the CDP session drops (useful for cloud browser session timeouts).
+- The daemon auto-reconnects once if the CDP session drops; pick `cdp="9222"` / `"auto"` / `"http://..."` (not a raw `ws://.../<UUID>`) if the remote Chrome may restart.
+
+For how to enable CDP on the target Chrome (Chrome 144+ `chrome://inspect/#remote-debugging` UI vs. legacy `--remote-debugging-port` launch flag) and the full limitation matrix, read [`cdp-mode.md`](cdp-mode.md).
 
 ## Non-Obvious SDK Behavior
 
@@ -168,3 +166,4 @@ Use structured exceptions from `bridgic.browser.errors` (for example `StateError
 - Need shell commands: read `cli-guide.md`.
 - Need CLI <-> SDK conversion or mapping: read `cli-sdk-api-mapping.md`.
 - Need environment variables or login state persistence details: read `env-vars.md`.
+- Need to connect to an existing Chrome instance (chrome://inspect, `--remote-debugging-port`, cloud browser, Electron), or want the full CDP limitation / reconnect reference: read `cdp-mode.md`.

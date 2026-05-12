@@ -45,6 +45,7 @@ Reference files cover all use cases. Load only the one(s) relevant to the task:
 | Explore via CLI, then generate Python code | CLI → Python | [cli-sdk-api-mapping.md](references/cli-sdk-api-mapping.md) + [sdk-guide.md](references/sdk-guide.md) |
 | Migrate / compare / explain CLI ↔ SDK | Both | [cli-sdk-api-mapping.md](references/cli-sdk-api-mapping.md) |
 | Configure env vars or login state persistence | Either | [env-vars.md](references/env-vars.md) |
+| Connect to an existing Chrome (chrome://inspect, `--remote-debugging-port`, cloud browser, Electron) | CLI / SDK | [cdp-mode.md](references/cdp-mode.md) |
 
 ## Interface Decision Rules
 
