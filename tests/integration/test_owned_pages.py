@@ -33,11 +33,13 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+from collections import Counter
 from pathlib import Path
-from typing import AsyncGenerator, Iterator
+from typing import AsyncGenerator, Iterator, Optional
 
 import pytest
 import pytest_asyncio
+from playwright.async_api import async_playwright
 
 from bridgic.browser.session import Browser
 
@@ -87,6 +89,28 @@ def _ws_url(port: int) -> str:
         return json.loads(resp.read())["webSocketDebuggerUrl"]
 
 
+async def _chrome_snapshot(ws_url: str) -> Counter:
+    """Read-only multiset of every page URL currently in the connected browser.
+
+    Connects independently of bridgic, walks all contexts/pages, then
+    disconnects without closing any context — borrowed-mode safe.
+
+    Used to assert "SDK exit didn't leak anything in Chrome":
+
+        pre = await _chrome_snapshot(ws)
+        async with Browser(cdp=ws, ...) as b: ...
+        post = await _chrome_snapshot(ws)
+        assert post - pre == Counter()  # bridgic added no residue
+    """
+    async with async_playwright() as p:
+        b = await p.chromium.connect_over_cdp(ws_url)
+        try:
+            return Counter(pg.url for ctx in b.contexts for pg in ctx.pages)
+        finally:
+            # connect_over_cdp + close() == disconnect; remote targets untouched.
+            await b.close()
+
+
 def _wait_chrome(port: int, timeout: float = 20.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -113,6 +137,13 @@ def chrome_with_user_tabs() -> Iterator[str]:
         "--disable-extensions",
         "--disable-sync",
         "--headless=new",
+        # macOS-specific: Playwright's bundled Chromium tries to read the
+        # system keychain on first launch, which can block the process for
+        # >20s waiting on a UI prompt (silent hang in headless mode). These
+        # two flags are no-ops on Linux/Windows but eliminate the macOS
+        # startup stall on developer laptops without affecting CI.
+        "--password-store=basic",
+        "--use-mock-keychain",
         "about:blank",
     ]
     if os.name != "nt":
@@ -497,3 +528,134 @@ async def test_non_cdp_close_fallback_to_remaining(tmp_path):
         assert browser._page is first
     finally:
         await browser.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# I11–I15 — Lifecycle contract: SDK exit reaps every bridgic-created tab.
+#
+# Each scenario drives real business code through `async with Browser(cdp=...)`
+# and uses an independent Playwright probe (`_chrome_snapshot`) to compare
+# Chrome's target multiset before vs after. Together they regression-lock
+# the bug where bridgic-created tabs leaked into the user's Chrome on every
+# SDK exit in CDP-borrowed mode (root cause: `_close` skipped page cleanup
+# entirely when `_is_cdp` was true).
+# ─────────────────────────────────────────────────────────────────────────────
+
+DETAIL_PLACEHOLDER = "data:text/html,<title>detail</title><body>x"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_I11_clean_exit_reaps_bridgic_tabs(chrome_with_user_tabs):
+    """Bare `async with Browser(cdp=...)` that opens two tabs and never calls
+    close_tab must still leave Chrome's target multiset unchanged on exit.
+
+    Regression guard: prior to the owned-pages-aware `_close` fix, every
+    SDK exit leaked the bridgic-created list tab(s)."""
+    pre = await _chrome_snapshot(chrome_with_user_tabs)
+    async with Browser(cdp=chrome_with_user_tabs, headless=True, stealth=False) as b:
+        await b.navigate_to(BRIDGIC_MAIN)
+        await b.new_tab(url=DETAIL_PLACEHOLDER)
+        # Deliberately don't close — verify exit-time reap path, not close_tab.
+    post = await _chrome_snapshot(chrome_with_user_tabs)
+    leaked = post - pre
+    assert not leaked, f"bridgic leaked tabs on clean exit: {dict(leaked)}"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_I12_mid_task_exception_still_reaps(chrome_with_user_tabs):
+    """User-code exception inside `async with` must still trigger reap on
+    `__aexit__`. Real-world failure mode: business code crashes mid-task,
+    bridgic must not accumulate residue across retries."""
+    pre = await _chrome_snapshot(chrome_with_user_tabs)
+    with pytest.raises(RuntimeError, match="simulated"):
+        async with Browser(cdp=chrome_with_user_tabs, headless=True, stealth=False) as b:
+            await b.navigate_to(BRIDGIC_MAIN)
+            await b.new_tab(url=DETAIL_PLACEHOLDER)
+            raise RuntimeError("simulated user-code crash mid-task")
+    post = await _chrome_snapshot(chrome_with_user_tabs)
+    leaked = post - pre
+    assert not leaked, f"leaked under exception path: {dict(leaked)}"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_I13_consecutive_sessions_no_accumulation(chrome_with_user_tabs):
+    """Three back-to-back `Browser()` sessions must each return Chrome to the
+    same multiset — no per-session drift. Catches accumulating leaks that
+    a single-session test (I11) would miss."""
+    pre = await _chrome_snapshot(chrome_with_user_tabs)
+    for i in range(3):
+        async with Browser(cdp=chrome_with_user_tabs, headless=True, stealth=False) as b:
+            await b.navigate_to(BRIDGIC_MAIN)
+            await b.new_tab(url=f"data:text/html,<title>run-{i}")
+    post = await _chrome_snapshot(chrome_with_user_tabs)
+    leaked = post - pre
+    assert not leaked, f"accumulated across 3 runs: {dict(leaked)}"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_I14_popup_reaped_at_sdk_exit(chrome_with_user_tabs):
+    """An adopted popup must be reaped at SDK exit, not just at explicit
+    close_tab. Adoption alone (covered by I4) doesn't imply lifecycle
+    cleanup — this test locks the exit-path reap too."""
+    pre = await _chrome_snapshot(chrome_with_user_tabs)
+    async with Browser(cdp=chrome_with_user_tabs, headless=True, stealth=False) as b:
+        await b.navigate_to(LINK_TARGET_BLANK)
+        async with b._context.expect_page() as info:
+            await b._page.click("#lnk")
+        popup = await info.value
+        await popup.wait_for_load_state("domcontentloaded")
+        # Allow adoption task to run (same pattern as I4).
+        for _ in range(40):
+            if popup in b._owned_pages:
+                break
+            await asyncio.sleep(0.05)
+        assert popup in b._owned_pages, "popup was not adopted within 2s"
+        # Don't explicitly close — exercise the exit-time reap path.
+    post = await _chrome_snapshot(chrome_with_user_tabs)
+    leaked = post - pre
+    assert not leaked, f"popup leaked on exit: {dict(leaked)}"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_I15_user_manual_close_does_not_break_exit(chrome_with_user_tabs):
+    """User closes a bridgic-owned tab mid-session (e.g. clicked × in Chrome,
+    here mimicked via an independent CDP client). SDK exit must not raise,
+    and the Chrome multiset must still match the baseline."""
+    pre = await _chrome_snapshot(chrome_with_user_tabs)
+    exit_exc: Optional[BaseException] = None
+    try:
+        async with Browser(cdp=chrome_with_user_tabs, headless=True, stealth=False) as b:
+            await b.navigate_to(BRIDGIC_MAIN)
+            target_url = b._page.url
+            # Reach in via a *separate* Playwright connection and close the
+            # tab that matches by URL — closest approximation to a human
+            # closing the tab from the Chrome UI.
+            async with async_playwright() as p:
+                killer = await p.chromium.connect_over_cdp(chrome_with_user_tabs)
+                try:
+                    for ctx in killer.contexts:
+                        for pg in ctx.pages:
+                            if pg.url == target_url:
+                                try:
+                                    await pg.close()
+                                except Exception:
+                                    pass
+                finally:
+                    await killer.close()
+            await asyncio.sleep(0.5)  # let bridgic's close listener observe
+            # Now exit the `async with` block — bridgic's `_close` must
+            # tolerate a vanished page and still complete normally.
+    except BaseException as e:
+        exit_exc = e
+    assert exit_exc is None, (
+        f"SDK exit raised after user-manual close: "
+        f"{type(exit_exc).__name__}: {exit_exc}"
+    )
+    post = await _chrome_snapshot(chrome_with_user_tabs)
+    leaked = post - pre
+    assert not leaked, f"residue after user-manual close + exit: {dict(leaked)}"
