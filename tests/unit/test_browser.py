@@ -2213,8 +2213,13 @@ class TestBrowserCloseCdp:
 
     @pytest.mark.asyncio
     async def test_cdp_close_does_not_close_borrowed_pages(self):
-        """close() in CDP borrowed context must NOT close any pages — bridgic
-        just disconnects and leaves the remote browser intact."""
+        """close() in CDP borrowed mode preserves the user's pre-existing
+        tabs but DOES close bridgic-created/adopted tabs — otherwise every
+        SDK exit leaks a tab into the user's Chrome.
+
+        The borrowed page (not in ``_owned_pages``) must survive disconnect;
+        the bridgic-owned page (created by ``_new_page`` during ``_start``)
+        must be closed."""
         borrowed_pg = MagicMock()
         borrowed_pg.close = AsyncMock()
         borrowed_pg.goto = AsyncMock()
@@ -2226,13 +2231,20 @@ class TestBrowserCloseCdp:
         bridgic_pg.is_closed = MagicMock(return_value=False)
         browser = await self._start_cdp_browser(mock_pw)
 
+        # Sanity: _start mints + owns the bridgic page, but never the borrowed one.
         assert browser._page is bridgic_pg
+        assert bridgic_pg in browser._owned_pages
+        assert borrowed_pg not in browser._owned_pages
+
+        # _new_page appended bridgic_pg to context.pages — replicate Playwright's
+        # context.pages tracking (the fixture only seeds the initial set).
+        mock_ctx.pages = [borrowed_pg, bridgic_pg]
 
         await browser.close()
 
-        # No page is closed — bridgic only disconnects.
+        # User's pre-existing tab survives; bridgic's own tab is closed.
         borrowed_pg.close.assert_not_called()
-        bridgic_pg.close.assert_not_called()
+        bridgic_pg.close.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_cdp_close_does_not_close_borrowed_context(self):
@@ -2304,7 +2316,8 @@ class TestBrowserCloseCdp:
 
     @pytest.mark.asyncio
     async def test_cdp_close_multiple_borrowed_pages_not_closed(self):
-        """close() in CDP borrowed mode must not close or navigate any page."""
+        """Multiple borrowed user tabs all survive disconnect; bridgic's own
+        tab is the only one closed."""
         page1 = MagicMock()
         page1.close = AsyncMock()
         page1.goto = AsyncMock()
@@ -2320,15 +2333,38 @@ class TestBrowserCloseCdp:
         mock_pw, _, mock_ctx, bridgic_pg = self._make_cdp_mocks(pages=[page1, page2])
         bridgic_pg.is_closed = MagicMock(return_value=False)
         browser = await self._start_cdp_browser(mock_pw)
+        mock_ctx.pages = [page1, page2, bridgic_pg]
 
         await browser.close()
 
-        # No page is closed or navigated — bridgic only disconnects.
         page1.close.assert_not_called()
         page2.close.assert_not_called()
         page1.goto.assert_not_called()
         page2.goto.assert_not_called()
-        bridgic_pg.close.assert_not_called()
+        bridgic_pg.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cdp_close_closes_adopted_popup(self):
+        """Adopted popups (in ``_owned_pages``) must be closed at SDK exit —
+        amphi-style code that opens a detail tab via ``new_tab`` and then
+        forgets to ``close_tab`` it would otherwise leak that tab into the
+        user's Chrome on every exit."""
+        adopted_popup = MagicMock()
+        adopted_popup.close = AsyncMock()
+        adopted_popup.is_closed = MagicMock(return_value=False)
+        adopted_popup.video = None
+
+        mock_pw, _, mock_ctx, bridgic_pg = self._make_cdp_mocks()
+        bridgic_pg.is_closed = MagicMock(return_value=False)
+        browser = await self._start_cdp_browser(mock_pw)
+        # Simulate the popup was adopted earlier in the session.
+        browser._owned_pages.add(adopted_popup)
+        mock_ctx.pages = [bridgic_pg, adopted_popup]
+
+        await browser.close()
+
+        adopted_popup.close.assert_awaited_once()
+        bridgic_pg.close.assert_awaited_once()
 
     # --- Owned CDP context: still just disconnect, no page/context cleanup ---
 
@@ -3754,36 +3790,118 @@ class TestClickIntegrationUsesFallbackGate:
 
 
 # ---------------------------------------------------------------------------
-# M01: _maybe_wrap_arrow_fn — CDP Runtime.evaluate arrow-fn auto-unwrap
+# _wrap_js_for_cdp_eval — parity with Playwright page.evaluate(str)
 # ---------------------------------------------------------------------------
 
-class TestMaybeWrapArrowFn:
-    """QA finding M01: ``() => "x"`` must return ``"x"`` under CDP borrowed
-    mode (parity with ``page.evaluate`` in non-CDP mode), not ``{}``.
+class TestWrapJsForCdpEval:
+    """The CDP-path wrapper must accept every input form ``page.evaluate(str)``
+    accepts, and produce the same value Playwright's non-CDP path produces.
 
-    The helper wraps arrow-function literals as IIFEs before handing them to
-    raw ``Runtime.evaluate``. Non-arrow expressions pass through unchanged.
+    Reproduces the historical bug: an IIFE ``(() => {...})()`` was naively
+    re-wrapped to ``((() => {...})();)()`` (a ``SyntaxError``), so user code
+    that worked in non-CDP mode silently broke under ``cdp="auto"``. Verifying
+    semantic parity here keeps that regression dead.
     """
 
-    @pytest.mark.parametrize(
-        "src,expected",
-        [
-            ('() => "hi"', '(() => "hi")()'),
-            ('()=>"hi"', '(()=>"hi")()'),
-            ('(x) => x+1', '((x) => x+1)()'),
-            ('async () => 1', '(async () => 1)()'),
-            ('x => x*2', '(x => x*2)()'),
-            ('  () => 42  ', '(() => 42)()'),
-            # Non-arrow expressions pass through unchanged.
-            ('document.title', 'document.title'),
-            ('42', '42'),
-            ('typeof document', 'typeof document'),
-            ('window.innerWidth', 'window.innerWidth'),
-            # A string literal containing '=>' does not start with an arrow.
-            ('"x => y"', '"x => y"'),
-            # Named function expression is not an arrow literal.
-            ('function () { return 1 }', 'function () { return 1 }'),
-        ],
-    )
-    def test_wrap_parametrized(self, src, expected):
-        assert _browser_module._maybe_wrap_arrow_fn(src) == expected
+    # The behaviour contract: for every input, wrapper(code) evaluated under
+    # raw Runtime.evaluate must produce the SAME value (or throw the same
+    # kind of error) as Playwright's page.evaluate(code). Each row is
+    # (case_name, user_code, expected_value_or_ThrowSentinel). THROW means
+    # both Playwright and our wrapper must reject; the value comparison is
+    # skipped in that case (only the exception path is verified).
+    #
+    # Note: these cases cover JavaScript-language semantics (V8-side).
+    # Browser host-object substitution (Window/Document/Node/Error) and
+    # the auto-call argument convention are verified end-to-end in
+    # tests/integration/test_evaluate_cdp_parity.py against real Chrome.
+    THROW = object()
+    _CASES = [
+        ("spread args (1 arg)",   "(...a) => a.length",                                                    1),  # wrapper auto-passes 1 undefined arg, matching Playwright
+        ("plain expr",            "document ? 42 : 0",                                                      42),
+        ("number literal",        "42",                                                                     42),
+        ("bare arrow fn",         "() => 42",                                                               42),
+        ("bare arrow body",       "() => { return { a: 1 } }",                                              {"a": 1}),
+        ("IIFE with ;",           '(() => { return JSON.stringify({a:1,b:"x"}) })();',                      '{"a":1,"b":"x"}'),
+        ("IIFE no ;",             '(() => { return JSON.stringify({a:1,b:"x"}) })()',                       '{"a":1,"b":"x"}'),
+        ("named fn expr",         "function() { return [1,2,3].length }",                                   3),
+        ("named function decl",   "function foo() { return 9 }; foo()",                                     THROW),  # PW SyntaxError; we must match
+        ("class decl + stmt",     "class C { get v() { return 1 } }; new C().v",                            1),
+        ("bare object literal",   "{a:1, b:2}",                                                             THROW),  # block-label ambiguity, PW rejects
+        ("paren obj literal",     "({a:1, b:2})",                                                           {"a": 1, "b": 2}),
+        ("let stmt list",         "let x = 5; x * 2",                                                       10),
+        ("two exprs",             "1+1; 2+2",                                                               4),
+        ("label block",           "lbl: { break lbl; }",                                                    None),
+        ("comment + expr",        "() => 42 // ok",                                                         42),
+        ("async arrow",           "async () => 7",                                                          7),
+        ("async IIFE w/ await",   "(async () => { return await Promise.resolve(33) })()",                   33),
+        ("this in page",          "this",                                                                   "ref: <Window>"),  # PW serializes Window to this
+        ("document.title",        "document.title",                                                         "hi"),
+        ("shorthand obj",         "const k = 7; ({k})",                                                     {"k": 7}),
+        ("array destructuring",   "const [a,b]=[1,2]; a+b",                                                 3),
+        ("rejected promise",      'Promise.reject(new Error("boom"))',                                      THROW),
+        ("regex literal",         "/abc/g.flags",                                                           "g"),
+        ("template literal",      "`a${1+1}b`",                                                             "a2b"),
+        ("spread",                "[...[1,2,3]]",                                                           [1, 2, 3]),
+        ("null literal",          "null",                                                                   None),
+        ("undefined literal",     "undefined",                                                              None),
+        ("throw expr",            'throw new Error("hi")',                                                  THROW),
+    ]
+
+    @pytest.mark.parametrize("name,src,expected", _CASES, ids=[c[0] for c in _CASES])
+    def test_wrapper_parity_with_playwright(self, name, src, expected):
+        """For every JS input form, the wrapped expression under V8 must
+        produce the same value (or matching throw) as Playwright's
+        ``page.evaluate(str)`` — verified by running through Node, whose V8
+        is the same engine driving Chromium ``Runtime.evaluate``.
+
+        This is the regression guard for the bug where users had to rewrite
+        IIFEs differently for CDP vs non-CDP modes."""
+        import json as _json
+        import shutil
+        import subprocess
+
+        wrapped = _browser_module._wrap_js_for_cdp_eval(src)
+        # User code must only be embedded as a JSON string literal, never
+        # spliced raw into the JS surface (XSS-style injection guard).
+        assert _json.dumps(src) in wrapped
+
+        node = shutil.which("node")
+        if node is None:
+            pytest.skip("node not installed; semantic check covered in integration tests")
+
+        # We host the wrapper inside a minimal page-like sandbox: set up
+        # `document.title = "hi"` so the `document.title` case has a concrete
+        # value, and use Window-stand-in serialization for `this`. Errors are
+        # serialized as `THROW:<msg>` so the harness can compare.
+        probe = (
+            "globalThis.document = { title: 'hi' };"
+            "globalThis.window = globalThis;"  # so `this` at top level resolves to window-like
+            f"const wrapped = {_json.dumps(wrapped)};"
+            "(async () => {"
+            "  try {"
+            "    let v = (0, eval)(wrapped);"
+            "    if (v && typeof v.then === 'function') v = await v;"
+            "    if (v === globalThis) v = 'ref: <Window>';"
+            "    console.log(JSON.stringify({ok: true, v: v === undefined ? null : v}));"
+            "  } catch (e) {"
+            "    console.log(JSON.stringify({ok: false, e: e.message}));"
+            "  }"
+            "})();"
+        )
+        result = subprocess.run([node, "-e", probe], capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, f"wrapper crashed node for {name}: {result.stderr}"
+        outcome = _json.loads(result.stdout.strip())
+
+        if expected is self.THROW:
+            assert outcome["ok"] is False, f"{name}: expected throw, got value {outcome.get('v')!r}"
+        else:
+            assert outcome["ok"] is True, f"{name}: unexpected throw {outcome.get('e')!r}"
+            assert outcome["v"] == expected, f"{name}: got {outcome['v']!r}, expected {expected!r}"
+
+    def test_pathological_user_code_does_not_break_wrapper(self):
+        """User code containing quotes, backslashes, ``)`` and ``=>`` must not
+        break the wrapper's JSON-embedded slot (injection guard)."""
+        pathological = r'"a => b\nx" /* )()=> */ + ` ${1+1} `'
+        wrapped = _browser_module._wrap_js_for_cdp_eval(pathological)
+        import json as _json
+        assert _json.dumps(pathological) in wrapped

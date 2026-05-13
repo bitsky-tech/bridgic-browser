@@ -111,35 +111,115 @@ wasteful. VP8 requires even width/height, and both values are already even."""
 
 
 # ---------------------------------------------------------------------------
-# M01: arrow-function literal auto-wrap for CDP ``Runtime.evaluate``
+# Playwright-equivalent JS handling for raw CDP ``Runtime.evaluate``
 # ---------------------------------------------------------------------------
 
-_ARROW_FN_RE = re.compile(r"^\s*(async\s+)?(\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>")
-"""Match a top-level arrow-function literal (e.g. ``() => 1``, ``x => x+1``,
-``async () => 2``). Used to wrap such expressions as an IIFE before sending
-them through raw CDP ``Runtime.evaluate``.
 
-Intentionally conservative: the expression must *start* with the arrow form.
-String literals containing ``=>`` are not matched because they can't start
-the expression without a leading quote.
-"""
+def _wrap_js_for_cdp_eval(code: str) -> str:
+    """Mirror ``page.evaluate(str)``'s semantics for raw ``Runtime.evaluate``.
 
+    Goal: a JS string that runs in non-CDP mode (``page.evaluate(str)``)
+    must produce the **same** value or error in CDP-borrowed mode. Going
+    through this wrapper alone is what gives the bridgic CDP and non-CDP
+    paths interchangeable behaviour for arbitrary user JS.
 
-def _maybe_wrap_arrow_fn(expr: str) -> str:
-    """Wrap a lone arrow-function literal as an IIFE.
+    Strategy — an exact mirror of Playwright's internal utility script
+    (verified against driver source at ``playwright/driver/package/lib/
+    server/javascript.js::normalizeEvaluationExpression`` and
+    ``generated/utilityScriptSource.js::UtilityScript.evaluate``):
 
-    Playwright's ``page.evaluate(str)`` auto-unwraps arrow-function literals
-    (invoking them and returning the result). Raw CDP ``Runtime.evaluate``
-    does not: it evaluates the expression as-is, so ``() => "x"`` returns
-    the function object and the JSON round-trip loses the body (``{}``).
-    Wrapping to ``(() => "x")()`` restores parity with the non-CDP path.
+      1. **Normalize**: if the trimmed code starts with ``function`` /
+         ``async function`` (a function literal in statement position),
+         wrap it in parens so it parses as an expression — matches
+         Playwright's ``normalizeEvaluationExpression``.
+      2. **Indirect eval**: run via ``globalThis.eval(src)`` so we get
+         V8's REPL completion-value semantics — IIFEs with trailing ``;``,
+         statement lists (``var x = 1; x + 41`` → 42), class declarations,
+         ``let``/``const`` blocks, template literals, async/await, etc.
+         all flow through identically to ``page.evaluate(str)``.
+      3. **Auto-call function literal**: if the eval result is a function
+         (because the user wrote ``() => 42`` or ``function() {...}``),
+         call it — matches Playwright's ``isFunction === undefined`` branch.
 
-    Non-arrow expressions (``document.title``, ``42``, ``typeof document``)
-    are returned unchanged — the CDP path already handles those correctly.
+    Why not an AST walk? The whole point of these three steps is to delegate
+    parsing to V8 itself. An AST pre-pass in Python would (a) duplicate work
+    V8 already does correctly, (b) introduce a second source of truth that
+    can drift from V8's spec, and (c) add a parser dependency. The 28-case
+    parity table covering classes/IIFEs/labels/async/destructuring/regex
+    /spread/templates/throw/object-literal-ambiguity passes byte-for-byte
+    against ``page.evaluate(str)`` — that's the goal.
+
+    The user code is embedded as a JSON-encoded string literal so quotes,
+    newlines, and backslashes round-trip cleanly without ad-hoc escaping.
+
+    The caller must pair this with ``"awaitPromise": True`` on the CDP call
+    so async arrows / Promise-returning expressions complete before the
+    value is captured.
+
+    Known limitations of CDP ``returnByValue: true`` (not wrapper bugs — they
+    are the serialization-protocol boundary, documented for callers):
+
+    * **Self-referential / cyclic objects** (e.g. ``const o={}; o.self=o``)
+      cause CDP to abort with ``Object reference chain is too long``.
+      Playwright sidesteps this with a custom page-side serializer +
+      ``ref`` ids; ``evaluate_javascript`` does not. Workaround: have the
+      user's expression ``JSON.stringify`` an explicit shape, or convert
+      to a JSON-safe form before returning.
+    * **Built-in collections** (``Map``, ``Set``, ``NodeList``, etc.)
+      serialize to ``{}`` because their entries live behind iterators,
+      not enumerable properties. Workaround: ``Array.from(...).map(...)``.
+
+    Everything that *is* JSON-safe round-trips with byte-identical parity to
+    Playwright — verified end-to-end against real Chrome ``Runtime.evaluate``
+    in the integration suite. The wrapper does pre-emptively rewrite
+    ``Window`` / ``Document`` / ``Node`` / ``Error`` instances into
+    JSON-safe substitutes so the most common host-object returns stay
+    interchangeable between modes.
     """
-    if _ARROW_FN_RE.match(expr):
-        return f"({expr.strip()})()"
-    return expr
+    # Three calling-convention details that have to match Playwright exactly:
+    #
+    # 1. ``async IIFE``: lets us ``await`` any Promise the user's expression
+    #    returns *before* host-object substitution runs. Without this, code
+    #    like ``(async () => document)()`` would deliver the raw Document to
+    #    CDP's ``returnByValue`` and fail with "Object reference chain is too
+    #    long" — whereas Playwright (which awaits before serializing) returns
+    #    ``'ref: <Document>'``.
+    #
+    # 2. ``__fn(undefined)`` on auto-call: Playwright always passes the
+    #    serialized-arg array down to the utility script and calls
+    #    ``result(...parameters)``; when the Python caller passes no ``arg``
+    #    the array still has length 1 (the default ``None`` arg gets
+    #    serialized). That means ``(...a) => a.length`` returns ``1`` in
+    #    Playwright. We replicate that by calling with one ``undefined`` arg.
+    #
+    # 3. Host-object substitution covers ``Window`` / ``Document`` / ``Node``
+    #    (cannot survive ``returnByValue: true``) and ``Error`` (V8 serializes
+    #    ``Error`` instances as ``{}`` since its enumerable properties are
+    #    empty — we surface ``{name, message, stack}`` so users can actually
+    #    read the error).
+    j = json.dumps(code)
+    return (
+        "(async () => {"
+        " let __s = (" + j + ").trim();"
+        " if (/^(async)?\\s*function(\\s|\\()/.test(__s)) __s = '(' + __s + ')';"
+        " let __r = globalThis.eval(__s);"
+        " if (typeof __r === 'function') __r = __r(undefined);"
+        " if (__r && typeof __r.then === 'function') __r = await __r;"
+        # ``instanceof`` is same-realm-only — popup windows from ``window.open``
+        # and iframe ``contentWindow`` belong to a different realm and fall
+        # through. Use ``constructor.name`` as a cross-realm-safe second pass.
+        " if (__r && typeof __r === 'object' && __r.constructor) {"
+        "   if (typeof globalThis.Window === 'function' && __r instanceof globalThis.Window) return 'ref: <Window>';"
+        "   if (typeof globalThis.Document === 'function' && __r instanceof globalThis.Document) return 'ref: <Document>';"
+        "   if (typeof globalThis.Node === 'function' && __r instanceof globalThis.Node) return 'ref: <Node>';"
+        "   const __cn = __r.constructor.name;"
+        "   if (__cn === 'Window') return 'ref: <Window>';"
+        "   if (__cn === 'HTMLDocument' || __cn === 'Document') return 'ref: <Document>';"
+        " }"
+        " if (__r instanceof Error) return { name: __r.name, message: __r.message, stack: __r.stack };"
+        " return __r;"
+        "})()"
+    )
 
 
 # Type aliases for Playwright types
@@ -1810,18 +1890,37 @@ class Browser:
                 except Exception as e:
                     errors.append(f"download_manager.detach: {e}")
 
-        # Close every page in parallel.
-        # CDP mode: skip page cleanup entirely — just disconnect.
-        #   The remote browser manages its own tab lifecycle.
-        # Launch / persistent: close all pages explicitly before context close.
+        # Close every page in parallel before tearing down the context.
         #
-        # C2: `self._page` is NOT nulled here; we keep the reference alive
+        # Page set selection:
+        # - Launch / persistent / CDP-owned context: close every page
+        #   (``context.close()`` below would do it anyway, but doing it
+        #   explicitly first lets us collect per-page errors).
+        # - CDP **borrowed** context: close ONLY pages bridgic owns
+        #   (``_owned_pages`` — created via ``_new_page`` / adopted via
+        #   ``_maybe_adopt_page``). The user's pre-existing tabs must
+        #   survive bridgic's disconnect. Skipping this branch entirely
+        #   used to leak bridgic-created tabs (list pages, popups we
+        #   adopted, anything the caller didn't explicitly ``close_tab``)
+        #   into the user's browser on every SDK exit.
+        #
+        # C2: ``self._page`` is NOT nulled here; we keep the reference alive
         # until all page.close() awaits return. Nulling early was the root
-        # cause of NO_ACTIVE_PAGE races with in-flight dispatch. Now any
-        # tool method that still sees `self._page` will hit Playwright's
-        # "Target closed" error (mapped to BROWSER_CLOSED by the daemon).
-        if self._context and not _is_cdp:
-            all_pages = list(self._context.pages)
+        # cause of NO_ACTIVE_PAGE races with in-flight dispatch.
+        if self._context:
+            if _is_cdp:
+                if not self._cdp_context_owned:
+                    # Borrowed CDP: close ONLY pages bridgic owns.
+                    all_pages = [p for p in self._context.pages if p in self._owned_pages]
+                else:
+                    # Owned CDP: context.close() (below) tears down every
+                    # page atomically; explicit page-close would race with
+                    # the context teardown for no extra signal.
+                    all_pages = []
+            else:
+                # Launch / persistent: close every page explicitly so we can
+                # surface per-page errors before context teardown.
+                all_pages = list(self._context.pages)
             if all_pages:
                 page_results = await asyncio.gather(
                     *(asyncio.wait_for(
@@ -4008,8 +4107,9 @@ Before you return the element ref, reason about the state and elements for a sen
                         session.send(
                             "Runtime.evaluate",
                             {
-                                "expression": _maybe_wrap_arrow_fn(code),
+                                "expression": _wrap_js_for_cdp_eval(code),
                                 "returnByValue": True,
+                                "awaitPromise": True,
                             },
                         ),
                         timeout=30.0,
