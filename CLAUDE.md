@@ -102,6 +102,68 @@ bridgic/browser/
 
 See [`docs/INTERNALS.md` — Owned-page Tracking](docs/INTERNALS.md#owned-page-tracking) for the full design and tradeoffs.
 
+### Downloads
+
+bridgic has two independent download pipelines, picked by mode:
+
+| Mode | Pipeline | Notes |
+|---|---|---|
+| non-CDP (launch / persistent_context) | Playwright's per-context `setDownloadBehavior(allowAndName, downloadPath=<artifactsDir>)` → `download` events fire → `DownloadManager.save_as()` copies to `downloads_path` with the real filename. | Files land at the real filename in `downloads_path`. If `downloads_path` is unset, DownloadManager is not attached and files are lost when Playwright deletes `artifactsDir` on close. |
+| CDP-owned (bridgic creates its own context on the remote Chrome) | Same as non-CDP: Playwright's per-context `allowAndName` routes through `artifactsDir`, DownloadManager copies. | Per-context override targets bridgic's own context, doesn't touch the user. |
+| **CDP-borrowed** (`Browser(cdp=...)` against a user's running Chrome) | bridgic's own override on bridgic's tab: `Browser.setDownloadBehavior(allowAndName, downloadPath=<effective>, eventsEnabled=true)` sent **via the page CDP session** (`BrowserContext.new_cdp_session(self._page)`). `CdpDownloadRenamer` subscribes to `Browser.downloadWillBegin/downloadProgress` on the same session and renames `<dir>/<guid>` → `<dir>/<real name>` on completion. | Page-session routing is the *only* form Chrome 138+ honors when the user has "Ask where to save each file" enabled — `Browser.setDownloadBehavior` over a browser-level session and `Page.setDownloadBehavior(allow, ...)` both still pop the dialog. See [empirically-tried alternatives](#empirically-tried-alternatives-for-cdp-borrowed-downloads) below. |
+
+#### Effective download path
+
+`Browser._effective_cdp_downloads_path(client_cwd=None)` resolves the path in CDP-borrowed mode:
+
+1. Explicit `Browser(downloads_path=...)` constructor arg or `bridgic-browser.json` config — always wins.
+2. `client_cwd` (per-command) or `self._pending_client_cwd` (set by the daemon before `_start()`). The CLI client puts `os.getcwd()` in every socket request; the daemon sets the hint pre-dispatch so the first lazy-start L1 sees it too. Gives `bridgic-browser` `curl -O`-style ergonomics — files land where the user ran the command.
+3. `~/Downloads` fallback.
+
+In non-CDP / CDP-owned modes the path is `self._downloads_path` only (CWD plumbing doesn't apply because DownloadManager is the pipeline). The CLI daemon **skips** its auto-default `downloads_path=~/Downloads` when `BRIDGIC_CDP` is set — otherwise that default would be indistinguishable from a user-explicit value and silently win over the CWD priority above.
+
+#### CDP-borrowed flow detail
+
+**L1 (post-connect, `_set_cdp_download_behavior` with `session=<page CDP session>`)**: after creating bridgic's tab, send `Browser.setDownloadBehavior(allowAndName, downloadPath=<effective>, eventsEnabled=true)` via `self._cdp_download_session = await self._context.new_cdp_session(self._page)`. Same session attaches `CdpDownloadRenamer`. Only runs in CDP-borrowed mode (`not self._cdp_context_owned`).
+
+**Per-command `cwd-update` (`update_cdp_downloads_path`)**: re-sends the same command (still via the page session) when the daemon's `client_cwd` resolves to a different effective path than `self._current_cdp_download_path`. Short-circuits when path is unchanged or in non-borrowed modes. The renamer's default target is updated for *future* downloads — in-flight downloads keep the dir captured at their `downloadWillBegin` time.
+
+**L2 rescue (pre-close, `_rescue_cdp_orphan_downloads`)**: scans every `playwright-artifacts-*` under the OS tempdir and moves orphan files to `~/Downloads/bridgic-rescue-<name>` before `browser.close()` triggers Playwright's `removeFolders([artifactsDir])`. The defense covers downloads from the user's other tabs that Playwright captured into its tempdir (per-context override on the borrowed default context still routes there); skips trace/video/HAR artifacts and files DownloadManager already saved. Mostly a no-op now that bridgic's own tab uses page-session routing, but kept as defense in depth.
+
+**L3 (pre-close)**: send `Browser.setDownloadBehavior(behavior="default")` over the page session, then detach renamer + session. Chrome reverts to its native prefs for any post-disconnect downloads on the user's tabs.
+
+#### Filename preservation (CdpDownloadRenamer)
+
+`allowAndName` writes files as `<downloadPath>/<guid>` (e.g. `08d0c134-9231-478e-aca1-08b3e0ec1798`). `_cdp_download_renamer.py:CdpDownloadRenamer`:
+
+1. On `Browser.downloadWillBegin`, records `{guid → (sanitized suggestedFilename, target_dir)}` — target dir snapshotted so a concurrent CWD swap doesn't retarget files mid-flight.
+2. On `Browser.downloadProgress.state="completed"`, renames `<target_dir>/<guid>` → `<target_dir>/<real name>`. Conflicts resolve to `name (1).ext`, `name (2).ext` (Chrome's scheme).
+3. On `state="canceled"`, removes the GUID stub.
+
+`sanitize_filename()` strips path separators, Windows-forbidden chars (`< > : " | ? *`), control bytes, and truncates to 255 bytes while preserving the extension. Empty result → `"download"`.
+
+#### Empirically-tried alternatives for CDP-borrowed downloads
+
+Verified against Chrome 138, macOS, with "Ask where to save each file" preference **on** (the default in many regions):
+
+| Attempt | Result | Verdict |
+|---|---|---|
+| `Page.setDownloadBehavior(allow, downloadPath=...)` | Dialog still pops. | ❌ |
+| `Browser.setDownloadBehavior(allow, downloadPath=...)` via browser CDP session | Dialog still pops; CDP accepts but Chrome honors user pref. | ❌ |
+| `Browser.setDownloadBehavior(allowAndName, downloadPath=...)` via browser CDP session | Dialog still pops. | ❌ |
+| `Browser.setDownloadBehavior(allowAndName, downloadPath=..., browserContextId=<defaultBrowserContextId from Target.getBrowserContexts>)` | Chrome rejects: `Failed to find browser context for id <X>`. (Playwright's own call uses `browserContextId=undefined` — see `crBrowser.js:89 new CRBrowserContext(browser, void 0, ...)`.) | ❌ |
+| `Browser.setDownloadBehavior(allowAndName, downloadPath=..., eventsEnabled=true)` via **page** CDP session (`ctx.new_cdp_session(page)`) | Silent download, real filename via post-completion rename, `downloadWillBegin/Progress` events fire on the same session. | ✅ chosen |
+
+agent-browser's `Some(session_id)` argument is the same trick — page-level CDP routing.
+
+#### Caveats
+
+- **bridgic's tab gets the override; user's tabs keep their normal Chrome UX** (intentional — the page-session scope is bridgic's tab only). User-initiated downloads in their other tabs still go to their Chrome's configured directory and obey their "Ask where to save" pref. This is by design and matches the "I gave you full control of *my agent's* tab via `--cdp`" semantics — user's private workspace is untouched.
+- **DownloadManager is not attached in CDP-borrowed mode.** Chrome writes directly to the final path; Playwright's per-context `download` event doesn't fire when the file is routed away from `artifactsDir`. `wait_for_download()` is correspondingly **unsupported in CDP-borrowed mode** — use CDP-owned or non-CDP for that.
+- **The renamer is best-effort.** If a CDP event is missed or the OS rename fails (cross-FS, permission, etc.) the file stays at its GUID path with a warning logged. It never deletes content.
+- **`last_close_artifacts()`** exposes a `rescued_downloads` list when L2 actually moved anything.
+- **"Show in Folder"** in Chrome's download bubble is broken whenever `setDownloadBehavior(allowAndName, eventsEnabled=true)` is active. This is a Chromium bug (`#324282051`) affecting all CDP-using tools. See [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md).
+
 ### Tool selection
 
 `BrowserToolSetBuilder` selects tools by category or name (combinable):

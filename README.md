@@ -680,7 +680,7 @@ browser = Browser(
 | `auto_follow_popups` | bool | True | When a bridgic-owned page spawns a popup (`<a target="_blank">` click, `window.open()`), automatically move `self._page` to the popup. Set False to keep the active-page pointer fixed; the popup is still adopted into the owned set. |
 | `channel` | str | None | Browser channel (chrome, msedge, etc.) |
 | `proxy` | dict | None | Proxy settings |
-| `downloads_path` | str/Path | None | Download directory |
+| `downloads_path` | str/Path | None | Download directory. Priority: explicit value > `bridgic-browser.json` > (CDP-borrowed CLI only) the CLI client's CWD > `~/Downloads`. See [Downloads](#downloads). |
 
 **Snapshot:** Use `get_snapshot(interactive=False, full_page=True)` to get an `EnhancedSnapshot` with `.tree` (accessibility tree string) and `.refs` (ref → locator data). By default `full_page=True` includes all elements regardless of viewport position. Pass `interactive=True` for clickable/editable elements only (flattened output), or `full_page=False` to limit to viewport-only elements. Use `get_element_by_ref(ref)` to get a Playwright Locator from a ref (e.g. "1f79fe5e") for click, fill, etc.
 
@@ -700,18 +700,35 @@ config = StealthConfig(
 browser = Browser(stealth=config, headless=False)
 ```
 
-#### DownloadManager
+#### Downloads
 
-Handle file downloads with proper filename preservation:
+bridgic preserves the original filename, suppresses the "Save As" dialog, and keeps the API the same across modes. Internally there are two pipelines — `DownloadManager` for non-CDP / CDP-owned, and `CdpDownloadRenamer` for CDP-borrowed (page-level CDP routing of `setDownloadBehavior(allowAndName)`). See [CLAUDE.md → Downloads](CLAUDE.md#downloads) for the full design.
+
+##### Download path matrix
+
+| Caller | Mode | `downloads_path` explicit | Effective path |
+|---|---|---|---|
+| **CLI** (`bridgic-browser ...`) | non-CDP | yes | the explicit value |
+| **CLI** | non-CDP | no | `~/Downloads` (daemon auto-default) |
+| **CLI** | CDP (`--cdp ...`) | yes | the explicit value |
+| **CLI** | CDP | no | the CLI client's working directory at command time (`os.getcwd()`) — `curl -O`-style ergonomics |
+| **SDK** (`Browser(...)`) | non-CDP | yes | the explicit value |
+| **SDK** | non-CDP | no | downloads not captured (Playwright wipes the temp dir on close — pass `downloads_path`) |
+| **SDK** | CDP (`Browser(cdp=...)`) | yes | the explicit value |
+| **SDK** | CDP | no | `~/Downloads` (SDK has no CLI CWD hint) |
 
 ```python
-# Pass downloads_path to Browser — it creates and manages the DownloadManager internally
+# Non-CDP (DownloadManager pipeline)
 browser = Browser(downloads_path="./downloads", headless=True)
-await browser.navigate_to("https://example.com")  # lazy start triggers here
+await browser.navigate_to("https://example.com")
+# Programmatic access to completed downloads
+for f in browser.download_manager.downloaded_files:
+    print(f"Downloaded: {f.file_name} ({f.file_size} bytes)")
 
-# Access downloaded files via the built-in manager
-for file in browser.download_manager.downloaded_files:
-    print(f"Downloaded: {file.file_name} ({file.file_size} bytes)")
+# CDP-borrowed (CdpDownloadRenamer pipeline; downloads land at downloads_path
+# with real filenames; download_manager is None — wait_for_download is
+# unsupported here).
+browser = Browser(cdp="auto", downloads_path="./downloads")
 ```
 
 ### Stealth Mode

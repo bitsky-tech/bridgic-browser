@@ -18,8 +18,8 @@ Short reference for the main session and download APIs. For tool lists and selec
 | `await browser.get_current_page_title()` | Get current page title string, or `None` if no page is open. |
 | `browser.get_current_page_url()` | Get current page URL string, or `None` if no page is open. (sync) |
 | `browser.get_config()` | Return dict of all current browser configuration options. |
-| `browser.download_manager` | `DownloadManager` instance (after `start()`), or `None` if `downloads_path` not set. |
-| `browser.downloaded_files` | Shortcut for `browser.download_manager.downloaded_files`. Returns `[]` if no download manager. |
+| `browser.download_manager` | `DownloadManager` instance (after `start()`) when `downloads_path` is set **and** the active pipeline uses it (non-CDP / CDP-owned). In **CDP-borrowed** mode the download manager is intentionally not attached — see [CdpDownloadRenamer](#cdp-borrowed-downloads-cdpdownloadrenamer). |
+| `browser.downloaded_files` | Shortcut for `browser.download_manager.downloaded_files`. Returns `[]` if no download manager (including CDP-borrowed). |
 | `browser.headless` | `bool` — whether the browser runs in headless mode. |
 | `browser.viewport` | `dict` or `None` — current viewport size configuration. |
 | `browser.channel` | `str` or `None` — browser distribution channel. |
@@ -31,14 +31,30 @@ Short reference for the main session and download APIs. For tool lists and selec
 | `browser.last_close_artifacts` | `dict` — trace and video paths produced by the most recent `close()` call. Shape: `{"trace": [str, ...], "video": [str, ...]}`. Empty lists before the first close, or when no tracing/video was active. Returns a fresh shallow copy on every access — mutating it does not affect the browser's internal state. |
 | `browser.last_close_errors` | `list[str]` — warnings/errors collected during the most recent `close()` call (e.g. trace-stop timeouts, video-finalize failures). Empty list before the first close, or on a clean shutdown. Returns a fresh copy on every access. |
 
-## DownloadManager
+## Downloads
+
+bridgic has two download pipelines, picked by mode. The download path resolution is:
+
+| Mode | Pipeline | `downloads_path` unset → falls back to |
+|---|---|---|
+| non-CDP (`Browser()`) | `DownloadManager.save_as` from Playwright's `artifactsDir` | DownloadManager is **not** attached; files are lost when Playwright wipes `artifactsDir` on close. Always pass `downloads_path` in non-CDP mode. |
+| CDP-owned (rare — `Browser(cdp=...)` against a remote Chrome that has no contexts yet) | Same as non-CDP | Same caveat as non-CDP. |
+| CDP-borrowed (`Browser(cdp=...)` against a user's running Chrome) | `CdpDownloadRenamer` (rename GUID → real name post-completion) via a page-level CDP session | `~/Downloads`. In daemon mode the CLI client's CWD (`os.getcwd()`) takes priority over the `~/Downloads` fallback — see [CLAUDE.md → Downloads](../CLAUDE.md#downloads). |
+
+### DownloadManager (non-CDP / CDP-owned modes)
 
 `Browser` creates and manages a `DownloadManager` automatically when `downloads_path` is provided. Access it via `browser.download_manager` after the browser has started (via `navigate_to()`, `search()`, or `_start()`).
 
 | Method / property | Description |
 |------------------|-------------|
-| `browser.download_manager` | The auto-created `DownloadManager` (None if `downloads_path` not set). |
+| `browser.download_manager` | The auto-created `DownloadManager` (None when `downloads_path` is unset, or in CDP-borrowed mode regardless of `downloads_path`). |
 | `browser.download_manager.downloaded_files` | List of `DownloadedFile` (`.url`, `.path`, `.file_name`, `.file_size`). |
+
+`browser.wait_for_download(...)` is **not supported in CDP-borrowed mode** — Playwright's per-context `download` event does not fire when the file is routed away from `artifactsDir` by the page-session override.
+
+### CDP-borrowed downloads (CdpDownloadRenamer)
+
+In CDP-borrowed mode bridgic sends `Browser.setDownloadBehavior(allowAndName, downloadPath=<path>, eventsEnabled=true)` over a **page-level CDP session** attached to bridgic's tab (the only CDP form that bypasses Chrome's "Ask where to save each file" preference in Chrome 138+). Chrome saves files as `<path>/<guid>`; `CdpDownloadRenamer` subscribes to `Browser.downloadWillBegin/downloadProgress` on the same session and renames `<guid>` → real filename on completion. See [CLAUDE.md → Downloads](../CLAUDE.md#downloads) for the full design, including alternatives tried.
 
 ## Snapshot and state (see SNAPSHOT_AND_STATE.md)
 

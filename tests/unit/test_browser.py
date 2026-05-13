@@ -1990,14 +1990,30 @@ class TestBrowserStartCdp:
         mock_pg = MagicMock()
         mock_pg.bring_to_front = AsyncMock()
 
+        # Per-page CDP session is awaited by _apply_cdp_silent_downloads
+        # (default ON in borrowed mode).
+        mock_page_session = MagicMock()
+        mock_page_session.send = AsyncMock()
+        mock_page_session.detach = AsyncMock()
+
         mock_ctx = MagicMock()
         mock_ctx.add_init_script = AsyncMock()
         mock_ctx.new_page = AsyncMock(return_value=mock_pg)
+        mock_ctx.new_cdp_session = AsyncMock(return_value=mock_page_session)
         mock_ctx.pages = pages if pages is not None else [mock_pg]
 
         mock_cdp_browser = MagicMock()
         mock_cdp_browser.contexts = [mock_ctx] * contexts_count
         mock_cdp_browser.new_context = AsyncMock(return_value=mock_ctx)
+        # _revoke_cdp_download_hijack uses new_browser_cdp_session unconditionally
+        # in CDP mode (L1 + L3); provide an awaitable session that records sends.
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+        mock_session.detach = AsyncMock()
+        mock_cdp_browser.new_browser_cdp_session = AsyncMock(return_value=mock_session)
+        # Expose sessions on the browser mock so individual tests can introspect.
+        mock_cdp_browser._mock_cdp_session = mock_session
+        mock_cdp_browser._mock_page_session = mock_page_session
 
         mock_pw = MagicMock()
         mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=mock_cdp_browser)
@@ -2102,10 +2118,13 @@ class TestBrowserStartCdp:
         assert browser._page is mock_pg
 
     @pytest.mark.asyncio
-    async def test_download_manager_attached_borrowed_context(self, tmp_path):
-        """In CDP borrowed-context mode the download manager must attach to
-        the bridgic page ONLY — attaching to the whole context would hijack
-        download events from the user's pre-existing tabs."""
+    async def test_download_manager_NOT_attached_in_borrowed_context(self, tmp_path):
+        """In CDP borrowed-context mode the download manager must NOT attach
+        anywhere. L1's revoke restored Chrome's native download path, so
+        Playwright never receives `Browser.downloadProgress(completed)`. A
+        page-scoped attach would leak a hung `save_as()` task per download.
+        Chrome handles downloads natively (potentially via its 'Save As'
+        dialog); programmatic capture requires owned mode."""
         mock_pw, _, mock_ctx, mock_pg = self._make_cdp_mocks()
         downloads_dir = tmp_path / "dl"
         downloads_dir.mkdir()
@@ -2120,7 +2139,7 @@ class TestBrowserStartCdp:
                  patch.object(browser._download_manager, "attach_to_page") as mock_attach_pg:
                 await browser._start()
         mock_attach_ctx.assert_not_called()
-        mock_attach_pg.assert_called_once_with(mock_pg)
+        mock_attach_pg.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_download_manager_attached_owned_context(self, tmp_path):
@@ -2184,9 +2203,15 @@ class TestBrowserCloseCdp:
         mock_pg.video = None
         mock_pg.is_closed = MagicMock(return_value=False)
 
+        # Per-page CDP session awaited by _apply_cdp_silent_downloads.
+        mock_page_session = MagicMock()
+        mock_page_session.send = AsyncMock()
+        mock_page_session.detach = AsyncMock()
+
         mock_ctx = MagicMock()
         mock_ctx.add_init_script = AsyncMock()
         mock_ctx.new_page = AsyncMock(return_value=mock_pg)
+        mock_ctx.new_cdp_session = AsyncMock(return_value=mock_page_session)
         mock_ctx.pages = pages if pages is not None else [mock_pg]
         mock_ctx.close = AsyncMock()
         mock_ctx.tracing = MagicMock()
@@ -2196,6 +2221,13 @@ class TestBrowserCloseCdp:
         mock_cdp_browser.contexts = [mock_ctx] * contexts_count
         mock_cdp_browser.new_context = AsyncMock(return_value=mock_ctx)
         mock_cdp_browser.close = AsyncMock()
+        # L1/L3 download-hijack revoke: provide an awaitable CDP session.
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+        mock_session.detach = AsyncMock()
+        mock_cdp_browser.new_browser_cdp_session = AsyncMock(return_value=mock_session)
+        mock_cdp_browser._mock_cdp_session = mock_session
+        mock_cdp_browser._mock_page_session = mock_page_session
 
         mock_pw = MagicMock()
         mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=mock_cdp_browser)
@@ -2395,8 +2427,510 @@ class TestBrowserCloseCdp:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# find_cdp_url() — system proxy bypass for loopback hosts
+# CDP download-behavior override (L1 set / L3 restore) + orphan rescue (L2)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestCdpDownloadBehaviorOverride:
+    """In CDP-borrowed mode bridgic takes over the user's default context
+    download behavior:
+
+    - L1 (post-connect): ``Browser.setDownloadBehavior(allowAndName,
+      downloadPath=..., eventsEnabled=true)`` replacing Playwright's
+      ``allowAndName + artifactsDir``. Affects all tabs in the user's
+      default context — files land at downloads_path / CLI CWD with no
+      "Save As" dialog. ``allowAndName`` is required because ``allow``
+      still honors Chrome's "Ask where to save each file" preference.
+      Real filenames are restored by :class:`CdpDownloadRenamer`, which
+      listens to ``Browser.downloadWillBegin/downloadProgress`` and
+      renames the GUID file on completion.
+    - L3 (pre-close): ``Browser.setDownloadBehavior(default)`` so the
+      user's Chrome reverts to its own prefs after bridgic disconnects.
+
+    Owned mode skips L1/L3 — Playwright's per-context override on bridgic's
+    own context already provides silent downloads via the DownloadManager
+    `save_as` transfer flow.
+    """
+
+    def _make_cdp_mocks(self, contexts_count=1):
+        mock_pg = MagicMock()
+        mock_pg.bring_to_front = AsyncMock()
+        mock_pg.close = AsyncMock()
+        mock_pg.goto = AsyncMock()
+        mock_pg.video = None
+        mock_pg.is_closed = MagicMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+        mock_session.detach = AsyncMock()
+        # The renamer's attach() registers handlers via session.on(...).
+        # MagicMock auto-creates `.on` as a sync Mock, which is exactly the
+        # contract the renamer expects (pyee-style sync registration).
+
+        mock_ctx = MagicMock()
+        mock_ctx.add_init_script = AsyncMock()
+        mock_ctx.new_page = AsyncMock(return_value=mock_pg)
+        # L1 now goes through the *page* CDP session (page-routing is
+        # required to bypass Chrome's "Ask where to save" preference;
+        # browser-routing was empirically shown not to work). Return the
+        # same shared mock so existing assertions on send() / detach()
+        # keep working against a single recorded call list.
+        mock_ctx.new_cdp_session = AsyncMock(return_value=mock_session)
+        mock_ctx.pages = [mock_pg]
+        mock_ctx.close = AsyncMock()
+        mock_ctx.tracing = MagicMock()
+        mock_ctx.tracing.stop = AsyncMock()
+
+        mock_cdp_browser = MagicMock()
+        mock_cdp_browser.contexts = [mock_ctx] * contexts_count
+        mock_cdp_browser.new_context = AsyncMock(return_value=mock_ctx)
+        mock_cdp_browser.close = AsyncMock()
+        mock_cdp_browser.new_browser_cdp_session = AsyncMock(return_value=mock_session)
+
+        mock_pw = MagicMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=mock_cdp_browser)
+        mock_pw.stop = AsyncMock()
+
+        return mock_pw, mock_cdp_browser, mock_ctx, mock_pg, mock_session
+
+    def _set_download_behavior_calls(self, mock_session):
+        """Filter calls to Browser.setDownloadBehavior from mock_session.send."""
+        return [
+            c for c in mock_session.send.await_args_list
+            if c.args[0] == "Browser.setDownloadBehavior"
+        ]
+
+    # ── L1: borrowed mode sets allowAndName + eventsEnabled ──────────────
+
+    @pytest.mark.asyncio
+    async def test_l1_borrowed_sends_allowAndName_with_downloads_path(self, tmp_path):
+        """L1 (borrowed): Browser.setDownloadBehavior(allowAndName,
+        downloadPath=<dl>, eventsEnabled=true)."""
+        mock_pw, _, _, _, mock_session = self._make_cdp_mocks()
+        downloads = tmp_path / "dl"
+        browser = Browser(
+            cdp="ws://localhost:9222/devtools/browser/abc",
+            stealth=False,
+            downloads_path=str(downloads),
+        )
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+
+        # L1 call (no close yet, so this is the only one).
+        calls = self._set_download_behavior_calls(mock_session)
+        assert len(calls) == 1
+        kwargs = calls[0].args[1]
+        assert kwargs["behavior"] == "allowAndName"
+        assert kwargs["downloadPath"] == str(downloads.expanduser())
+        assert kwargs.get("eventsEnabled") is True
+        # No browserContextId means "default context" in CDP semantics.
+        assert "browserContextId" not in kwargs
+        # Path is created if missing.
+        assert downloads.exists()
+        # Renamer + tracked path are populated when override succeeds.
+        assert browser._cdp_download_renamer is not None
+        assert browser._current_cdp_download_path == downloads.expanduser()
+
+    @pytest.mark.asyncio
+    async def test_l1_borrowed_defaults_to_home_downloads_when_no_path(self):
+        """When downloads_path is unset, L1 uses ~/Downloads."""
+        mock_pw, _, _, _, mock_session = self._make_cdp_mocks()
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+
+        calls = self._set_download_behavior_calls(mock_session)
+        assert len(calls) == 1
+        assert calls[0].args[1]["downloadPath"] == str(Path.home() / "Downloads")
+        assert calls[0].args[1]["behavior"] == "allowAndName"
+
+    # ── L1: owned mode does NOT send ──────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_l1_owned_mode_skips_setDownloadBehavior(self):
+        """Owned mode: bridgic's own context already routed by Playwright's
+        allowAndName + DownloadManager.save_as. Skip L1 to avoid double work."""
+        mock_pw, mock_cdp_browser, _, _, mock_session = self._make_cdp_mocks(contexts_count=0)
+        mock_cdp_browser.contexts = []
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+
+        assert browser._cdp_context_owned is True
+        assert self._set_download_behavior_calls(mock_session) == []
+
+    # ── L3: borrowed mode close sends default; owned mode skips ───────────
+
+    @pytest.mark.asyncio
+    async def test_l3_borrowed_close_sends_default(self):
+        """On close in borrowed mode, restore Chrome's user prefs by sending
+        Browser.setDownloadBehavior(default)."""
+        mock_pw, _, _, _, mock_session = self._make_cdp_mocks()
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+
+        l1_count = len(self._set_download_behavior_calls(mock_session))
+        await browser.close()
+        all_calls = self._set_download_behavior_calls(mock_session)
+        new_calls = all_calls[l1_count:]
+
+        # L3 sends behavior=default (and only that — no downloadPath).
+        assert len(new_calls) >= 1
+        assert new_calls[-1].args[1] == {"behavior": "default"}
+
+    @pytest.mark.asyncio
+    async def test_l3_owned_mode_skips_default_restore(self):
+        """Owned mode never set the default-context override (L1 was a no-op),
+        so L3 should also skip — no need to restore something not changed."""
+        mock_pw, mock_cdp_browser, _, _, mock_session = self._make_cdp_mocks(contexts_count=0)
+        mock_cdp_browser.contexts = []
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+        await browser.close()
+
+        assert self._set_download_behavior_calls(mock_session) == []
+
+    # ── Failure paths ────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_new_browser_cdp_session_failure_does_not_abort_start(self):
+        """If new_browser_cdp_session raises, _start still completes."""
+        mock_pw, mock_cdp_browser, _, _, _ = self._make_cdp_mocks()
+        mock_cdp_browser.new_browser_cdp_session = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()  # must not raise
+
+        assert browser._context is not None
+        assert browser._page is not None
+
+    @pytest.mark.asyncio
+    async def test_send_timeout_is_handled(self):
+        """A CDP send timeout is logged best-effort, detach still attempted."""
+        mock_pw, _, _, _, mock_session = self._make_cdp_mocks()
+        mock_session.send = AsyncMock(side_effect=asyncio.TimeoutError())
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()  # must not raise
+
+        mock_session.detach.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_download_path_mkdir_failure_skips_override(self, tmp_path):
+        """If downloads_path mkdir fails (e.g., name collision with a file),
+        L1 logs and skips — Chrome's native behavior remains."""
+        # Create a regular file where downloads_path would be — mkdir raises.
+        bad = tmp_path / "block.txt"
+        bad.touch()  # this is a FILE, not a dir
+        mock_pw, _, _, _, mock_session = self._make_cdp_mocks()
+        browser = Browser(
+            cdp="ws://localhost:9222/devtools/browser/abc",
+            stealth=False,
+            downloads_path=str(bad),  # collision
+        )
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()  # must not raise
+
+        # L1 bailed out — no CDP send.
+        assert self._set_download_behavior_calls(mock_session) == []
+
+
+class TestEffectiveCdpDownloadsPath:
+    """``_effective_cdp_downloads_path(client_cwd)`` — priority chain that
+    decides where CDP-borrowed downloads land. Order matters: explicit
+    config > per-command CWD from the CLI client > ~/Downloads fallback.
+    """
+
+    def test_explicit_downloads_path_wins(self, tmp_path):
+        b = Browser(downloads_path=str(tmp_path / "explicit"))
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        assert b._effective_cdp_downloads_path(cwd) == (tmp_path / "explicit")
+
+    def test_client_cwd_used_when_no_explicit(self, tmp_path):
+        b = Browser()
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        assert b._effective_cdp_downloads_path(cwd) == cwd
+
+    def test_falls_back_to_home_downloads(self):
+        b = Browser()
+        assert b._effective_cdp_downloads_path(None) == Path.home() / "Downloads"
+
+
+class TestUpdateCdpDownloadsPath:
+    """``update_cdp_downloads_path`` is the daemon's per-command hook that
+    re-targets the CDP download directory when the CLI client's CWD changes.
+    """
+
+    def _make_cdp_mocks(self, contexts_count=1):
+        # Mirrors TestCdpDownloadBehaviorOverride._make_cdp_mocks above.
+        mock_pg = MagicMock()
+        mock_pg.bring_to_front = AsyncMock()
+        mock_pg.close = AsyncMock()
+        mock_pg.goto = AsyncMock()
+        mock_pg.video = None
+        mock_pg.is_closed = MagicMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+        mock_session.detach = AsyncMock()
+        # Renamer attach uses session.on() — sync MagicMock is fine.
+
+        mock_ctx = MagicMock()
+        mock_ctx.add_init_script = AsyncMock()
+        mock_ctx.new_page = AsyncMock(return_value=mock_pg)
+        # L1/cwd-update route through this page-level CDP session.
+        mock_ctx.new_cdp_session = AsyncMock(return_value=mock_session)
+        mock_ctx.pages = [mock_pg]
+        mock_ctx.close = AsyncMock()
+        mock_ctx.tracing = MagicMock()
+        mock_ctx.tracing.stop = AsyncMock()
+
+        mock_cdp_browser = MagicMock()
+        mock_cdp_browser.contexts = [mock_ctx] * contexts_count
+        mock_cdp_browser.new_context = AsyncMock(return_value=mock_ctx)
+        mock_cdp_browser.close = AsyncMock()
+        mock_cdp_browser.new_browser_cdp_session = AsyncMock(return_value=mock_session)
+
+        mock_pw = MagicMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=mock_cdp_browser)
+        mock_pw.stop = AsyncMock()
+
+        return mock_pw, mock_cdp_browser, mock_ctx, mock_pg, mock_session
+
+    def _setdownload_calls(self, mock_session):
+        return [
+            c for c in mock_session.send.await_args_list
+            if c.args[0] == "Browser.setDownloadBehavior"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_resends_cdp_when_path_changes(self, tmp_path):
+        """A different CWD triggers a fresh setDownloadBehavior call."""
+        mock_pw, _, _, _, mock_session = self._make_cdp_mocks()
+        b = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await b._start()
+
+        before = len(self._setdownload_calls(mock_session))
+        new_dir = tmp_path / "new"
+        new_dir.mkdir()
+        await b.update_cdp_downloads_path(new_dir)
+
+        after = self._setdownload_calls(mock_session)
+        assert len(after) == before + 1
+        assert after[-1].args[1]["downloadPath"] == str(new_dir)
+        assert after[-1].args[1]["behavior"] == "allowAndName"
+        assert b._current_cdp_download_path == new_dir
+        assert b._cdp_download_renamer.default_dir == new_dir
+
+    @pytest.mark.asyncio
+    async def test_noop_when_path_unchanged(self):
+        mock_pw, _, _, _, mock_session = self._make_cdp_mocks()
+        b = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await b._start()
+
+        before = len(self._setdownload_calls(mock_session))
+        await b.update_cdp_downloads_path(b._current_cdp_download_path)
+        after = self._setdownload_calls(mock_session)
+        assert len(after) == before
+
+    @pytest.mark.asyncio
+    async def test_owned_mode_is_noop(self):
+        """Owned mode never installed L1; update should not introduce one."""
+        mock_pw, mock_cdp_browser, _, _, mock_session = self._make_cdp_mocks(
+            contexts_count=0
+        )
+        mock_cdp_browser.contexts = []
+        b = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await b._start()
+
+        assert b._cdp_context_owned is True
+        await b.update_cdp_downloads_path(Path("/tmp/something"))
+        assert self._setdownload_calls(mock_session) == []
+
+
+class TestRescueCdpOrphanDownloads:
+    """L2: `_rescue_cdp_orphan_downloads` moves orphan files out of
+    `playwright-artifacts-*` directories before `browser.close()`
+    triggers the temp-dir cleanup."""
+
+    @pytest.fixture
+    def fake_tempdir(self, tmp_path, monkeypatch):
+        """Redirect tempfile.gettempdir() and Path.home() so the rescue logic
+        operates inside tmp_path. Returns (tmpdir, home, downloads)."""
+        monkeypatch.setattr(
+            "bridgic.browser.session._browser.tempfile.gettempdir",
+            lambda: str(tmp_path),
+        )
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        downloads = fake_home / "Downloads"
+        # Don't pre-create — _rescue creates if missing.
+        monkeypatch.setattr(
+            "bridgic.browser.session._browser.Path.home",
+            classmethod(lambda cls: fake_home),
+        )
+        return tmp_path, fake_home, downloads
+
+    @pytest.fixture
+    def browser(self):
+        """Bare Browser instance with no playwright state — only the rescue
+        method is exercised here."""
+        return Browser()
+
+    @pytest.mark.asyncio
+    async def test_rescue_moves_orphan_file_to_downloads(self, browser, fake_tempdir):
+        """A GUID-named file under playwright-artifacts-* is moved
+        into ~/Downloads with a bridgic-rescue- prefix."""
+        tmp, _, downloads = fake_tempdir
+        art = tmp / "playwright-artifacts-abc"
+        art.mkdir()
+        guid_file = art / "deadbeef-cafe-1234"
+        guid_file.write_bytes(b"APK CONTENT")
+
+        rescued = await browser._rescue_cdp_orphan_downloads()
+
+        assert len(rescued) == 1
+        # File is GONE from artifactsDir...
+        assert not guid_file.exists()
+        # ...and now in Downloads with the bridgic-rescue- prefix.
+        target = downloads / "bridgic-rescue-deadbeef-cafe-1234"
+        assert target.exists()
+        assert target.read_bytes() == b"APK CONTENT"
+        assert str(target) in rescued
+
+    @pytest.mark.asyncio
+    async def test_rescue_skips_files_already_saved_by_download_manager(self, browser, fake_tempdir):
+        """Files DownloadManager already copied to downloads_path (recorded in
+        `_downloaded_files`) must NOT be re-rescued — they are still in the
+        artifactsDir as Playwright's own staging, but the user already has a
+        good copy."""
+        from bridgic.browser.session._download import DownloadManager, DownloadedFile
+
+        tmp, _, downloads = fake_tempdir
+        art = tmp / "playwright-artifacts-abc"
+        art.mkdir()
+        already_saved = art / "guid-already-saved"
+        already_saved.write_bytes(b"X")
+        truly_orphan = art / "guid-orphan"
+        truly_orphan.write_bytes(b"Y")
+
+        # Make DownloadManager say "I already saved <already_saved>".
+        dm = DownloadManager(downloads_path=str(tmp / "user-downloads"))
+        dm._downloaded_files.append(  # type: ignore[attr-defined]
+            DownloadedFile(
+                url="http://x",
+                path=str(already_saved),
+                file_name="x",
+                file_size=1,
+            )
+        )
+        browser._download_manager = dm
+
+        rescued = await browser._rescue_cdp_orphan_downloads()
+
+        # Already-saved file untouched.
+        assert already_saved.exists()
+        # Orphan moved.
+        assert not truly_orphan.exists()
+        assert len(rescued) == 1
+        assert any("guid-orphan" in p for p in rescued)
+
+    @pytest.mark.asyncio
+    async def test_rescue_collision_uses_numeric_suffix(self, browser, fake_tempdir):
+        """If the rescue target already exists, the rescue file gets a numeric
+        suffix to avoid clobbering."""
+        tmp, _, downloads = fake_tempdir
+        downloads.mkdir(parents=True)
+        existing = downloads / "bridgic-rescue-collide"
+        existing.write_bytes(b"OLD")
+
+        art = tmp / "playwright-artifacts-xyz"
+        art.mkdir()
+        new_file = art / "collide"
+        new_file.write_bytes(b"NEW")
+
+        rescued = await browser._rescue_cdp_orphan_downloads()
+
+        # Original untouched, new file lands at suffix .1.
+        assert existing.read_bytes() == b"OLD"
+        assert (downloads / "bridgic-rescue-collide.1").read_bytes() == b"NEW"
+        assert any(p.endswith("bridgic-rescue-collide.1") for p in rescued)
+
+    @pytest.mark.asyncio
+    async def test_rescue_skips_known_artifact_extensions(self, browser, fake_tempdir):
+        """Trace zips, video webm, etc. are Playwright's own artifacts — not
+        user downloads. They must not be moved (bridgic's own trace/video flow
+        already handles these out-of-band)."""
+        tmp, _, downloads = fake_tempdir
+        art = tmp / "playwright-artifacts-abc"
+        art.mkdir()
+        (art / "trace.zip").write_bytes(b"Z")
+        (art / "video.webm").write_bytes(b"V")
+        (art / "session.har").write_bytes(b"H")
+        (art / "real-download").write_bytes(b"D")
+
+        rescued = await browser._rescue_cdp_orphan_downloads()
+
+        assert (art / "trace.zip").exists()
+        assert (art / "video.webm").exists()
+        assert (art / "session.har").exists()
+        assert not (art / "real-download").exists()
+        assert len(rescued) == 1
+
+    @pytest.mark.asyncio
+    async def test_rescue_no_artifacts_dir_returns_empty(self, browser, fake_tempdir):
+        """When no playwright-artifacts-* dirs exist, rescue is a
+        no-op and returns an empty list (no exception)."""
+        rescued = await browser._rescue_cdp_orphan_downloads()
+        assert rescued == []
+
+    @pytest.mark.asyncio
+    async def test_rescue_falls_back_when_home_downloads_unwritable(self, browser, tmp_path, monkeypatch):
+        """If ~/Downloads cannot be created (read-only home), rescue falls back
+        to a tmp-based bridgic-rescue/ root so the file is still saved."""
+        # Redirect tempdir to tmp_path so the artifactsDir glob picks it up.
+        monkeypatch.setattr(
+            "bridgic.browser.session._browser.tempfile.gettempdir",
+            lambda: str(tmp_path),
+        )
+        # Make Path.home() return a path under which mkdir on /Downloads will fail.
+        readonly_home = tmp_path / "ro_home"
+        readonly_home.touch()  # File, not dir → mkdir(/Downloads) raises NotADirectoryError
+        monkeypatch.setattr(
+            "bridgic.browser.session._browser.Path.home",
+            classmethod(lambda cls: readonly_home),
+        )
+
+        art = tmp_path / "playwright-artifacts-q"
+        art.mkdir()
+        (art / "guid-1").write_bytes(b"data")
+
+        rescued = await browser._rescue_cdp_orphan_downloads()
+
+        # Fell back to <tmpdir>/bridgic-rescue/
+        assert len(rescued) == 1
+        assert "bridgic-rescue" in rescued[0]
+
 
 class TestFindCdpUrlProxyBypass:
     """find_cdp_url(mode="port") must bypass the system HTTP proxy when probing

@@ -98,7 +98,7 @@ Notes:
 | `slow_mo` | number (ms) | Slow down Playwright actions. |
 | `args` | `string[]` | Extra launch arguments. |
 | `ignore_default_args` | `true | false | string[]` | Ignore all defaults or a list. |
-| `downloads_path` | string (path) | Used by DownloadManager. Auto-enables `accept_downloads` if not set. |
+| `downloads_path` | string (path) | Target directory for downloads. In non-CDP / CDP-owned modes used by `DownloadManager` (auto-enables `accept_downloads` if not explicitly set). In CDP-borrowed mode used by `CdpDownloadRenamer` (page-level CDP `setDownloadBehavior(allowAndName)` + GUID→real-name rename); `DownloadManager` is not attached. CLI without this key falls back to: non-CDP → `~/Downloads`, CDP → the CLI client's CWD at command time. |
 | `devtools` | `true | false` | Opens DevTools; forces `headless=false`. |
 | `user_agent` | string | Context user agent. |
 | `locale` | string | BCP-47 locale (for example `zh-CN`). |

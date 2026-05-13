@@ -1,13 +1,16 @@
 import asyncio
 import base64
+import glob
 import json
 import logging
 import os
 import re
+import shutil
 import signal
 import sys
 import tempfile
 import time
+from contextlib import suppress
 from urllib.parse import urlparse
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Set, Union
@@ -88,6 +91,7 @@ from ._stealth import (
     get_fallback_real_chrome_ua,
 )
 from ._download import DownloadManager, DownloadedFile
+from ._cdp_download_renamer import CdpDownloadRenamer
 from . import _video_recorder as _video_recorder_mod
 from ..utils import find_page_by_id, generate_page_id, model_to_llm_string
 from ..errors import (
@@ -457,7 +461,8 @@ class Browser:
         color_scheme = color_scheme if color_scheme is not None else _cfg.pop('color_scheme', None)
         # Remove any named-param keys that were skipped above (explicit value won)
         for _named_key in (
-            'cdp', 'auto_follow_popups', 'headless', 'stealth', 'viewport',
+            'cdp', 'auto_follow_popups',
+            'headless', 'stealth', 'viewport',
             'user_data_dir', 'clear_user_data', 'channel', 'executable_path',
             'proxy', 'timeout', 'slow_mo', 'args', 'ignore_default_args',
             'downloads_path', 'devtools', 'user_agent', 'locale',
@@ -587,6 +592,26 @@ class Browser:
         self._download_manager: Optional[DownloadManager] = None
         if self._downloads_path:
             self._download_manager = DownloadManager(downloads_path=self._downloads_path)
+
+        # CDP-borrowed download infrastructure. Populated in `_start()` when
+        # connecting via CDP without owning the context. The renamer is the
+        # *only* mechanism that restores real filenames over Chrome's
+        # ``allowAndName`` GUID names — ``allowAndName`` is required because
+        # ``allow`` still honors the user's "Ask where to save each file"
+        # preference and would pop a dialog. The dedicated CDP session is
+        # browser-wide and persists for the lifetime of the connection.
+        self._cdp_download_renamer: Optional[CdpDownloadRenamer] = None
+        self._cdp_download_session: Optional[Any] = None
+        # The currently-applied CDP download path (after
+        # ``Browser.setDownloadBehavior``). ``update_cdp_downloads_path``
+        # uses this to short-circuit no-op CDP roundtrips on every command.
+        self._current_cdp_download_path: Optional[Path] = None
+        # CLI-client CWD recorded by the daemon before dispatch; used as
+        # the fallback at L1 time when ``downloads_path`` is unset. The
+        # daemon also calls ``update_cdp_downloads_path`` once the browser
+        # is up, but the first command that triggers lazy start would
+        # otherwise see L1 at ``~/Downloads``.
+        self._pending_client_cwd: Optional[Path] = None
 
         # Cache for last snapshot
         self._last_snapshot: Optional[EnhancedSnapshot] = None
@@ -1073,6 +1098,238 @@ class Browser:
 
     # ==================== Lifecycle ====================
 
+    async def _set_cdp_download_behavior(
+        self,
+        behavior: str,
+        *,
+        download_path: Optional[Path] = None,
+        reason: str,
+        events_enabled: bool = False,
+        session: Optional[Any] = None,
+    ) -> bool:
+        """Send CDP ``Browser.setDownloadBehavior`` for bridgic's tab.
+
+        Critical CDP routing detail discovered empirically against
+        Chrome 138:
+
+        - When sent via a **browser-level** CDP session
+          (``Browser.new_browser_cdp_session()``), Chrome accepts the
+          command but the override DOES NOT bypass the user's "Ask where
+          to save each file" preference — the dialog still pops up. The
+          same is true for ``behavior="allow"``.
+        - When sent via a **page-level** CDP session
+          (``BrowserContext.new_cdp_session(page)``), Chrome treats it as
+          a target-scoped override that bypasses the user preference.
+          Downloads triggered from that page land directly at
+          ``downloadPath`` (under a GUID for ``allowAndName``), no
+          dialog.
+
+        agent-browser confirms this — it passes ``Some(session_id)`` (a
+        page session id) for the same reason. Therefore callers MUST
+        pass ``session=<page CDP session>``. The browser-session fallback
+        kept here is only for ``reason="pre-close"`` after the page is
+        already gone.
+
+        ``allowAndName`` writes files under a GUID name;
+        :class:`CdpDownloadRenamer` restores the real filename via
+        ``Browser.downloadWillBegin``/``downloadProgress`` events
+        (subscribed on the same page session).
+
+        Returns ``True`` if the CDP send completed, ``False`` on any
+        failure (mkdir, session creation, send timeout, etc.). Callers
+        use this to decide whether to attach dependent state.
+        """
+        if not self._browser:
+            return False
+        if download_path is not None:
+            try:
+                download_path.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "[CDP %s] cannot ensure download path %s: %s. "
+                    "Skipping download-behavior override; Chrome native UX applies.",
+                    reason, download_path, exc,
+                )
+                return False
+        owns_session = False
+        if session is None:
+            try:
+                session = await self._browser.new_browser_cdp_session()
+                owns_session = True
+            except Exception as exc:
+                logger.warning(
+                    "[CDP %s] new_browser_cdp_session failed: %s", reason, exc
+                )
+                return False
+        ok = False
+        try:
+            payload: Dict[str, Any] = {"behavior": behavior}
+            if download_path is not None:
+                payload["downloadPath"] = str(download_path)
+            if events_enabled:
+                payload["eventsEnabled"] = True
+            await asyncio.wait_for(
+                session.send("Browser.setDownloadBehavior", payload),
+                timeout=2.0,
+            )
+            if behavior == "default":
+                logger.info(
+                    "[CDP %s] restored Chrome native download behavior", reason,
+                )
+            else:
+                logger.info(
+                    "[CDP %s] overrode download behavior: behavior=%s path=%s "
+                    "(applies to bridgic's tab via page-level CDP routing)",
+                    reason, behavior, download_path,
+                )
+            ok = True
+        except Exception as exc:
+            logger.warning(
+                "[CDP %s] Browser.setDownloadBehavior failed: %s. "
+                "Downloads may behave unpredictably.",
+                reason, exc,
+            )
+        finally:
+            if owns_session:
+                with suppress(Exception):
+                    await session.detach()
+        return ok
+
+    def _effective_cdp_downloads_path(
+        self, client_cwd: Optional[Path] = None
+    ) -> Path:
+        """Resolve the CDP-borrowed download path the user should see.
+
+        Priority (highest first):
+
+        1. Explicit ``Browser(downloads_path=...)`` / config file. SDK users
+           and project-level config win — they made a deliberate choice.
+        2. ``client_cwd`` passed explicitly (per-command from the daemon's
+           dispatcher), or ``self._pending_client_cwd`` set by the daemon
+           before lazy start. Makes ``bridgic-browser`` mirror the native
+           ``curl -O`` ergonomics — files land where the user ran the
+           command.
+        3. ``~/Downloads`` fallback for ad-hoc cases where neither config
+           nor a CWD is known (e.g. SDK without ``downloads_path``).
+        """
+        if self._downloads_path is not None:
+            return self._downloads_path
+        if client_cwd is not None:
+            return client_cwd
+        if self._pending_client_cwd is not None:
+            return self._pending_client_cwd
+        return Path.home() / "Downloads"
+
+    async def update_cdp_downloads_path(self, new_path: Path) -> None:
+        """Hot-swap the CDP-borrowed download path between commands.
+
+        Called by the daemon before each command so that downloads follow
+        the latest CLI invocation's CWD. No-op outside CDP-borrowed mode
+        or when ``new_path`` is unchanged (avoids per-command CDP traffic).
+
+        Failures are logged and swallowed: a failed update is strictly
+        worse than no update, but better than killing the command.
+        """
+        if self._cdp_context_owned:
+            # Owned mode uses Playwright's per-context DownloadManager; CWD
+            # plumbing is not how downloads get retargeted there.
+            return
+        if self._current_cdp_download_path is None:
+            # No L1 takeover happened — either not CDP at all, or
+            # post-connect failed earlier. Nothing to hot-swap.
+            return
+        if Path(new_path) == self._current_cdp_download_path:
+            return
+        target = Path(new_path)
+        ok = await self._set_cdp_download_behavior(
+            "allowAndName",
+            download_path=target,
+            reason="cwd-update",
+            events_enabled=True,
+            session=self._cdp_download_session,
+        )
+        if not ok:
+            # Keep the renamer pointed at the old path so in-flight
+            # downloads (and any new ones that *do* honor the old
+            # downloadPath because the override didn't apply) still rename
+            # correctly. Tracking state isn't advanced either.
+            return
+        if self._cdp_download_renamer is not None:
+            self._cdp_download_renamer.set_default_dir(target)
+        self._current_cdp_download_path = target
+
+    async def _rescue_cdp_orphan_downloads(self) -> List[str]:
+        """Salvage downloads that landed in Playwright's artifactsDir.
+
+        L1 revoke runs immediately after `connect_over_cdp` returns, but
+        there is a small window (≤~100 ms) in which a user-initiated
+        download in a pre-existing tab can still hit the hijacked path.
+        On `browser.close()`, Playwright's `Disconnected` handler runs
+        `removeFolders([artifactsDir])` and permanently deletes those
+        files. This method must run BEFORE `browser.close()`.
+
+        Scans every `playwright-artifacts-*` directory under
+        the OS tempdir, skips any file already saved by `DownloadManager`,
+        and moves the rest to `~/Downloads/bridgic-rescue-<name>` (with a
+        numeric suffix if that target already exists). Failures degrade
+        silently — losing a file is bad but breaking close() is worse.
+        """
+        rescued: List[str] = []
+        # Playwright's chromium driver creates download/trace/video tempdirs
+        # via `mkdtemp(path.join(os.tmpdir(), "playwright-artifacts-"))`
+        # (chromium.js:56). The prefix uses HYPHENS, not underscores.
+        pattern = os.path.join(
+            tempfile.gettempdir(), "playwright-artifacts-*"
+        )
+        registered: Set[str] = set()
+        if self._download_manager:
+            registered = {df.path for df in self._download_manager.downloaded_files}
+
+        rescue_root = Path.home() / "Downloads"
+        try:
+            rescue_root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            rescue_root = Path(tempfile.gettempdir()) / "bridgic-rescue"
+            try:
+                rescue_root.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.warning("[CDP rescue] cannot create rescue root: %s", exc)
+                return rescued
+
+        for art_dir in glob.glob(pattern):
+            art_path = Path(art_dir)
+            if not art_path.is_dir():
+                continue
+            try:
+                entries = list(art_path.iterdir())
+            except OSError:
+                continue
+            for f in entries:
+                if not f.is_file():
+                    continue
+                if str(f) in registered:
+                    continue
+                # Skip non-download artifacts: Playwright also writes traces
+                # (.zip, *_trace*) and videos (.webm) into the same dir; we
+                # only want to rescue the GUID-named download files (which
+                # have no extension) and anything that looks like a real
+                # downloaded asset.
+                if f.suffix.lower() in {".zip", ".webm", ".har", ".log"}:
+                    continue
+                dst = rescue_root / f"bridgic-rescue-{f.name}"
+                n = 1
+                while dst.exists():
+                    dst = rescue_root / f"bridgic-rescue-{f.name}.{n}"
+                    n += 1
+                    if n > 9999:
+                        break
+                try:
+                    shutil.move(str(f), str(dst))
+                    rescued.append(str(dst))
+                except OSError as exc:
+                    logger.warning("[CDP rescue] failed to move %s: %s", f, exc)
+        return rescued
+
     async def _apply_debugger_skip_pauses(self, context: "BrowserContext", page: "Page") -> None:
         """Tell CDP to skip debugger pauses on ``page``.
 
@@ -1261,6 +1518,7 @@ class Browser:
                     _redact_cdp_url(self._cdp_resolved),
                 )
                 self._browser = await self._playwright.chromium.connect_over_cdp(self._cdp_resolved)
+
                 # Playwright invariant for connect_over_cdp() (verified
                 # against playwright-core 1.57):
                 #   chromium.ts _connectOverCDPImpl always passes
@@ -1280,6 +1538,19 @@ class Browser:
                 else:
                     self._context = await self._browser.new_context(**self._get_context_options())
                     self._cdp_context_owned = True
+
+                # ── CDP-borrowed download takeover (L1) deferred ──
+                # Playwright's _defaultContext._initialize() unconditionally
+                # sends `Browser.setDownloadBehavior(allowAndName,
+                # downloadPath=<artifactsDir>)` on the default context, but
+                # empirically that browser-session override does NOT bypass
+                # the user's "Ask where to save each file" preference. We
+                # MUST use a page-level CDP session — see L1 block after
+                # `self._page` is created below.
+                #
+                # CDP-owned mode is intentionally skipped: Playwright already
+                # routes bridgic's own context to the artifactsDir, and
+                # `DownloadManager.save_as` transfers files to downloads_path.
 
                 # Inject JS stealth patches only in headless mode.  Headed mode
                 # skips the script to avoid breaking Cloudflare Turnstile (same
@@ -1327,18 +1598,73 @@ class Browser:
                 # round-trip of Debugger.paused events.
                 await self._apply_debugger_skip_pauses(self._context, self._page)
 
+                # ── CDP-borrowed download takeover (L1) ──
+                # Send Browser.setDownloadBehavior via a PAGE-level CDP
+                # session attached to bridgic's tab. Browser-session routing
+                # was tested and shown to NOT bypass Chrome's "Ask where to
+                # save each file" preference (dialog still pops up); page
+                # routing scopes the override to the target and bypasses
+                # the user pref. The renamer subscribes events on the same
+                # page session.
+                if not self._cdp_context_owned:
+                    take_over_path = self._effective_cdp_downloads_path()
+                    try:
+                        self._cdp_download_session = (
+                            await self._context.new_cdp_session(self._page)
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[CDP post-connect] could not open page CDP "
+                            "session: %s. Native download dialog applies.",
+                            exc,
+                        )
+                        self._cdp_download_session = None
+
+                    if self._cdp_download_session is not None:
+                        override_ok = await self._set_cdp_download_behavior(
+                            "allowAndName",
+                            download_path=take_over_path,
+                            reason="post-connect",
+                            events_enabled=True,
+                            session=self._cdp_download_session,
+                        )
+                        if override_ok:
+                            self._current_cdp_download_path = take_over_path
+                            try:
+                                self._cdp_download_renamer = CdpDownloadRenamer(
+                                    default_dir=take_over_path
+                                )
+                                await self._cdp_download_renamer.attach(
+                                    self._cdp_download_session
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "[CDP post-connect] renamer attach "
+                                    "failed: %s. Downloads will keep their "
+                                    "GUID filenames.", exc,
+                                )
+                                self._cdp_download_renamer = None
+                        else:
+                            # Override failed — release the session.
+                            with suppress(Exception):
+                                await self._cdp_download_session.detach()
+                            self._cdp_download_session = None
+
                 # Download manager attachment strategy (CDP):
                 # - Owned context (bridgic created it): attach to the whole
-                #   context — all pages in it belong to bridgic anyway.
-                # - Borrowed context (user's): attach ONLY to the bridgic tab.
-                #   attaching to the context would hijack download events from
-                #   the user's pre-existing tabs (they'd land in our
-                #   downloads_path instead of Chrome's default behaviour).
-                if self._download_manager:
-                    if self._cdp_context_owned:
-                        self._download_manager.attach_to_context(self._context)
-                    else:
-                        self._download_manager.attach_to_page(self._page)
+                #   context — all pages in it belong to bridgic, and
+                #   Playwright's per-context setDownloadBehavior(allowAndName)
+                #   still routes downloads through the artifactsDir, so
+                #   DownloadManager.save_as() can copy files to downloads_path.
+                # - Borrowed context: NOT attached. Our L1 override took the
+                #   default context to allow + downloadPath, so Chrome writes
+                #   directly to the final path; bridgic is not in the
+                #   file-transfer loop. Trying to `save_as` here would block
+                #   forever (Playwright no longer receives
+                #   Browser.downloadProgress(completed) once the path moved
+                #   out of artifactsDir).
+                if self._download_manager and self._cdp_context_owned:
+                    self._download_manager.attach_to_context(self._context)
 
                 logger.info("Playwright started (mode=cdp, stealth_js=%s)", self.stealth_enabled)
                 return
@@ -1874,17 +2200,13 @@ class Browser:
         logger.debug("[close] disconnecting browser")
         # Detach download manager before context closes to remove handlers.
         # Mirror the attach strategy:
-        # - Borrowed CDP context: handler was page-scoped on the bridgic tab,
-        #   so detach at the page level (detach_from_context would no-op
-        #   since the context was never attached).
-        # - All other modes: handler was context-scoped, detach at context.
-        if self._download_manager:
-            if _is_cdp and not self._cdp_context_owned and self._page:
-                try:
-                    self._download_manager.detach_from_page(self._page)
-                except Exception as e:
-                    errors.append(f"download_manager.detach_page: {e}")
-            elif self._context:
+        # - CDP borrowed: was never attached (L1 revoke means Chrome handles
+        #   downloads natively; attaching DownloadManager would leak a hung
+        #   save_as() task per download). Nothing to detach.
+        # - All other modes (launch / persistent / CDP owned): handler was
+        #   context-scoped, detach at context.
+        if self._download_manager and self._context:
+            if not (_is_cdp and not self._cdp_context_owned):
                 try:
                     self._download_manager.detach_from_context(self._context)
                 except Exception as e:
@@ -2010,6 +2332,60 @@ class Browser:
         elif self._context:
             # CDP borrowed mode: release reference without closing.
             self._context = None
+
+        # ── L2 + L3: protect downloads before browser.close() destroys artifactsDir ──
+        # CDP-only: Playwright's `Disconnected` handler triggers
+        # `removeFolders([artifactsDir])` inside `browser.close()`. Anything
+        # still in that dir is gone. Two safeguards, both BEFORE close:
+        #   L2 rescue: scan playwright-artifacts-* and move orphan files
+        #              (downloads that landed there before our L1 override
+        #              took effect — ≤~100 ms race window) into ~/Downloads.
+        #   L3 restore: send Browser.setDownloadBehavior(default) on the
+        #              default context (borrowed mode only) so the user's
+        #              Chrome reverts to its own download prefs once bridgic
+        #              disconnects — e.g. ~/Downloads/tmp/ + Save-As dialog
+        #              for users who configured those.
+        if _is_cdp and self._browser:
+            # Send L3 (restore) on the SAME page CDP session that received
+            # L1, before detaching anything. After this, Chrome reverts
+            # to its native download prefs for bridgic's tab.
+            if not self._cdp_context_owned:
+                try:
+                    await self._set_cdp_download_behavior(
+                        "default", reason="pre-close",
+                        session=self._cdp_download_session,
+                    )
+                except Exception as e:
+                    errors.append(f"cdp.download_behavior_restore: {e}")
+                self._current_cdp_download_path = None
+
+            # Detach the renamer (also detaches the underlying session).
+            if self._cdp_download_renamer is not None:
+                try:
+                    await self._cdp_download_renamer.detach()
+                except Exception as e:
+                    errors.append(f"cdp.renamer_detach: {e}")
+                self._cdp_download_renamer = None
+            # If renamer didn't own the session (init failure path), make
+            # sure we still release it here.
+            if self._cdp_download_session is not None:
+                with suppress(Exception):
+                    await self._cdp_download_session.detach()
+                self._cdp_download_session = None
+
+            try:
+                rescued_paths = await self._rescue_cdp_orphan_downloads()
+                if rescued_paths:
+                    logger.warning(
+                        "[CDP rescue] recovered %d orphaned download(s) "
+                        "before disconnect: %s",
+                        len(rescued_paths), rescued_paths,
+                    )
+                    shutdown_artifacts.setdefault("rescued_downloads", []).extend(
+                        rescued_paths
+                    )
+            except Exception as e:
+                errors.append(f"cdp.rescue_orphans: {e}")
 
         # Close browser.
         # - Normal launch mode: closes browser process.

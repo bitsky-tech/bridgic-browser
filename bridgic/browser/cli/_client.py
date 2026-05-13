@@ -103,7 +103,20 @@ async def _send_command_async(command: str, args: Dict[str, Any]) -> str:
     reader, writer = await transport.open_connection(stream_limit=STREAM_LIMIT)
     response_timeout = _compute_response_timeout(args, command)
     try:
-        payload = transport.inject_auth({"command": command, "args": args})
+        # Capture the client's CWD per request so the daemon can mirror
+        # ``curl -O`` ergonomics: in CDP-borrowed mode without an explicit
+        # ``downloads_path`` config, downloads land where the user invoked
+        # the CLI from. ``os.getcwd()`` can raise ``FileNotFoundError`` if
+        # the user deleted the directory the shell is in — silently fall
+        # back so command dispatch isn't blocked by an exotic shell state.
+        try:
+            client_cwd = os.getcwd()
+        except OSError:
+            client_cwd = None
+        request: Dict[str, Any] = {"command": command, "args": args}
+        if client_cwd is not None:
+            request["cwd"] = client_cwd
+        payload = transport.inject_auth(request)
         writer.write((json.dumps(payload) + "\n").encode())
         await writer.drain()
 
@@ -260,7 +273,11 @@ def send_command(
 # Daemon lifecycle helpers
 # ---------------------------------------------------------------------------
 
-def _spawn_daemon(headed: bool = False, clear_user_data: bool = False, cdp: Optional[str] = None) -> None:
+def _spawn_daemon(
+    headed: bool = False,
+    clear_user_data: bool = False,
+    cdp: Optional[str] = None,
+) -> None:
     """Spawn the daemon as a detached subprocess and wait for its READY_SIGNAL.
 
     Uses a background reader thread so the 30-second timeout is always
@@ -522,4 +539,8 @@ def ensure_daemon_running(
                     ) from exc
         remove_run_info()
 
-    _spawn_daemon(headed=headed, clear_user_data=clear_user_data, cdp=cdp)
+    _spawn_daemon(
+        headed=headed,
+        clear_user_data=clear_user_data,
+        cdp=cdp,
+    )

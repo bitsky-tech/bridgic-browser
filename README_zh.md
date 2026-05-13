@@ -674,7 +674,7 @@ browser = Browser(
 | `auto_follow_popups` | bool | True | 当 bridgic 拥有的页面派生出弹窗（`<a target="_blank">` 点击、`window.open()`）时，是否自动把 `self._page` 切到弹窗。设为 False 时弹窗仍会被纳入 owned 集合，只是活动指针不动 |
 | `channel` | str | None | 浏览器通道（chrome、msedge 等） |
 | `proxy` | dict | None | 代理设置 |
-| `downloads_path` | str/Path | None | 下载目录 |
+| `downloads_path` | str/Path | None | 下载目录。优先级:显式值 > `bridgic-browser.json` > (仅 CDP-borrowed CLI)CLI 客户端 CWD > `~/Downloads`。详见 [下载](#下载)。 |
 
 **快照：** 使用 `get_snapshot(interactive=False, full_page=True)` 获取 `EnhancedSnapshot`，含 `.tree`（无障碍树字符串）和 `.refs`（ref → 定位数据）。默认 `full_page=True` 包含视口内外全部元素。`interactive=True` 仅包含可点击/可编辑元素（扁平输出），`full_page=False` 仅包含视口内元素。使用 `get_element_by_ref(ref)` 根据 ref（如 "1f79fe5e"）获取 Playwright Locator 后进行 click、fill 等操作。
 
@@ -694,18 +694,34 @@ config = StealthConfig(
 browser = Browser(stealth=config, headless=False)
 ```
 
-#### DownloadManager
+#### 下载
 
-处理文件下载，正确保留文件名：
+bridgic 在所有模式下都保留原始文件名、屏蔽"另存为"对话框,API 一致。内部有两条流水线 —— 非 CDP / CDP-owned 用 `DownloadManager`,CDP-borrowed 用 `CdpDownloadRenamer`(通过 page-level CDP session 下发 `setDownloadBehavior(allowAndName)`)。完整设计见 [CLAUDE.md → Downloads](CLAUDE.md#downloads)。
+
+##### 下载路径矩阵
+
+| 调用方 | 模式 | 显式 `downloads_path` | 实际落点 |
+|---|---|---|---|
+| **CLI** (`bridgic-browser ...`) | 非 CDP | 有 | 显式值 |
+| **CLI** | 非 CDP | 无 | `~/Downloads` (daemon 自动默认) |
+| **CLI** | CDP (`--cdp ...`) | 有 | 显式值 |
+| **CLI** | CDP | 无 | CLI 启动时的工作目录(`os.getcwd()`)—— `curl -O` 风格 |
+| **SDK** (`Browser(...)`) | 非 CDP | 有 | 显式值 |
+| **SDK** | 非 CDP | 无 | 下载不被捕获(Playwright 会清掉 temp dir —— 请显式传 `downloads_path`) |
+| **SDK** | CDP (`Browser(cdp=...)`) | 有 | 显式值 |
+| **SDK** | CDP | 无 | `~/Downloads`(SDK 没有 CLI CWD 提示) |
 
 ```python
-# 将 downloads_path 传给 Browser — 它会内部创建并管理 DownloadManager
+# 非 CDP(DownloadManager 流水线)
 browser = Browser(downloads_path="./downloads", headless=True)
-await browser.navigate_to("https://example.com")  # 懒加载，首次导航时自动启动
+await browser.navigate_to("https://example.com")
+# 程序化访问已完成的下载
+for f in browser.download_manager.downloaded_files:
+    print(f"已下载:{f.file_name}({f.file_size} 字节)")
 
-# 通过内置管理器访问已下载的文件
-for file in browser.download_manager.downloaded_files:
-    print(f"已下载：{file.file_name}（{file.file_size} 字节）")
+# CDP-borrowed(CdpDownloadRenamer 流水线;文件以真名落到 downloads_path,
+# download_manager 为 None —— wait_for_download 在此模式不支持)
+browser = Browser(cdp="auto", downloads_path="./downloads")
 ```
 
 ### 隐身模式

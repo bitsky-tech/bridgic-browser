@@ -567,7 +567,7 @@ When `self._page` is closed, `_select_fallback_page` returns the first match fro
 
 - `_mark_owned(page)` is idempotent: it adds to set + stack, then registers a `page.on("close", self._on_owned_page_close)` callback for automatic pruning.
 - `_on_owned_page_close` only prunes bookkeeping; it deliberately does NOT touch `self._page` — the `_close_page` flow handles that, and double-handling would cause double video/download swaps.
-- `_switch_self_page_to(new_page)` consolidates "move self._page" side effects: focus stack push, `_invalidate_page_state()`, `_switch_video_to_page()`, and (in CDP-borrowed mode only) `DownloadManager.detach_from_page(old) + attach_to_page(new)` so popups don't leak downloads into the user's Chrome default path.
+- `_switch_self_page_to(new_page)` consolidates "move self._page" side effects: focus stack push, `_invalidate_page_state()`, `_switch_video_to_page()`. A legacy `DownloadManager.detach_from_page(old) + attach_to_page(new)` swap is kept as a no-op safety net — DownloadManager is not the active pipeline in CDP-borrowed mode; `CdpDownloadRenamer` is, and it stays bound to the original `self._page`'s CDP session. Downloads triggered from a followed popup therefore are **not** subject to the renamer; they fall back to Playwright's per-context override (artifactsDir) and rely on the L2 rescue net on close. See [CLAUDE.md → Downloads](../CLAUDE.md#downloads).
 
 ### Adoption truth table (CDP borrowed mode)
 

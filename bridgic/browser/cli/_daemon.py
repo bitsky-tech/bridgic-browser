@@ -1024,6 +1024,31 @@ async def _handle_connection(
                 stop_event.set()
             return
 
+        # Per-command CWD propagation for CDP-borrowed mode.
+        # Each CLI invocation may run from a different shell directory; we
+        # mirror ``curl -O`` ergonomics by retargeting the CDP download
+        # path before dispatching. Two paths:
+        #   1. ``_pending_client_cwd`` hint — consumed at L1 time when
+        #      the browser lazy-starts inside the dispatch below.
+        #   2. ``update_cdp_downloads_path`` — for the steady-state case
+        #      where the browser is already running.
+        # Both no-op outside CDP-borrowed mode and when the effective
+        # path is unchanged. Failures are logged and swallowed; a
+        # CWD-update miss is strictly less bad than killing an otherwise-
+        # valid command.
+        raw_cwd = req.get("cwd")
+        if isinstance(raw_cwd, str) and raw_cwd:
+            try:
+                client_cwd = Path(raw_cwd)
+                browser._pending_client_cwd = client_cwd
+                effective = browser._effective_cdp_downloads_path(client_cwd)
+                await browser.update_cdp_downloads_path(effective)
+            except Exception as exc:
+                logger.debug(
+                    "[daemon] update_cdp_downloads_path failed for '%s': %s",
+                    command, exc,
+                )
+
         # Run dispatch concurrently with an EOF watcher.  If the client
         # closes the socket while the dispatch is in flight (e.g. CLI hit
         # its own response timeout), cancel the in-flight task so it does
@@ -1242,7 +1267,13 @@ async def run_daemon() -> None:
 
     # Auto-enable downloads in daemon mode.
     # SDK users are unaffected (they control downloads_path explicitly).
-    if "downloads_path" not in kwargs:
+    # CDP-borrowed mode is deliberately excluded: in that path downloads
+    # are routed by per-command CDP setDownloadBehavior whose default
+    # falls back to the CLI client's CWD (matching `curl -O` ergonomics).
+    # Auto-setting downloads_path here would be indistinguishable from
+    # a user-explicit setting in Browser._effective_cdp_downloads_path
+    # and would silently pin every download to ~/Downloads.
+    if "downloads_path" not in kwargs and not _raw_cdp_env:
         _cfg_check = _load_config_sources()
         if "downloads_path" not in _cfg_check:
             kwargs["downloads_path"] = str(_resolve_default_downloads_dir())

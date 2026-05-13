@@ -4,8 +4,8 @@
 
 ### Symptom
 
-When using bridgic-browser in headed mode, files download successfully with correct
-filenames to the configured `downloads_path`. However, clicking **"Show in Folder"**
+When using bridgic-browser, files download successfully with correct
+filenames to the configured target path. However, clicking **"Show in Folder"**
 (or "Show in Finder" on macOS) in Chrome's download panel has no effect — the
 button does nothing, or shows "file deleted".
 
@@ -20,26 +20,24 @@ and then filed upstream on the Chromium bug tracker:
 
 **Any tool that uses this CDP command (Puppeteer, Playwright, etc.) is affected.**
 
-Playwright internally uses `Browser.setDownloadBehavior` with
-`behavior: 'allowAndName'` to intercept all downloads, so it is equally
-affected:
+`eventsEnabled: true` is required for download tracking in every bridgic
+download pipeline:
 
-```js
-// Playwright internal code (chromium/crBrowser.ts)
-behavior: this._options.acceptDownloads === 'accept' ? 'allowAndName' : 'deny'
-```
+- **Non-CDP / CDP-owned**: Playwright sets it internally via
+  `Browser.setDownloadBehavior(allowAndName, ..., eventsEnabled: true)` on
+  bridgic's context (`crBrowser.ts`); `DownloadManager.save_as()` copies the
+  GUID-named tempfile to `downloads_path` with the real filename.
+- **CDP-borrowed**: bridgic sets it directly via a page-level CDP session,
+  and `CdpDownloadRenamer` renames the GUID → real filename post-completion.
+  See [CLAUDE.md → Downloads](../CLAUDE.md#downloads).
 
-Once `setDownloadBehavior(allowAndName)` is active:
-
-1. Links on `chrome://downloads` page and inside the download bubble
-   (including "Show in Folder") become broken.
-2. Playwright saves files to an internal temp directory with UUID filenames.
-3. bridgic-browser's `DownloadManager` then copies files via `download.save_as()`
-   to the user's `downloads_path` with correct filenames.
+All three pipelines therefore trip the same Chromium bug — files end up
+at the configured target with correct filenames, but Chrome's *own* "Show
+in Folder" UI cannot resolve them.
 
 ### Verification
 
-This was verified by testing with **raw Playwright** (no bridgic-browser code):
+Verified with **raw Playwright** (no bridgic-browser code):
 
 ```python
 context = await p.chromium.launch_persistent_context(
@@ -55,11 +53,16 @@ triggered by the CDP `setDownloadBehavior` command, not a bridgic-browser issue.
 
 ### Workarounds
 
-- **Manual navigation**: Open the downloads folder directly in your file manager.
-  The files are saved with correct filenames at the configured `downloads_path`
-  (defaults to `~/Downloads` in daemon mode).
-- **Programmatic access**: Use `DownloadManager.downloaded_files` to get the list
-  of downloaded files with their paths.
+- **Manual navigation**: Open the downloads folder directly in your file
+  manager. Files are saved with correct filenames at the target path — see
+  the [download path matrix](../README.md#downloads).
+- **Programmatic access (non-CDP / CDP-owned)**: Use
+  `browser.download_manager.downloaded_files` to get the list of downloaded
+  files with their paths.
+- **Programmatic access (CDP-borrowed)**: `download_manager` is `None`; the
+  renamer logs each completed download to the daemon log
+  (`[CdpDownloadRenamer] <guid-prefix> → <real-name>`). For deterministic
+  capture, set `downloads_path` and poll the directory after the click.
 
 ### References
 
