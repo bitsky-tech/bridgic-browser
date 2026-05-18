@@ -214,7 +214,7 @@ The currently gated mechanisms are:
 2. Does the patch use a CDP override (`Emulation.*`, `Network.*`, `Page.*`)? CDP overrides apply to the whole target including all its frames. Gate to `self._headless` unless you've verified iframe consistency.
 3. Does the patch hook `page.on('worker')` / `context.on('serviceworker')`? Workers can be spawned by any frame in the page tree — same rule.
 4. Does the patch wrap a global constructor like `Worker`, `WebSocket`, `RTCPeerConnection`? Wrap inside `if (window === window.top) { ... }` if the wrap result is observably different from the original.
-5. Run the 3-site headed verification (`bash scripts/qa/...` or manual): `https://chat-auto-team.pages.dev/redeem` (Cloudflare), `https://x.com` (server-side detection), `https://blog.aepkill.com/demos/devtools-detector/` (devtools probe). Any of these breaking is a hard block.
+5. Run the 3-site headed verification (`bash scripts/qa/...` or manual): a Cloudflare-Turnstile-protected page (Cloudflare), `https://x.com` (server-side detection), `https://blog.aepkill.com/demos/devtools-detector/` (devtools probe). Any of these breaking is a hard block.
 
 For the full list of patched navigator/window properties, see [`docs/INTERNALS.md` — Stealth JS Init Script](docs/INTERNALS.md#stealth-js-init-script--patched-properties). For the design rationale of mode-aware stealth, see [`docs/INTERNALS.md` — Mode-aware stealth design](docs/INTERNALS.md#mode-aware-stealth-design). For known capability boundaries, see [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md).
 
