@@ -70,10 +70,25 @@ def refs_by_type(refs: Dict[str, dict], elem_type: str) -> List[dict]:
 
 
 def find_ref(refs: Dict[str, dict], elem_type: str, name_contains: str = "") -> Optional[str]:
+    """Find a ref by accessible role and (optionally) a name substring.
+
+    ``name_contains`` does case-insensitive substring matching. Callers that
+    need precise matching (e.g. to distinguish ``"Item 1"`` from
+    ``"Drag Item 1"``) should use :func:`find_ref_exact`.
+    """
     for ref, info in refs.items():
         if info["type"].lower() == elem_type.lower():
             if not name_contains or name_contains.lower() in info["name"].lower():
                 return ref
+    return None
+
+
+def find_ref_exact(refs: Dict[str, dict], elem_type: str, name: str) -> Optional[str]:
+    """Find a ref by accessible role and exact (case-insensitive) name."""
+    target = name.lower()
+    for ref, info in refs.items():
+        if info["type"].lower() == elem_type.lower() and info["name"].lower() == target:
+            return ref
     return None
 
 
@@ -130,18 +145,26 @@ class TestSnapshotModes:
 
     @pytest.mark.asyncio
     async def test_default_mode_excludes_below_viewport(self, browser):
-        """Default mode should NOT contain elements far below the viewport."""
+        """Default mode should NOT contain interactive controls far below the
+        viewport.
+
+        Non-interactive ``generic`` leaves (grid items, scroll markers, etc.)
+        are intentionally "assumed in-viewport" for performance — only refs
+        with roles in ``INTERACTIVE_ROLES`` or ``VIEWPORT_CONTAINER_ROLES``
+        get precise getBoundingClientRect checks. See ``_pre_filter_raw_snapshot``
+        design notes in ``_snapshot.py`` for rationale.
+        """
         snap = await browser.get_snapshot_text(interactive=False, full_page=False)
         refs = parse_snapshot(snap)
 
-        # Grid items, scroll markers, drag items are far below viewport
-        assert not find_ref(refs, "generic", "Item 1"), \
-            "Grid items should be excluded from viewport-only mode"
-        assert not find_ref(refs, "generic", "Marker 1"), \
-            "Scroll markers should be excluded from viewport-only mode"
-        # Buttons below viewport
-        assert not find_ref(refs, "button", "Show Alert"), \
+        # Interactive controls below viewport must be excluded — they go
+        # through the control_leaf visibility check.
+        assert not find_ref_exact(refs, "button", "Show Alert"), \
             "Dialog buttons should be excluded from viewport-only mode"
+        assert not find_ref_exact(refs, "button", "Toggle Element"), \
+            "Visibility toggle button should be excluded from viewport-only mode"
+        assert not find_ref_exact(refs, "button", "Disabled Button"), \
+            "Disabled section button should be excluded from viewport-only mode"
 
     @pytest.mark.asyncio
     async def test_interactive_mode_only_actionable(self, browser):
@@ -259,6 +282,15 @@ class TestInteractiveDetection:
         # Double-click area has ondblclick
         assert find_ref(refs, "generic", "Double-click me!"), \
             "Element with ondblclick handler not detected as interactive"
+
+    @pytest.mark.asyncio
+    async def test_focusable_generic_with_keyboard_handlers_detected(self, browser):
+        """Focusable generics should survive interactive pre-filter fallback."""
+        snap = await browser.get_snapshot_text(interactive=True, full_page=True)
+        refs = parse_snapshot(snap)
+
+        assert find_ref(refs, "generic", "Press a key..."), \
+            "Focusable key-display generic should be in interactive snapshot"
 
     @pytest.mark.asyncio
     async def test_disabled_elements_included_with_flag(self, browser):

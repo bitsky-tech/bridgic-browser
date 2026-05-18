@@ -11,10 +11,57 @@ from __future__ import annotations
 
 import json
 import os
+import platform as _platform
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+
+# ========== UA cleanup helpers (R1) ==========
+# Playwright's bundled Chromium reports `HeadlessChrome/<ver>` in `navigator.userAgent`
+# and `HeadlessChromium`/`Chromium` in `navigator.userAgentData.brands` — both are
+# 1-shot fingerprint giveaways. We strip the Headless marker and also rewrite the
+# UA-CH brand list via CDP `Network.setUserAgentOverride` (see _browser.py).
+
+_FALLBACK_REAL_CHROME_UA: Dict[str, str] = {
+    "darwin": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+    "linux":  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+    "win32":  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+}
+
+
+def clean_headless_ua(ua: str) -> str:
+    """Strip the `Headless` marker from a Chromium UA string."""
+    return ua.replace("HeadlessChrome", "Chrome")
+
+
+def get_fallback_real_chrome_ua() -> str:
+    """Platform-aware fallback UA used when stealth is on but no UA was probed yet."""
+    return _FALLBACK_REAL_CHROME_UA.get(sys.platform, _FALLBACK_REAL_CHROME_UA["linux"])
+
+
+def build_ua_metadata(chrome_version: str) -> Dict[str, Any]:
+    """userAgentMetadata for CDP Network.setUserAgentOverride.
+    Keeps Sec-CH-UA brands consistent with our cleaned navigator.userAgent.
+    """
+    major = (chrome_version.split(".")[0] if chrome_version else "143")
+    plat_name = {"darwin": "macOS", "linux": "Linux", "win32": "Windows"}.get(sys.platform, "Linux")
+    plat_ver = "10.15.7" if sys.platform == "darwin" else ("10.0" if sys.platform == "win32" else "6.0")
+    arch = "arm" if "arm" in (_platform.machine() or "").lower() else "x86"
+    return {
+        "brands": [
+            {"brand": "Google Chrome", "version": major},
+            {"brand": "Not_A Brand",   "version": "8"},
+            {"brand": "Chromium",      "version": major},
+        ],
+        "fullVersion": chrome_version or "143.0.0.0",
+        "platform": plat_name,
+        "platformVersion": plat_ver,
+        "architecture": arch,
+        "model": "",
+        "mobile": False,
+    }
 
 
 # ========== JS Init Script — navigator/window property patches ==========
@@ -51,24 +98,35 @@ _STEALTH_INIT_SCRIPT_TEMPLATE: str = """
   }, 'toString');
 
   // ── navigator.webdriver ────────────────────────────────────────────────────
-  // --disable-blink-features=AutomationControlled removes this from
-  // Navigator.prototype in the main frame. Only patch when the property
-  // actually exists (sub-frames or environments without the flag) to avoid
-  // creating a detectable own-property where real Chrome has none.
-  // 'webdriver' in navigator should be false in real Chrome — adding it even
-  // as undefined is a fingerprint signal.
+  // Goal: match the state real Chrome reaches with --disable-blink-features=
+  // AutomationControlled — the descriptor is absent from Navigator.prototype
+  // entirely, so `'webdriver' in navigator` returns false AND the value is
+  // undefined.
+  //
+  // Web IDL §3.7.6 defines interface attributes with `configurable: true`, so
+  // we can just delete the descriptor directly. Re-defining it with an
+  // undefined-getter (an earlier approach) leaves the descriptor in place —
+  // detectors using the `in` operator (fpscanner / incolumitas WEBDRIVER) then
+  // still see it as present, an internally inconsistent fingerprint that no
+  // real Chrome configuration produces.
   const _wdDesc = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver');
-  if (_wdDesc) {
-    // Property is defined on the prototype — override to return undefined
+  if (_wdDesc && _wdDesc.configurable) {
+    delete Navigator.prototype.webdriver;
+  } else if (_wdDesc) {
+    // Non-configurable descriptor (very old Chromium quirk): fall back to
+    // an undefined-getter with enumerable:false so at least Object.keys /
+    // for...in / JSON.stringify don't list it.
     Object.defineProperty(Navigator.prototype, 'webdriver', {
       get: _mkNative(function () { return undefined; }, ''),
       configurable: true,
+      enumerable: false,
     });
   } else if (navigator.webdriver !== undefined) {
-    // Fallback: own property on the instance (e.g. some sub-frame environments)
+    // Sub-frame edge case: descriptor not on prototype but value is non-undefined.
     Object.defineProperty(navigator, 'webdriver', {
       get: _mkNative(function () { return undefined; }, ''),
       configurable: true,
+      enumerable: false,
     });
   }
   // else: property is already absent — safest to leave it alone
@@ -92,7 +150,7 @@ _STEALTH_INIT_SCRIPT_TEMPLATE: str = """
       const localMime = { type: m.type, suffixes: m.suffixes, description: m.description, enabledPlugin: p };
       Object.defineProperty(p, i, { value: localMime, enumerable: true });
     });
-    p.item      = _mkNative(function item(i) { return p[i] ?? null; }, 'item');
+    p.item      = _mkNative(function item(i) { return p[i >>> 0] ?? null; }, 'item');
     p.namedItem = _mkNative(function namedItem(n) { const idx = _pdfMimes.findIndex(m => m.type === n); return idx >= 0 ? p[idx] : null; }, 'namedItem');
     return p;
   };
@@ -109,11 +167,20 @@ _STEALTH_INIT_SCRIPT_TEMPLATE: str = """
   _pdfMimes.forEach((m) => { m.enabledPlugin = _plugins[0]; });
 
   const _pluginList = Object.assign([..._plugins], {
-    item:      _mkNative(function item(i) { return _plugins[i] ?? null; }, 'item'),
+    // Web IDL §3.2.4: indexed property access truncates to uint32 (`>>> 0`).
+    // Real Chrome's `plugins.item(4294967296)` returns `plugins[0]`; without
+    // this truncation we return null, which incolumitas's `overflowTest` flags.
+    item:      _mkNative(function item(i) { return _plugins[i >>> 0] ?? null; }, 'item'),
     namedItem: _mkNative(function namedItem(n) { return _plugins.find(p => p.name === n) ?? null; }, 'namedItem'),
     refresh:   _mkNative(function refresh() {}, 'refresh'),
     length:    _plugins.length,
   });
+
+  // Make our fakes inherit the real prototypes so `instanceof PluginArray` and
+  // `Object.getPrototypeOf(navigator.plugins).constructor.name === "PluginArray"`
+  // checks pass. Without this, our arrays look like plain `Array`.
+  try { if (typeof PluginArray !== 'undefined') Object.setPrototypeOf(_pluginList, PluginArray.prototype); } catch (_) {}
+  try { if (typeof Plugin      !== 'undefined') _plugins.forEach(p => Object.setPrototypeOf(p, Plugin.prototype)); } catch (_) {}
 
   Object.defineProperty(navigator, 'plugins', {
     get: _mkNative(function () { return _pluginList; }, ''),
@@ -121,15 +188,121 @@ _STEALTH_INIT_SCRIPT_TEMPLATE: str = """
   });
 
   const _mimeList = Object.assign([..._pdfMimes], {
-    item:      _mkNative(function item(i) { return _pdfMimes[i] ?? null; }, 'item'),
+    item:      _mkNative(function item(i) { return _pdfMimes[i >>> 0] ?? null; }, 'item'),
     namedItem: _mkNative(function namedItem(n) { return _pdfMimes.find(m => m.type === n) ?? null; }, 'namedItem'),
     length:    _pdfMimes.length,
   });
+
+  try { if (typeof MimeTypeArray !== 'undefined') Object.setPrototypeOf(_mimeList, MimeTypeArray.prototype); } catch (_) {}
+  try { if (typeof MimeType      !== 'undefined') _pdfMimes.forEach(m => Object.setPrototypeOf(m, MimeType.prototype)); } catch (_) {}
 
   Object.defineProperty(navigator, 'mimeTypes', {
     get: _mkNative(function () { return _mimeList; }, ''),
     configurable: true,
   });
+
+  // ── Worker / SharedWorker / ServiceWorker wrappers (R3) ──────────────────
+  // page.on('worker') / page.on('serviceworker') are too late: detection libs
+  // spawn workers and synchronously postMessage navigator props back. CDP
+  // `worker.evaluate` is async — it always loses this race.
+  //
+  // Hook the worker spawn APIs at construct/register time and prepend our
+  // stealth code via importScripts so it runs FIRST inside the new worker,
+  // before any line of detector code touches navigator.
+  //
+  // __BRIDGIC_WORKER_STEALTH__ is a JS-string-literal placeholder substituted
+  // by get_init_script() with the full worker stealth body.
+  //
+  // **TOP-FRAME ONLY**: Cloudflare Turnstile / hCaptcha challenges run in
+  // cross-origin iframes. Wrapping their Worker constructor with a same-origin
+  // blob URL + importScripts(externalURL) breaks CORS for the challenge
+  // worker. We never touch iframe Workers.
+  if ((function () { try { return window === window.top; } catch (_) { return false; } })()) {
+  const _BRIDGIC_STEALTH = "__BRIDGIC_WORKER_STEALTH__";
+  const _bridgicWrapWorkerURL = (scriptURL) => {
+    try {
+      const u = String(scriptURL);
+      const wrapper = _BRIDGIC_STEALTH + ";importScripts(" + JSON.stringify(u) + ");";
+      const blob = new Blob([wrapper], { type: 'application/javascript' });
+      return URL.createObjectURL(blob);
+    } catch (_) {
+      return scriptURL;
+    }
+  };
+  // Only wrap blob: URLs (always same-origin to creator) and same-origin URLs.
+  // Cross-origin worker scripts (e.g. https://www.gstatic.com/recaptcha/...)
+  // would have our blob worker do `importScripts(crossOriginURL)`, which fails
+  // CORS unless the cross-origin host serves Access-Control-Allow-Origin — and
+  // most don't. Result: worker silently dies, library hangs forever
+  // (reCAPTCHA v3 was the regression that surfaced this).
+  // Detector libraries (incolumitas, fpscanner, etc.) build workers from
+  // inline `URL.createObjectURL(new Blob([code]))` — i.e. blob: URLs — so
+  // they're still wrapped and patched.
+  const _bridgicWorkerWrapSafe = (scriptURL) => {
+    try {
+      const u = String(scriptURL);
+      if (u.startsWith('blob:') || u.startsWith('data:')) return true;
+      const parsed = new URL(u, location.href);
+      return parsed.origin === location.origin;
+    } catch (_) {
+      return false;
+    }
+  };
+
+  try {
+    const _OrigWorker = window.Worker;
+    if (_OrigWorker) {
+      const _W = new Proxy(_OrigWorker, {
+        construct(target, args) {
+          try {
+            let [scriptURL, options] = args;
+            if (scriptURL && (typeof scriptURL === 'string' || scriptURL instanceof URL) && _bridgicWorkerWrapSafe(scriptURL)) {
+              return new target(_bridgicWrapWorkerURL(scriptURL), options);
+            }
+          } catch (_) {}
+          return new target(...args);
+        }
+      });
+      _mkNative(_W, 'Worker');
+      Object.defineProperty(window, 'Worker', { value: _W, writable: true, configurable: true });
+    }
+  } catch (_) {}
+
+  try {
+    const _OrigSharedWorker = window.SharedWorker;
+    if (_OrigSharedWorker) {
+      const _SW = new Proxy(_OrigSharedWorker, {
+        construct(target, args) {
+          try {
+            let [scriptURL, options] = args;
+            if (scriptURL && (typeof scriptURL === 'string' || scriptURL instanceof URL) && _bridgicWorkerWrapSafe(scriptURL)) {
+              return new target(_bridgicWrapWorkerURL(scriptURL), options);
+            }
+          } catch (_) {}
+          return new target(...args);
+        }
+      });
+      _mkNative(_SW, 'SharedWorker');
+      Object.defineProperty(window, 'SharedWorker', { value: _SW, writable: true, configurable: true });
+    }
+  } catch (_) {}
+
+  // ServiceWorker uses navigator.serviceWorker.register(url, options) — a
+  // method, not a constructor. importScripts works inside SWs the same way.
+  try {
+    if (navigator.serviceWorker && navigator.serviceWorker.register) {
+      const _origReg = navigator.serviceWorker.register.bind(navigator.serviceWorker);
+      navigator.serviceWorker.register = _mkNative(function register(scriptURL, options) {
+        try {
+          if (scriptURL && (typeof scriptURL === 'string' || scriptURL instanceof URL) && _bridgicWorkerWrapSafe(scriptURL)) {
+            return _origReg(_bridgicWrapWorkerURL(scriptURL), options);
+          }
+        } catch (_) {}
+        return _origReg(scriptURL, options);
+      }, 'register');
+    }
+  } catch (_) {}
+  } // end top-frame-only Worker wrappers
 
   // ── navigator.languages ───────────────────────────────────────────────────
   // __BRIDGIC_LANGS__ is replaced by get_init_script() based on the Browser locale setting.
@@ -293,6 +466,125 @@ _STEALTH_INIT_SCRIPT_TEMPLATE: str = """
 """
 
 
+# ========== Worker Stealth Script (R3) ==========
+# Web Workers / Service Workers run their own copy of `navigator` separate from
+# the page. Playwright's add_init_script() does NOT reach into worker contexts,
+# so detection libs spawn a worker, postMessage navigator props back, and
+# compare against main-thread values — any mismatch is a fingerprint.
+#
+# Patch only the worker-accessible surface (no plugins/chrome/WebGL — those
+# don't exist in worker scope and patching them would CREATE inconsistencies):
+#   - webdriver: hide from enumeration (matches main-thread R4)
+#   - deviceMemory: force 8 (worker default is undefined → mismatch with main)
+#   - hardwareConcurrency: align with main-thread fallback
+#   - languages: must equal main-thread languages; placeholder substituted by
+#     get_worker_init_script(locale=…)
+#   - vendor / productSub / vendorSub: WorkerNavigator inherits NavigatorID per
+#     spec, but Playwright Chromium leaves them undefined in worker scope,
+#     producing a main↔worker diff that incolumitas explicitly probes
+#
+# UA in workers is automatically inherited from Network/Emulation
+# setUserAgentOverride applied on the parent page, so no UA patch needed here.
+_STEALTH_WORKER_SCRIPT: str = """
+(function () {
+  try {
+    if (typeof console !== 'undefined') {
+      ['log', 'debug', 'info', 'warn', 'error', 'trace'].forEach(function (m) {
+        try {
+          var _orig = console[m];
+          if (typeof _orig !== 'function') return;
+          console[m] = function () {
+            var args = new Array(arguments.length);
+            for (var i = 0; i < arguments.length; i++) {
+              var a = arguments[i];
+              args[i] = (a instanceof Error) ? (a.name + ': ' + a.message) : a;
+            }
+            return _orig.apply(console, args);
+          };
+        } catch (_) {}
+      });
+    }
+  } catch (_) {}
+  try {
+    const _proto = Object.getPrototypeOf(navigator);
+    if (_proto && Object.getOwnPropertyDescriptor(_proto, 'webdriver')) {
+      Object.defineProperty(_proto, 'webdriver', {
+        get: function () { return undefined; },
+        configurable: true,
+        enumerable: false,
+      });
+    }
+  } catch (_) {}
+  try {
+    Object.defineProperty(navigator, 'deviceMemory', {
+      get: function () { return 8; },
+      configurable: true,
+    });
+  } catch (_) {}
+  try {
+    if (!navigator.hardwareConcurrency || navigator.hardwareConcurrency < 2) {
+      Object.defineProperty(navigator, 'hardwareConcurrency', {
+        get: function () { return 8; },
+        configurable: true,
+      });
+    }
+  } catch (_) {}
+  try {
+    Object.defineProperty(navigator, 'languages', {
+      get: function () { return __BRIDGIC_WORKER_LANGS__; },
+      configurable: true,
+    });
+  } catch (_) {}
+  try {
+    if (navigator.vendor === undefined || navigator.vendor === '') {
+      Object.defineProperty(navigator, 'vendor', {
+        get: function () { return 'Google Inc.'; },
+        configurable: true,
+      });
+    }
+  } catch (_) {}
+  try {
+    if (navigator.vendorSub === undefined) {
+      Object.defineProperty(navigator, 'vendorSub', {
+        get: function () { return ''; },
+        configurable: true,
+      });
+    }
+  } catch (_) {}
+  try {
+    if (navigator.productSub === undefined) {
+      Object.defineProperty(navigator, 'productSub', {
+        get: function () { return '20030107'; },
+        configurable: true,
+      });
+    }
+  } catch (_) {}
+  // WebGL vendor/renderer in worker (OffscreenCanvas) — must match main-thread
+  // patch (Intel Inc. / Intel Iris OpenGL Engine) or `hasInconsistentWorkerValues` flips.
+  try {
+    const _patchWG = (Ctx) => {
+      if (!Ctx) return;
+      const _orig = Ctx.prototype.getParameter;
+      Ctx.prototype.getParameter = function getParameter(parameter) {
+        const _val = _orig.call(this, parameter);
+        if (parameter === 37445) {
+          if (_val && (String(_val).indexOf('Google') !== -1 || _val === '')) return 'Intel Inc.';
+          return _val;
+        }
+        if (parameter === 37446) {
+          if (_val && (String(_val).indexOf('SwiftShader') !== -1 || _val === '')) return 'Intel Iris OpenGL Engine';
+          return _val;
+        }
+        return _val;
+      };
+    };
+    if (typeof WebGLRenderingContext  !== 'undefined') _patchWG(WebGLRenderingContext);
+    if (typeof WebGL2RenderingContext !== 'undefined') _patchWG(WebGL2RenderingContext);
+  } catch (_) {}
+})();
+"""
+
+
 # ========== Anti devtools-detector Script ==========
 # Neutralises the devtools-detector library
 # (https://github.com/AEPKILL/devtools-detector).
@@ -354,6 +646,29 @@ _ANTI_DEVTOOLS_DETECTOR_SCRIPT: str = """
   console.table = _mkNative(function table() {
     return _origLog.apply(console, arguments);
   }, 'table');
+
+  // ── 1b. CDP-attach detection via console.<m>(error) (R5-lite) ──
+  // When CDP is attached, any console method that receives an Error triggers
+  // Runtime.consoleAPICalled, which serializes args — for an Error this calls
+  // `.stack` getter. Detection libs (e.g. deviceandbrowserinfo
+  // `isAutomatedWithCDP`) install a getter proxy on `error.stack` and watch
+  // it fire. Defense: pre-stringify any Error before the underlying console
+  // method runs, so CDP never sees the live Error object. Normal logging of
+  // strings/numbers/objects is unaffected — only Error args are coerced.
+  ['log', 'debug', 'info', 'warn', 'error', 'trace'].forEach(function (m) {
+    try {
+      var _orig = console[m];
+      if (typeof _orig !== 'function') return;
+      console[m] = _mkNative(function () {
+        var args = new Array(arguments.length);
+        for (var i = 0; i < arguments.length; i++) {
+          var a = arguments[i];
+          args[i] = (a instanceof Error) ? (a.name + ': ' + a.message) : a;
+        }
+        return _orig.apply(console, args);
+      }, m);
+    } catch (_) {}
+  });
 
   // ── 2. devtoolsFormatterChecker: freeze devtoolsFormatters ────────
   // devtools-detector registers a custom formatter whose header() fires
@@ -803,7 +1118,15 @@ class StealthArgsBuilder:
         else:
             langs = ["en-US", "en"]
 
-        return _STEALTH_INIT_SCRIPT_TEMPLATE.replace("__BRIDGIC_LANGS__", json.dumps(langs))
+        # Inline the worker stealth body so the Worker-constructor wrapper has
+        # something to prepend at construct time (R3 race-proof path).
+        worker_body = _STEALTH_WORKER_SCRIPT.replace("__BRIDGIC_WORKER_LANGS__", json.dumps(langs))
+        return (
+            _STEALTH_INIT_SCRIPT_TEMPLATE
+            .replace("__BRIDGIC_LANGS__", json.dumps(langs))
+            # JS string literal substitution: must be JSON-encoded (quotes, escapes)
+            .replace('"__BRIDGIC_WORKER_STEALTH__"', json.dumps(worker_body))
+        )
 
     def get_anti_devtools_script(self) -> Optional[str]:
         """Return JS to neutralise the devtools-detector library.
@@ -818,6 +1141,27 @@ class StealthArgsBuilder:
         if not self.config.enabled:
             return None
         return _ANTI_DEVTOOLS_DETECTOR_SCRIPT
+
+    def get_worker_init_script(self, locale: Optional[str] = None) -> Optional[str]:
+        """JS run in each new Web/Service Worker — closes the main↔worker
+        navigator inconsistency that detectors exploit (R3).
+
+        ``locale`` mirrors the main-thread ``navigator.languages`` patch so
+        the two sides stay byte-identical.
+        """
+        if not self.config.enabled:
+            return None
+        if locale:
+            normalized = locale.replace("_", "-")
+            base = normalized.split("-")[0]
+            langs: list[str] = [normalized]
+            if base != normalized:
+                langs.append(base)
+            if base.lower() != "en" and "en" not in langs:
+                langs.append("en")
+        else:
+            langs = ["en-US", "en"]
+        return _STEALTH_WORKER_SCRIPT.replace("__BRIDGIC_WORKER_LANGS__", json.dumps(langs))
 
 def create_stealth_config(
     enabled: bool = True,

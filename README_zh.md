@@ -12,8 +12,8 @@
 - **基于 Python 的工具** — 用于智能体 / 工作流代码生成；更易与 [Bridgic](https://github.com/bitsky-tech/bridgic) 集成
 - **语义不变的快照** — 基于无障碍树与专门设计的 ref 生成算法，保证元素 ref 在页面重载后仍可对应同一元素
 - **Skills** — 用于引导探索与代码生成；兼容多数编程类智能体
-- **隐身模式（默认开启）** — 模式感知反检测策略：headless 模式使用 50+ Chrome 参数 + JS 补丁；headed 模式仅使用 ~11 个最小 flag，与真实 Chrome 指纹一致
-- **持久化与临时会话** — 默认持久化 profile（`~/.bridgic/bridgic-browser/user_data/`）；传入 `clear_user_data=True` 可开启临时会话（无 profile）
+- **隐身模式（默认开启）** — 模式感知反检测，覆盖 24+ 项 JS/CDP 指纹向量。已在公开 bot 检测基准套件上验证通过，详见下方 [反检测](#反检测) 章节
+- **持久化与临时会话** — 默认持久化 profile（`$BRIDGIC_HOME/bridgic-browser/user_data/`，默认 `~/.bridgic/...`）；传入 `clear_user_data=True` 可开启临时会话（无 profile）
 - **嵌套 iframe 支持** — 支持在多层嵌套 iframe 内对 DOM 元素进行操作
 
 ### 快速开始
@@ -177,7 +177,7 @@ if __name__ == "__main__":
 | 来源 | 示例 |
 |--------|---------|
 | 默认值 | `headless=True`，`clear_user_data=False`（持久化 profile） |
-| `~/.bridgic/bridgic-browser/bridgic-browser.json` | 用户级持久配置 |
+| `$BRIDGIC_HOME/bridgic-browser/bridgic-browser.json` | 用户级持久配置（默认 `~/.bridgic/...`） |
 | `./bridgic-browser.json` | 项目本地配置（daemon 启动时的工作目录） |
 | 环境变量 | 见 `skills/bridgic-browser/references/env-vars.md` |
 
@@ -186,6 +186,52 @@ if __name__ == "__main__":
 若需覆盖此行为，请设置：
 - `channel`：例如 `”chrome”`、`”msedge”`
 - `executable_path`：浏览器可执行文件的绝对路径
+
+### 反检测
+
+bridgic 内置工业级隐身层，在不依赖定制 Chromium 二进制、代理、CAPTCHA 解算器
+的前提下，绕过绝大多数基于 JavaScript 指纹的 bot 检测。设计**模式感知**：有头
+模式利用真实系统 Chrome 的 TLS 真实性，无头模式应用更完整的 JS + CDP 补丁集合。
+架构详情见 [`docs/INTERNALS.md#mode-aware-stealth-design`](docs/INTERNALS.md#mode-aware-stealth-design)。
+
+#### Benchmark
+
+最近一次验证：2026-05-12（Playwright Chromium 143 / 系统 Chrome 147，macOS）。
+
+| 站点 | bridgic 结果 |
+|---|---|
+| `bot.sannysoft.com` | 0 / 57 fail（两种模式） |
+| `bot.incolumitas.com` | 0 fail（两种模式） |
+| `browserscan.net/bot-detection` | 0 abnormal / 19 normal（两种模式） |
+| `demo.fingerprint.com/web-scraping` | 通过（有头模式） |
+| `recaptcha-demo.appspot.com` (reCAPTCHA v3) | 评分 = 0.9（两种模式） |
+
+#### 覆盖范围
+
+24+ 项检测向量，在 JS + CDP 层完成补丁：
+
+- **反内省基础设施** — `Function.prototype.toString` 拦截，挫败 `.toString()` 探测
+- **navigator** — `webdriver`（从 `Navigator.prototype` 上整体 delete，与
+  `--disable-blink-features=AutomationControlled` 语义一致；`'webdriver' in
+  navigator` 返回 `false`）、`plugins` 和 `mimeTypes`（继承原生
+  `PluginArray` / `MimeTypeArray` prototype；`item(i)` 按 Web IDL §3.2.4
+  做 uint32 截断）、`languages`、`deviceMemory`、`hardwareConcurrency`、
+  `connection`、`permissions.query`
+- **window / document** — `chrome`（完整 `runtime`/`csi`/`loadTimes`）、
+  `outerWidth/Height`、`hasFocus`/`hidden`/`visibilityState`、`Notification.permission`
+- **WebGL** — UNMASKED_VENDOR / UNMASKED_RENDERER（替换 SwiftShader / 通用厂商泄漏）
+- **UA / Sec-CH-UA**（无头模式独占，通过 CDP `Emulation.setUserAgentOverride`）
+  — `navigator.userAgent`、`userAgentData.brands`
+- **Web Worker / SharedWorker / Service Worker**（通过构造器 wrap + `importScripts`
+  实现 race-proof 注入）— 主线程↔worker 一致性，涵盖 `deviceMemory`、`languages`、
+  `vendor`、`productSub`、`vendorSub`、WebGL
+- **CDP attach 检测** — `Debugger.setSkipAllPauses`、`console.*` 对 `Error` 实参的
+  pre-stringify 包裹（阻断 `error.stack` getter 探测）
+- **devtools-detector 库对抗** — `console.table` 计时归一化、`devtoolsFormatters`
+  锁定、`Function` 构造器 `debugger` 关键字剥除
+
+逐向量实现细节见
+[`docs/INTERNALS.md#stealth-js-init-script--patched-properties`](docs/INTERNALS.md#stealth-js-init-script--patched-properties)。
 
 JSON 来源支持任意 `Browser` 构造参数：
 
@@ -204,6 +250,146 @@ JSON 来源支持任意 `Browser` 构造参数：
 BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open URL
 # 单次临时会话（无持久化 profile）
 BRIDGIC_BROWSER_JSON='{"clear_user_data":true}' bridgic-browser open URL
+```
+
+#### 多实例隔离（`BRIDGIC_HOME`）
+
+默认所有状态存储在 `~/.bridgic` 下。设置 `BRIDGIC_HOME` 可同时运行多个独立的 daemon 实例——各自拥有独立的 socket、日志、用户数据和配置：
+
+```bash
+# 实例 1（默认）
+bridgic-browser open https://site-a.com
+
+# 实例 2（独立 home 目录）
+BRIDGIC_HOME=/tmp/b2 bridgic-browser open https://site-b.com
+
+# 各实例独立操作
+bridgic-browser snapshot                        # site-a 快照
+BRIDGIC_HOME=/tmp/b2 bridgic-browser snapshot   # site-b 快照
+
+# 分别关闭各实例
+bridgic-browser close
+BRIDGIC_HOME=/tmp/b2 bridgic-browser close
+```
+
+SDK 同进程多实例隔离使用 `Browser(user_data_dir=...)` 为每个实例指定不同的 profile 路径。完全的进程级隔离则在启动子进程前设置 `BRIDGIC_HOME` 环境变量。详见 `skills/bridgic-browser/references/env-vars.md`。
+
+#### 存储状态（跨实例共享登录态）
+
+将一个浏览器实例的 cookies 和 localStorage 导出，导入到另一个实例中——适用于跨实例共享登录会话，或将认证状态持久化以便后续运行复用：
+
+```bash
+# 1. 在实例 A 中登录目标网站
+bridgic-browser open https://github.com --headed
+# ... 在浏览器中完成登录 ...
+
+# 2. 导出存储状态（cookies + localStorage）
+bridgic-browser storage-save /tmp/github-login.json
+
+# 3. 在另一个实例中导入（可以使用不同的 BRIDGIC_HOME）
+BRIDGIC_HOME=/tmp/b2 bridgic-browser open https://github.com --headed
+BRIDGIC_HOME=/tmp/b2 bridgic-browser storage-load /tmp/github-login.json
+BRIDGIC_HOME=/tmp/b2 bridgic-browser reload   # 刷新页面以应用导入的 cookies
+
+# 实例 B 现在已使用与实例 A 相同的会话完成登录
+```
+
+导出的 JSON 文件包含浏览器访问过的所有域的全部 cookies（包括 HttpOnly / Secure 属性的）和 localStorage 条目。
+
+存储状态文件**跨模式兼容**——可以从 headed 会话导出后导入到 headless 会话中使用（反之亦然），登录态会完整保留。这在需要认证的自动化场景中特别实用：先在 headed 模式下手动登录（处理验证码、2FA 等交互），导出存储状态，之后在 headless 自动化运行中直接复用。
+
+**SDK 用法：**
+
+```python
+import asyncio
+from bridgic.browser import Browser
+
+async def main():
+    # 1. 导出：在有头模式下交互登录，然后保存存储状态
+    async with Browser(headless=False) as browser:
+        await browser.navigate_to("https://github.com")
+        # ... 在浏览器中完成登录 ...
+        await browser.save_storage_state("/tmp/github-login.json")
+
+    # 2. 导入：在新的（无头）实例中复用登录会话
+    async with Browser(headless=True, user_data_dir="/tmp/sdk-profile") as browser:
+        await browser.restore_storage_state("/tmp/github-login.json")
+        await browser.navigate_to("https://github.com")
+        snap = await browser.get_snapshot(interactive=True)
+        print(snap.tree)  # Dashboard — 已登录
+
+asyncio.run(main())
+```
+
+#### CDP 模式（连接已有浏览器）
+
+`bridgic-browser` 可以通过 [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) 连接到已经运行的 Chrome/Chromium 实例，而非启动新浏览器。
+
+开启远程调试端点有两种方式。
+
+**方式一 —— Chrome 144+ 浏览器内 UI 启用（无需重启 Chrome）。** 在你日常使用的 Chrome 中打开 `chrome://inspect/#remote-debugging`，按对话框提示**允许**远程调试连接即可。Chrome 会在本地开启调试端点，并把连接信息写入 user data 目录根部的 `DevToolsActivePort` 文件：
+
+| 平台 | 路径 |
+|------|------|
+| macOS   | `~/Library/Application Support/Google/Chrome/DevToolsActivePort` |
+| Linux   | `~/.config/google-chrome/DevToolsActivePort` |
+| Windows | `%LOCALAPPDATA%\Google\Chrome\User Data\DevToolsActivePort` |
+
+文件总共两行 —— 端口号 + 浏览器级 WebSocket 路径：
+
+```
+9222
+/devtools/browser/f8632266-41b6-4eb8-8239-d48a86bb44b1
+```
+
+由于 bridgic 的 `--cdp auto` 本身就会扫描这些标准 profile 目录里的 `DevToolsActivePort`，你无需任何额外参数即可直接连接：
+
+```bash
+bridgic-browser open https://example.com --cdp auto
+```
+
+会话激活期间 Chrome 会在顶部显示 *"Chrome 正在受到自动测试软件的控制"* 横幅，并可能在每次新建调试会话时再次弹出确认对话框。来源：[Chrome DevTools MCP 博客](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session)、[chrome-devtools-mcp README](https://github.com/ChromeDevTools/chrome-devtools-mcp/)。完整说明见 [`docs/CDP_MODE.md`](docs/CDP_MODE.md)。
+
+**方式二 —— 启动参数（Chrome <144 或需要独立 profile 时）。** 使用 `--remote-debugging-port` 启动 Chrome：
+
+```bash
+# macOS
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+    --remote-debugging-port=9222 --user-data-dir=/tmp/cdp-profile
+
+# Linux
+google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/cdp-profile
+```
+
+然后使用 `--cdp` 连接：
+
+```bash
+bridgic-browser open https://example.com --cdp 9222
+bridgic-browser open https://example.com --cdp ws://localhost:9222/devtools/browser/...
+bridgic-browser open https://example.com --cdp wss://cloud.example.com/chromium?token=...
+bridgic-browser open https://example.com --cdp auto
+```
+
+| 格式 | 说明 |
+|--------|-------------|
+| `9222` | 端口号 -- 向 `localhost:9222/json/version` 查询 WebSocket URL |
+| `ws://...` / `wss://...` | 直接 WebSocket URL（原始 CDP 或 Playwright WS 协议），原样传递 |
+| `http://host:port` | HTTP 发现端点 -- 向该主机的 `/json/version` 查询 |
+| `auto` | 自动扫描本地 Chrome/Chromium/Brave 配置目录（含 Canary 变体），查找活跃的 `DevToolsActivePort` 文件 |
+
+**Tab 可见性：** 连接到用户已在运行的 Chrome 后，bridgic 只看得到自己打开的页面 —— 连接时自动创建的初始空白页、`new-tab` 新建的标签，以及由这些页面派生出来的弹窗（在 `<a target="_blank">` 上**普通左键点击**、或 JavaScript `window.open()`，通过 `Page.opener()` 自动归属）。**用户用 Cmd+click（macOS）/ Ctrl+click（Win/Linux）/ 中键点击 / Cmd+T / 地址栏新开的标签*不会*被采纳** —— Cmd/Ctrl/中键点击会走 Chromium 的"背景 tab 导航"路径，opener 在 browser 进程层被剥离；Cmd+T 和地址栏开 tab 则**根本就没有** opener 关系。两种情况 bridgic 都看不到。**用户其它已存在的标签对 bridgic 的 `tabs` / `switch-tab` / `close-tab` 也是不可见的。** 这是一条隐私边界，避免 LLM 驱动的 bridgic 误切到或关闭用户的私人工作 tab。如需操作已打开的页面，请通过 bridgic 重新导航到该 URL。默认情况下，bridgic 当前 tab 派生的弹窗会自动接管为新的活动 tab（`auto_follow_popups=True`）；如需保持活动指针不动，可用 `Browser(auto_follow_popups=False)`。完整采纳对照表见 [`docs/CDP_MODE.md#tab-ownership-in-cdp-mode`](docs/CDP_MODE.md#tab-ownership-in-cdp-mode)。
+
+**关闭行为：** `bridgic-browser close` 会断开与远程浏览器的连接，但**不会**终止 Chrome 进程。浏览器继续运行，可以重新连接。
+
+**使用场景：**
+- 复用已有 Chrome 会话及其登录状态和扩展
+- 连接云端浏览器服务（Browserless、Steel.dev 等）
+- 自动化开放 CDP 端口的 Electron 应用
+
+SDK 等效用法：
+
+```python
+browser = Browser(cdp="ws://localhost:9222/devtools/browser/...")
 ```
 
 #### 命令列表
@@ -303,7 +489,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `go_back()` / `go_forward()` - 浏览器历史导航
 
 **快照（1 个工具）：**
-- `get_snapshot_text(limit=10000, interactive=False, full_page=True, file=None)` - 获取供 LLM 使用的页面状态字符串（带 ref 的无障碍树）。**limit**（默认 10000）控制最多返回的字符数。当快照超过 limit 或显式提供了 **file** 时，完整内容会保存到 **file**（若为 `None` 且超限则自动生成至 `~/.bridgic/bridgic-browser/snapshot/`），仅返回包含文件路径的提示。**interactive** 与 **full_page** 与 `get_snapshot` 一致（仅交互元素或默认全页）。
+- `get_snapshot_text(limit=10000, interactive=False, full_page=True, file=None)` - 获取供 LLM 使用的页面状态字符串（带 ref 的无障碍树）。**limit**（默认 10000）控制最多返回的字符数。当快照超过 limit 或显式提供了 **file** 时，完整内容会保存到 **file**（若为 `None` 且超限则自动生成至 `$BRIDGIC_HOME/bridgic-browser/snapshot/`），仅返回包含文件路径的提示。**interactive** 与 **full_page** 与 `get_snapshot` 一致（仅交互元素或默认全页）。
 
 **元素交互（13 个工具）- 通过 ref：**
 - `click_element_by_ref(ref)` - 点击元素
@@ -455,7 +641,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 ```python
 from bridgic.browser.session import Browser
 
-# 持久化会话（默认 — profile 保存至 ~/.bridgic/bridgic-browser/user_data/）
+# 持久化会话（默认 — profile 保存至 $BRIDGIC_HOME/bridgic-browser/user_data/）
 browser = Browser(
     headless=True,
     viewport={"width": 1600, "height": 900},
@@ -484,9 +670,11 @@ browser = Browser(
 | `user_data_dir` | str/Path | None | 持久化 profile 自定义路径（`clear_user_data=True` 时忽略） |
 | `clear_user_data` | bool | False | True 时使用临时会话（无 profile）；False 时使用持久化 profile |
 | `stealth` | bool/StealthConfig | True | 隐身模式配置 |
+| `cdp` | str | None | 通过 CDP 连接已有 Chrome（跳过启动）。接受端口号、`ws://` / `wss://` URL、`http://host:port`、`"auto"` —— 与 CLI `--cdp` 一致 |
+| `auto_follow_popups` | bool | True | 当 bridgic 拥有的页面派生出弹窗（`<a target="_blank">` 点击、`window.open()`）时，是否自动把 `self._page` 切到弹窗。设为 False 时弹窗仍会被纳入 owned 集合，只是活动指针不动 |
 | `channel` | str | None | 浏览器通道（chrome、msedge 等） |
 | `proxy` | dict | None | 代理设置 |
-| `downloads_path` | str/Path | None | 下载目录 |
+| `downloads_path` | str/Path | None | 下载目录。优先级:显式值 > `bridgic-browser.json` > (仅 CDP-borrowed CLI)CLI 客户端 CWD > `~/Downloads`。详见 [下载](#下载)。 |
 
 **快照：** 使用 `get_snapshot(interactive=False, full_page=True)` 获取 `EnhancedSnapshot`，含 `.tree`（无障碍树字符串）和 `.refs`（ref → 定位数据）。默认 `full_page=True` 包含视口内外全部元素。`interactive=True` 仅包含可点击/可编辑元素（扁平输出），`full_page=False` 仅包含视口内元素。使用 `get_element_by_ref(ref)` 根据 ref（如 "1f79fe5e"）获取 Playwright Locator 后进行 click、fill 等操作。
 
@@ -506,26 +694,42 @@ config = StealthConfig(
 browser = Browser(stealth=config, headless=False)
 ```
 
-#### DownloadManager
+#### 下载
 
-处理文件下载，正确保留文件名：
+bridgic 在所有模式下都保留原始文件名、屏蔽"另存为"对话框,API 一致。内部有两条流水线 —— 非 CDP / CDP-owned 用 `DownloadManager`,CDP-borrowed 用 `CdpDownloadRenamer`(通过 page-level CDP session 下发 `setDownloadBehavior(allowAndName)`)。完整设计见 [CLAUDE.md → Downloads](CLAUDE.md#downloads)。
+
+##### 下载路径矩阵
+
+| 调用方 | 模式 | 显式 `downloads_path` | 实际落点 |
+|---|---|---|---|
+| **CLI** (`bridgic-browser ...`) | 非 CDP | 有 | 显式值 |
+| **CLI** | 非 CDP | 无 | `~/Downloads` (daemon 自动默认) |
+| **CLI** | CDP (`--cdp ...`) | 有 | 显式值 |
+| **CLI** | CDP | 无 | CLI 启动时的工作目录(`os.getcwd()`)—— `curl -O` 风格 |
+| **SDK** (`Browser(...)`) | 非 CDP | 有 | 显式值 |
+| **SDK** | 非 CDP | 无 | 下载不被捕获(Playwright 会清掉 temp dir —— 请显式传 `downloads_path`) |
+| **SDK** | CDP (`Browser(cdp=...)`) | 有 | 显式值 |
+| **SDK** | CDP | 无 | `~/Downloads`(SDK 没有 CLI CWD 提示) |
 
 ```python
-# 将 downloads_path 传给 Browser — 它会内部创建并管理 DownloadManager
+# 非 CDP(DownloadManager 流水线)
 browser = Browser(downloads_path="./downloads", headless=True)
-await browser.navigate_to("https://example.com")  # 懒加载，首次导航时自动启动
+await browser.navigate_to("https://example.com")
+# 程序化访问已完成的下载
+for f in browser.download_manager.downloaded_files:
+    print(f"已下载:{f.file_name}({f.file_size} 字节)")
 
-# 通过内置管理器访问已下载的文件
-for file in browser.download_manager.downloaded_files:
-    print(f"已下载：{file.file_name}（{file.file_size} 字节）")
+# CDP-borrowed(CdpDownloadRenamer 流水线;文件以真名落到 downloads_path,
+# download_manager 为 None —— wait_for_download 在此模式不支持)
+browser = Browser(cdp="auto", downloads_path="./downloads")
 ```
 
 ### 隐身模式
 
 隐身模式**默认启用**，包括：
 
-- **Headless 模式**：50+ Chrome 参数 + JS init script，修补 `navigator.webdriver`、`window.chrome`、WebGL、`document.hasFocus()`、`visibilityState` 等。所有被修补的函数均通过 `Function.prototype.toString` 欺骗返回 `[native code]`。
-- **Headed 模式**：仅使用 ~11 个最小 flag（与真实 Chrome 一致），完全跳过 JS 补丁注入，确保 Cloudflare Turnstile 等第三方 challenge iframe 看到未经修改的原生 API。
+- **Headless 模式**：50+ Chrome 参数 + JS init script + Web/Service/Shared Worker 注入 + CDP UA-CH 覆写。完整覆盖向量见 [反检测](#反检测) 章节。
+- **Headed 模式**：仅使用 ~11 个最小 flag + 系统 Chrome（`channel="chrome"`），保证 TLS 真实性。主 JS init script 完全跳过注入，确保 Cloudflare Turnstile 等跨域 challenge iframe 看到未经修改的原生 API。详见 [反检测](#反检测) 章节。
 
 ```python
 # 隐身默认开启
@@ -590,3 +794,4 @@ MIT 许可证
 - [浏览器工具指南](docs/BROWSER_TOOLS_GUIDE.md) — 工具选择、ref 与坐标、等待策略、常见模式。
 - [快照与页面状态](docs/SNAPSHOT_AND_STATE.md) — SnapshotOptions、EnhancedSnapshot、get_snapshot_text、get_element_by_ref。
 - [API 摘要](docs/API.md) — Session 与 DownloadManager API 说明。
+- [已知限制](docs/KNOWN_LIMITATIONS.md) — 已知问题与上游 bug（如 Chrome「在文件夹中打开」不可用）。
