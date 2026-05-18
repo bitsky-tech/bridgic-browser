@@ -4,6 +4,7 @@ Unit tests for the Browser class.
 
 import asyncio
 import os
+import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -4327,6 +4328,19 @@ class TestClickIntegrationUsesFallbackGate:
 # _wrap_js_for_cdp_eval — parity with Playwright page.evaluate(str)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "Each parametrized case spawns node.exe; on Windows GitHub Actions "
+        "runners Defender real-time scan + spawn queueing make this "
+        "consistently flaky (10s → 30s budget still hit hard timeouts on "
+        "multiple cases). The wrapper under test (`_wrap_js_for_cdp_eval`) "
+        "is pure platform-independent Python string composition — coverage "
+        "on macOS/Linux CI is sufficient. JS semantic parity is "
+        "independently verified end-to-end against real Chrome in "
+        "tests/integration/test_evaluate_cdp_parity.py."
+    ),
+)
 class TestWrapJsForCdpEval:
     """The CDP-path wrapper must accept every input form ``page.evaluate(str)``
     accepts, and produce the same value Playwright's non-CDP path produces.
@@ -4422,11 +4436,7 @@ class TestWrapJsForCdpEval:
             "  }"
             "})();"
         )
-        # timeout=30 (not 10) to absorb Windows GitHub Actions runner
-        # cold-start latency: Defender real-time scan + I/O contention can
-        # push the first `node.exe` spawn to 5-15s. Normal-path execution
-        # is still <500ms per case; the cap only matters on cold runners.
-        result = subprocess.run([node, "-e", probe], capture_output=True, text=True, timeout=30)
+        result = subprocess.run([node, "-e", probe], capture_output=True, text=True, timeout=10)
         assert result.returncode == 0, f"wrapper crashed node for {name}: {result.stderr}"
         outcome = _json.loads(result.stdout.strip())
 
