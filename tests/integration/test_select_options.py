@@ -323,3 +323,78 @@ class TestAntdSelect:
         assert "frontend" in display_text.lower() and "backend" in display_text.lower(), (
             f"Expected 'frontend' and 'backend' in display, got: '{display_text}'"
         )
+
+
+# ---------------------------------------------------------------------------
+# Section 4: Shadow-select portal dropdown (Arco / Element Plus style)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+class TestShadowSelectPortalDropdown:
+    """Regression tests for components that host a hidden native ``<select>``
+    inside the trigger (for a11y / form posting) while rendering the real
+    visible options in a portalized ``[role='listbox']``.
+
+    Previously ``_get_dropdown_option_locators`` preferred ``locator.locator("option")``
+    first, hitting the hidden shadow ``<option>`` elements. ``select_dropdown_option_by_ref``
+    then dispatched a click to those hidden elements, returning ``"Selected option: X"``
+    while the UI remained unchanged. The fix reorders lookup to prefer
+    ``aria-controls`` / visible ``[role='option']`` and strictly filters hidden
+    candidates for non-native triggers.
+    """
+
+    @pytest.mark.asyncio
+    async def test_options_ignores_shadow_select(self, browser):
+        """options() must list the 4 visible portal options, not the 2 shadow ones."""
+        snapshot = await _open_and_snapshot(browser)
+        combo_ref = _find_ref(snapshot, "combobox", "Appeal status")
+        assert combo_ref, "combobox 'Appeal status' not found"
+
+        # Expand the dropdown so the portal listbox becomes visible
+        await browser.click_element_by_ref(combo_ref)
+
+        result = await browser.get_dropdown_options_by_ref(combo_ref)
+        for expected in ("All", "Pending", "Processing", "Resolved"):
+            assert expected in result, (
+                f"Expected '{expected}' in options, got: {result}"
+            )
+        # Shadow select only has "All" and "Pending". "Processing"/"Resolved"
+        # presence proves we're reading the portal listbox, not the shadow.
+
+    @pytest.mark.asyncio
+    async def test_select_pending_actually_applies(self, browser):
+        """select('Pending') must update status-display, not silently no-op."""
+        snapshot = await _open_and_snapshot(browser)
+        combo_ref = _find_ref(snapshot, "combobox", "Appeal status")
+        assert combo_ref
+
+        result = await browser.select_dropdown_option_by_ref(combo_ref, "Pending")
+        assert "error" not in result.lower(), f"select failed: {result}"
+
+        page = browser._context.pages[0]
+        display_text = await page.evaluate(
+            "document.getElementById('status-display').textContent"
+        )
+        assert display_text == "Pending", (
+            f"Expected 'Pending', got '{display_text}'. "
+            "Selection likely hit the shadow <option> without applying to UI."
+        )
+
+    @pytest.mark.asyncio
+    async def test_select_then_switch(self, browser):
+        """Selecting twice should land on the second choice."""
+        snapshot = await _open_and_snapshot(browser)
+        combo_ref = _find_ref(snapshot, "combobox", "Appeal status")
+        assert combo_ref
+
+        await browser.select_dropdown_option_by_ref(combo_ref, "Processing")
+        result = await browser.select_dropdown_option_by_ref(combo_ref, "Resolved")
+        assert "error" not in result.lower(), f"second select failed: {result}"
+
+        page = browser._context.pages[0]
+        display_text = await page.evaluate(
+            "document.getElementById('status-display').textContent"
+        )
+        assert display_text == "Resolved", (
+            f"Expected 'Resolved' after switching, got '{display_text}'"
+        )

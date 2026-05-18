@@ -36,6 +36,7 @@ Tool Coverage (67 tools, aligned with CLI sections):
 """
 
 import asyncio
+import json
 import os
 import re
 import tempfile
@@ -47,7 +48,7 @@ import pytest_asyncio
 
 pytestmark = pytest.mark.integration
 
-from bridgic.browser.errors import VerificationError
+from bridgic.browser.errors import BridgicBrowserError, VerificationError
 from bridgic.browser.session import Browser
 
 # ==================== Constants ====================
@@ -107,7 +108,7 @@ async def browser():
         stealth=False,
         viewport={"width": 1280, "height": 720},
     )
-    test_url = f"file://{TEST_PAGE_PATH.absolute()}"
+    test_url = TEST_PAGE_PATH.absolute().as_uri()
     await browser_instance.navigate_to(test_url)
     await asyncio.sleep(0.3)
     yield browser_instance
@@ -128,13 +129,13 @@ class TestNavigationTools:
 
     @pytest.mark.asyncio
     async def test_navigate_to(self, browser):
-        test_url = f"file://{TEST_PAGE_PATH.absolute()}"
+        test_url = TEST_PAGE_PATH.absolute().as_uri()
         result = await browser.navigate_to(test_url)
         assert "Navigated to" in result
 
     @pytest.mark.asyncio
     async def test_go_back_and_forward(self, browser):
-        test_url = f"file://{TEST_PAGE_PATH.absolute()}"
+        test_url = TEST_PAGE_PATH.absolute().as_uri()
         page = await browser.get_current_page()
         await page.click("#link-form")
         await asyncio.sleep(0.2)
@@ -153,6 +154,28 @@ class TestNavigationTools:
         assert "Searched on Duckduckgo" in result
         info = await browser.get_current_page_info()
         assert "duckduckgo.com" in info
+
+    @pytest.mark.asyncio
+    async def test_ref_invalidated_after_go_back(self, browser):
+        """task.md §8.1: go_back drops the snapshot cache; a stale ref must
+        raise instead of silently resolving to a wrong same-role element."""
+        snapshot = await browser.get_snapshot_text(interactive=True, full_page=True)
+        refs = extract_refs_from_snapshot(snapshot)
+        assert refs, f"test page must yield at least one ref:\n{snapshot}"
+        stale_ref = next(iter(refs))
+
+        page = await browser.get_current_page()
+        await page.click("#link-form")
+        await asyncio.sleep(0.2)
+        await browser.go_back()
+
+        with pytest.raises(BridgicBrowserError) as exc_info:
+            await browser.click_element_by_ref(stale_ref)
+        code = getattr(exc_info.value, "code", "")
+        assert (
+            code in {"REF_NOT_AVAILABLE", "NOT_FOUND", "INVALID_REF"}
+            or "ref" in str(exc_info.value).lower()
+        ), f"expected ref-invalidation error, got code={code!r} message={exc_info.value}"
 
 # ==================== 2. Page & Tab Tools (9 tools) ====================
 
@@ -199,7 +222,7 @@ class TestPageTools:
         assert result.startswith("Created new blank tab")
         assert re.search(r"\bpage_\d+\b", result), result
 
-        test_url = f"file://{TEST_PAGE_PATH.absolute()}"
+        test_url = TEST_PAGE_PATH.absolute().as_uri()
         await browser.navigate_to(test_url)
 
         result_str = await browser.get_tabs()
@@ -394,6 +417,27 @@ class TestActionTools:
         )
         assert "Primary" in result
 
+    @pytest.mark.asyncio
+    async def test_click_disabled_button_raises_without_firing_handler(self, browser):
+        """task.md §5.2: <button disabled> click must fail (not silently "succeed"),
+        and the onclick handler must NOT fire via a dispatch_event fallback — the
+        2s dispatch budget from M01 prevents the fallback from pressing a disabled
+        element on Playwright's behalf."""
+        fixture = Path(__file__).resolve().parents[2] / "scripts/qa/disabled-button.html"
+        await browser.navigate_to(fixture.absolute().as_uri())
+        snapshot = await browser.get_snapshot_text(interactive=True, full_page=True)
+        refs = extract_refs_from_snapshot(snapshot)
+        btn_ref = find_ref_by_type_and_name(refs, "button", "Native-disabled")
+        assert btn_ref is not None, f"disabled button ref missing from snapshot:\n{snapshot}"
+
+        with pytest.raises(BridgicBrowserError):
+            await browser.click_element_by_ref(btn_ref)
+
+        leaked = await browser.evaluate_javascript("() => window._nativeClicked === true")
+        assert str(leaked).lower() != "true", (
+            "disabled button onclick fired — dispatch_event fallback regression (M01)"
+        )
+
 # ==================== 5. Mouse Tools (6 tools) ====================
 
 class TestMouseTools:
@@ -458,7 +502,7 @@ class TestMouseTools:
 # ==================== 6. Keyboard Tools (5 tools) ====================
 
 class TestKeyboardTools:
-    """Tests: type_text, key_down, key_up, fill_form, insert_text"""
+    """Tests: type_text, key_down, key_up, fill_form"""
 
     @pytest.mark.asyncio
     async def test_type_text(self, browser_with_complete_snapshot):
@@ -483,20 +527,6 @@ class TestKeyboardTools:
         assert result_down is not None
         result_up = await browser.key_up("Shift")
         assert result_up is not None
-
-    @pytest.mark.asyncio
-    async def test_insert_text(self, browser_with_complete_snapshot):
-        """insert_text inserts text at cursor position."""
-        browser, _, refs = browser_with_complete_snapshot
-        tb_ref = find_ref_by_type_and_name(refs, "textbox", "Email")
-        assert tb_ref is not None
-        await browser.focus_element_by_ref(tb_ref)
-        result = await browser.insert_text("test@example.com")
-        assert result is not None
-
-        page = await browser.get_current_page()
-        value = await page.evaluate("document.getElementById('email').value")
-        assert "test@example.com" in value
 
     @pytest.mark.asyncio
     async def test_fill_form(self, browser_with_complete_snapshot):
@@ -580,7 +610,7 @@ class TestNetworkTools:
         assert result is not None
 
         # Trigger a navigation (which creates network requests)
-        test_url = f"file://{TEST_PAGE_PATH.absolute()}"
+        test_url = TEST_PAGE_PATH.absolute().as_uri()
         await browser.navigate_to(test_url)
 
         reqs = await browser.get_network_requests(include_static=True)
@@ -678,6 +708,89 @@ class TestStorageTools:
             result = await browser.restore_storage_state(filename=filepath)
             assert result is not None
 
+    @pytest.mark.asyncio
+    async def test_restore_storage_state_multi_origin(self):
+        """Restored localStorage must be scoped to its own origin, not the current page's origin."""
+        async def _stub(route):
+            try:
+                await route.fulfill(
+                    status=200,
+                    content_type="text/html",
+                    body="<!doctype html><html></html>",
+                )
+            except Exception:
+                try:
+                    await route.abort()
+                except Exception:
+                    pass
+
+        origins = [
+            "http://alpha.bridgic.test",
+            "http://beta.bridgic.test",
+            "http://gamma.bridgic.test",
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "state.json")
+
+            seed = Browser(headless=True, stealth=False)
+            await seed._start()
+            try:
+                await seed._context.route("**/*", _stub)
+                seed_page = await seed.get_current_page()
+                if seed_page is None:
+                    seed_page = await seed._context.new_page()
+                for origin in origins:
+                    await seed_page.goto(origin, wait_until="domcontentloaded")
+                    await seed_page.evaluate(
+                        "origin => { localStorage.setItem('origin_marker', origin);"
+                        " localStorage.setItem('flag', 'seeded');"
+                        " document.cookie = 'site_marker=' + location.hostname + '; path=/; max-age=3600'; }",
+                        origin,
+                    )
+                await seed.save_storage_state(filename=state_path)
+            finally:
+                await seed.close()
+
+            with open(state_path) as f:
+                state = json.load(f)
+            assert {o["origin"] for o in state["origins"]} == set(origins)
+
+            restore = Browser(headless=True, stealth=False)
+            await restore._start()
+            try:
+                await restore._context.route("**/*", _stub)
+                page = await restore.get_current_page()
+                if page is None:
+                    page = await restore._context.new_page()
+                await page.goto(origins[0], wait_until="domcontentloaded")
+
+                await restore.restore_storage_state(filename=state_path)
+
+                for origin in origins:
+                    await page.goto(origin, wait_until="domcontentloaded")
+                    result = await page.evaluate(
+                        "() => ({ origin: location.origin,"
+                        " marker: localStorage.getItem('origin_marker'),"
+                        " flag: localStorage.getItem('flag'),"
+                        " keyCount: localStorage.length,"
+                        " cookie: document.cookie })"
+                    )
+                    assert result["origin"] == origin, f"goto origin mismatch for {origin}"
+                    assert result["marker"] == origin, (
+                        f"localStorage scoped to wrong origin: {origin} got marker={result['marker']}"
+                    )
+                    assert result["flag"] == "seeded", f"missing flag on {origin}"
+                    assert result["keyCount"] == 2, (
+                        f"unexpected localStorage key count on {origin}: {result['keyCount']}"
+                    )
+                    hostname = origin.split("//", 1)[1]
+                    assert f"site_marker={hostname}" in result["cookie"], (
+                        f"cookie missing/wrong on {origin}: {result['cookie']!r}"
+                    )
+            finally:
+                await restore.close()
+
 # ==================== 11. Verification Tools (6 tools) ====================
 
 class TestVerificationTools:
@@ -712,7 +825,7 @@ class TestVerificationTools:
 
     @pytest.mark.asyncio
     async def test_verify_url(self, browser):
-        test_url = f"file://{TEST_PAGE_PATH.absolute()}"
+        test_url = TEST_PAGE_PATH.absolute().as_uri()
         result = await browser.verify_url(test_url, exact=True)
         assert "PASS" in result
 

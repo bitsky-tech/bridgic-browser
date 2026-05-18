@@ -4,6 +4,7 @@ Unit tests for the Browser class.
 
 import asyncio
 import os
+import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ import pytest_asyncio
 from bridgic.browser.errors import InvalidInputError, OperationError, StateError
 from bridgic.browser.session import Browser, StealthConfig
 import bridgic.browser.session._browser as _browser_module
+from bridgic.browser import _timeouts as _bridgic_timeouts
 
 
 @pytest.fixture(autouse=True)
@@ -500,25 +502,78 @@ class TestBrowserStartStop:
 
     @pytest.mark.asyncio
     async def test_default_persistent_uses_bridgic_user_data_dir(self, mock_playwright):
-        """Default (clear_user_data=False, no user_data_dir) passes BRIDGIC_USER_DATA_DIR to launch_persistent_context."""
-        from bridgic.browser._constants import BRIDGIC_USER_DATA_DIR
+        """Default (no user_data_dir) → BRIDGIC_USER_DATA_DIR/headless is passed to launch_persistent_context."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_base = Path(tmpdir) / "user_data"
+            with patch("bridgic.browser.session._browser.async_playwright") as mock_ap, \
+                 patch("bridgic.browser.session._browser.BRIDGIC_USER_DATA_DIR", fake_base):
+                mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
 
-        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
-            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+                browser = Browser(stealth=False)
+                assert browser.use_persistent_context is True
+                assert browser.clear_user_data is False
 
-            browser = Browser(stealth=False)
-            assert browser.use_persistent_context is True
-            assert browser.clear_user_data is False
+                await browser._start()
 
-            await browser._start()
+                mock_playwright.chromium.launch_persistent_context.assert_called_once()
+                call_kwargs = mock_playwright.chromium.launch_persistent_context.call_args
+                assert call_kwargs.kwargs.get("user_data_dir") == str(fake_base / "headless")
+                assert (fake_base / "headless").is_dir()
 
-            mock_playwright.chromium.launch_persistent_context.assert_called_once()
-            call_kwargs = mock_playwright.chromium.launch_persistent_context.call_args
-            # _isolate_config fixture patches BRIDGIC_USER_DATA_DIR with a MagicMock whose
-            # str() returns str(BRIDGIC_USER_DATA_DIR), so this check remains meaningful.
-            assert call_kwargs.kwargs.get("user_data_dir") == str(BRIDGIC_USER_DATA_DIR)
+                await browser.close()
 
-            await browser.close()
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "headless,use_custom_base,expected_mode",
+        [
+            (True, False, "headless"),
+            (False, False, "headed"),
+            (True, True, "headless"),
+            (False, True, "headed"),
+        ],
+    )
+    async def test_persistent_profile_dir_split_headed_headless(
+        self, mock_playwright, headless, use_custom_base, expected_mode
+    ):
+        """Persistent profile is placed under <base>/headed or <base>/headless per mode.
+
+        Covers both the default base (BRIDGIC_USER_DATA_DIR) and a user-supplied
+        base; the suffix must always be applied to prevent SingletonLock collisions.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir) / ("custom" if use_custom_base else "user_data")
+            kwargs = {"stealth": False, "headless": headless}
+            patches = [patch("bridgic.browser.session._browser.async_playwright")]
+            if use_custom_base:
+                kwargs["user_data_dir"] = str(base)
+            else:
+                patches.append(
+                    patch("bridgic.browser.session._browser.BRIDGIC_USER_DATA_DIR", base)
+                )
+
+            with patches[0] as mock_ap:
+                mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+                stack = patches[1] if len(patches) > 1 else None
+                if stack is not None:
+                    stack.start()
+                try:
+                    browser = Browser(**kwargs)
+                    await browser._start()
+
+                    call_kwargs = mock_playwright.chromium.launch_persistent_context.call_args
+                    expected = base / expected_mode
+                    assert call_kwargs.kwargs.get("user_data_dir") == str(expected)
+                    assert expected.is_dir()
+                    # Public property still reflects the user-supplied value (or None).
+                    if use_custom_base:
+                        assert browser.user_data_dir == base
+                    else:
+                        assert browser.user_data_dir is None
+
+                    await browser.close()
+                finally:
+                    if stack is not None:
+                        stack.stop()
 
     @pytest.mark.asyncio
     async def test_async_context_manager_uses_start_and_kill(self, mock_playwright, mock_context, mock_page):
@@ -564,10 +619,21 @@ class TestBrowserStartStop:
             context.tracing = MagicMock()
             context.tracing.stop = AsyncMock()
             context.pages = [page]
+            context.remove_listener = MagicMock()
 
-            page.video = MagicMock()
-            page.video.path = AsyncMock(return_value="/tmp/playwright-video.webm")
-            page.video.save_as = AsyncMock()
+            # Create a mock CDP screencast recorder
+            import tempfile
+            _tmp_video_fd, _tmp_video_path = tempfile.mkstemp(suffix=".webm")
+            os.close(_tmp_video_fd)
+            mock_recorder = MagicMock()
+            mock_recorder.prepare_stop = AsyncMock()
+            mock_recorder.finalize = AsyncMock(return_value=_tmp_video_path)
+            mock_recorder.stop = AsyncMock(return_value=_tmp_video_path)
+            browser._video_recorder = mock_recorder
+            browser._video_session = {
+                "width": 800, "height": 600, "context": context,
+                "page_listener": lambda *_: None,
+            }
 
             context_key = browser_module._get_context_key(context)
             browser._tracing_state[context_key] = True
@@ -581,12 +647,11 @@ class TestBrowserStartStop:
             assert "close-" in trace_path
             assert trace_path.endswith("trace.zip")
 
-            page.close.assert_awaited()
+            mock_recorder.prepare_stop.assert_awaited_once()
+            mock_recorder.finalize.assert_awaited_once()
             assert browser._last_shutdown_artifacts["trace"] == [os.path.abspath(trace_path)]
-            # Video saved via save_as into session dir
             assert len(browser._last_shutdown_artifacts["video"]) == 1
             video_path = browser._last_shutdown_artifacts["video"][0]
-            assert "close-" in video_path
             assert "video" in video_path
             assert context_key not in browser._tracing_state
             assert context_key not in browser._video_state
@@ -610,10 +675,21 @@ class TestBrowserStartStop:
             context.tracing = MagicMock()
             context.tracing.stop = AsyncMock()
             context.pages = [page]
+            context.remove_listener = MagicMock()
 
-            page.video = MagicMock()
-            page.video.path = AsyncMock(return_value="/tmp/auto_video.webm")
-            page.video.save_as = AsyncMock()
+            # Create a mock CDP screencast recorder
+            import tempfile
+            _tmp_video_fd, _tmp_video_path = tempfile.mkstemp(suffix=".webm")
+            os.close(_tmp_video_fd)
+            mock_recorder = MagicMock()
+            mock_recorder.prepare_stop = AsyncMock()
+            mock_recorder.finalize = AsyncMock(return_value=_tmp_video_path)
+            mock_recorder.stop = AsyncMock(return_value=_tmp_video_path)
+            browser._video_recorder = mock_recorder
+            browser._video_session = {
+                "width": 800, "height": 600, "context": context,
+                "page_listener": lambda *_: None,
+            }
 
             context_key = browser_module._get_context_key(context)
             browser._tracing_state[context_key] = True
@@ -624,6 +700,105 @@ class TestBrowserStartStop:
             assert "Browser closed successfully" in result
             assert "trace.zip" in result
             assert "video" in result
+
+    @pytest.mark.asyncio
+    async def test_close_auto_stops_cdp_recorder(self, mock_playwright):
+        """close() should auto-stop the CDP screencast recorder and save the video."""
+        from bridgic.browser.session import _browser as browser_module
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            context = browser._context
+            page = browser._page
+            assert context is not None
+            assert page is not None
+            context.pages = [page]
+            context.remove_listener = MagicMock()
+
+            # Create a mock VideoRecorder
+            import tempfile
+            _tmp_fd, _tmp_path = tempfile.mkstemp(suffix=".webm")
+            os.close(_tmp_fd)
+            mock_recorder = MagicMock()
+            mock_recorder.prepare_stop = AsyncMock()
+            mock_recorder.finalize = AsyncMock(return_value=_tmp_path)
+            mock_recorder.stop = AsyncMock(return_value=_tmp_path)
+            browser._video_recorder = mock_recorder
+            browser._video_session = {
+                "width": 800, "height": 600, "context": context,
+                "page_listener": lambda *_: None,
+            }
+
+            context_key = browser_module._get_context_key(context)
+            browser._video_state[context_key] = True
+
+            await browser.close()
+
+            mock_recorder.prepare_stop.assert_awaited_once()
+            mock_recorder.finalize.assert_awaited_once()
+            assert browser._video_recorder is None
+            assert browser._video_session is None
+            assert len(browser._last_shutdown_artifacts["video"]) == 1
+            assert context_key not in browser._video_state
+
+    @pytest.mark.asyncio
+    async def test_close_page_switches_recorder_to_remaining_tab(self, mock_playwright):
+        """_close_page() should switch the recorder to a remaining page, not stop it."""
+        from bridgic.browser.session import _browser as browser_module
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            context = browser._context
+            page = browser._page
+            assert context is not None
+            assert page is not None
+
+            # Mock a second page so _close_page has a tab to switch to
+            second_page = MagicMock()
+            second_page.url = "https://example.com/2"
+            second_page.title = AsyncMock(return_value="Page 2")
+            second_page.close = AsyncMock()
+            second_page.is_closed = MagicMock(return_value=False)
+            second_page.opener = AsyncMock(return_value=None)
+            context.pages = [page, second_page]
+            # Owned-page tracking: the helper-style ownership seed only ran
+            # against the initial `page` during `_start()`. Mark `second_page`
+            # owned manually so the new fallback selector treats it as a valid
+            # successor.
+            browser._owned_pages.add(second_page)
+            browser._focus_stack.append(second_page)
+
+            # Set up mock recorder recording the current page
+            mock_recorder = MagicMock()
+            mock_recorder.is_stopped = False
+            mock_recorder.current_page = page
+            mock_recorder.switch_page = AsyncMock()
+            browser._video_recorder = mock_recorder
+            browser._video_session = {
+                "width": 800, "height": 600, "context": context,
+                "page_listener": lambda *_: None,
+            }
+
+            context_key = browser_module._get_context_key(context)
+            browser._video_state[context_key] = True
+
+            # Close the page that is being recorded
+            success, msg = await browser._close_page(page)
+            assert success
+
+            # Recorder should have been switched to the remaining page, not stopped
+            mock_recorder.switch_page.assert_awaited_once_with(second_page)
+            # Recorder is still active
+            assert browser._video_recorder is mock_recorder
+            assert browser._video_session is not None
 
     @pytest.mark.asyncio
     async def test_stop_warns_on_trace_finalize_failure(self, mock_playwright):
@@ -673,11 +848,6 @@ class TestBrowserStartStop:
             assert page is not None
 
             context.pages = [page]
-            page.video = MagicMock()
-            page.video.path = AsyncMock(return_value="/tmp/auto_listener_video.webm")
-
-            context_key = browser_module._get_context_key(context)
-            browser._video_state[context_key] = True
 
             page_key = browser_module._get_page_key(page)
             console_handler = MagicMock()
@@ -723,6 +893,131 @@ class TestBrowserStartStop:
                 for warning in browser._last_shutdown_errors
             )
 
+    def test_last_close_properties_default_empty_before_close(self):
+        """Before any close() runs, both properties return empty defaults."""
+        browser = Browser(stealth=False)
+        assert browser.last_close_artifacts == {"trace": [], "video": []}
+        assert browser.last_close_errors == []
+
+    @pytest.mark.asyncio
+    async def test_last_close_properties_after_clean_close(self, mock_playwright):
+        """A clean close() with no tracing/video leaves both properties empty."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser._start()
+            await browser.close()
+
+            assert browser.last_close_artifacts == {"trace": [], "video": []}
+            assert browser.last_close_errors == []
+
+    @pytest.mark.asyncio
+    async def test_last_close_properties_populated_after_trace_video_close(self, mock_playwright):
+        """close() with active trace+video populates the properties, and the
+        returned objects are independent copies (mutating them does not affect
+        the browser's internal state)."""
+        from bridgic.browser.session import _browser as browser_module
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            context = browser._context
+            page = browser._page
+            assert context is not None
+            assert page is not None
+
+            context.tracing = MagicMock()
+            context.tracing.stop = AsyncMock()
+            context.pages = [page]
+            context.remove_listener = MagicMock()
+
+            import tempfile
+            _tmp_video_fd, _tmp_video_path = tempfile.mkstemp(suffix=".webm")
+            os.close(_tmp_video_fd)
+            mock_recorder = MagicMock()
+            mock_recorder.prepare_stop = AsyncMock()
+            mock_recorder.finalize = AsyncMock(return_value=_tmp_video_path)
+            mock_recorder.stop = AsyncMock(return_value=_tmp_video_path)
+            browser._video_recorder = mock_recorder
+            browser._video_session = {
+                "width": 800, "height": 600, "context": context,
+                "page_listener": lambda *_: None,
+            }
+
+            context_key = browser_module._get_context_key(context)
+            browser._tracing_state[context_key] = True
+            browser._video_state[context_key] = True
+
+            await browser.close()
+
+            artifacts = browser.last_close_artifacts
+            assert len(artifacts["trace"]) == 1
+            assert artifacts["trace"][0].endswith("trace.zip")
+            assert len(artifacts["video"]) == 1
+            assert "video" in artifacts["video"][0]
+            assert browser.last_close_errors == []
+
+            # Defensive copy: mutating the returned dict and lists must
+            # not affect the browser's stored state.
+            artifacts["trace"].clear()
+            artifacts["video"].clear()
+            artifacts["trace"].append("hacked")
+            errors = browser.last_close_errors
+            errors.append("hacked")
+
+            re_read = browser.last_close_artifacts
+            assert len(re_read["trace"]) == 1
+            assert re_read["trace"][0].endswith("trace.zip")
+            assert len(re_read["video"]) == 1
+            assert browser.last_close_errors == []
+
+    @pytest.mark.asyncio
+    async def test_inspect_close_artifacts_skips_dir_when_nothing_active(self, mock_playwright):
+        """Regression: SDK close() with no tracing/video must not leak an
+        empty close-session directory under BRIDGIC_TMP_DIR.
+
+        Previously inspect_pending_close_artifacts() always created a
+        ``close-<ts>-<rand>/`` directory, so every plain ``Browser.close()``
+        accumulated an empty directory for the SDK user. The fix returns an
+        empty ``session_dir`` when there is nothing to write, and close()
+        propagates that — no directory should be created.
+        """
+        from bridgic.browser._constants import BRIDGIC_TMP_DIR
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            # Snapshot the existing close-* directories so we can verify
+            # nothing new was created (the directory may already exist
+            # from prior tests/sessions in the same temp root).
+            tmp_root = Path(str(BRIDGIC_TMP_DIR))
+            before = set()
+            if tmp_root.exists():
+                before = {p.name for p in tmp_root.iterdir() if p.name.startswith("close-")}
+
+            artifacts = browser.inspect_pending_close_artifacts()
+            assert artifacts["session_dir"] == ""
+            assert artifacts["trace"] == []
+            assert artifacts["video"] == []
+            assert browser._close_session_dir is None
+
+            await browser.close()
+
+            after = set()
+            if tmp_root.exists():
+                after = {p.name for p in tmp_root.iterdir() if p.name.startswith("close-")}
+            new_dirs = after - before
+            assert new_dirs == set(), (
+                f"close() leaked empty session dirs: {new_dirs}"
+            )
+
     @pytest.mark.asyncio
     async def test_ensure_started_recovers_from_inconsistent_state(self, mock_playwright, mock_context, mock_page):
         """_ensure_started() resets cleanly when _playwright is set but _context is None."""
@@ -740,6 +1035,416 @@ class TestBrowserStartStop:
 
             assert browser._playwright is not None
             assert browser._context is not None
+
+    @pytest.mark.asyncio
+    async def test_launch_mode_close_records_page_close_failure(self, mock_playwright, mock_page):
+        """Launch / persistent mode: page.close() failures must be recorded in
+        _last_shutdown_errors, mirroring the borrowed-CDP branch (symmetry).
+
+        Regression guard for H1: the non-borrowed branch in Browser.close() used
+        to silently swallow regular Exception results from asyncio.gather().
+        """
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            # Simulate page.close() raising a regular Exception (not BaseException).
+            mock_page.close = AsyncMock(side_effect=RuntimeError("page-boom"))
+
+            await browser.close()
+
+            assert any("page-boom" in e for e in browser._last_shutdown_errors), (
+                f"expected 'page-boom' in errors, got: {browser._last_shutdown_errors}"
+            )
+            # Downstream cleanup must still complete.
+            assert browser._page is None
+            assert browser._context is None
+
+
+class TestCloseClosingFlag:
+    """Regression guard for C2: close() must publish a `_closing` sentinel
+    synchronously (before any await) so concurrent dispatches short-circuit
+    with a clear error, and must defer nulling `_page` until after all page
+    close awaits complete so in-flight calls surface Playwright's own
+    "Target closed" error (which the daemon maps to BROWSER_CLOSED) rather
+    than a misleading NO_ACTIVE_PAGE."""
+
+    @pytest.mark.asyncio
+    async def test_closing_flag_default_false(self):
+        browser = Browser()
+        assert browser._closing is False
+
+    @pytest.mark.asyncio
+    async def test_close_sets_closing_flag_synchronously(self, mock_playwright, mock_page):
+        """`_closing` must flip to True before close() awaits anything."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            close_task = asyncio.ensure_future(browser.close())
+            # Yield ONCE — close() should have set the flag synchronously
+            # before hitting its first await, so after one loop turn the flag
+            # must already be True.
+            await asyncio.sleep(0)
+            try:
+                assert browser._closing is True
+            finally:
+                await close_task
+
+    @pytest.mark.asyncio
+    async def test_close_nulls_page_only_after_page_closes(self, mock_playwright, mock_page):
+        """`_page` must remain non-None while page.close() is still running."""
+        observed_page_ref: list = []
+
+        async def _slow_close(*_a, **_kw):
+            # At this point close() has already entered the page-close phase.
+            # The reference should STILL be present so concurrent dispatchers
+            # raise Playwright's "Target closed" rather than NO_ACTIVE_PAGE.
+            observed_page_ref.append(browser._page)
+            await asyncio.sleep(0)
+
+        mock_page.close = AsyncMock(side_effect=_slow_close)
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+            await browser.close()
+
+        assert observed_page_ref, "page.close() must have been invoked"
+        assert observed_page_ref[0] is not None, (
+            "self._page was already None when page.close() ran — this is the C2 bug"
+        )
+        assert browser._page is None  # eventually nulled after close finishes
+
+
+class TestPrefetchGenerationToken:
+    """Regression guard for C4: `_pre_warm_snapshot` must not clobber a
+    just-cancelled prefetch with a stale snapshot. If the background task
+    returns from its `await` between `_cancel_prefetch()` and the new
+    navigation completing, the old result must be discarded — checked via
+    a monotonic `_prefetch_gen` counter held across the write."""
+
+    @pytest.mark.asyncio
+    async def test_prefetch_gen_default_zero(self):
+        browser = Browser()
+        assert browser._prefetch_gen == 0
+
+    @pytest.mark.asyncio
+    async def test_cancel_prefetch_bumps_generation(self):
+        browser = Browser()
+        gen0 = browser._prefetch_gen
+        browser._cancel_prefetch()
+        assert browser._prefetch_gen == gen0 + 1
+        browser._cancel_prefetch()
+        assert browser._prefetch_gen == gen0 + 2
+
+    @pytest.mark.asyncio
+    async def test_pre_warm_discards_snapshot_if_gen_bumped(self):
+        """If `_cancel_prefetch()` runs while the prefetch task is awaiting,
+        the eventual commit must see a generation mismatch and discard."""
+        from bridgic.browser.session._snapshot import EnhancedSnapshot
+
+        browser = Browser()
+        fake_snap = MagicMock(spec=EnhancedSnapshot)
+        fake_page = MagicMock()
+        fake_page.url = "https://example.com/a"
+        # Pretend this page is the active one — the existing identity guard
+        # (`self._page is page`) should not be the thing that saves us here;
+        # the generation check is.
+        browser._page = fake_page
+
+        _snapshot_returned = asyncio.Event()
+        _can_commit = asyncio.Event()
+
+        async def _fake_gen(_page, _opts):
+            _snapshot_returned.set()
+            await _can_commit.wait()
+            return fake_snap
+
+        browser._prefetch_generator = MagicMock()
+        browser._prefetch_generator.get_enhanced_snapshot_async = _fake_gen
+
+        # Kick off pre-warm capturing the current gen.
+        my_gen = browser._prefetch_gen
+        task = asyncio.ensure_future(browser._pre_warm_snapshot(fake_page, my_gen))
+
+        # Wait until the task has reached the generator await.
+        # (Task yields to sleep(0.5) first — skip it by patching.)
+        with patch("asyncio.sleep", new=AsyncMock(return_value=None)):
+            # Re-schedule under the patch so sleep(0.5) resolves instantly
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            task = asyncio.ensure_future(browser._pre_warm_snapshot(fake_page, my_gen))
+            await _snapshot_returned.wait()
+
+            # Simulate a navigation happening while the task is still awaiting
+            # the snapshot result: this increments the generation.
+            browser._cancel_prefetch()
+
+            # Let the task finish and attempt its (now-stale) commit.
+            _can_commit.set()
+            await task
+
+        assert browser._prefetch_snapshot is None, (
+            "pre-warm wrote a stale snapshot after _cancel_prefetch — C4 is back"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_snapshot_does_not_deadlock_waiting_for_prefetch_commit(self):
+        """Regression: get_snapshot() must not await prefetch while holding _snapshot_lock."""
+        from bridgic.browser.session._snapshot import EnhancedSnapshot, SnapshotOptions
+
+        browser = Browser()
+        fake_page = MagicMock()
+        fake_page.url = "https://example.com/prefetch"
+        browser._page = fake_page
+
+        prefetched = MagicMock(spec=EnhancedSnapshot)
+        options = SnapshotOptions(interactive=True, full_page=True)
+        browser._prefetch_options = options
+        browser._prefetch_url = fake_page.url
+        allow_commit = asyncio.Event()
+
+        async def _commit_prefetch():
+            await allow_commit.wait()
+            async with browser._snapshot_lock:
+                browser._prefetch_snapshot = prefetched
+
+        browser._prefetch_task = asyncio.create_task(_commit_prefetch())
+        browser._snapshot_generator = MagicMock()
+        browser._snapshot_generator.get_enhanced_snapshot_async = AsyncMock(
+            side_effect=AssertionError("should consume prefetched snapshot instead of recomputing")
+        )
+
+        get_task = asyncio.create_task(
+            browser.get_snapshot(interactive=True, full_page=True)
+        )
+        await asyncio.sleep(0)
+        allow_commit.set()
+
+        result = await asyncio.wait_for(get_task, timeout=0.2)
+
+        assert result is prefetched
+
+
+class TestInvalidatePageState:
+    """Regression guard: every navigation-ish entry point must drop
+    ``_last_snapshot`` + bump ``_prefetch_gen`` BEFORE the navigation, so
+    ``get_element_by_ref`` cannot resolve an old-page ref against the new
+    document (which would silently land on a same-role+name neighbour).
+    """
+
+    @pytest.mark.asyncio
+    async def test_invalidate_page_state_clears_cache_and_bumps_gen(self):
+        browser = Browser()
+        browser._last_snapshot = MagicMock()
+        browser._last_snapshot_url = "https://example.com/a"
+        gen_before = browser._prefetch_gen
+
+        browser._invalidate_page_state()
+
+        assert browser._last_snapshot is None
+        assert browser._last_snapshot_url is None
+        assert browser._prefetch_gen == gen_before + 1
+
+    @pytest.mark.asyncio
+    async def test_go_back_invalidates_page_state(self):
+        # Fresh Browser() has _cdp_resolved=None → _is_cdp_borrowed=False,
+        # so go_back takes the `page.go_back` branch.
+        browser = Browser()
+        fake_page = MagicMock()
+        fake_page.url = "https://example.com/prev"
+        fake_page.go_back = AsyncMock(return_value=MagicMock())
+        browser._page = fake_page
+        browser._context = MagicMock()
+
+        browser._last_snapshot = MagicMock()
+        browser._last_snapshot_url = "https://example.com/a"
+        gen_before = browser._prefetch_gen
+
+        await browser.go_back()
+
+        assert browser._last_snapshot is None
+        assert browser._last_snapshot_url is None
+        assert browser._prefetch_gen == gen_before + 1
+
+    @pytest.mark.asyncio
+    async def test_go_forward_invalidates_page_state(self):
+        browser = Browser()
+        fake_page = MagicMock()
+        fake_page.url = "https://example.com/next"
+        fake_page.go_forward = AsyncMock(return_value=MagicMock())
+        browser._page = fake_page
+        browser._context = MagicMock()
+
+        browser._last_snapshot = MagicMock()
+        browser._last_snapshot_url = "https://example.com/a"
+        gen_before = browser._prefetch_gen
+
+        await browser.go_forward()
+
+        assert browser._last_snapshot is None
+        assert browser._last_snapshot_url is None
+        assert browser._prefetch_gen == gen_before + 1
+
+    @pytest.mark.asyncio
+    async def test_reload_page_invalidates_page_state(self):
+        browser = Browser()
+        fake_page = MagicMock()
+        fake_page.url = "https://example.com/a"
+        fake_page.reload = AsyncMock(return_value=None)
+        # _get_page_title takes the non-CDP branch and calls page.title()
+        # on a fresh Browser(): _cdp_resolved is None so _is_cdp_borrowed=False.
+        fake_page.title = AsyncMock(return_value="A")
+        browser._page = fake_page
+        browser._context = MagicMock()
+
+        browser._last_snapshot = MagicMock()
+        browser._last_snapshot_url = "https://example.com/a"
+        gen_before = browser._prefetch_gen
+
+        await browser.reload_page()
+
+        assert browser._last_snapshot is None
+        assert browser._last_snapshot_url is None
+        assert browser._prefetch_gen == gen_before + 1
+
+
+class TestSingleVideoRecorderClose:
+    """Tests verifying single-stream video recorder lifecycle during close().
+
+    close() uses a two-phase shutdown:
+      Phase 1: prepare_stop() the single recorder (fast, while Chrome alive)
+      Phase 2: finalize() the single recorder (slow, after Chrome exits)
+    """
+
+    @pytest.mark.asyncio
+    async def test_close_finalize_success(self, mock_playwright):
+        """close() must finalize the single recorder and move the video file."""
+        import tempfile as _tempfile
+        from bridgic.browser.session import _browser as browser_module
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            context = browser._context
+            assert context is not None
+            context.remove_listener = MagicMock()
+
+            _fd, _temp_path = _tempfile.mkstemp(suffix=".webm")
+            os.close(_fd)
+
+            page = MagicMock()
+            page.close = AsyncMock()
+            rec = MagicMock()
+            rec.prepare_stop = AsyncMock()
+            rec.finalize = AsyncMock(return_value=_temp_path)
+
+            context.pages = [page]
+            browser._video_recorder = rec
+            browser._video_session = {
+                "width": 800, "height": 600, "context": context,
+                "page_listener": lambda *_: None,
+            }
+            context_key = browser_module._get_context_key(context)
+            browser._video_state[context_key] = True
+
+            await browser.close()
+
+            rec.prepare_stop.assert_awaited_once()
+            rec.finalize.assert_awaited_once()
+            assert len(browser._last_shutdown_artifacts["video"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_close_collects_finalize_timeout_error(self, mock_playwright):
+        """close() must collect the timeout error from finalize, not raise."""
+        from bridgic.browser.session import _browser as browser_module
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            context = browser._context
+            assert context is not None
+            context.remove_listener = MagicMock()
+
+            async def timeout_finalize():
+                raise asyncio.TimeoutError()
+
+            page = MagicMock()
+            page.close = AsyncMock()
+            rec = MagicMock()
+            rec.prepare_stop = AsyncMock()
+            rec.finalize = timeout_finalize
+
+            context.pages = [page]
+            browser._video_recorder = rec
+            browser._video_session = {
+                "width": 800, "height": 600, "context": context,
+                "page_listener": lambda *_: None,
+            }
+            context_key = browser_module._get_context_key(context)
+            browser._video_state[context_key] = True
+
+            await browser.close()  # must not raise
+
+            timeout_errors = [
+                e for e in browser._last_shutdown_errors
+                if "video_recorder.finalize: timeout" in e
+            ]
+            assert len(timeout_errors) == 1
+
+    @pytest.mark.asyncio
+    async def test_close_re_raises_cancelled_error_from_recorder(self, mock_playwright):
+        """CancelledError from finalize is stored and re-raised after cleanup."""
+        from bridgic.browser.session import _browser as browser_module
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            context = browser._context
+            assert context is not None
+            context.remove_listener = MagicMock()
+
+            async def cancelling_finalize() -> str:
+                raise asyncio.CancelledError("simulated task cancellation")
+
+            page = MagicMock()
+            page.close = AsyncMock()
+            rec = MagicMock()
+            rec.prepare_stop = AsyncMock()
+            rec.finalize = cancelling_finalize
+
+            context.pages = [page]
+            browser._video_recorder = rec
+            browser._video_session = {
+                "width": 800, "height": 600, "context": context,
+                "page_listener": lambda *_: None,
+            }
+            context_key = browser_module._get_context_key(context)
+            browser._video_state[context_key] = True
+
+            with pytest.raises(asyncio.CancelledError):
+                await browser.close()
+
+            assert any(
+                "video_recorder.finalize" in e for e in browser._last_shutdown_errors
+            )
 
 
 class TestBrowserNavigation:
@@ -776,12 +1481,16 @@ class TestBrowserNavigation:
             assert browser._last_snapshot_url is None
 
     @pytest.mark.asyncio
-    async def test_navigate_to_empty_url_raises_invalid_input(self):
-        browser = Browser(stealth=False)
+    async def test_navigate_to_empty_url_raises_invalid_input(self, mock_playwright):
+        # navigate_to runs _ensure_started() before the URL_EMPTY check, so
+        # async_playwright must be mocked or this test launches real Chromium.
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
 
-        with pytest.raises(InvalidInputError) as exc_info:
-            await browser.navigate_to("   ")
-        assert exc_info.value.code == "URL_EMPTY"
+            with pytest.raises(InvalidInputError) as exc_info:
+                await browser.navigate_to("   ")
+            assert exc_info.value.code == "URL_EMPTY"
 
     @pytest.mark.asyncio
     async def test_navigate_to_wraps_playwright_errors(self, mock_playwright, mock_page):
@@ -1268,3 +1977,2479 @@ class TestGetElementByRefAriaRef:
         browser._page.frame_locator.assert_called_once_with("iframe")
         frame_locator_mock.nth.assert_called_once_with(0)
         nth_mock.locator.assert_called_once_with("aria-ref=f1e99")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Browser._start() CDP mode
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBrowserStartCdp:
+    """Tests for Browser._start() in CDP connect mode (connect_over_cdp)."""
+
+    def _make_cdp_mocks(self, pages=None, contexts_count=1):
+        """Return (mock_pw, mock_cdp_browser, mock_ctx, mock_page) tuple."""
+        mock_pg = MagicMock()
+        mock_pg.bring_to_front = AsyncMock()
+
+        # Per-page CDP session is awaited by _apply_cdp_silent_downloads
+        # (default ON in borrowed mode).
+        mock_page_session = MagicMock()
+        mock_page_session.send = AsyncMock()
+        mock_page_session.detach = AsyncMock()
+
+        mock_ctx = MagicMock()
+        mock_ctx.add_init_script = AsyncMock()
+        mock_ctx.new_page = AsyncMock(return_value=mock_pg)
+        mock_ctx.new_cdp_session = AsyncMock(return_value=mock_page_session)
+        mock_ctx.pages = pages if pages is not None else [mock_pg]
+
+        mock_cdp_browser = MagicMock()
+        mock_cdp_browser.contexts = [mock_ctx] * contexts_count
+        mock_cdp_browser.new_context = AsyncMock(return_value=mock_ctx)
+        # _revoke_cdp_download_hijack uses new_browser_cdp_session unconditionally
+        # in CDP mode (L1 + L3); provide an awaitable session that records sends.
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+        mock_session.detach = AsyncMock()
+        mock_cdp_browser.new_browser_cdp_session = AsyncMock(return_value=mock_session)
+        # Expose sessions on the browser mock so individual tests can introspect.
+        mock_cdp_browser._mock_cdp_session = mock_session
+        mock_cdp_browser._mock_page_session = mock_page_session
+
+        mock_pw = MagicMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=mock_cdp_browser)
+        mock_pw.stop = AsyncMock()
+
+        return mock_pw, mock_cdp_browser, mock_ctx, mock_pg
+
+    @pytest.mark.asyncio
+    async def test_cdp_calls_connect_over_cdp(self):
+        mock_pw, mock_cdp_brow, mock_ctx, _ = self._make_cdp_mocks()
+        cdp = "ws://localhost:9222/devtools/browser/abc"
+        browser = Browser(cdp=cdp, stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+        mock_pw.chromium.connect_over_cdp.assert_awaited_once_with(cdp)
+        mock_pw.chromium.launch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_existing_contexts_reused(self):
+        mock_pw, mock_cdp_brow, mock_ctx, _ = self._make_cdp_mocks()
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+        assert browser._context is mock_ctx
+        mock_cdp_brow.new_context.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_contexts_calls_new_context(self):
+        mock_pw, mock_cdp_brow, mock_ctx, _ = self._make_cdp_mocks(contexts_count=0)
+        mock_cdp_brow.contexts = []
+        mock_cdp_brow.new_context = AsyncMock(return_value=mock_ctx)
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+        mock_cdp_brow.new_context.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stealth_true_headless_calls_add_init_script(self):
+        """Headless CDP mode with stealth adds two init scripts: the JS stealth
+        patch set (window.chrome, WebGL, etc.) AND the anti-devtools script
+        (timing neutralization). Parity with non-CDP headless mode."""
+        mock_pw, _, mock_ctx, _ = self._make_cdp_mocks()
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=True, headless=True)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+        assert mock_ctx.add_init_script.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_stealth_true_headed_adds_only_anti_devtools(self):
+        """Headed CDP mode with stealth: the full JS stealth patch is skipped
+        (would break Cloudflare Turnstile), but the anti-devtools script is
+        still added because it only neutralizes timing probes and is safe in
+        Turnstile iframes. Parity with non-CDP headed mode."""
+        mock_pw, _, mock_ctx, _ = self._make_cdp_mocks()
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=True, headless=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+        mock_ctx.add_init_script.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stealth_false_no_add_init_script(self):
+        mock_pw, _, mock_ctx, _ = self._make_cdp_mocks()
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+        mock_ctx.add_init_script.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cdp_always_creates_new_page_in_borrowed_context(self):
+        """CDP mode must NEVER reuse a borrowed user tab. Always create a new
+        bridgic-owned page so the user's existing tabs stay untouched."""
+        page1, page2 = MagicMock(), MagicMock()
+        page1.bring_to_front = AsyncMock()
+        page2.bring_to_front = AsyncMock()
+        # mock_pg is the page returned by mock_ctx.new_page() — this is the
+        # page bridgic should adopt as self._page, NOT page2.
+        mock_pw, _, mock_ctx, mock_pg = self._make_cdp_mocks(pages=[page1, page2])
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+        mock_ctx.new_page.assert_awaited_once()
+        assert browser._page is mock_pg
+        assert browser._page is not page2  # CRITICAL: never hijack user's tab
+
+    @pytest.mark.asyncio
+    async def test_cdp_new_page_called_unconditionally(self):
+        """Even when the borrowed context has no pages, _start() still calls
+        new_page() to create a tab for bridgic to drive."""
+        mock_pw, _, mock_ctx, mock_pg = self._make_cdp_mocks(pages=[])
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+        mock_ctx.new_page.assert_awaited_once()
+        assert browser._page is mock_pg
+
+    @pytest.mark.asyncio
+    async def test_download_manager_NOT_attached_in_borrowed_context(self, tmp_path):
+        """In CDP borrowed-context mode the download manager must NOT attach
+        anywhere. L1's revoke restored Chrome's native download path, so
+        Playwright never receives `Browser.downloadProgress(completed)`. A
+        page-scoped attach would leak a hung `save_as()` task per download.
+        Chrome handles downloads natively (potentially via its 'Save As'
+        dialog); programmatic capture requires owned mode."""
+        mock_pw, _, mock_ctx, mock_pg = self._make_cdp_mocks()
+        downloads_dir = tmp_path / "dl"
+        downloads_dir.mkdir()
+        browser = Browser(
+            cdp="ws://localhost:9222/devtools/browser/abc",
+            stealth=False,
+            downloads_path=str(downloads_dir),
+        )
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            with patch.object(browser._download_manager, "attach_to_context") as mock_attach_ctx, \
+                 patch.object(browser._download_manager, "attach_to_page") as mock_attach_pg:
+                await browser._start()
+        mock_attach_ctx.assert_not_called()
+        mock_attach_pg.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_download_manager_attached_owned_context(self, tmp_path):
+        """In CDP owned-context mode (bridgic created the context because
+        browser.contexts was empty), the manager attaches to the whole
+        context — all pages in it belong to bridgic."""
+        mock_pw, mock_cdp_browser, mock_ctx, _ = self._make_cdp_mocks(contexts_count=0)
+        mock_cdp_browser.contexts = []
+        downloads_dir = tmp_path / "dl"
+        downloads_dir.mkdir()
+        browser = Browser(
+            cdp="ws://localhost:9222/devtools/browser/abc",
+            stealth=False,
+            downloads_path=str(downloads_dir),
+        )
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            with patch.object(browser._download_manager, "attach_to_context") as mock_attach_ctx, \
+                 patch.object(browser._download_manager, "attach_to_page") as mock_attach_pg:
+                await browser._start()
+        mock_attach_ctx.assert_called_once_with(mock_ctx)
+        mock_attach_pg.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Browser.use_persistent_context — CDP mode
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBrowserUsePersistentContextCdp:
+    """Tests for use_persistent_context property in CDP vs normal mode."""
+
+    def test_cdp_returns_false(self):
+        browser = Browser(
+            cdp="ws://localhost:9222/devtools/browser/abc",
+            user_data_dir="/tmp/profile",
+        )
+        assert browser.use_persistent_context is False
+
+    def test_no_cdp_with_user_data_dir_returns_true(self):
+        browser = Browser(user_data_dir="/tmp/profile")
+        assert browser.use_persistent_context is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Browser.close() — CDP mode
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBrowserCloseCdp:
+    """Tests for Browser.close() in CDP mode — must disconnect without
+    destroying pages/context in the remote browser."""
+
+    def _make_cdp_mocks(self, pages=None, contexts_count=1):
+        """Return (mock_pw, mock_cdp_browser, mock_ctx, mock_page) tuple.
+
+        ``mock_page`` is the page returned by ``mock_ctx.new_page()`` — i.e. the
+        bridgic-owned page in CDP mode."""
+        mock_pg = MagicMock()
+        mock_pg.bring_to_front = AsyncMock()
+        mock_pg.close = AsyncMock()
+        mock_pg.goto = AsyncMock()
+        mock_pg.video = None
+        mock_pg.is_closed = MagicMock(return_value=False)
+
+        # Per-page CDP session awaited by _apply_cdp_silent_downloads.
+        mock_page_session = MagicMock()
+        mock_page_session.send = AsyncMock()
+        mock_page_session.detach = AsyncMock()
+
+        mock_ctx = MagicMock()
+        mock_ctx.add_init_script = AsyncMock()
+        mock_ctx.new_page = AsyncMock(return_value=mock_pg)
+        mock_ctx.new_cdp_session = AsyncMock(return_value=mock_page_session)
+        mock_ctx.pages = pages if pages is not None else [mock_pg]
+        mock_ctx.close = AsyncMock()
+        mock_ctx.tracing = MagicMock()
+        mock_ctx.tracing.stop = AsyncMock()
+
+        mock_cdp_browser = MagicMock()
+        mock_cdp_browser.contexts = [mock_ctx] * contexts_count
+        mock_cdp_browser.new_context = AsyncMock(return_value=mock_ctx)
+        mock_cdp_browser.close = AsyncMock()
+        # L1/L3 download-hijack revoke: provide an awaitable CDP session.
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+        mock_session.detach = AsyncMock()
+        mock_cdp_browser.new_browser_cdp_session = AsyncMock(return_value=mock_session)
+        mock_cdp_browser._mock_cdp_session = mock_session
+        mock_cdp_browser._mock_page_session = mock_page_session
+
+        mock_pw = MagicMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=mock_cdp_browser)
+        mock_pw.stop = AsyncMock()
+
+        return mock_pw, mock_cdp_browser, mock_ctx, mock_pg
+
+    async def _start_cdp_browser(self, mock_pw, *, cdp="ws://localhost:9222/devtools/browser/abc", **kwargs):
+        """Create and start a Browser in CDP mode."""
+        browser = Browser(cdp=cdp, stealth=False, **kwargs)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+        return browser
+
+    @pytest.mark.asyncio
+    async def test_cdp_close_does_not_close_borrowed_pages(self):
+        """close() in CDP borrowed mode preserves the user's pre-existing
+        tabs but DOES close bridgic-created/adopted tabs — otherwise every
+        SDK exit leaks a tab into the user's Chrome.
+
+        The borrowed page (not in ``_owned_pages``) must survive disconnect;
+        the bridgic-owned page (created by ``_new_page`` during ``_start``)
+        must be closed."""
+        borrowed_pg = MagicMock()
+        borrowed_pg.close = AsyncMock()
+        borrowed_pg.goto = AsyncMock()
+        borrowed_pg.bring_to_front = AsyncMock()
+        borrowed_pg.video = None
+        borrowed_pg.is_closed = MagicMock(return_value=False)
+
+        mock_pw, _, mock_ctx, bridgic_pg = self._make_cdp_mocks(pages=[borrowed_pg])
+        bridgic_pg.is_closed = MagicMock(return_value=False)
+        browser = await self._start_cdp_browser(mock_pw)
+
+        # Sanity: _start mints + owns the bridgic page, but never the borrowed one.
+        assert browser._page is bridgic_pg
+        assert bridgic_pg in browser._owned_pages
+        assert borrowed_pg not in browser._owned_pages
+
+        # _new_page appended bridgic_pg to context.pages — replicate Playwright's
+        # context.pages tracking (the fixture only seeds the initial set).
+        mock_ctx.pages = [borrowed_pg, bridgic_pg]
+
+        await browser.close()
+
+        # User's pre-existing tab survives; bridgic's own tab is closed.
+        borrowed_pg.close.assert_not_called()
+        bridgic_pg.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cdp_close_does_not_close_borrowed_context(self):
+        """close() in CDP mode must NOT call context.close() on borrowed context."""
+        mock_pw, _, mock_ctx, _ = self._make_cdp_mocks()
+        browser = await self._start_cdp_browser(mock_pw)
+
+        assert browser._cdp_context_owned is False
+        await browser.close()
+
+        mock_ctx.close.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cdp_close_closes_owned_context(self):
+        """close() in CDP mode with an owned context (bridgic created it because
+        browser.contexts was empty) MUST call context.close() to avoid leaking
+        the context on the remote Chrome for its lifetime."""
+        mock_pw, mock_cdp_browser, mock_ctx, _ = self._make_cdp_mocks(contexts_count=0)
+        mock_cdp_browser.contexts = []
+        browser = await self._start_cdp_browser(mock_pw)
+
+        assert browser._cdp_context_owned is True
+        await browser.close()
+
+        mock_ctx.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cdp_close_does_not_navigate_about_blank(self):
+        """close() in CDP mode must NOT navigate pages to about:blank."""
+        mock_pw, _, mock_ctx, mock_pg = self._make_cdp_mocks()
+        browser = await self._start_cdp_browser(mock_pw)
+
+        await browser.close()
+
+        mock_pg.goto.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cdp_close_disconnects_browser(self):
+        """close() in CDP mode must call _browser.close() to disconnect."""
+        mock_pw, mock_cdp_browser, _, _ = self._make_cdp_mocks()
+        browser = await self._start_cdp_browser(mock_pw)
+
+        await browser.close()
+
+        mock_cdp_browser.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cdp_close_stops_playwright(self):
+        """close() in CDP mode must stop the Playwright driver."""
+        mock_pw, _, _, _ = self._make_cdp_mocks()
+        browser = await self._start_cdp_browser(mock_pw)
+
+        await browser.close()
+
+        mock_pw.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cdp_close_clears_internal_references(self):
+        """close() in CDP mode must clear all internal references."""
+        mock_pw, _, _, _ = self._make_cdp_mocks()
+        browser = await self._start_cdp_browser(mock_pw)
+
+        await browser.close()
+
+        assert browser._playwright is None
+        assert browser._browser is None
+        assert browser._context is None
+        assert browser._page is None
+
+    @pytest.mark.asyncio
+    async def test_cdp_close_multiple_borrowed_pages_not_closed(self):
+        """Multiple borrowed user tabs all survive disconnect; bridgic's own
+        tab is the only one closed."""
+        page1 = MagicMock()
+        page1.close = AsyncMock()
+        page1.goto = AsyncMock()
+        page1.bring_to_front = AsyncMock()
+        page1.video = None
+        page1.is_closed = MagicMock(return_value=False)
+        page2 = MagicMock()
+        page2.close = AsyncMock()
+        page2.goto = AsyncMock()
+        page2.bring_to_front = AsyncMock()
+        page2.video = None
+        page2.is_closed = MagicMock(return_value=False)
+        mock_pw, _, mock_ctx, bridgic_pg = self._make_cdp_mocks(pages=[page1, page2])
+        bridgic_pg.is_closed = MagicMock(return_value=False)
+        browser = await self._start_cdp_browser(mock_pw)
+        mock_ctx.pages = [page1, page2, bridgic_pg]
+
+        await browser.close()
+
+        page1.close.assert_not_called()
+        page2.close.assert_not_called()
+        page1.goto.assert_not_called()
+        page2.goto.assert_not_called()
+        bridgic_pg.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cdp_close_closes_adopted_popup(self):
+        """Adopted popups (in ``_owned_pages``) must be closed at SDK exit —
+        amphi-style code that opens a detail tab via ``new_tab`` and then
+        forgets to ``close_tab`` it would otherwise leak that tab into the
+        user's Chrome on every exit."""
+        adopted_popup = MagicMock()
+        adopted_popup.close = AsyncMock()
+        adopted_popup.is_closed = MagicMock(return_value=False)
+        adopted_popup.video = None
+
+        mock_pw, _, mock_ctx, bridgic_pg = self._make_cdp_mocks()
+        bridgic_pg.is_closed = MagicMock(return_value=False)
+        browser = await self._start_cdp_browser(mock_pw)
+        # Simulate the popup was adopted earlier in the session.
+        browser._owned_pages.add(adopted_popup)
+        mock_ctx.pages = [bridgic_pg, adopted_popup]
+
+        await browser.close()
+
+        adopted_popup.close.assert_awaited_once()
+        bridgic_pg.close.assert_awaited_once()
+
+    # --- Owned CDP context: still just disconnect, no page/context cleanup ---
+
+    @pytest.mark.asyncio
+    async def test_cdp_owned_context_does_not_close_pages(self):
+        """Owned CDP context: page.close() is NOT called — bridgic only disconnects."""
+        mock_pw, mock_cdp_browser, mock_ctx, mock_pg = self._make_cdp_mocks(contexts_count=0)
+        mock_cdp_browser.contexts = []
+        browser = await self._start_cdp_browser(mock_pw)
+
+        assert browser._cdp_context_owned is True
+        await browser.close()
+
+        mock_pg.close.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cdp_owned_context_closes_context(self):
+        """Owned CDP context: context.close() IS called — otherwise the bridgic
+        -created context leaks on the remote browser indefinitely (repeated
+        connect/disconnect cycles would exhaust remote memory)."""
+        mock_pw, mock_cdp_browser, mock_ctx, mock_pg = self._make_cdp_mocks(contexts_count=0)
+        mock_cdp_browser.contexts = []
+        browser = await self._start_cdp_browser(mock_pw)
+
+        await browser.close()
+
+        mock_ctx.close.assert_awaited_once()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CDP download-behavior override (L1 set / L3 restore) + orphan rescue (L2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestCdpDownloadBehaviorOverride:
+    """In CDP-borrowed mode bridgic takes over the user's default context
+    download behavior:
+
+    - L1 (post-connect): ``Browser.setDownloadBehavior(allowAndName,
+      downloadPath=..., eventsEnabled=true)`` replacing Playwright's
+      ``allowAndName + artifactsDir``. Affects all tabs in the user's
+      default context — files land at downloads_path / CLI CWD with no
+      "Save As" dialog. ``allowAndName`` is required because ``allow``
+      still honors Chrome's "Ask where to save each file" preference.
+      Real filenames are restored by :class:`CdpDownloadRenamer`, which
+      listens to ``Browser.downloadWillBegin/downloadProgress`` and
+      renames the GUID file on completion.
+    - L3 (pre-close): ``Browser.setDownloadBehavior(default)`` so the
+      user's Chrome reverts to its own prefs after bridgic disconnects.
+
+    Owned mode skips L1/L3 — Playwright's per-context override on bridgic's
+    own context already provides silent downloads via the DownloadManager
+    `save_as` transfer flow.
+    """
+
+    def _make_cdp_mocks(self, contexts_count=1):
+        mock_pg = MagicMock()
+        mock_pg.bring_to_front = AsyncMock()
+        mock_pg.close = AsyncMock()
+        mock_pg.goto = AsyncMock()
+        mock_pg.video = None
+        mock_pg.is_closed = MagicMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+        mock_session.detach = AsyncMock()
+        # The renamer's attach() registers handlers via session.on(...).
+        # MagicMock auto-creates `.on` as a sync Mock, which is exactly the
+        # contract the renamer expects (pyee-style sync registration).
+
+        mock_ctx = MagicMock()
+        mock_ctx.add_init_script = AsyncMock()
+        mock_ctx.new_page = AsyncMock(return_value=mock_pg)
+        # L1 now goes through the *page* CDP session (page-routing is
+        # required to bypass Chrome's "Ask where to save" preference;
+        # browser-routing was empirically shown not to work). Return the
+        # same shared mock so existing assertions on send() / detach()
+        # keep working against a single recorded call list.
+        mock_ctx.new_cdp_session = AsyncMock(return_value=mock_session)
+        mock_ctx.pages = [mock_pg]
+        mock_ctx.close = AsyncMock()
+        mock_ctx.tracing = MagicMock()
+        mock_ctx.tracing.stop = AsyncMock()
+
+        mock_cdp_browser = MagicMock()
+        mock_cdp_browser.contexts = [mock_ctx] * contexts_count
+        mock_cdp_browser.new_context = AsyncMock(return_value=mock_ctx)
+        mock_cdp_browser.close = AsyncMock()
+        mock_cdp_browser.new_browser_cdp_session = AsyncMock(return_value=mock_session)
+
+        mock_pw = MagicMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=mock_cdp_browser)
+        mock_pw.stop = AsyncMock()
+
+        return mock_pw, mock_cdp_browser, mock_ctx, mock_pg, mock_session
+
+    def _set_download_behavior_calls(self, mock_session):
+        """Filter calls to Browser.setDownloadBehavior from mock_session.send."""
+        return [
+            c for c in mock_session.send.await_args_list
+            if c.args[0] == "Browser.setDownloadBehavior"
+        ]
+
+    # ── L1: borrowed mode sets allowAndName + eventsEnabled ──────────────
+
+    @pytest.mark.asyncio
+    async def test_l1_borrowed_sends_allowAndName_with_downloads_path(self, tmp_path):
+        """L1 (borrowed): Browser.setDownloadBehavior(allowAndName,
+        downloadPath=<dl>, eventsEnabled=true)."""
+        mock_pw, _, _, _, mock_session = self._make_cdp_mocks()
+        downloads = tmp_path / "dl"
+        browser = Browser(
+            cdp="ws://localhost:9222/devtools/browser/abc",
+            stealth=False,
+            downloads_path=str(downloads),
+        )
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+
+        # L1 call (no close yet, so this is the only one).
+        calls = self._set_download_behavior_calls(mock_session)
+        assert len(calls) == 1
+        kwargs = calls[0].args[1]
+        assert kwargs["behavior"] == "allowAndName"
+        assert kwargs["downloadPath"] == str(downloads.expanduser())
+        assert kwargs.get("eventsEnabled") is True
+        # No browserContextId means "default context" in CDP semantics.
+        assert "browserContextId" not in kwargs
+        # Path is created if missing.
+        assert downloads.exists()
+        # Renamer + tracked path are populated when override succeeds.
+        assert browser._cdp_download_renamer is not None
+        assert browser._current_cdp_download_path == downloads.expanduser()
+
+    @pytest.mark.asyncio
+    async def test_l1_borrowed_defaults_to_home_downloads_when_no_path(self):
+        """When downloads_path is unset, L1 uses ~/Downloads."""
+        mock_pw, _, _, _, mock_session = self._make_cdp_mocks()
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+
+        calls = self._set_download_behavior_calls(mock_session)
+        assert len(calls) == 1
+        assert calls[0].args[1]["downloadPath"] == str(Path.home() / "Downloads")
+        assert calls[0].args[1]["behavior"] == "allowAndName"
+
+    # ── L1: owned mode does NOT send ──────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_l1_owned_mode_skips_setDownloadBehavior(self):
+        """Owned mode: bridgic's own context already routed by Playwright's
+        allowAndName + DownloadManager.save_as. Skip L1 to avoid double work."""
+        mock_pw, mock_cdp_browser, _, _, mock_session = self._make_cdp_mocks(contexts_count=0)
+        mock_cdp_browser.contexts = []
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+
+        assert browser._cdp_context_owned is True
+        assert self._set_download_behavior_calls(mock_session) == []
+
+    # ── L3: borrowed mode close sends default; owned mode skips ───────────
+
+    @pytest.mark.asyncio
+    async def test_l3_borrowed_close_sends_default(self):
+        """On close in borrowed mode, restore Chrome's user prefs by sending
+        Browser.setDownloadBehavior(default)."""
+        mock_pw, _, _, _, mock_session = self._make_cdp_mocks()
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+
+        l1_count = len(self._set_download_behavior_calls(mock_session))
+        await browser.close()
+        all_calls = self._set_download_behavior_calls(mock_session)
+        new_calls = all_calls[l1_count:]
+
+        # L3 sends behavior=default (and only that — no downloadPath).
+        assert len(new_calls) >= 1
+        assert new_calls[-1].args[1] == {"behavior": "default"}
+
+    @pytest.mark.asyncio
+    async def test_l3_owned_mode_skips_default_restore(self):
+        """Owned mode never set the default-context override (L1 was a no-op),
+        so L3 should also skip — no need to restore something not changed."""
+        mock_pw, mock_cdp_browser, _, _, mock_session = self._make_cdp_mocks(contexts_count=0)
+        mock_cdp_browser.contexts = []
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()
+        await browser.close()
+
+        assert self._set_download_behavior_calls(mock_session) == []
+
+    # ── Failure paths ────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_new_browser_cdp_session_failure_does_not_abort_start(self):
+        """If new_browser_cdp_session raises, _start still completes."""
+        mock_pw, mock_cdp_browser, _, _, _ = self._make_cdp_mocks()
+        mock_cdp_browser.new_browser_cdp_session = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()  # must not raise
+
+        assert browser._context is not None
+        assert browser._page is not None
+
+    @pytest.mark.asyncio
+    async def test_send_timeout_is_handled(self):
+        """A CDP send timeout is logged best-effort, detach still attempted."""
+        mock_pw, _, _, _, mock_session = self._make_cdp_mocks()
+        mock_session.send = AsyncMock(side_effect=asyncio.TimeoutError())
+        browser = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()  # must not raise
+
+        mock_session.detach.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_download_path_mkdir_failure_skips_override(self, tmp_path):
+        """If downloads_path mkdir fails (e.g., name collision with a file),
+        L1 logs and skips — Chrome's native behavior remains."""
+        # Create a regular file where downloads_path would be — mkdir raises.
+        bad = tmp_path / "block.txt"
+        bad.touch()  # this is a FILE, not a dir
+        mock_pw, _, _, _, mock_session = self._make_cdp_mocks()
+        browser = Browser(
+            cdp="ws://localhost:9222/devtools/browser/abc",
+            stealth=False,
+            downloads_path=str(bad),  # collision
+        )
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await browser._start()  # must not raise
+
+        # L1 bailed out — no CDP send.
+        assert self._set_download_behavior_calls(mock_session) == []
+
+
+class TestEffectiveCdpDownloadsPath:
+    """``_effective_cdp_downloads_path(client_cwd)`` — priority chain that
+    decides where CDP-borrowed downloads land. Order matters: explicit
+    config > per-command CWD from the CLI client > ~/Downloads fallback.
+    """
+
+    def test_explicit_downloads_path_wins(self, tmp_path):
+        b = Browser(downloads_path=str(tmp_path / "explicit"))
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        assert b._effective_cdp_downloads_path(cwd) == (tmp_path / "explicit")
+
+    def test_client_cwd_used_when_no_explicit(self, tmp_path):
+        b = Browser()
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        assert b._effective_cdp_downloads_path(cwd) == cwd
+
+    def test_falls_back_to_home_downloads(self):
+        b = Browser()
+        assert b._effective_cdp_downloads_path(None) == Path.home() / "Downloads"
+
+
+class TestUpdateCdpDownloadsPath:
+    """``update_cdp_downloads_path`` is the daemon's per-command hook that
+    re-targets the CDP download directory when the CLI client's CWD changes.
+    """
+
+    def _make_cdp_mocks(self, contexts_count=1):
+        # Mirrors TestCdpDownloadBehaviorOverride._make_cdp_mocks above.
+        mock_pg = MagicMock()
+        mock_pg.bring_to_front = AsyncMock()
+        mock_pg.close = AsyncMock()
+        mock_pg.goto = AsyncMock()
+        mock_pg.video = None
+        mock_pg.is_closed = MagicMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+        mock_session.detach = AsyncMock()
+        # Renamer attach uses session.on() — sync MagicMock is fine.
+
+        mock_ctx = MagicMock()
+        mock_ctx.add_init_script = AsyncMock()
+        mock_ctx.new_page = AsyncMock(return_value=mock_pg)
+        # L1/cwd-update route through this page-level CDP session.
+        mock_ctx.new_cdp_session = AsyncMock(return_value=mock_session)
+        mock_ctx.pages = [mock_pg]
+        mock_ctx.close = AsyncMock()
+        mock_ctx.tracing = MagicMock()
+        mock_ctx.tracing.stop = AsyncMock()
+
+        mock_cdp_browser = MagicMock()
+        mock_cdp_browser.contexts = [mock_ctx] * contexts_count
+        mock_cdp_browser.new_context = AsyncMock(return_value=mock_ctx)
+        mock_cdp_browser.close = AsyncMock()
+        mock_cdp_browser.new_browser_cdp_session = AsyncMock(return_value=mock_session)
+
+        mock_pw = MagicMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=mock_cdp_browser)
+        mock_pw.stop = AsyncMock()
+
+        return mock_pw, mock_cdp_browser, mock_ctx, mock_pg, mock_session
+
+    def _setdownload_calls(self, mock_session):
+        return [
+            c for c in mock_session.send.await_args_list
+            if c.args[0] == "Browser.setDownloadBehavior"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_resends_cdp_when_path_changes(self, tmp_path):
+        """A different CWD triggers a fresh setDownloadBehavior call."""
+        mock_pw, _, _, _, mock_session = self._make_cdp_mocks()
+        b = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await b._start()
+
+        before = len(self._setdownload_calls(mock_session))
+        new_dir = tmp_path / "new"
+        new_dir.mkdir()
+        await b.update_cdp_downloads_path(new_dir)
+
+        after = self._setdownload_calls(mock_session)
+        assert len(after) == before + 1
+        assert after[-1].args[1]["downloadPath"] == str(new_dir)
+        assert after[-1].args[1]["behavior"] == "allowAndName"
+        assert b._current_cdp_download_path == new_dir
+        assert b._cdp_download_renamer.default_dir == new_dir
+
+    @pytest.mark.asyncio
+    async def test_noop_when_path_unchanged(self):
+        mock_pw, _, _, _, mock_session = self._make_cdp_mocks()
+        b = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await b._start()
+
+        before = len(self._setdownload_calls(mock_session))
+        await b.update_cdp_downloads_path(b._current_cdp_download_path)
+        after = self._setdownload_calls(mock_session)
+        assert len(after) == before
+
+    @pytest.mark.asyncio
+    async def test_owned_mode_is_noop(self):
+        """Owned mode never installed L1; update should not introduce one."""
+        mock_pw, mock_cdp_browser, _, _, mock_session = self._make_cdp_mocks(
+            contexts_count=0
+        )
+        mock_cdp_browser.contexts = []
+        b = Browser(cdp="ws://localhost:9222/devtools/browser/abc", stealth=False)
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_pw)
+            await b._start()
+
+        assert b._cdp_context_owned is True
+        await b.update_cdp_downloads_path(Path("/tmp/something"))
+        assert self._setdownload_calls(mock_session) == []
+
+
+class TestRescueCdpOrphanDownloads:
+    """L2: `_rescue_cdp_orphan_downloads` moves orphan files out of
+    `playwright-artifacts-*` directories before `browser.close()`
+    triggers the temp-dir cleanup."""
+
+    @pytest.fixture
+    def fake_tempdir(self, tmp_path, monkeypatch):
+        """Redirect tempfile.gettempdir() and Path.home() so the rescue logic
+        operates inside tmp_path. Returns (tmpdir, home, downloads)."""
+        monkeypatch.setattr(
+            "bridgic.browser.session._browser.tempfile.gettempdir",
+            lambda: str(tmp_path),
+        )
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        downloads = fake_home / "Downloads"
+        # Don't pre-create — _rescue creates if missing.
+        monkeypatch.setattr(
+            "bridgic.browser.session._browser.Path.home",
+            classmethod(lambda cls: fake_home),
+        )
+        return tmp_path, fake_home, downloads
+
+    @pytest.fixture
+    def browser(self):
+        """Bare Browser instance with no playwright state — only the rescue
+        method is exercised here."""
+        return Browser()
+
+    @pytest.mark.asyncio
+    async def test_rescue_moves_orphan_file_to_downloads(self, browser, fake_tempdir):
+        """A GUID-named file under playwright-artifacts-* is moved
+        into ~/Downloads with a bridgic-rescue- prefix."""
+        tmp, _, downloads = fake_tempdir
+        art = tmp / "playwright-artifacts-abc"
+        art.mkdir()
+        guid_file = art / "deadbeef-cafe-1234"
+        guid_file.write_bytes(b"APK CONTENT")
+
+        rescued = await browser._rescue_cdp_orphan_downloads()
+
+        assert len(rescued) == 1
+        # File is GONE from artifactsDir...
+        assert not guid_file.exists()
+        # ...and now in Downloads with the bridgic-rescue- prefix.
+        target = downloads / "bridgic-rescue-deadbeef-cafe-1234"
+        assert target.exists()
+        assert target.read_bytes() == b"APK CONTENT"
+        assert str(target) in rescued
+
+    @pytest.mark.asyncio
+    async def test_rescue_skips_files_already_saved_by_download_manager(self, browser, fake_tempdir):
+        """Files DownloadManager already copied to downloads_path (recorded in
+        `_downloaded_files`) must NOT be re-rescued — they are still in the
+        artifactsDir as Playwright's own staging, but the user already has a
+        good copy."""
+        from bridgic.browser.session._download import DownloadManager, DownloadedFile
+
+        tmp, _, downloads = fake_tempdir
+        art = tmp / "playwright-artifacts-abc"
+        art.mkdir()
+        already_saved = art / "guid-already-saved"
+        already_saved.write_bytes(b"X")
+        truly_orphan = art / "guid-orphan"
+        truly_orphan.write_bytes(b"Y")
+
+        # Make DownloadManager say "I already saved <already_saved>".
+        dm = DownloadManager(downloads_path=str(tmp / "user-downloads"))
+        dm._downloaded_files.append(  # type: ignore[attr-defined]
+            DownloadedFile(
+                url="http://x",
+                path=str(already_saved),
+                file_name="x",
+                file_size=1,
+            )
+        )
+        browser._download_manager = dm
+
+        rescued = await browser._rescue_cdp_orphan_downloads()
+
+        # Already-saved file untouched.
+        assert already_saved.exists()
+        # Orphan moved.
+        assert not truly_orphan.exists()
+        assert len(rescued) == 1
+        assert any("guid-orphan" in p for p in rescued)
+
+    @pytest.mark.asyncio
+    async def test_rescue_collision_uses_numeric_suffix(self, browser, fake_tempdir):
+        """If the rescue target already exists, the rescue file gets a numeric
+        suffix to avoid clobbering."""
+        tmp, _, downloads = fake_tempdir
+        downloads.mkdir(parents=True)
+        existing = downloads / "bridgic-rescue-collide"
+        existing.write_bytes(b"OLD")
+
+        art = tmp / "playwright-artifacts-xyz"
+        art.mkdir()
+        new_file = art / "collide"
+        new_file.write_bytes(b"NEW")
+
+        rescued = await browser._rescue_cdp_orphan_downloads()
+
+        # Original untouched, new file lands at suffix .1.
+        assert existing.read_bytes() == b"OLD"
+        assert (downloads / "bridgic-rescue-collide.1").read_bytes() == b"NEW"
+        assert any(p.endswith("bridgic-rescue-collide.1") for p in rescued)
+
+    @pytest.mark.asyncio
+    async def test_rescue_skips_known_artifact_extensions(self, browser, fake_tempdir):
+        """Trace zips, video webm, etc. are Playwright's own artifacts — not
+        user downloads. They must not be moved (bridgic's own trace/video flow
+        already handles these out-of-band)."""
+        tmp, _, downloads = fake_tempdir
+        art = tmp / "playwright-artifacts-abc"
+        art.mkdir()
+        (art / "trace.zip").write_bytes(b"Z")
+        (art / "video.webm").write_bytes(b"V")
+        (art / "session.har").write_bytes(b"H")
+        (art / "real-download").write_bytes(b"D")
+
+        rescued = await browser._rescue_cdp_orphan_downloads()
+
+        assert (art / "trace.zip").exists()
+        assert (art / "video.webm").exists()
+        assert (art / "session.har").exists()
+        assert not (art / "real-download").exists()
+        assert len(rescued) == 1
+
+    @pytest.mark.asyncio
+    async def test_rescue_no_artifacts_dir_returns_empty(self, browser, fake_tempdir):
+        """When no playwright-artifacts-* dirs exist, rescue is a
+        no-op and returns an empty list (no exception)."""
+        rescued = await browser._rescue_cdp_orphan_downloads()
+        assert rescued == []
+
+    @pytest.mark.asyncio
+    async def test_rescue_falls_back_when_home_downloads_unwritable(self, browser, tmp_path, monkeypatch):
+        """If ~/Downloads cannot be created (read-only home), rescue falls back
+        to a tmp-based bridgic-rescue/ root so the file is still saved."""
+        # Redirect tempdir to tmp_path so the artifactsDir glob picks it up.
+        monkeypatch.setattr(
+            "bridgic.browser.session._browser.tempfile.gettempdir",
+            lambda: str(tmp_path),
+        )
+        # Make Path.home() return a path under which mkdir on /Downloads will fail.
+        readonly_home = tmp_path / "ro_home"
+        readonly_home.touch()  # File, not dir → mkdir(/Downloads) raises NotADirectoryError
+        monkeypatch.setattr(
+            "bridgic.browser.session._browser.Path.home",
+            classmethod(lambda cls: readonly_home),
+        )
+
+        art = tmp_path / "playwright-artifacts-q"
+        art.mkdir()
+        (art / "guid-1").write_bytes(b"data")
+
+        rescued = await browser._rescue_cdp_orphan_downloads()
+
+        # Fell back to <tmpdir>/bridgic-rescue/
+        assert len(rescued) == 1
+        assert "bridgic-rescue" in rescued[0]
+
+
+class TestFindCdpUrlProxyBypass:
+    """find_cdp_url(mode="port") must bypass the system HTTP proxy when probing
+    loopback hosts (localhost / 127.0.0.1 / ::1) so a misconfigured proxy cannot
+    return misleading 502 errors for ports that are simply not listening.
+
+    Remote hosts (cloud browser services, SSH-tunneled CDP, etc.) MUST keep
+    proxy support."""
+
+    def _make_fake_response(self, payload: dict):
+        """Return an object with a .read() method returning JSON bytes."""
+        import json as _json
+        fake = MagicMock()
+        fake.read = MagicMock(return_value=_json.dumps(payload).encode("utf-8"))
+        return fake
+
+    def test_find_cdp_url_localhost_bypasses_system_proxy(self, monkeypatch):
+        """Localhost probes must build an opener with empty ProxyHandler({})."""
+        import urllib.request
+        from bridgic.browser.session import find_cdp_url
+
+        # Set a system proxy that would obviously break the probe if used.
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+
+        captured_handlers = []
+        real_build_opener = urllib.request.build_opener
+
+        def _spy_build_opener(*handlers):
+            captured_handlers.append(handlers)
+            opener = MagicMock()
+            opener.open = MagicMock(
+                return_value=self._make_fake_response(
+                    {"webSocketDebuggerUrl": "ws://localhost:9222/devtools/browser/abc"}
+                )
+            )
+            return opener
+
+        # Track whether default urlopen was used (it must NOT be).
+        urlopen_calls = []
+        real_urlopen = urllib.request.urlopen
+
+        def _spy_urlopen(*args, **kwargs):
+            urlopen_calls.append((args, kwargs))
+            return self._make_fake_response(
+                {"webSocketDebuggerUrl": "ws://localhost:9222/devtools/browser/abc"}
+            )
+
+        monkeypatch.setattr(urllib.request, "build_opener", _spy_build_opener)
+        monkeypatch.setattr(urllib.request, "urlopen", _spy_urlopen)
+
+        result = find_cdp_url(mode="port", host="localhost", port=9222)
+
+        assert result == "ws://localhost:9222/devtools/browser/abc"
+        # build_opener was called once for the loopback bypass path.
+        assert len(captured_handlers) == 1, (
+            f"Expected 1 build_opener call, got {len(captured_handlers)}"
+        )
+        # The handler list must contain a ProxyHandler with empty proxies dict.
+        handler_types = [type(h).__name__ for h in captured_handlers[0]]
+        assert "ProxyHandler" in handler_types, (
+            f"Expected ProxyHandler in handlers, got: {handler_types}"
+        )
+        for h in captured_handlers[0]:
+            if isinstance(h, urllib.request.ProxyHandler):
+                # Empty dict means: no proxies, bypass system config entirely.
+                assert h.proxies == {}, (
+                    f"ProxyHandler must be constructed with empty dict, got: {h.proxies}"
+                )
+        # Default urlopen must not be used for loopback hosts.
+        assert urlopen_calls == [], (
+            f"Default urlopen must not be used for localhost, got: {urlopen_calls}"
+        )
+
+    def test_find_cdp_url_127_0_0_1_bypasses_system_proxy(self, monkeypatch):
+        """127.0.0.1 must also trigger the loopback bypass path."""
+        import urllib.request
+        from bridgic.browser.session import find_cdp_url
+
+        captured_handlers = []
+
+        def _spy_build_opener(*handlers):
+            captured_handlers.append(handlers)
+            opener = MagicMock()
+            opener.open = MagicMock(
+                return_value=self._make_fake_response(
+                    {"webSocketDebuggerUrl": "ws://localhost:9222/devtools/browser/abc"}
+                )
+            )
+            return opener
+
+        monkeypatch.setattr(urllib.request, "build_opener", _spy_build_opener)
+
+        result = find_cdp_url(mode="port", host="127.0.0.1", port=9222)
+
+        assert "ws://127.0.0.1:9222/devtools/browser/abc" == result
+        assert len(captured_handlers) == 1
+        assert any(
+            isinstance(h, urllib.request.ProxyHandler) and h.proxies == {}
+            for h in captured_handlers[0]
+        )
+
+    def test_find_cdp_url_remote_uses_default_opener(self, monkeypatch):
+        """Remote hosts must keep proxy support and use the default urlopen."""
+        import urllib.request
+        from bridgic.browser.session import find_cdp_url
+
+        build_opener_calls = []
+
+        def _spy_build_opener(*handlers):
+            build_opener_calls.append(handlers)
+            return MagicMock()
+
+        urlopen_calls = []
+
+        def _spy_urlopen(*args, **kwargs):
+            urlopen_calls.append((args, kwargs))
+            return self._make_fake_response(
+                {"webSocketDebuggerUrl": "ws://localhost:9222/devtools/browser/abc"}
+            )
+
+        monkeypatch.setattr(urllib.request, "build_opener", _spy_build_opener)
+        monkeypatch.setattr(urllib.request, "urlopen", _spy_urlopen)
+
+        result = find_cdp_url(mode="port", host="example.com", port=9222)
+
+        # Remote host: replace localhost in the returned URL with the actual host.
+        assert result == "ws://example.com:9222/devtools/browser/abc"
+        # Loopback bypass branch must NOT have been taken.
+        assert build_opener_calls == [], (
+            f"Remote host must not call build_opener, got {build_opener_calls}"
+        )
+        # Default urlopen must have been used exactly once.
+        assert len(urlopen_calls) == 1, (
+            f"Expected 1 urlopen call for remote host, got {len(urlopen_calls)}"
+        )
+
+    def test_find_cdp_url_localhost_returns_connection_error_when_port_dead(self):
+        """End-to-end check: probing a dead local port surfaces a clean
+        ConnectionError that mentions the port number, not a proxy-shaped
+        message like '502 Bad Gateway'.
+
+        Note: the original macOS system-proxy bug cannot be reproduced via
+        env-var proxies in unit tests because urllib auto-bypasses 127.0.0.1
+        for env-var proxies (proxy_bypass_environment). The two preceding tests
+        cover the bypass mechanism directly via build_opener spying. This test
+        guards against regressions in the basic localhost path."""
+        import socket
+        from bridgic.browser.session import find_cdp_url
+
+        # Find a free port by binding then releasing it.
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            dead_port = s.getsockname()[1]
+        finally:
+            s.close()
+
+        with pytest.raises(ConnectionError) as exc_info:
+            find_cdp_url(mode="port", host="127.0.0.1", port=dead_port)
+
+        # Error message must mention the port and not look like a proxy error.
+        msg = str(exc_info.value)
+        assert str(dead_port) in msg, f"Expected port {dead_port} in error: {msg}"
+        assert "Bad Gateway" not in msg, f"Error must not mention Bad Gateway: {msg}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API exposure
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApiExposure:
+    """Smoke tests verifying find_cdp_url and resolve_cdp_input are callable
+    and present in the public API (bridgic.browser and bridgic.browser.session)."""
+
+    def test_importable_from_bridgic_browser(self):
+        from bridgic.browser import find_cdp_url, resolve_cdp_input
+        assert callable(find_cdp_url)
+        assert callable(resolve_cdp_input)
+
+    def test_importable_from_bridgic_browser_session(self):
+        from bridgic.browser.session import find_cdp_url, resolve_cdp_input
+        assert callable(find_cdp_url)
+        assert callable(resolve_cdp_input)
+
+    def test_in_all(self):
+        import bridgic.browser as pkg
+        assert "find_cdp_url" in pkg.__all__
+        assert "resolve_cdp_input" in pkg.__all__
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# get_page_size_info
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGetPageSizeInfo:
+    """Tests for Browser.get_page_size_info (CDP Page.getLayoutMetrics path)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_page_size_info_from_cdp(self, mock_playwright, mock_page, mock_context, mock_cdp_session):
+        """Successful CDP Page.getLayoutMetrics returns a populated PageSizeInfo."""
+        from bridgic.browser.session._browser_model import PageSizeInfo
+
+        mock_cdp_session.send = AsyncMock(return_value={
+            "cssLayoutViewport": {"clientWidth": 1280, "clientHeight": 800, "pageX": 0, "pageY": 200},
+            "cssContentSize": {"width": 1280, "height": 4000},
+            "cssVisualViewport": {"clientWidth": 1280, "clientHeight": 800},
+        })
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            result = await browser.get_page_size_info()
+
+        assert isinstance(result, PageSizeInfo)
+        assert result.viewport_width == 1280
+        assert result.viewport_height == 800
+        assert result.page_height == 4000
+        assert result.scroll_y == 200
+        assert result.pixels_above == 200
+        assert result.pixels_below == 4000 - 800 - 200
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_page(self):
+        """Returns None immediately when no page is open."""
+        browser = Browser(stealth=False)
+        assert browser._page is None
+        result = await browser.get_page_size_info()
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_evaluate_raises(self, mock_playwright, mock_page, mock_context, mock_cdp_session):
+        """Returns None gracefully when CDP session send fails."""
+        mock_cdp_session.send = AsyncMock(side_effect=RuntimeError("cdp failed"))
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            result = await browser.get_page_size_info()
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_cdp_session_created_and_detached(self, mock_playwright, mock_page, mock_context, mock_cdp_session):
+        """Verify CDP session is opened for Page.getLayoutMetrics and detached afterwards."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+
+            await browser.get_page_size_info()
+
+        mock_context.new_cdp_session.assert_called_once_with(mock_page)
+        mock_cdp_session.send.assert_called_once_with("Page.getLayoutMetrics")
+        mock_cdp_session.detach.assert_called_once()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# get_full_page_info
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGetFullPageInfo:
+    """Tests for Browser.get_full_page_info concurrent fetch behavior."""
+
+    @pytest.mark.asyncio
+    async def test_returns_full_page_info_on_success(self, mock_playwright, mock_page, mock_context):
+        """Returns FullPageInfo combining snapshot tree and page size data."""
+        from bridgic.browser.session._browser_model import FullPageInfo
+
+        fake_snapshot = MagicMock()
+        fake_snapshot.tree = "- button \"Go\" [ref=abc]"
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+            browser.get_snapshot = AsyncMock(return_value=fake_snapshot)
+
+            result = await browser.get_full_page_info()
+
+        assert isinstance(result, FullPageInfo)
+        assert result.tree == fake_snapshot.tree
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_page(self):
+        """Returns None immediately when no page is open."""
+        browser = Browser(stealth=False)
+        assert browser._page is None
+        result = await browser.get_full_page_info()
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_snapshot_raises(self, mock_playwright, mock_page):
+        """Returns None when get_snapshot raises."""
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+            browser.get_snapshot = AsyncMock(side_effect=RuntimeError("snap failed"))
+
+            result = await browser.get_full_page_info()
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_page_info_fails(self, mock_playwright, mock_page, mock_context, mock_cdp_session):
+        """Returns None when get_page_size_info returns None (CDP send failed)."""
+        fake_snapshot = MagicMock()
+        fake_snapshot.tree = "- heading \"Hi\""
+
+        mock_cdp_session.send = AsyncMock(side_effect=RuntimeError("cdp error"))
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+            browser.get_snapshot = AsyncMock(return_value=fake_snapshot)
+
+            result = await browser.get_full_page_info()
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_snapshot_and_page_info_run_concurrently(self, mock_playwright, mock_page, mock_context, mock_cdp_session):
+        """get_snapshot and get_page_size_info must overlap in time (asyncio.gather)."""
+        call_log: list[str] = []
+        snapshot_started = asyncio.Event()
+        page_info_started = asyncio.Event()
+
+        async def _slow_snapshot(*args, **kwargs):
+            call_log.append("snapshot:start")
+            snapshot_started.set()
+            await asyncio.sleep(0)  # yield to let get_page_size_info start
+            await page_info_started.wait()
+            call_log.append("snapshot:end")
+            snap = MagicMock()
+            snap.tree = "- button"
+            return snap
+
+        async def _slow_cdp_send(*args, **kwargs):
+            call_log.append("page_info:start")
+            page_info_started.set()
+            await snapshot_started.wait()
+            return {
+                "cssLayoutViewport": {"clientWidth": 1280, "clientHeight": 800, "pageX": 0, "pageY": 0},
+                "cssContentSize": {"width": 1280, "height": 2000},
+                "cssVisualViewport": {"clientWidth": 1280, "clientHeight": 800},
+            }
+
+        mock_cdp_session.send = AsyncMock(side_effect=_slow_cdp_send)
+
+        with patch("bridgic.browser.session._browser.async_playwright") as mock_ap:
+            mock_ap.return_value.start = AsyncMock(return_value=mock_playwright)
+            browser = Browser(stealth=False)
+            await browser._start()
+            browser.get_snapshot = AsyncMock(side_effect=_slow_snapshot)
+
+            result = await browser.get_full_page_info()
+
+        assert result is not None
+        # Both must have started before either finished — proving concurrency.
+        assert "snapshot:start" in call_log
+        assert "page_info:start" in call_log
+        snapshot_end_idx = call_log.index("snapshot:end")
+        page_info_start_idx = call_log.index("page_info:start")
+        # page_info started before snapshot finished → they overlapped
+        assert page_info_start_idx < snapshot_end_idx, (
+            "page_info should have started before snapshot finished (concurrent)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# _locator_action_with_fallback — click timeout + dispatch_event fallback
+# ---------------------------------------------------------------------------
+
+class TestLocatorActionWithFallback:
+    """Tests for :func:`_browser_module._locator_action_with_fallback`.
+
+    This helper caps Playwright's default 30s locator timeout at 10s and
+    dispatches a DOM event as a fallback. It's the core defence against the
+    "click hangs for 30s on SPA elements" pathology observed in prod logs.
+
+    The fallback is **gated** on ``is_visible()`` AND ``is_enabled()``: the
+    stable-check-loop pathology always has both True, so we preserve the
+    fallback there; a ``<button disabled>`` or ``aria-disabled="true"``
+    widget has ``is_enabled()`` False, and we must NOT silently click it.
+    """
+
+    @staticmethod
+    def _make_locator(*, visible: bool = True, enabled: bool = True) -> MagicMock:
+        """Build a locator mock that reports the given actionability state."""
+        loc = MagicMock()
+        loc.is_visible = AsyncMock(return_value=visible)
+        loc.is_enabled = AsyncMock(return_value=enabled)
+        loc.dispatch_event = AsyncMock()
+        return loc
+
+    @pytest.mark.asyncio
+    async def test_primary_action_success_uses_timeout(self):
+        """Happy path: action succeeds; no fallback event dispatched."""
+        locator = self._make_locator()
+        locator.click = AsyncMock(return_value=None)
+
+        await _browser_module._locator_action_with_fallback(locator, action="click")
+
+        locator.click.assert_awaited_once()
+        # Timeout must be explicitly passed (lower than Playwright's default).
+        assert locator.click.await_args.kwargs.get("timeout") == _browser_module._DEFAULT_CLICK_TIMEOUT_MS
+        locator.dispatch_event.assert_not_awaited()
+        # Probe not needed on success.
+        locator.is_visible.assert_not_awaited()
+        locator.is_enabled.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_on_visible_enabled_falls_back(self):
+        """On Playwright TimeoutError with a visible+enabled element, dispatch_event fires."""
+        locator = self._make_locator(visible=True, enabled=True)
+        locator.click = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("locator.click: Timeout 10000ms")
+        )
+
+        await _browser_module._locator_action_with_fallback(
+            locator, action="click", fallback_event="click"
+        )
+
+        locator.click.assert_awaited_once()
+        locator.dispatch_event.assert_awaited_once_with(
+            "click", timeout=_bridgic_timeouts.FALLBACK_DISPATCH_TIMEOUT_MS
+        )
+
+    @pytest.mark.asyncio
+    async def test_dblclick_fallback_event(self):
+        """dblclick action pairs with a 'dblclick' DOM fallback by convention."""
+        locator = self._make_locator(visible=True, enabled=True)
+        locator.dblclick = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("timeout")
+        )
+
+        await _browser_module._locator_action_with_fallback(
+            locator, action="dblclick", fallback_event="dblclick"
+        )
+
+        locator.dispatch_event.assert_awaited_once_with(
+            "dblclick", timeout=_bridgic_timeouts.FALLBACK_DISPATCH_TIMEOUT_MS
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_timeout_error_not_swallowed(self):
+        """Errors that aren't PlaywrightTimeoutError bubble up unchanged."""
+        locator = self._make_locator()
+        locator.click = AsyncMock(side_effect=RuntimeError("not a timeout"))
+
+        with pytest.raises(RuntimeError, match="not a timeout"):
+            await _browser_module._locator_action_with_fallback(locator, action="click")
+
+        locator.dispatch_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_custom_timeout_respected(self):
+        """Caller-supplied timeout overrides the module default."""
+        locator = self._make_locator()
+        locator.click = AsyncMock(return_value=None)
+
+        await _browser_module._locator_action_with_fallback(
+            locator, action="click", timeout_ms=5000
+        )
+
+        assert locator.click.await_args.kwargs.get("timeout") == 5000
+
+    @pytest.mark.asyncio
+    async def test_check_action_dispatches_click_on_timeout(self):
+        """`check` action falls back to a 'click' DOM event (same activation semantics)."""
+        locator = self._make_locator(visible=True, enabled=True)
+        locator.check = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("timeout")
+        )
+
+        await _browser_module._locator_action_with_fallback(
+            locator, action="check", fallback_event="click"
+        )
+
+        locator.dispatch_event.assert_awaited_once_with(
+            "click", timeout=_bridgic_timeouts.FALLBACK_DISPATCH_TIMEOUT_MS
+        )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_fallback_has_bounded_timeout(self):
+        """H03: fallback dispatch_event must pass an explicit timeout.
+
+        Without it, continuously-animating elements inherit Playwright's 30 s
+        default and the outer 10 s click cap is meaningless (observed in QA:
+        shake-button total 40 s).
+        """
+        locator = self._make_locator(visible=True, enabled=True)
+        locator.click = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("timeout")
+        )
+
+        await _browser_module._locator_action_with_fallback(locator, action="click")
+
+        (_, kwargs) = locator.dispatch_event.await_args
+        assert "timeout" in kwargs, "fallback must not inherit Playwright's 30 s default"
+        assert kwargs["timeout"] == _bridgic_timeouts.FALLBACK_DISPATCH_TIMEOUT_MS
+
+    @pytest.mark.asyncio
+    async def test_dispatch_fallback_timeout_propagates(self):
+        """H03: if dispatch_event itself times out, the error surfaces to the caller."""
+        locator = self._make_locator(visible=True, enabled=True)
+        locator.click = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError(
+                "locator.click: Timeout 10000ms"
+            )
+        )
+        locator.dispatch_event = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError(
+                "Locator.dispatch_event: Timeout 2000ms exceeded."
+            )
+        )
+
+        with pytest.raises(_browser_module.PlaywrightTimeoutError):
+            await _browser_module._locator_action_with_fallback(locator, action="click")
+
+        locator.dispatch_event.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_timeout_on_disabled_element_re_raises(self):
+        """<button disabled> / aria-disabled=true: timeout must NOT silent-click."""
+        locator = self._make_locator(visible=True, enabled=False)
+        locator.click = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("timeout")
+        )
+
+        with pytest.raises(_browser_module.PlaywrightTimeoutError):
+            await _browser_module._locator_action_with_fallback(locator, action="click")
+
+        locator.dispatch_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_on_invisible_element_re_raises(self):
+        """display:none / off-screen / hidden: timeout must NOT silent-click."""
+        locator = self._make_locator(visible=False, enabled=True)
+        locator.click = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("timeout")
+        )
+
+        with pytest.raises(_browser_module.PlaywrightTimeoutError):
+            await _browser_module._locator_action_with_fallback(locator, action="click")
+
+        locator.dispatch_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_with_hung_probe_re_raises_conservatively(self):
+        """If the actionability probe itself times out we do NOT silent-click."""
+        import asyncio
+        locator = MagicMock()
+        locator.click = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("timeout")
+        )
+        locator.dispatch_event = AsyncMock()
+
+        async def _hang() -> bool:
+            await asyncio.sleep(10.0)
+            return True
+
+        locator.is_visible = AsyncMock(side_effect=_hang)
+        locator.is_enabled = AsyncMock(side_effect=_hang)
+
+        with pytest.raises(_browser_module.PlaywrightTimeoutError):
+            await _browser_module._locator_action_with_fallback(locator, action="click")
+
+        locator.dispatch_event.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# _retriable_launch — exponential back-off for transient launch failures
+# ---------------------------------------------------------------------------
+
+class TestRetriableLaunch:
+    """Tests for :func:`_browser_module._retriable_launch`.
+
+    Playwright's :meth:`launch_persistent_context` can fail with
+    ``TargetClosedError`` when the prior Chromium process hasn't released the
+    user-data-dir singleton lock. Without back-off, a user repeatedly running
+    ``navigate_to`` gets 8 rapid-fire failures (per prod log). With the
+    helper, we get 3 attempts max with 0s → 1s → 2.5s spacing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_success_on_first_attempt(self):
+        """Successful launch returns immediately; no retries, no sleeps."""
+        result_obj = object()
+        call_count = 0
+
+        async def launch():
+            nonlocal call_count
+            call_count += 1
+            return result_obj
+
+        with patch("bridgic.browser.session._browser.asyncio.sleep") as mock_sleep:
+            result = await _browser_module._retriable_launch(launch, mode="persistent_context")
+
+        assert result is result_obj
+        assert call_count == 1
+        # First-attempt delay is 0.0 → sleep not called (helper guards >0).
+        mock_sleep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retries_on_target_closed_error(self):
+        """Transient 'target ... has been closed' error retries until success."""
+        attempts = []
+
+        async def launch():
+            attempts.append("tried")
+            if len(attempts) < 2:
+                raise Exception("Target page, context or browser has been closed")
+            return "ok"
+
+        with patch("bridgic.browser.session._browser.asyncio.sleep", new=AsyncMock()):
+            result = await _browser_module._retriable_launch(launch, mode="persistent_context")
+
+        assert result == "ok"
+        assert len(attempts) == 2
+
+    @pytest.mark.asyncio
+    async def test_retries_on_singleton_lock(self):
+        """'SingletonLock' error (profile still held) is retriable."""
+        attempts = []
+
+        async def launch():
+            attempts.append("tried")
+            if len(attempts) < 3:
+                raise Exception("SingletonLock still held by previous process")
+            return "ok"
+
+        with patch("bridgic.browser.session._browser.asyncio.sleep", new=AsyncMock()):
+            result = await _browser_module._retriable_launch(launch, mode="persistent_context")
+
+        assert result == "ok"
+        assert len(attempts) == 3
+
+    @pytest.mark.asyncio
+    async def test_non_retriable_fails_fast(self):
+        """Errors not in _RETRIABLE_LAUNCH_TOKENS raise after the first attempt."""
+        attempts = []
+
+        async def launch():
+            attempts.append("tried")
+            raise Exception("Executable not found at /bad/path")
+
+        with patch("bridgic.browser.session._browser.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(Exception, match="Executable not found"):
+                await _browser_module._retriable_launch(launch, mode="launch")
+
+        assert len(attempts) == 1
+
+    @pytest.mark.asyncio
+    async def test_gives_up_after_max_attempts(self):
+        """Persistent transient errors exhaust all delays and re-raise the last error."""
+        attempts = []
+
+        async def launch():
+            attempts.append("tried")
+            raise Exception("SingletonLock still held")
+
+        with patch("bridgic.browser.session._browser.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(Exception, match="SingletonLock"):
+                await _browser_module._retriable_launch(launch, mode="persistent_context")
+
+        assert len(attempts) == len(_browser_module._LAUNCH_RETRY_DELAYS)
+
+    @pytest.mark.asyncio
+    async def test_backoff_delays_applied(self):
+        """Each retry waits the corresponding delay before calling the launch callable."""
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(delay):
+            sleep_calls.append(delay)
+
+        async def launch():
+            raise Exception("Target page, context or browser has been closed")
+
+        with patch("bridgic.browser.session._browser.asyncio.sleep", side_effect=fake_sleep):
+            with pytest.raises(Exception):
+                await _browser_module._retriable_launch(launch, mode="persistent_context")
+
+        # Only non-zero delays get a real sleep call; attempt 1 has delay=0.0.
+        expected = [d for d in _browser_module._LAUNCH_RETRY_DELAYS if d > 0]
+        assert sleep_calls == expected
+
+    @pytest.mark.asyncio
+    async def test_bare_target_closed_does_not_retry(self):
+        """Regression guard for I1: bare ``"Target closed"`` (without the
+        full Playwright transient phrase) must NOT be retried — it fires on
+        many permanent failures and earlier spuriously retried 3x each time.
+        """
+        attempts = []
+
+        async def launch():
+            attempts.append("tried")
+            raise Exception("Target closed")
+
+        with patch("bridgic.browser.session._browser.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(Exception, match="Target closed"):
+                await _browser_module._retriable_launch(launch, mode="persistent_context")
+
+        assert len(attempts) == 1
+
+    @pytest.mark.asyncio
+    async def test_bare_has_been_closed_does_not_retry(self):
+        """Regression guard for I1: bare ``"has been closed"`` appears in
+        many permanent failures (e.g. ``"Executable has been closed"`` on a
+        bad binary path); must NOT be retried.
+        """
+        attempts = []
+
+        async def launch():
+            attempts.append("tried")
+            raise Exception("Executable has been closed")
+
+        with patch("bridgic.browser.session._browser.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(Exception, match="has been closed"):
+                await _browser_module._retriable_launch(launch, mode="persistent_context")
+
+        assert len(attempts) == 1
+
+
+# ---------------------------------------------------------------------------
+# CDP borrowed-mode browser paths (from PR #21 CR follow-ups)
+# ---------------------------------------------------------------------------
+# `_is_cdp_borrowed` is True when `_cdp_resolved` is set AND
+# `_cdp_context_owned` is False (the default). The paths below bypass
+# Playwright's `_mainContext()` because it never resolves for pre-existing
+# tabs — every CDP-specific branch must be covered here.
+
+
+def _make_cdp_borrowed_browser():
+    """Construct a Browser in CDP borrowed mode without starting Playwright.
+
+    Sets ``_cdp_resolved`` to a fake ws url (truthy) and keeps the default
+    ``_cdp_context_owned = False`` so ``_is_cdp_borrowed`` returns True.
+    """
+    b = Browser()
+    b._cdp_resolved = "ws://localhost:9222/devtools/browser/abc"
+    b._cdp_context_owned = False
+    b._context = MagicMock()
+    return b
+
+
+class TestGetPageTitleCDP:
+    """Tests for ``Browser._get_page_title`` across CDP and non-CDP paths."""
+
+    @pytest.mark.asyncio
+    async def test_non_cdp_calls_playwright_title(self):
+        """Non-CDP path: delegate to ``page.title()`` directly."""
+        browser = Browser()  # _is_cdp_borrowed = False
+        fake_page = MagicMock()
+        fake_page.title = AsyncMock(return_value="Hello World")
+
+        result = await browser._get_page_title(fake_page)
+
+        assert result == "Hello World"
+        fake_page.title.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cdp_uses_runtime_evaluate_for_document_title(self):
+        """CDP borrowed mode: read ``document.title`` via raw ``CDPSession``."""
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.url = "https://example.com"
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(
+            return_value={"result": {"type": "string", "value": "CDP Title"}}
+        )
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        result = await browser._get_page_title(fake_page)
+
+        assert result == "CDP Title"
+        fake_session.send.assert_awaited_once_with(
+            "Runtime.evaluate",
+            {"expression": "document.title", "returnByValue": True},
+        )
+        fake_session.detach.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cdp_falls_back_to_url_on_empty_title(self):
+        """Empty ``document.title`` value → fall back to ``page.url`` (chrome:// etc.)."""
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.url = "chrome://newtab"
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(return_value={"result": {"value": ""}})
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        result = await browser._get_page_title(fake_page)
+
+        assert result == "chrome://newtab"
+
+    @pytest.mark.asyncio
+    async def test_cdp_falls_back_to_url_on_cdp_exception(self):
+        """CDP session raises → fall back to ``page.url`` instead of bubbling up."""
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.url = "https://broken.example.com"
+        browser._context.new_cdp_session = AsyncMock(
+            side_effect=RuntimeError("CDP detach failed")
+        )
+
+        result = await browser._get_page_title(fake_page)
+
+        assert result == "https://broken.example.com"
+
+    @pytest.mark.asyncio
+    async def test_cdp_falls_back_to_url_on_timeout(self):
+        """CDP ``Runtime.evaluate`` timing out → URL fallback.
+
+        The 5 s wait_for inside ``_get_page_title`` is the belt-and-suspenders
+        guard against a truly wedged Chrome; the URL fallback is what the SDK
+        / CLI caller actually sees.
+        """
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.url = "https://wedged.example.com"
+
+        async def _hang(*_a, **_kw):
+            await asyncio.sleep(30.0)
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(side_effect=_hang)
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        # Patch the module's wait_for timeout so the test doesn't actually wait 5s.
+        with patch(
+            "bridgic.browser.session._browser.asyncio.wait_for",
+            new=AsyncMock(side_effect=asyncio.TimeoutError()),
+        ):
+            result = await browser._get_page_title(fake_page)
+
+        assert result == "https://wedged.example.com"
+
+    @pytest.mark.asyncio
+    async def test_cdp_detaches_session_in_finally(self):
+        """The CDPSession must be detached even when send() raises."""
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.url = "https://a.com"
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(side_effect=RuntimeError("boom"))
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        await browser._get_page_title(fake_page)
+
+        fake_session.detach.assert_awaited_once()
+
+
+class TestCdpNavigateHistory:
+    """Tests for ``Browser._cdp_navigate_history`` — CDP-level go_back/forward."""
+
+    @pytest.mark.asyncio
+    async def test_delta_minus_one_navigates_to_previous_entry(self):
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.wait_for_load_state = AsyncMock()
+
+        fake_session = MagicMock()
+        history = {
+            "currentIndex": 2,
+            "entries": [{"id": 10}, {"id": 11}, {"id": 12}],
+        }
+
+        async def _send(cmd, params=None):
+            if cmd == "Page.getNavigationHistory":
+                return history
+            if cmd == "Page.navigateToHistoryEntry":
+                assert params == {"entryId": 11}
+                return {}
+            raise AssertionError(f"unexpected CDP command {cmd}")
+
+        fake_session.send = AsyncMock(side_effect=_send)
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        await browser._cdp_navigate_history(fake_page, delta=-1)
+
+        # Two CDP calls: getNavigationHistory + navigateToHistoryEntry
+        assert fake_session.send.await_count == 2
+        fake_session.detach.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_delta_plus_one_navigates_to_next_entry(self):
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.wait_for_load_state = AsyncMock()
+
+        fake_session = MagicMock()
+        history = {
+            "currentIndex": 0,
+            "entries": [{"id": 10}, {"id": 11}],
+        }
+        entry_ids_visited = []
+
+        async def _send(cmd, params=None):
+            if cmd == "Page.getNavigationHistory":
+                return history
+            if cmd == "Page.navigateToHistoryEntry":
+                entry_ids_visited.append(params["entryId"])
+                return {}
+
+        fake_session.send = AsyncMock(side_effect=_send)
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        await browser._cdp_navigate_history(fake_page, delta=+1)
+
+        assert entry_ids_visited == [11]
+
+    @pytest.mark.asyncio
+    async def test_out_of_bounds_negative_raises_no_history_entry(self):
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.wait_for_load_state = AsyncMock()
+
+        fake_session = MagicMock()
+        history = {"currentIndex": 0, "entries": [{"id": 10}]}
+        fake_session.send = AsyncMock(return_value=history)
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        with pytest.raises(StateError) as exc_info:
+            await browser._cdp_navigate_history(fake_page, delta=-1)
+
+        assert exc_info.value.code == "NO_HISTORY_ENTRY"
+        assert exc_info.value.retryable is False
+        # Session still detached on the error path.
+        fake_session.detach.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_out_of_bounds_positive_raises_no_history_entry(self):
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.wait_for_load_state = AsyncMock()
+
+        fake_session = MagicMock()
+        history = {
+            "currentIndex": 1,
+            "entries": [{"id": 10}, {"id": 11}],
+        }
+        fake_session.send = AsyncMock(return_value=history)
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        with pytest.raises(StateError) as exc_info:
+            await browser._cdp_navigate_history(fake_page, delta=+1)
+
+        assert exc_info.value.code == "NO_HISTORY_ENTRY"
+
+    @pytest.mark.asyncio
+    async def test_load_state_timeout_is_swallowed(self):
+        """wait_for_load_state() may time out when the target already loaded
+        before we called it — not a real error.
+        """
+        browser = _make_cdp_borrowed_browser()
+        fake_page = MagicMock()
+        fake_page.wait_for_load_state = AsyncMock(side_effect=asyncio.TimeoutError())
+
+        fake_session = MagicMock()
+        history = {"currentIndex": 1, "entries": [{"id": 10}, {"id": 11}]}
+        fake_session.send = AsyncMock(return_value=history)
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        # Must not raise.
+        await browser._cdp_navigate_history(fake_page, delta=-1)
+
+
+class TestEvaluateJavascriptCDPReturnTypes:
+    """Tests for ``Browser.evaluate_javascript`` CDP return-value handling.
+
+    PR #21 introduced a raw ``Runtime.evaluate`` path in CDP borrowed mode.
+    Unlike Playwright's ``page.evaluate`` (rich serialiser), the raw CDP
+    call is strict JSON and loses non-JSON types. The follow-up fix in
+    PR #26 returns the CDP ``description`` string for those cases instead
+    of a misleading ``None``.
+    """
+
+    @pytest.mark.asyncio
+    async def _run(self, browser, cdp_result):
+        """Helper: invoke ``evaluate_javascript`` with a mocked CDP response."""
+        fake_page = MagicMock()
+        browser.get_current_page = AsyncMock(return_value=fake_page)
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(return_value={"result": cdp_result})
+        fake_session.detach = AsyncMock()
+        browser._context.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        return await browser.evaluate_javascript("() => document.title")
+
+    @pytest.mark.asyncio
+    async def test_cdp_plain_string_returned(self):
+        browser = _make_cdp_borrowed_browser()
+        result = await self._run(browser, {"type": "string", "value": "hello"})
+        assert result == "hello"
+
+    @pytest.mark.asyncio
+    async def test_cdp_number_formatted_as_str(self):
+        browser = _make_cdp_borrowed_browser()
+        result = await self._run(browser, {"type": "number", "value": 42})
+        assert result == "42"
+
+    @pytest.mark.asyncio
+    async def test_cdp_boolean_formatted_as_True_False(self):
+        browser = _make_cdp_borrowed_browser()
+        result_true = await self._run(browser, {"type": "boolean", "value": True})
+        assert result_true == "True"
+        result_false = await self._run(browser, {"type": "boolean", "value": False})
+        assert result_false == "False"
+
+    @pytest.mark.asyncio
+    async def test_cdp_null_value_returns_None_string(self):
+        browser = _make_cdp_borrowed_browser()
+        # CDP serialises null as {type: "object", subtype: "null", value: None}
+        result = await self._run(
+            browser, {"type": "object", "subtype": "null", "value": None}
+        )
+        assert result == "None"
+
+    @pytest.mark.asyncio
+    async def test_cdp_undefined_returns_None_string(self):
+        """``{type: 'undefined'}`` has no ``value`` → we coerce to None → 'None'."""
+        browser = _make_cdp_borrowed_browser()
+        result = await self._run(browser, {"type": "undefined"})
+        assert result == "None"
+
+    @pytest.mark.asyncio
+    async def test_cdp_non_serializable_falls_back_to_description(self):
+        """Date / RegExp / Map / Set / DOM node return no ``value``.
+
+        The PR #26 follow-up returns the CDP ``description`` string so the
+        caller gets something human-readable instead of a misleading ``None``.
+        """
+        browser = _make_cdp_borrowed_browser()
+        result = await self._run(
+            browser,
+            {"type": "object", "subtype": "date", "description": "Fri Jan 01 1970 00:00:00 GMT+0000"},
+        )
+        assert "Fri Jan 01 1970" in result
+
+    @pytest.mark.asyncio
+    async def test_cdp_non_serializable_without_description_uses_placeholder(self):
+        """Degenerate CDP response: type but no value AND no description."""
+        browser = _make_cdp_borrowed_browser()
+        result = await self._run(browser, {"type": "object"})
+        assert "<non-serializable" in result
+
+    @pytest.mark.asyncio
+    async def test_cdp_json_object_returns_str_repr(self):
+        """Plain JSON objects round-trip via ``returnByValue: True`` as dicts."""
+        browser = _make_cdp_borrowed_browser()
+        result = await self._run(
+            browser, {"type": "object", "value": {"a": 1, "b": [2, 3]}}
+        )
+        # The exact formatting is ``str(dict)``; what we care about is that
+        # the payload made it out intact.
+        assert "'a'" in result and "'b'" in result
+
+    @pytest.mark.asyncio
+    async def test_non_cdp_calls_page_evaluate_directly(self):
+        """Non-CDP mode: take the standard Playwright path, no CDP session."""
+        browser = Browser()  # _is_cdp_borrowed = False
+        fake_page = MagicMock()
+        fake_page.evaluate = AsyncMock(return_value="ok")
+        browser.get_current_page = AsyncMock(return_value=fake_page)
+
+        result = await browser.evaluate_javascript("() => 'ok'")
+
+        assert result == "ok"
+        fake_page.evaluate.assert_awaited_once_with("() => 'ok'")
+
+
+class TestCheckElementCoveredCDP:
+    """Tests for ``_check_element_covered`` CDP borrowed-mode geometric check.
+
+    Added in PR #26 to fix the "silent miss-click on element under a modal"
+    CDP-mode bug. The CDP path uses raw ``Runtime.evaluate`` instead of
+    ``locator.evaluate()`` (which hangs in borrowed mode).
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_cdp_path_uses_locator_evaluate(self):
+        """Non-CDP path: ``t === el && !el.contains(t)`` via main world."""
+        from bridgic.browser.session._locator_utils import _check_element_covered
+
+        locator = MagicMock()
+        locator.evaluate = AsyncMock(return_value=True)
+
+        result = await _check_element_covered(locator, 100, 200, cdp_context=None)
+
+        assert result is True
+        locator.evaluate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cdp_path_same_rect_reports_not_covered(self):
+        """Locator bbox matches hit rect (± 1 px) → not covered."""
+        from bridgic.browser.session._locator_utils import _check_element_covered
+
+        locator = MagicMock()
+        locator.bounding_box = AsyncMock(
+            return_value={"x": 100.0, "y": 200.0, "width": 50.0, "height": 30.0}
+        )
+        fake_page = MagicMock()
+        locator.page = fake_page
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(
+            return_value={"result": {"value": [100.0, 200.0, 50.0, 30.0]}}
+        )
+        fake_session.detach = AsyncMock()
+        cdp_ctx = MagicMock()
+        cdp_ctx.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        result = await _check_element_covered(locator, 125, 215, cdp_context=cdp_ctx)
+
+        assert result is False
+        fake_session.detach.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cdp_path_different_rect_reports_covered(self):
+        """Hit rect differs from locator bbox → something covers it."""
+        from bridgic.browser.session._locator_utils import _check_element_covered
+
+        locator = MagicMock()
+        locator.bounding_box = AsyncMock(
+            return_value={"x": 100.0, "y": 200.0, "width": 50.0, "height": 30.0}
+        )
+        locator.page = MagicMock()
+
+        fake_session = MagicMock()
+        # Hit element sits somewhere else entirely (modal overlay).
+        fake_session.send = AsyncMock(
+            return_value={"result": {"value": [10.0, 10.0, 800.0, 600.0]}}
+        )
+        fake_session.detach = AsyncMock()
+        cdp_ctx = MagicMock()
+        cdp_ctx.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        result = await _check_element_covered(locator, 125, 215, cdp_context=cdp_ctx)
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_cdp_path_sub_pixel_tolerance(self):
+        """±1 px tolerance absorbs DPR / rounding jitter."""
+        from bridgic.browser.session._locator_utils import _check_element_covered
+
+        locator = MagicMock()
+        locator.bounding_box = AsyncMock(
+            return_value={"x": 100.0, "y": 200.0, "width": 50.0, "height": 30.0}
+        )
+        locator.page = MagicMock()
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(
+            # 0.5 px drift on every side
+            return_value={"result": {"value": [100.5, 200.5, 50.5, 30.5]}}
+        )
+        fake_session.detach = AsyncMock()
+        cdp_ctx = MagicMock()
+        cdp_ctx.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        result = await _check_element_covered(locator, 125, 215, cdp_context=cdp_ctx)
+
+        assert result is False  # within tolerance → not covered
+
+    @pytest.mark.asyncio
+    async def test_cdp_path_missing_bbox_returns_not_covered(self):
+        """Element with no bbox → conservatively return not-covered."""
+        from bridgic.browser.session._locator_utils import _check_element_covered
+
+        locator = MagicMock()
+        locator.bounding_box = AsyncMock(return_value=None)
+        cdp_ctx = MagicMock()
+
+        result = await _check_element_covered(locator, 100, 200, cdp_context=cdp_ctx)
+
+        assert result is False
+        # No CDP session should have been opened when bbox is missing.
+        cdp_ctx.new_cdp_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cdp_path_hit_none_returns_not_covered(self):
+        """``elementFromPoint`` returning null → treat as not covered."""
+        from bridgic.browser.session._locator_utils import _check_element_covered
+
+        locator = MagicMock()
+        locator.bounding_box = AsyncMock(
+            return_value={"x": 100.0, "y": 200.0, "width": 50.0, "height": 30.0}
+        )
+        locator.page = MagicMock()
+
+        fake_session = MagicMock()
+        fake_session.send = AsyncMock(return_value={"result": {"value": None}})
+        fake_session.detach = AsyncMock()
+        cdp_ctx = MagicMock()
+        cdp_ctx.new_cdp_session = AsyncMock(return_value=fake_session)
+
+        result = await _check_element_covered(locator, 125, 215, cdp_context=cdp_ctx)
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_cdp_path_cdp_session_error_returns_not_covered(self):
+        """CDP session exception → swallow and return False (pre-PR #26 behaviour)."""
+        from bridgic.browser.session._locator_utils import _check_element_covered
+
+        locator = MagicMock()
+        locator.bounding_box = AsyncMock(
+            return_value={"x": 100.0, "y": 200.0, "width": 50.0, "height": 30.0}
+        )
+        locator.page = MagicMock()
+
+        cdp_ctx = MagicMock()
+        cdp_ctx.new_cdp_session = AsyncMock(side_effect=RuntimeError("CDP dead"))
+
+        result = await _check_element_covered(locator, 100, 200, cdp_context=cdp_ctx)
+
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Interaction tools — prefetch cancellation + actionability delegation
+# ---------------------------------------------------------------------------
+# Every click-like interaction must invoke ``_cancel_prefetch()`` at the top
+# of its body: a click can silently trigger navigation (<a href>, form submit,
+# SPA route) and any pre-warm snapshot started BEFORE the click is now stale.
+# Likewise every normal (non-covered, non-shadow-DOM) click path funnels
+# through ``_locator_action_with_fallback`` so the daemon-responsive 10 s
+# cap and the PR #26 enabled/visible fallback gate both apply.
+
+
+class TestInteractionToolsCancelPrefetch:
+    """Pin down that each interaction tool bumps ``_prefetch_gen`` on entry.
+
+    This is the contract that lets ``_pre_warm_snapshot`` reject a stale
+    commit when the action it was racing against has already happened.
+    """
+
+    def _make_browser(self) -> Browser:
+        b = Browser()
+        b._context = MagicMock()
+        b._page = MagicMock()
+        return b
+
+    @pytest.mark.asyncio
+    async def test_click_element_by_ref_cancels_prefetch_before_action(self):
+        """``click_element_by_ref`` must call ``_cancel_prefetch`` before any
+        other work (observed via ``_prefetch_gen`` bump when the element
+        lookup fails immediately).
+        """
+        browser = self._make_browser()
+        browser.get_element_by_ref = AsyncMock(return_value=None)  # trigger early return
+
+        gen_before = browser._prefetch_gen
+        with pytest.raises(StateError):
+            await browser.click_element_by_ref("nonexistent")
+
+        assert browser._prefetch_gen == gen_before + 1, (
+            "click must bump _prefetch_gen before raising REF_NOT_AVAILABLE"
+        )
+
+    @pytest.mark.asyncio
+    async def test_check_checkbox_or_radio_cancels_prefetch(self):
+        browser = self._make_browser()
+        browser.get_element_by_ref = AsyncMock(return_value=None)
+
+        gen_before = browser._prefetch_gen
+        with pytest.raises(StateError):
+            await browser.check_checkbox_or_radio_by_ref("x")
+
+        assert browser._prefetch_gen == gen_before + 1
+
+    @pytest.mark.asyncio
+    async def test_uncheck_checkbox_cancels_prefetch(self):
+        browser = self._make_browser()
+        browser.get_element_by_ref = AsyncMock(return_value=None)
+
+        gen_before = browser._prefetch_gen
+        with pytest.raises(StateError):
+            await browser.uncheck_checkbox_by_ref("x")
+
+        assert browser._prefetch_gen == gen_before + 1
+
+    @pytest.mark.asyncio
+    async def test_double_click_cancels_prefetch(self):
+        browser = self._make_browser()
+        browser.get_element_by_ref = AsyncMock(return_value=None)
+
+        gen_before = browser._prefetch_gen
+        with pytest.raises(StateError):
+            await browser.double_click_element_by_ref("x")
+
+        assert browser._prefetch_gen == gen_before + 1
+
+    @pytest.mark.asyncio
+    async def test_select_dropdown_option_cancels_prefetch(self):
+        browser = self._make_browser()
+        browser.get_element_by_ref = AsyncMock(return_value=None)
+
+        gen_before = browser._prefetch_gen
+        with pytest.raises(StateError):
+            await browser.select_dropdown_option_by_ref("x", "option1")
+
+        assert browser._prefetch_gen == gen_before + 1
+
+
+class TestClickIntegrationUsesFallbackGate:
+    """End-to-end-style verification that a visible+enabled element with a
+    stable-check timeout still succeeds (via fallback), while a visible but
+    *disabled* element raises — exercising the PR #26 gating logic through
+    ``click_element_by_ref``.
+    """
+
+    def _make_browser(self) -> Browser:
+        b = Browser()
+        b._context = MagicMock()
+        b._page = MagicMock()
+        return b
+
+    @pytest.mark.asyncio
+    async def test_click_on_stable_flap_element_succeeds_via_fallback(self):
+        """Element is visible+enabled but Playwright's stable check flaps →
+        fallback dispatches the click and the call returns 'Clicked ...'.
+        """
+        browser = self._make_browser()
+
+        locator = MagicMock()
+        locator.bounding_box = AsyncMock(return_value=None)  # force the "no bbox" branch
+        locator.is_visible = AsyncMock(return_value=True)
+        locator.is_enabled = AsyncMock(return_value=True)
+        # Primary click times out — Vue/React SPA stable-check loop.
+        locator.click = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("timeout")
+        )
+        locator.dispatch_event = AsyncMock()
+
+        browser.get_element_by_ref = AsyncMock(return_value=locator)
+
+        result = await browser.click_element_by_ref("ref1")
+
+        assert "Clicked" in result
+        # Fallback dispatch actually fired (visible + enabled = eligible).
+        locator.dispatch_event.assert_awaited_once_with(
+            "click", timeout=_bridgic_timeouts.FALLBACK_DISPATCH_TIMEOUT_MS
+        )
+
+    @pytest.mark.asyncio
+    async def test_click_on_aria_disabled_element_raises(self):
+        """Visible but aria-disabled button → fallback gate rejects → user sees
+        a real TIMEOUT error (wrapped as OperationError via the tool's outer
+        except clause), never a misleading silent 'Clicked'.
+        """
+        browser = self._make_browser()
+
+        locator = MagicMock()
+        locator.bounding_box = AsyncMock(return_value=None)
+        locator.is_visible = AsyncMock(return_value=True)
+        locator.is_enabled = AsyncMock(return_value=False)  # aria-disabled
+        locator.click = AsyncMock(
+            side_effect=_browser_module.PlaywrightTimeoutError("timeout")
+        )
+        locator.dispatch_event = AsyncMock()
+
+        browser.get_element_by_ref = AsyncMock(return_value=locator)
+
+        with pytest.raises((_browser_module.PlaywrightTimeoutError, OperationError)):
+            await browser.click_element_by_ref("ref1")
+
+        # Crucially: dispatch_event was NEVER called — the gate rejected it.
+        locator.dispatch_event.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# _wrap_js_for_cdp_eval — parity with Playwright page.evaluate(str)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "Each parametrized case spawns node.exe; on Windows GitHub Actions "
+        "runners Defender real-time scan + spawn queueing make this "
+        "consistently flaky (10s → 30s budget still hit hard timeouts on "
+        "multiple cases). The wrapper under test (`_wrap_js_for_cdp_eval`) "
+        "is pure platform-independent Python string composition — coverage "
+        "on macOS/Linux CI is sufficient. JS semantic parity is "
+        "independently verified end-to-end against real Chrome in "
+        "tests/integration/test_evaluate_cdp_parity.py."
+    ),
+)
+class TestWrapJsForCdpEval:
+    """The CDP-path wrapper must accept every input form ``page.evaluate(str)``
+    accepts, and produce the same value Playwright's non-CDP path produces.
+
+    Reproduces the historical bug: an IIFE ``(() => {...})()`` was naively
+    re-wrapped to ``((() => {...})();)()`` (a ``SyntaxError``), so user code
+    that worked in non-CDP mode silently broke under ``cdp="auto"``. Verifying
+    semantic parity here keeps that regression dead.
+    """
+
+    # The behaviour contract: for every input, wrapper(code) evaluated under
+    # raw Runtime.evaluate must produce the SAME value (or throw the same
+    # kind of error) as Playwright's page.evaluate(code). Each row is
+    # (case_name, user_code, expected_value_or_ThrowSentinel). THROW means
+    # both Playwright and our wrapper must reject; the value comparison is
+    # skipped in that case (only the exception path is verified).
+    #
+    # Note: these cases cover JavaScript-language semantics (V8-side).
+    # Browser host-object substitution (Window/Document/Node/Error) and
+    # the auto-call argument convention are verified end-to-end in
+    # tests/integration/test_evaluate_cdp_parity.py against real Chrome.
+    THROW = object()
+    _CASES = [
+        ("spread args (1 arg)",   "(...a) => a.length",                                                    1),  # wrapper auto-passes 1 undefined arg, matching Playwright
+        ("plain expr",            "document ? 42 : 0",                                                      42),
+        ("number literal",        "42",                                                                     42),
+        ("bare arrow fn",         "() => 42",                                                               42),
+        ("bare arrow body",       "() => { return { a: 1 } }",                                              {"a": 1}),
+        ("IIFE with ;",           '(() => { return JSON.stringify({a:1,b:"x"}) })();',                      '{"a":1,"b":"x"}'),
+        ("IIFE no ;",             '(() => { return JSON.stringify({a:1,b:"x"}) })()',                       '{"a":1,"b":"x"}'),
+        ("named fn expr",         "function() { return [1,2,3].length }",                                   3),
+        ("named function decl",   "function foo() { return 9 }; foo()",                                     THROW),  # PW SyntaxError; we must match
+        ("class decl + stmt",     "class C { get v() { return 1 } }; new C().v",                            1),
+        ("bare object literal",   "{a:1, b:2}",                                                             THROW),  # block-label ambiguity, PW rejects
+        ("paren obj literal",     "({a:1, b:2})",                                                           {"a": 1, "b": 2}),
+        ("let stmt list",         "let x = 5; x * 2",                                                       10),
+        ("two exprs",             "1+1; 2+2",                                                               4),
+        ("label block",           "lbl: { break lbl; }",                                                    None),
+        ("comment + expr",        "() => 42 // ok",                                                         42),
+        ("async arrow",           "async () => 7",                                                          7),
+        ("async IIFE w/ await",   "(async () => { return await Promise.resolve(33) })()",                   33),
+        ("this in page",          "this",                                                                   "ref: <Window>"),  # PW serializes Window to this
+        ("document.title",        "document.title",                                                         "hi"),
+        ("shorthand obj",         "const k = 7; ({k})",                                                     {"k": 7}),
+        ("array destructuring",   "const [a,b]=[1,2]; a+b",                                                 3),
+        ("rejected promise",      'Promise.reject(new Error("boom"))',                                      THROW),
+        ("regex literal",         "/abc/g.flags",                                                           "g"),
+        ("template literal",      "`a${1+1}b`",                                                             "a2b"),
+        ("spread",                "[...[1,2,3]]",                                                           [1, 2, 3]),
+        ("null literal",          "null",                                                                   None),
+        ("undefined literal",     "undefined",                                                              None),
+        ("throw expr",            'throw new Error("hi")',                                                  THROW),
+    ]
+
+    @pytest.mark.parametrize("name,src,expected", _CASES, ids=[c[0] for c in _CASES])
+    def test_wrapper_parity_with_playwright(self, name, src, expected):
+        """For every JS input form, the wrapped expression under V8 must
+        produce the same value (or matching throw) as Playwright's
+        ``page.evaluate(str)`` — verified by running through Node, whose V8
+        is the same engine driving Chromium ``Runtime.evaluate``.
+
+        This is the regression guard for the bug where users had to rewrite
+        IIFEs differently for CDP vs non-CDP modes."""
+        import json as _json
+        import shutil
+        import subprocess
+
+        wrapped = _browser_module._wrap_js_for_cdp_eval(src)
+        # User code must only be embedded as a JSON string literal, never
+        # spliced raw into the JS surface (XSS-style injection guard).
+        assert _json.dumps(src) in wrapped
+
+        node = shutil.which("node")
+        if node is None:
+            pytest.skip("node not installed; semantic check covered in integration tests")
+
+        # We host the wrapper inside a minimal page-like sandbox: set up
+        # `document.title = "hi"` so the `document.title` case has a concrete
+        # value, and use Window-stand-in serialization for `this`. Errors are
+        # serialized as `THROW:<msg>` so the harness can compare.
+        probe = (
+            "globalThis.document = { title: 'hi' };"
+            "globalThis.window = globalThis;"  # so `this` at top level resolves to window-like
+            f"const wrapped = {_json.dumps(wrapped)};"
+            "(async () => {"
+            "  try {"
+            "    let v = (0, eval)(wrapped);"
+            "    if (v && typeof v.then === 'function') v = await v;"
+            "    if (v === globalThis) v = 'ref: <Window>';"
+            "    console.log(JSON.stringify({ok: true, v: v === undefined ? null : v}));"
+            "  } catch (e) {"
+            "    console.log(JSON.stringify({ok: false, e: e.message}));"
+            "  }"
+            "})();"
+        )
+        result = subprocess.run([node, "-e", probe], capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, f"wrapper crashed node for {name}: {result.stderr}"
+        outcome = _json.loads(result.stdout.strip())
+
+        if expected is self.THROW:
+            assert outcome["ok"] is False, f"{name}: expected throw, got value {outcome.get('v')!r}"
+        else:
+            assert outcome["ok"] is True, f"{name}: unexpected throw {outcome.get('e')!r}"
+            assert outcome["v"] == expected, f"{name}: got {outcome['v']!r}, expected {expected!r}"
+
+    def test_pathological_user_code_does_not_break_wrapper(self):
+        """User code containing quotes, backslashes, ``)`` and ``=>`` must not
+        break the wrapper's JSON-embedded slot (injection guard)."""
+        pathological = r'"a => b\nx" /* )()=> */ + ` ${1+1} `'
+        wrapped = _browser_module._wrap_js_for_cdp_eval(pathological)
+        import json as _json
+        assert _json.dumps(pathological) in wrapped

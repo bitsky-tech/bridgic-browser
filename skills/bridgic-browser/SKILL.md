@@ -32,6 +32,7 @@ Notes:
 - If login, verification, or authorization is required during exploration, pause and ask the user to complete it manually, unless the user explicitly provides instructions in the task.
 - To avoid operating on websites too frequently, maintain human-like access intervals during both exploration and coding. You may simulate random wait times to reduce the risk of being blocked. Note: the `bridgic-browser wait` command parameter is in **seconds**, not milliseconds; for example, `bridgic-browser wait 2` or `bridgic-browser wait 3.2`.
 - After finishing exploration and code writing, automatically run testing/validation.
+- **CDP mode tab visibility**: when attached via `--cdp` to a user's running Chrome, `tabs` / `switch-tab` / `close-tab` only see pages bridgic itself opened (the initial blank tab plus anything spawned from it via `new-tab` or a click on a `target="_blank"` link). The user's other tabs are deliberately invisible to bridgic — never assume you can `switch-tab` into them. To work with such a tab, ask the user to navigate to it through bridgic, or use `new-tab <url>`.
 
 ## Reference Files
 
@@ -45,6 +46,7 @@ Reference files cover all use cases. Load only the one(s) relevant to the task:
 | Explore via CLI, then generate Python code | CLI → Python | [cli-sdk-api-mapping.md](references/cli-sdk-api-mapping.md) + [sdk-guide.md](references/sdk-guide.md) |
 | Migrate / compare / explain CLI ↔ SDK | Both | [cli-sdk-api-mapping.md](references/cli-sdk-api-mapping.md) |
 | Configure env vars or login state persistence | Either | [env-vars.md](references/env-vars.md) |
+| Connect to an existing Chrome (chrome://inspect, `--remote-debugging-port`, cloud browser, Electron) | CLI / SDK | [cdp-mode.md](references/cdp-mode.md) |
 
 ## Interface Decision Rules
 
@@ -57,8 +59,8 @@ Reference files cover all use cases. Load only the one(s) relevant to the task:
 
 - Ref-based actions depend on the latest snapshot.
 - After navigation or major DOM updates, refs can become stale; refresh snapshot before ref actions.
-- CLI keeps state in a daemon session across invocations.
-- SDK keeps state in the Python process/context. By default, browser profile (cookies, session) is persisted to `~/.bridgic/bridgic-browser/user_data/`; pass `clear_user_data=True` to `Browser()` for an ephemeral session.
+- CLI keeps state in a daemon session across invocations. Set `BRIDGIC_HOME` env var to run multiple independent daemon instances (each with its own socket, logs, and user data).
+- SDK keeps state in the Python process/context. By default, browser profile (cookies, session) is persisted to `$BRIDGIC_HOME/bridgic-browser/user_data/` (default `~/.bridgic/...`); pass `clear_user_data=True` to `Browser()` for an ephemeral session.
 - Use exact command/method names from references; do not invent aliases.
 
 ## Bridge Workflow: CLI Actions -> Python Code

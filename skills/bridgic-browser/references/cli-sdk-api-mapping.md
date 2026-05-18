@@ -26,8 +26,8 @@ CLI commands and SDK tool methods are **intentionally aligned**:
 - This means CLI behavior and SDK tool-method behavior are equivalent by design. Understanding one side gives you the other.
 
 State model difference:
-- **CLI**: browser state lives in the daemon process, persists across multiple short-lived CLI invocations, resets on `close`. Browser profile is saved to `~/.bridgic/bridgic-browser/user_data/` by default; use `--clear-user-data` on `open`/`search` to start with no profile.
-- **SDK**: browser state lives in the Python process, scoped to the `Browser` object lifetime (`async with Browser(...) as browser:`). Profile is also persisted by default; use `Browser(clear_user_data=True)` for an ephemeral session.
+- **CLI**: browser state lives in the daemon process, persists across multiple short-lived CLI invocations, resets on `close`. Browser profile is saved to `$BRIDGIC_HOME/bridgic-browser/user_data/` by default; use `--clear-user-data` on `open`/`search` to start with no profile. Set `BRIDGIC_HOME` to run multiple independent instances.
+- **SDK**: browser state lives in the Python process, scoped to the `Browser` object lifetime (`async with Browser(...) as browser:`). Profile is also persisted by default; use `Browser(clear_user_data=True)` for an ephemeral session. For multi-instance isolation, use `Browser(user_data_dir=...)` per instance; for full process-level isolation set `BRIDGIC_HOME` env var before spawning a subprocess.
 
 This model is the foundation of all correspondence in this guide.
 
@@ -195,7 +195,7 @@ These CLI behaviors have no direct SDK equivalent or work differently:
 | `scroll` argument style | `--dy`/`--dx` flag options (not positional) to allow negative values | `mouse_wheel(delta_x=X, delta_y=Y)` keyword args |
 | `fill-form` input format | JSON string on command line | Python list of dicts |
 | `take_screenshot` return value | CLI always writes to a file path | SDK: `filename=None` returns base64 data URL; `filename="path.png"` writes file |
-| Video file write timing | `video-stop` registers path; file is written when daemon/browser closes | Same for SDK: `.webm` is written when page closes via `close()` or `close_tab()` |
+| Video file write timing | `video-stop` stops the recorder and saves the `.webm` file immediately | Same for SDK: `stop_video()` saves the file immediately — no page close needed |
 
 ## Practical Rule for Mixed Tasks
 

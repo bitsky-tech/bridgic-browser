@@ -36,6 +36,13 @@ make publish version=0.1.0 repo=testpypi      # Full release: version check → 
 make playwright-install
 ```
 
+**Mode matrix QA** (real-browser coverage across all link modes × display modes):
+```bash
+bash scripts/qa/run-mode-matrix.sh                            # full V1..V7 matrix
+BRIDGIC_QA_VARIANTS="V1" bash scripts/qa/run-mode-matrix.sh   # single-variant regression
+```
+Report: `$QA_DIR/mode-matrix/mode-matrix-report.md`. Per-variant semantics and expected N/A in `scripts/qa/mode-matrix-scenarios.md`.
+
 ## Architecture
 
 ### Package structure
@@ -44,26 +51,37 @@ make playwright-install
 bridgic/browser/
 ├── __main__.py       # Entry point: routes `daemon` subcommand vs CLI
 ├── _config.py        # Config file loading (shared by SDK + CLI daemon)
+├── _cli_catalog.py   # CLI_COMMAND_TO_TOOL_METHOD + CLI_HELP_SECTION_SPECS (SSoT for command/category mapping)
+├── _constants.py     # ToolCategory enum + path constants (BRIDGIC_BROWSER_HOME, etc.)
+├── _timeouts.py      # Shared timeout budgets + env-var-overridable knobs
+├── _redact.py        # Log redaction helpers
+├── errors.py         # Public BridgicBrowserError hierarchy
 ├── session/          # Core browser session
-│   ├── _browser.py       # Browser class – main entry point
-│   ├── _snapshot.py      # SnapshotGenerator + EnhancedSnapshot + RefData
-│   ├── _stealth.py       # StealthConfig + StealthArgsBuilder (50+ Chrome args)
-│   ├── _download.py      # DownloadManager
-│   └── _browser_model.py # Data models
+│   ├── _browser.py        # Browser class – main entry point (all 67 tool methods live here)
+│   ├── _browser_model.py  # Data models
+│   ├── _snapshot.py       # SnapshotGenerator + EnhancedSnapshot + RefData
+│   ├── _stealth.py        # StealthConfig + StealthArgsBuilder (50+ Chrome args)
+│   ├── _download.py       # DownloadManager
+│   ├── _video_recorder.py # VideoRecorder (CDP screencast → ffmpeg)
+│   ├── _cdp_discovery.py  # find_cdp_url + resolve_cdp_input (port / file / scan / service modes)
+│   ├── _launch.py         # launch-mode helpers (retriable_launch, etc.)
+│   ├── _locator_utils.py  # _click_checkable_target and other locator helpers
+│   └── _errors.py         # session-internal error types
 ├── tools/            # 67 automation tools (all implemented in _browser.py)
 │   ├── _browser_tool_set_builder.py  # BrowserToolSetBuilder (category/name selection)
 │   └── _browser_tool_spec.py         # BrowserToolSpec (wraps tool for agents)
 └── cli/              # CLI tool (bridgic-browser command)
-    ├── __init__.py       # Exports main()
-    ├── _commands.py      # Click command definitions (68 commands incl. utility metadata command, SectionedGroup)
-    ├── _client.py        # Socket client: send_command(), ensure_daemon_running()
-    └── _daemon.py        # Daemon: asyncio Unix socket server + Browser instance
+    ├── __init__.py    # Exports main()
+    ├── _commands.py   # Click command definitions (67 commands, SectionedGroup)
+    ├── _client.py     # Socket client: send_command(), ensure_daemon_running()
+    ├── _daemon.py     # Daemon: asyncio Unix socket server + Browser instance
+    └── _transport.py  # Unix-socket transport layer (used by client and daemon)
 ```
 
 ### Core data flow
 
 1. **`Browser`** (`session/_browser.py`) — instantiate; browser starts lazily on first `navigate_to` / `search`, or explicitly via `async with Browser(...) as b:` (calls `_start()`). `Browser()` **automatically loads config** from `~/.bridgic/bridgic-browser/bridgic-browser.json` → `./bridgic-browser.json` → `BRIDGIC_BROWSER_JSON` env var (via `_config.py:_load_config_sources()`). Explicit constructor params override config values; `headless` and `stealth` default to `None` (resolved to `True` if no config present). Auto-selects:
-   - Persistent mode (default, `clear_user_data=False`): `launch_persistent_context(user_data_dir)` — uses provided `user_data_dir`, or `~/.bridgic/bridgic-browser/user_data/` by default
+   - Persistent mode (default, `clear_user_data=False`): `launch_persistent_context(user_data_dir)` — uses provided `user_data_dir`, or `~/.bridgic/bridgic-browser/user_data/` by default. Actual profile is always placed under a mode-specific subdir (`<base>/headed` or `<base>/headless`) so headed/headless Chromium can't collide on `SingletonLock`. The public `Browser.user_data_dir` property still returns the base path the user supplied.
    - Ephemeral mode (`clear_user_data=True`): `launch()` + `new_context()` — no profile, `user_data_dir` ignored
 
 2. **`await browser.get_snapshot()`** → returns `EnhancedSnapshot`:
@@ -74,30 +92,88 @@ bridgic/browser/
 
 4. **Tools** are bound async methods on the `Browser` class. Pass them to an LLM agent via `BrowserToolSetBuilder`.
 
-### Element reference system
+### Owned-page tracking
 
-Refs (like `1f79fe5e`, `8d4b03a9`, …) are generated during snapshot and stored in `EnhancedSnapshot.refs`. They are the stable, accessibility-aware identifiers used by all `*_by_ref` tools. When a page changes, call `get_snapshot()` again to refresh refs.
+`Browser` maintains an internal `_owned_pages` set + `_focus_stack` so all public tab operations (`get_pages` / `get_tabs` / `switch_tab` / `close_tab`) only see pages bridgic created or adopted. In **CDP borrowed mode** (`connect_over_cdp` against a user's running Chrome) pre-existing user tabs stay invisible to bridgic; in **non-CDP modes** every page in the context is seeded as owned at start, so the filter degenerates to identity and behaviour matches pre-refactor semantics.
+
+- **Adoption**: `context.on("page")` listener calls `_maybe_adopt_page` → adopts iff `await page.opener()` is already owned. Pages bridgic creates via `_new_page()` are owned unconditionally. *Whether `opener()` returns a parent depends on Chromium's navigation disposition, not on who clicked: foreground-tab navigations (programmatic click, user plain left-click, `window.open()` with user gesture) preserve `openerId`; background-tab navigations (Cmd/Ctrl+click, middle-click, Cmd+T, address bar) clear it at the browser-process level. `rel="noopener"` only suppresses JS-level `window.opener` and does NOT prevent adoption. bridgic itself can bypass adoption by holding `Meta` via `key-down` before click (CDP `Input.dispatchMouseEvent.modifiers` propagates the held key) — role-agnostic, behavior-driven. Full matrix in [`docs/INTERNALS.md#adoption-truth-table-cdp-borrowed-mode`](docs/INTERNALS.md#adoption-truth-table-cdp-borrowed-mode).*
+- **Popup follow**: when `auto_follow_popups=True` (default) and the popup's opener is `self._page`, `self._page` moves to the popup (mirrors Chrome's "new tab takes foreground" UX). Disable by passing `auto_follow_popups=False` to the constructor or via the same key in the config file.
+- **Close fallback**: `_close_page` resolves a successor via `_select_fallback_page` in four tiers — `closed_page.opener()` → `_focus_stack` top — `get_pages()[0]` → `None`. `closed_page.opener()` is queried *before* `page.close()` is awaited so the opener relationship is still resolvable.
+
+See [`docs/INTERNALS.md` — Owned-page Tracking](docs/INTERNALS.md#owned-page-tracking) for the full design and tradeoffs.
+
+### Downloads
+
+bridgic has two independent download pipelines, picked by mode:
+
+| Mode | Pipeline | Notes |
+|---|---|---|
+| non-CDP (launch / persistent_context) | Playwright's per-context `setDownloadBehavior(allowAndName, downloadPath=<artifactsDir>)` → `download` events fire → `DownloadManager.save_as()` copies to `downloads_path` with the real filename. | Files land at the real filename in `downloads_path`. If `downloads_path` is unset, DownloadManager is not attached and files are lost when Playwright deletes `artifactsDir` on close. |
+| CDP-owned (bridgic creates its own context on the remote Chrome) | Same as non-CDP: Playwright's per-context `allowAndName` routes through `artifactsDir`, DownloadManager copies. | Per-context override targets bridgic's own context, doesn't touch the user. |
+| **CDP-borrowed** (`Browser(cdp=...)` against a user's running Chrome) | bridgic's own override on bridgic's tab: `Browser.setDownloadBehavior(allowAndName, downloadPath=<effective>, eventsEnabled=true)` sent **via the page CDP session** (`BrowserContext.new_cdp_session(self._page)`). `CdpDownloadRenamer` subscribes to `Browser.downloadWillBegin/downloadProgress` on the same session and renames `<dir>/<guid>` → `<dir>/<real name>` on completion. | Page-session routing is the *only* form Chrome 138+ honors when the user has "Ask where to save each file" enabled — `Browser.setDownloadBehavior` over a browser-level session and `Page.setDownloadBehavior(allow, ...)` both still pop the dialog. See [empirically-tried alternatives](#empirically-tried-alternatives-for-cdp-borrowed-downloads) below. |
+
+#### Effective download path
+
+`Browser._effective_cdp_downloads_path(client_cwd=None)` resolves the path in CDP-borrowed mode:
+
+1. Explicit `Browser(downloads_path=...)` constructor arg or `bridgic-browser.json` config — always wins.
+2. `client_cwd` (per-command) or `self._pending_client_cwd` (set by the daemon before `_start()`). The CLI client puts `os.getcwd()` in every socket request; the daemon sets the hint pre-dispatch so the first lazy-start L1 sees it too. Gives `bridgic-browser` `curl -O`-style ergonomics — files land where the user ran the command.
+3. `~/Downloads` fallback.
+
+In non-CDP / CDP-owned modes the path is `self._downloads_path` only (CWD plumbing doesn't apply because DownloadManager is the pipeline). The CLI daemon **skips** its auto-default `downloads_path=~/Downloads` when `BRIDGIC_CDP` is set — otherwise that default would be indistinguishable from a user-explicit value and silently win over the CWD priority above.
+
+#### CDP-borrowed flow detail
+
+**L1 (post-connect, `_set_cdp_download_behavior` with `session=<page CDP session>`)**: after creating bridgic's tab, send `Browser.setDownloadBehavior(allowAndName, downloadPath=<effective>, eventsEnabled=true)` via `self._cdp_download_session = await self._context.new_cdp_session(self._page)`. Same session attaches `CdpDownloadRenamer`. Only runs in CDP-borrowed mode (`not self._cdp_context_owned`).
+
+**Per-command `cwd-update` (`update_cdp_downloads_path`)**: re-sends the same command (still via the page session) when the daemon's `client_cwd` resolves to a different effective path than `self._current_cdp_download_path`. Short-circuits when path is unchanged or in non-borrowed modes. The renamer's default target is updated for *future* downloads — in-flight downloads keep the dir captured at their `downloadWillBegin` time.
+
+**L2 rescue (pre-close, `_rescue_cdp_orphan_downloads`)**: scans every `playwright-artifacts-*` under the OS tempdir and moves orphan files to `~/Downloads/bridgic-rescue-<name>` before `browser.close()` triggers Playwright's `removeFolders([artifactsDir])`. The defense covers downloads from the user's other tabs that Playwright captured into its tempdir (per-context override on the borrowed default context still routes there); skips trace/video/HAR artifacts and files DownloadManager already saved. Mostly a no-op now that bridgic's own tab uses page-session routing, but kept as defense in depth.
+
+**L3 (pre-close)**: send `Browser.setDownloadBehavior(behavior="default")` over the page session, then detach renamer + session. Chrome reverts to its native prefs for any post-disconnect downloads on the user's tabs.
+
+#### Filename preservation (CdpDownloadRenamer)
+
+`allowAndName` writes files as `<downloadPath>/<guid>` (e.g. `08d0c134-9231-478e-aca1-08b3e0ec1798`). `_cdp_download_renamer.py:CdpDownloadRenamer`:
+
+1. On `Browser.downloadWillBegin`, records `{guid → (sanitized suggestedFilename, target_dir)}` — target dir snapshotted so a concurrent CWD swap doesn't retarget files mid-flight.
+2. On `Browser.downloadProgress.state="completed"`, renames `<target_dir>/<guid>` → `<target_dir>/<real name>`. Conflicts resolve to `name (1).ext`, `name (2).ext` (Chrome's scheme).
+3. On `state="canceled"`, removes the GUID stub.
+
+`sanitize_filename()` strips path separators, Windows-forbidden chars (`< > : " | ? *`), control bytes, and truncates to 255 bytes while preserving the extension. Empty result → `"download"`.
+
+#### Empirically-tried alternatives for CDP-borrowed downloads
+
+Verified against Chrome 138, macOS, with "Ask where to save each file" preference **on** (the default in many regions):
+
+| Attempt | Result | Verdict |
+|---|---|---|
+| `Page.setDownloadBehavior(allow, downloadPath=...)` | Dialog still pops. | ❌ |
+| `Browser.setDownloadBehavior(allow, downloadPath=...)` via browser CDP session | Dialog still pops; CDP accepts but Chrome honors user pref. | ❌ |
+| `Browser.setDownloadBehavior(allowAndName, downloadPath=...)` via browser CDP session | Dialog still pops. | ❌ |
+| `Browser.setDownloadBehavior(allowAndName, downloadPath=..., browserContextId=<defaultBrowserContextId from Target.getBrowserContexts>)` | Chrome rejects: `Failed to find browser context for id <X>`. (Playwright's own call uses `browserContextId=undefined` — see `crBrowser.js:89 new CRBrowserContext(browser, void 0, ...)`.) | ❌ |
+| `Browser.setDownloadBehavior(allowAndName, downloadPath=..., eventsEnabled=true)` via **page** CDP session (`ctx.new_cdp_session(page)`) | Silent download, real filename via post-completion rename, `downloadWillBegin/Progress` events fire on the same session. | ✅ chosen |
+
+agent-browser's `Some(session_id)` argument is the same trick — page-level CDP routing.
+
+#### Caveats
+
+- **bridgic's tab gets the override; user's tabs keep their normal Chrome UX** (intentional — the page-session scope is bridgic's tab only). User-initiated downloads in their other tabs still go to their Chrome's configured directory and obey their "Ask where to save" pref. This is by design and matches the "I gave you full control of *my agent's* tab via `--cdp`" semantics — user's private workspace is untouched.
+- **DownloadManager is not attached in CDP-borrowed mode.** Chrome writes directly to the final path; Playwright's per-context `download` event doesn't fire when the file is routed away from `artifactsDir`. `wait_for_download()` is correspondingly **unsupported in CDP-borrowed mode** — use CDP-owned or non-CDP for that.
+- **The renamer is best-effort.** If a CDP event is missed or the OS rename fails (cross-FS, permission, etc.) the file stays at its GUID path with a warning logged. It never deletes content.
+- **`last_close_artifacts()`** exposes a `rescued_downloads` list when L2 actually moved anything.
+- **"Show in Folder"** in Chrome's download bubble is broken whenever `setDownloadBehavior(allowAndName, eventsEnabled=true)` is active. This is a Chromium bug (`#324282051`) affecting all CDP-using tools. See [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md).
 
 ### Tool selection
 
-`BrowserToolSetBuilder` supports multiple selection strategies:
+`BrowserToolSetBuilder` selects tools by category or name (combinable):
 
 ```python
-# By category
 builder = BrowserToolSetBuilder.for_categories(browser, "navigation", "element_interaction")
 tools = builder.build()["tool_specs"]
-
-# By tool name
-builder = BrowserToolSetBuilder.for_tool_names(
-    browser, "click_element_by_ref", "input_text_by_ref"
-)
-tools = builder.build()["tool_specs"]
-
-# Combine multiple for_* selections
-builder1 = BrowserToolSetBuilder.for_categories(browser, "navigation", "element_interaction", "capture")
-builder2 = BrowserToolSetBuilder.for_tool_names(browser, "verify_url")
-tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 ```
+
+Also available: `for_tool_names(browser, "click_element_by_ref", ...)` and combining multiple builders. See `docs/BROWSER_TOOLS_GUIDE.md` for full examples.
 
 ### Snapshot modes
 
@@ -110,67 +186,37 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 
 `StealthConfig` (default enabled) applies Chrome arguments and a JS init script to evade bot detection. The strategy is **mode-aware**: headless mode uses a full 50+ flag set; headed mode uses a minimal ~11 flag set to match real Chrome user behavior.
 
-Key options:
-- `use_new_headless=True` (default) — use full Chromium binary with `--headless=new` instead of headless-shell (see below)
-- `docker_mode=True` for container environments
+Key decisions and constraints:
+- **New headless redirect** (`use_new_headless=True`, default): bridgic passes `headless=False` to Playwright (selecting the full Chromium binary) and manually adds `--headless=new` + scrollbar/audio/blink flags. `Browser._headless` = user's intent; `options["headless"]` = binary selection.
+- **Headed mode auto-switches to system Chrome**: Playwright's bundled "Chrome for Testing" is blocked by Google OAuth. When stealth is enabled in headed mode and system Chrome is detected, bridgic sets `channel="chrome"` automatically. `--test-type=` suppresses the "unsupported flag" warning banner.
+- **JS init script is headless-only**: skipped in headed mode because `add_init_script()` runs in ALL frames including Cloudflare Turnstile's challenge iframe — patching `window.chrome`/`navigator.permissions.query`/WebGL inside it causes detectable inconsistencies that fail the challenge.
+- **Anti-toString (`_mkNative`)**: all patched functions return `"function name() { [native code] }"` via intercepted `Function.prototype.toString` to defeat DataDome/PerimeterX/Cloudflare `.toString()` probing.
 
-**New headless mode (`use_new_headless=True`, default)**:
-When `headless=True` (default) and stealth is enabled, bridgic redirects Playwright to the full Chromium binary to avoid headless-shell's detectable fingerprint differences:
+#### Iframe-safety rule (CRITICAL)
 
-```
-self._headless=True (user intent)  →  Playwright receives headless=False  →  full Chromium binary
-                                       build_args() adds --headless=new    →  no visible window
-```
+> **Any patch that can propagate into a cross-origin iframe MUST be gated to `self._headless`.**
 
-Key distinction:
-- `Browser._headless` — **user's intent** (hide the window?)
-- `options["headless"]` passed to Playwright — **binary selection** (which binary to pick?)
+The Cloudflare Turnstile / hCaptcha challenge runs inside a cross-origin iframe (`challenges.cloudflare.com`). When a patch leaks into that iframe, the challenge worker sees navigator/Worker/UA values that don't match Cloudflare's edge-server expectation → instant bot signal → challenge fails silently.
 
-`StealthArgsBuilder.build_args(headless_intent=True, locale=None)`:
-- `headless_intent=True` (default, headless mode): uses `CHROME_STEALTH_ARGS` (50+ flags) + `CHROME_DISABLED_COMPONENTS` (28 features). Injects `--headless=new`, `--hide-scrollbars`, `--mute-audio`, and `--blink-settings=...` explicitly (Playwright normally adds these when `headless=True`, but since we pass `headless=False`, we add them manually).
-- `headless_intent=False` (headed mode): uses `CHROME_STEALTH_ARGS_HEADED` (~11 flags) + `CHROME_DISABLED_COMPONENTS_HEADED` (3 features). Uses `--lang={locale}` (not hardcoded `en-US`). Never adds `--headless=new`. Goal: fingerprint indistinguishable from a real Chrome user — excessive disable-* flags in headed mode create a detectable anomaly and can break Cloudflare Turnstile's AJAX challenge requests.
+The currently gated mechanisms are:
 
-This redirect is skipped when:
-- `StealthConfig.use_new_headless=False` (opt-out to restore old headless-shell)
-- System Chrome is used (`channel` or `executable_path` set) — system Chrome manages its own binary
+| Mechanism | Headless | Headed | Why |
+|---|---|---|---|
+| Main `_STEALTH_INIT_SCRIPT_TEMPLATE` (webdriver, plugins, chrome obj, WebGL, …) | ✅ injected | ❌ skipped | `add_init_script` runs in all frames |
+| **R1 — Context `user_agent` fallback + CDP `Emulation.setUserAgentOverride`** | ✅ active | ❌ skipped | CDP UA override propagates to all frames in the target |
+| **R3 — `page.on('worker')` worker stealth injection** | ✅ active | ❌ skipped | `page.workers` includes workers spawned by cross-origin iframes |
+| Anti-devtools-detector script | ✅ injected | ✅ injected (with `if (window !== window.top) return;` guard inside) | Self-gates to top frame |
+| **R3 — `Worker` / `SharedWorker` / `serviceWorker.register` constructor wrap** (in main init script) | ✅ wrapped | ❌ (whole script skipped) | Wrapped section has its own `if (window === window.top)` guard so even if main script runs in iframes, this part doesn't |
 
-**Headed mode auto-switches to system Chrome**:
-Playwright's bundled "Google Chrome for Testing" binary is blocked by Google OAuth (login rejected as "unsafe browser") and shows a "test" label in the macOS Dock. In headed mode, when stealth is enabled and system Chrome is detected (`_detect_system_chrome()`), bridgic automatically sets `channel="chrome"` to use the real system Chrome binary. This is transparent to the user. The headed stealth args (~11 flags) are still applied; `--test-type=` is added to suppress Chrome's "unsupported flag" warning banner for `--disable-blink-features=AutomationControlled`. If system Chrome is not installed, bridgic falls back to Chrome for Testing.
+#### Iframe-safe checklist (run before merging any new stealth patch)
 
-**JS init script** (`_STEALTH_INIT_SCRIPT_TEMPLATE` in `_stealth.py`) — **headless mode only**. Skipped entirely in headed mode (`self._headless=False`) because `context.add_init_script()` runs in ALL frames including Cloudflare Turnstile's challenge iframe; patching `window.chrome` (`configurable:false`), `navigator.permissions.query`, and WebGL prototype inside the iframe causes detectable API inconsistencies that fail the challenge. Playwright CLI injects nothing and passes Turnstile; bridgic matches that behaviour in headed mode.
+1. Does the patch live in `_STEALTH_INIT_SCRIPT_TEMPLATE` (runs in all frames)? If yes, ask: would patching this in a cross-origin Cloudflare iframe create an inconsistency vs. what Cloudflare's server logged for the parent page request?
+2. Does the patch use a CDP override (`Emulation.*`, `Network.*`, `Page.*`)? CDP overrides apply to the whole target including all its frames. Gate to `self._headless` unless you've verified iframe consistency.
+3. Does the patch hook `page.on('worker')` / `context.on('serviceworker')`? Workers can be spawned by any frame in the page tree — same rule.
+4. Does the patch wrap a global constructor like `Worker`, `WebSocket`, `RTCPeerConnection`? Wrap inside `if (window === window.top) { ... }` if the wrap result is observably different from the original.
+5. Run the 3-site headed verification (`bash scripts/qa/...` or manual): a Cloudflare-Turnstile-protected page (Cloudflare), `https://x.com` (server-side detection), `https://blog.aepkill.com/demos/devtools-detector/` (devtools probe). Any of these breaking is a hard block.
 
-When active (headless mode), patches these navigator/window properties before any page script runs:
-
-**Anti-toString-detection (`_mkNative` framework)**:
-All patched functions are registered in a `WeakSet` (`_nativeFns`) via `_mkNative(fn, name)`. `Function.prototype.toString` is itself intercepted to return `"function foo() { [native code] }"` for any registered function. This closes the entire class of "call `.toString()` on a function to detect monkey-patching" attacks used by DataDome, PerimeterX, and Cloudflare bot detectors.
-
-```javascript
-const _nativeFns = new WeakSet();
-const _nativeFnNames = new WeakMap();
-const _mkNative = (fn, name) => { _nativeFns.add(fn); _nativeFnNames.set(fn, name); return fn; };
-Function.prototype.toString = _mkNative(function toString() {
-  if (_nativeFns.has(this)) return `function ${_nativeFnNames.get(this) ?? this.name}() { [native code] }`;
-  return _origFnToString.call(this);
-}, 'toString');
-```
-
-**Patched properties**:
-- `navigator.webdriver` → **conditionally** `undefined`; checks `Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver')` first and patches the prototype descriptor. Falls back to instance property only if the prototype has no descriptor but the value is non-undefined. Avoids creating an own-property (which makes `'webdriver' in navigator` = true — detectable in real Chrome where the property is absent).
-- `navigator.plugins` / `navigator.mimeTypes` → realistic PDF Viewer entries (5 plugins, 2 MIME types); each plugin holds its own per-plugin mime copies so `enabledPlugin` refs are correct
-- `navigator.languages` → derived from `Browser(locale=...)` to keep `navigator.language === navigator.languages[0]` (e.g. `["zh-CN", "zh", "en"]` for `locale="zh-CN"`); defaults to `["en-US", "en"]`
-- `window.chrome` → complete object with `runtime`, `csi()`, `loadTimes()` (all wrapped with `_mkNative`)
-- `navigator.permissions.query` → returns `"default"` for notifications (not `"denied"`); wrapped with `_mkNative`
-- `window.outerWidth/Height` → matches `innerWidth/Height` when zero (guard for edge cases; with `--headless=new` + `screen` context option these are already correctly set by Chrome)
-- `navigator.deviceMemory` → `8` (headless environments may return `undefined`)
-- `navigator.hardwareConcurrency` → `8` when value is 0 or 1 (headless may report fewer cores)
-- `navigator.connection` → `{ effectiveType: '4g', downlink: 10, rtt: 100, saveData: false }` when absent
-- `WebGLRenderingContext` / `WebGL2RenderingContext` → `getParameter(37445/37446)` **conditionally** returns `'Intel Inc.'` / `'Intel Iris OpenGL Engine'` only when the real vendor contains `'Google'` or `'SwiftShader'` (masks SwiftShader which is a well-known bot signal). On headed Apple Silicon Mac the real `'Apple Inc.'` value is preserved so the WebGL fingerprint stays consistent with DPI, Canvas, and font rendering signals. `getParameter` is wrapped with `_mkNative`.
-- `document.hasFocus()` → always returns `true` (headless tabs return `false` by default; Cloudflare and DataDome probe this); wrapped with `_mkNative`
-- `document.hidden` → always `false` (via `Object.defineProperty`)
-- `document.visibilityState` → always `'visible'` (via `Object.defineProperty`); headless tabs default to `'hidden'` which is a strong bot signal
-- `Notification.permission` → guarded: only patched if `Notification` exists and its permission is `'denied'`; returns `'default'`
-
-`get_init_script(locale=None)` accepts the locale and performs the `__BRIDGIC_LANGS__` substitution before returning the script. Called from `_browser.py:_start()` with `self._locale` only when `self._headless=True`.
+For the full list of patched navigator/window properties, see [`docs/INTERNALS.md` — Stealth JS Init Script](docs/INTERNALS.md#stealth-js-init-script--patched-properties). For the design rationale of mode-aware stealth, see [`docs/INTERNALS.md` — Mode-aware stealth design](docs/INTERNALS.md#mode-aware-stealth-design). For known capability boundaries, see [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md).
 
 ### CLI architecture
 
@@ -186,339 +232,27 @@ bridgic-browser click @8d4b03a9
        │◄─── JSON response ────────────────────────────   dispatch → tool fn()
 ```
 
-Key implementation details:
-- **`_client.py`**: `send_command()` auto-starts the daemon if no socket exists. `_spawn_daemon()` uses `select.select()` + `os.read()` for the 30-second ready timeout (avoids blocking `proc.stdout.read()`). `start_if_needed=False` prevents auto-start for the `close` command.
-- **`_daemon.py`**: `run_daemon()` creates a `Browser()` instance directly (lazy start — Playwright does **not** launch immediately; `Browser.__init__` auto-loads config from `_config.py`), writes `BRIDGIC_DAEMON_READY` to stdout, and serves one JSON command per connection. The browser's Playwright process starts on the first command that calls `_ensure_started()` (e.g. `navigate_to`). `asyncio.wait_for(reader.readline(), timeout=60)` prevents hanging on idle connections. Signal handling uses `loop.add_signal_handler()` (asyncio-safe).
-- **`_commands.py`**: 67 Click commands in 15 sections via `SectionedGroup`. `scroll` uses `--dy`/`--dx` options (not positional) to support negative values. `screenshot`/`pdf`/`upload`/`storage-save`/`storage-load`/`trace-stop` call `os.path.abspath()` on the client side before sending (daemon cwd may differ). `snapshot` supports `-i`/`--interactive`, `-f/-F`/`--full-page/--no-full-page`, `-l`/`--limit` (default 10000), and `-s`/`--file` (overflow file path); it delegates to `browser.get_snapshot_text()`. When content exceeds limit or `--file` is provided, full snapshot is saved to a file (auto-generated under `~/.bridgic/bridgic-browser/snapshot/` when over limit, or the specified path).
-  - **`wait`**: argument is named `SECONDS_OR_TEXT`. When the argument parses as a float it always takes the time-wait path (`wait_seconds`); when it is a string it takes the text-wait path (`text` or `text_gone` with `--gone`). The `--gone` flag is **only** meaningful with a string argument — a numeric argument with `--gone` is ignored (number always → time). Unit is **seconds**, not milliseconds. This is documented explicitly in the command docstring and in `_cli_catalog.py` to prevent LLM confusion. Text search traverses **all frames** (main + iframes) via polling, so text inside iframes is detectable.
-  - **`type`**: docstring explicitly states the text goes into the **currently focused element** and that the user must `click` or `focus` the target first.
-  - **`mouse-move` / `mouse-click` / `mouse-drag`**: coordinates are **viewport pixels from the top-left corner**; documented in both docstrings and `_cli_catalog.py`.
-  - **`eval-on`**: CODE must be an arrow function or named function that receives the element as its argument (e.g. `"(el) => el.textContent"`); this calling convention is documented in the docstring with examples.
-- **Config loading**: `Browser.__init__` auto-loads config via `_config.py:_load_config_sources()`. The `--headed` CLI flag merges `{"headless": false}` into `BRIDGIC_BROWSER_JSON` before spawning the daemon. The `--clear-user-data` CLI flag merges `{"clear_user_data": true}` into `BRIDGIC_BROWSER_JSON`.
-- **`close` command fast-path**: the daemon calls `browser.inspect_pending_close_artifacts()` to pre-allocate a session dir, trace path, and video paths (all grouped under `~/.bridgic/bridgic-browser/tmp/close-<timestamp>-<rand>/`), responds to the client immediately with those paths, then sets `stop_event`. Actual `browser.close()` runs after the client disconnects. After close, `_write_close_report()` writes `close-report.json` in the session dir with status (`"success"`, `"success_with_timeouts"`, `"error"`, or `"timeout"`), artifact paths, and any errors.
-- **Daemon cleanup ownership guard**: after `browser.close()` finishes, `run_daemon()` reads the run-info file and compares its `pid` field to `os.getpid()` before calling `transport.cleanup()` / `remove_run_info()`. This prevents the outgoing daemon from deleting the new daemon's socket when a `close` is followed immediately by a new command (which starts a new daemon before the old one's shutdown completes). If the run-info is gone (`None`) the old daemon is still the owner and cleans up normally.
-
-Socket path: `BRIDGIC_SOCKET` env var (default `~/.bridgic/bridgic-browser/run/bridgic-browser.sock`).
-The directory is created with `0o700` permissions on first use. Users upgrading from an older version that used `/tmp/bridgic-browser.sock` should stop any running daemon first (`bridgic-browser close`) before upgrading.
-
-Snapshot overflow: `get_snapshot_text(limit=10000, file=None, ...)` — when content exceeds `limit` or `file` is explicitly provided, full snapshot is written to `file` (auto-generated if `None` and over limit) and only a notice with the file path is returned. `limit` must be ≥ 1. `file` is validated: empty/whitespace-only paths, null bytes, and existing directories raise `InvalidInputError`.
-
-## Key Implementation Details & Playwright Internals
-
-### Two Co-existing Ref Systems (Foundation for Understanding the Entire Chain)
-
-bridgic has **two distinct ref systems** that must not be confused:
-
-| | bridgic ref | playwright_ref |
-|---|---|---|
-| Example | `"8d4b03a9"` | `"e369"` / `"f1e5"` |
-| Generated in | `_snapshot.py:_compute_stable_ref()` | Playwright injected script `computeAriaRef()` |
-| Format | SHA-256(namespace+role+name+frame_path+nth) first 4 bytes hex | `{refPrefix}e{lastRef}` incrementing integer |
-| Stability | **Stable across snapshots** (same element, same ref) | **Resets after each snapshot** (valid only within current snapshotForAI) |
-| Purpose | Exposed to LLM / tool calls / CLI | O(1) DOM pointer lookup for aria-ref fast path |
-| Stored in | `EnhancedSnapshot.refs: Dict[str, RefData]` | `RefData.playwright_ref` |
-
----
-
-### Playwright Source: Ref Generation Rules
-
-All source paths are under `.venv/lib/python3.10/site-packages/playwright/driver/package/lib/`.
-
-#### 1. `lastRef` Counter and `computeAriaRef()`
-**File**: `generated/injectedScriptSource.js` (this script is injected into each frame; each frame has its own independent instance)
-
-```javascript
-// injectedScriptSource.js — module-level variable in injected script (independent per frame)
-var lastRef = 0;
-
-function computeAriaRef(ariaNode, options) {
-  if (options.refs === "none") return;
-  // when mode="ai", refs="interactable" — only assigns refs to visible elements that receive pointer events
-  if (options.refs === "interactable" && (!ariaNode.box.visible || !ariaNode.receivesPointerEvents))
-    return;
-
-  let ariaRef = ariaNode.element._ariaRef;  // cache on the DOM element
-  if (!ariaRef || ariaRef.role !== ariaNode.role || ariaRef.name !== ariaNode.name) {
-    // cache miss (first time / role or name changed) → generate new ref
-    ariaRef = {
-      role: ariaNode.role,
-      name: ariaNode.name,
-      ref: (options.refPrefix ?? "") + "e" + ++lastRef   // ← core format
-    };
-    ariaNode.element._ariaRef = ariaRef;  // write back to DOM element
-  }
-  ariaNode.ref = ariaRef.ref;
-}
-```
-
-**Key rules**:
-- `lastRef` is a module-level integer that **monotonically increases throughout the lifetime of the injected script instance for the same frame and is never reset**
-- If role+name is unchanged for the same element, **the previous ref is reused** (`element._ariaRef` cache), `lastRef` is not incremented
-- Ref format: `{refPrefix}e{lastRef}`, e.g. `"e1"`, `"e5"`, `"f1e3"`, `"f2e7"`
-- `refPrefix` is passed by the caller (see next section)
-
-#### 2. Source of `refPrefix`: frame.seq
-**File**: `server/page.js:825` (`snapshotFrameForAI` function)
-
-```javascript
-// page.js — snapshotFrameForAI()
-injectedScript.evaluate((injected, options) => {
-  return injected.incrementalAriaSnapshot(node, { mode: "ai", ...options });
-}, {
-  refPrefix: frame.seq ? "f" + frame.seq : "",  // ← main frame seq=0 → "", child frame seq=N → "fN"
-  track: options.track
-});
-```
-
-**File**: `server/frames.js:368` (Frame constructor)
-
-```javascript
-// frames.js — Frame constructor
-this.seq = page.frameManager.nextFrameSeq();
-// main frame seq=0; subsequent frames increment: 1, 2, 3...
-// seq is not "the Nth iframe" — it is a globally unique sequence number
-```
-
-**Format summary**:
-- Main frame (seq=0): `refPrefix=""` → refs are `"e1"`, `"e2"`, …
-- Child frame (seq=1): `refPrefix="f1"` → refs are `"f1e1"`, `"f1e2"`, …
-- Child frame (seq=2): `refPrefix="f2"` → refs are `"f2e1"`, `"f2e3"`, …
-- **Note**: seq is a page-level global counter, unrelated to iframe position in the DOM
-
-#### 3. Building the `snapshot.elements` Map
-**File**: `generated/injectedScriptSource.js` (the `visit` callback inside `generateAriaTree`)
-
-```javascript
-// injectedScriptSource.js — generateAriaTree > visit()
-if (childAriaNode.ref) {
-  snapshot.elements.set(childAriaNode.ref, element);  // ref → DOM Element
-  snapshot.refs.set(element, childAriaNode.ref);       // DOM Element → ref (reverse mapping)
-  if (childAriaNode.role === "iframe")
-    snapshot.iframeRefs.push(childAriaNode.ref);       // iframes collected separately for recursive child snapshots
-}
-```
-
-#### 4. Writing to `_lastAriaSnapshotForQuery`
-**File**: `generated/injectedScriptSource.js` (`InjectedScript.incrementalAriaSnapshot()` method)
-
-```javascript
-// injectedScriptSource.js — InjectedScript class
-incrementalAriaSnapshot(node, options) {
-  const ariaSnapshot = generateAriaTree(node, options);
-  // ...
-  this._lastAriaSnapshotForQuery = ariaSnapshot;  // ← overwritten after each snapshot
-  return { full, incremental, iframeRefs: ariaSnapshot.iframeRefs };
-}
-```
-
-**Key**: `_lastAriaSnapshotForQuery` is a property on each frame's injected script instance and is **completely independent per frame**. The L1 frame's injected script only holds L1's `elements` Map (with keys like `"f1e1"`).
-
----
-
-### Playwright Source: Ref Lookup Rules
-
-#### 5. aria-ref Engine: `_createAriaRefEngine()`
-**File**: `generated/injectedScriptSource.js` (registered in the `InjectedScript` constructor)
-
-```javascript
-// injectedScriptSource.js — _createAriaRefEngine()
-_createAriaRefEngine() {
-  const queryAll = (root, selector) => {
-    const result = this._lastAriaSnapshotForQuery?.elements?.get(selector);
-    // selector = the raw string after "aria-ref=", e.g. "e369" or "f1e5"
-    return result && result.isConnected ? [result] : [];
-    // isConnected check: returns empty if element has been removed from DOM (stale case)
-  };
-  return { queryAll };
-}
-```
-
-O(1) Map lookup; `isConnected` ensures stale refs return empty instead of throwing.
-
-#### 6. `_jumpToAriaRefFrameIfNeeded()`: Cross-frame Routing
-**File**: `server/frameSelectors.js:85`
-
-```javascript
-// frameSelectors.js — FrameSelectors class
-_jumpToAriaRefFrameIfNeeded(selector, info, frame) {
-  if (info.parsed.parts[0].name !== "aria-ref") return frame;
-  const body = info.parsed.parts[0].body;          // "f1e5" or "e369"
-  const match = body.match(/^f(\d+)e\d+$/);        // only matches child frame refs (with "f" prefix)
-  if (!match) return frame;                          // main frame ref → no jump
-  const frameSeq = +match[1];                       // extract seq number
-  const jumptToFrame = this.frame._page.frameManager.frames()
-    .find(frame2 => frame2.seq === frameSeq);        // global linear search
-  if (!jumptToFrame)
-    throw new InvalidSelectorError(...);
-  return jumptToFrame;
-}
-```
-
-**Important**: `_jumpToAriaRefFrameIfNeeded` switches the execution target frame **before** running `queryAll`, so the query runs in the correct frame's injected script context (which holds the corresponding key in its `_lastAriaSnapshotForQuery`).
-
-**This means**: from an element resolution perspective, both `page.locator("aria-ref=f1e5")` and `frame_locator("iframe").nth(0).locator("aria-ref=f1e5")` correctly find the L1 frame element, because `_jumpToAriaRefFrameIfNeeded` auto-routes. However, `locator.evaluate()`'s JS execution context is **not affected** — it always runs in the frame that **owns the locator's scope** (see below).
-
----
-
-### bridgic Source: Ref Generation Rules
-
-#### 7. Generating the bridgic ref (stable ID)
-**File**: `bridgic/browser/session/_snapshot.py`
-
-```python
-# _snapshot.py:394
-_REF_NAMESPACE = "bridgic-browser-v1"
-
-# _snapshot.py:422 — _compute_stable_ref()
-@staticmethod
-def _compute_stable_ref(role, name, frame_path, nth) -> str:
-    frame_str = ",".join(str(x) for x in frame_path) if frame_path else ""
-    raw = f"{_REF_NAMESPACE}\x1f{role}\x1f{name or ''}\x1f{frame_str}\x1f{nth}"
-    # \x1f (ASCII Unit Separator) used as field delimiter — cannot appear in HTML accessible names
-    digest = hashlib.sha256(raw.encode("utf-8")).digest()
-    return digest[:4].hex()   # 8 hex characters, e.g. "8d4b03a9"
-```
-
-**Stability guarantee**: as long as the four fields role, name, frame_path, and nth remain unchanged, the same element always gets the same ref ID across snapshots — the LLM can use it persistently across snapshots.
-
-#### 8. Extracting and Storing `playwright_ref`
-**File**: `bridgic/browser/session/_snapshot.py`
-
-```python
-# _snapshot.py:374
-_REF_EXTRACT_PATTERN = re.compile(r'\[ref=([a-zA-Z0-9]+)\]')
-
-# _snapshot.py:1400-1491 — _process_page_snapshot_for_ai() parsing loop
-# Extract before clean_suffix removes [ref=...]:
-_pw_ref_match = ref_extract_pattern.search(suffix) if suffix else None
-playwright_ref_for_element = _pw_ref_match.group(1) if _pw_ref_match else None
-
-# Store in RefData:
-refs[ref] = RefData(
-    ...
-    playwright_ref=playwright_ref_for_element,   # Playwright's "e369" / "f1e5"
-)
-```
-
-`playwright_ref` is extracted from the `[ref=...]` suffix in Playwright's snapshot text lines and is only valid for the lifetime of the current `snapshotForAI` call.
-
-#### 9. Generating `frame_path`
-**File**: `bridgic/browser/session/_snapshot.py:1229` (parsing loop)
-
-```python
-# _snapshot.py — _process_page_snapshot_for_ai()
-_iframe_local_counters: Dict[tuple, int] = {}   # key=parent path tuple, value=number of child iframes seen so far
-# ...
-# When an iframe node is encountered:
-parent_path = tuple(iframe_stack[-1][1]) if iframe_stack else ()
-local_idx = _iframe_local_counters.get(parent_path, 0)
-_iframe_local_counters[parent_path] = local_idx + 1
-iframe_stack.append((original_depth, list(parent_path) + [local_idx]))
-```
-
-`frame_path` records **the per-level local indices from the main frame to the target iframe** (same-level iframes start from index 0), and is unrelated to `frame.seq`.
-
----
-
-### bridgic Source: Ref Lookup Rules
-
-#### 10. Two-phase Lookup in `get_element_by_ref()`
-**File**: `bridgic/browser/session/_browser.py`
-
-```
-Input: bridgic ref (e.g. "8d4b03a9")
-   ↓
-self._last_snapshot.refs.get(ref) → RefData
-   ↓
-Phase 1: aria-ref fast path (O(1))
-  Condition: ref_data.playwright_ref is non-empty (i.e. no re-navigation since last snapshot)
-  Implementation:
-    scope = page
-    for nth in ref_data.frame_path:          # build scope chain following frame_path
-        scope = scope.frame_locator("iframe").nth(nth)
-    locator = scope.locator(f"aria-ref={ref_data.playwright_ref}")
-    count = await locator.count()
-    count == 1 → return directly (Playwright's _jumpToAriaRefFrameIfNeeded guarantees routing)
-    count == 0 → stale, fall through
-    Exception  → engine unavailable, fall through
-
-Phase 2: CSS rebuild path (get_locator_from_ref_async)
-  Location: _snapshot.py:1830
-  Strategy priority (by signal strength):
-    1) get_by_role(role, name=name, exact=True)          ← most elements
-    2) get_by_role(role).filter(has_text=...)            ← ROLE_TEXT_MATCH_ROLES
-    3) get_by_text(text, exact=True)                     ← TEXT_LEAF_ROLES (text pseudo-role)
-    4) STRUCTURAL_NOISE_ROLES with match_text            ← CSS-scoped + filter(has_text) + nth
-    5) STRUCTURAL_NOISE_ROLES child-anchor path          ← unnamed noise with no text
-    6) get_by_role(role)                                 ← bare role fallback when no name
-  scope: chain frame_locator("iframe").nth(n) per frame_path level first
-  nth: applied only when locator key space matches role:name key space (excluding STRUCTURAL_NOISE/TEXT_LEAF)
-
-STRUCTURAL_NOISE child-anchor path (strategy 5) detail:
-  Applies to: unnamed generic/group/none/presentation with no stored text
-  Sub-strategies (tried in order):
-    a) Find text-leaf child (role='text', parent_ref==ref) → CSS-scoped container locator (STRUCTURAL_NOISE_CSS)
-    b) Find named STRUCTURAL_NOISE child (parent_ref==ref, role in STRUCTURAL_NOISE_ROLES, name non-empty)
-       → scope.locator(STRUCTURAL_NOISE_CSS_NAMED).filter(has_text=name).locator('..')
-         Note: locator('..') is auto-detected as XPath parent by Playwright (selectorParser.js:159)
-         Note: STRUCTURAL_NOISE_CSS_NAMED adds span:not([role]) vs STRUCTURAL_NOISE_CSS because
-               the child may be a <span> that Playwright maps to 'generic' role.
-               nth is NOT applied; the parent is located structurally via the child.
-    c) fallback: get_by_role(role) (returns 0 results for implicit generic — last resort)
-```
-
----
-
-### Covered-element Check
-
-**6 locations**: `_click_checkable_target` (`_browser.py:239`), `click_element_by_ref` (`~3151`), `hover_element_by_ref` (`~3393`), `check_checkbox_or_radio_by_ref` (`~3645`), `uncheck_checkbox_by_ref` (`~3751`), `double_click_element_by_ref` (`~3847`)
-
-```javascript
-(el) => {
-  if (window.parent !== window) return false;   // ← skip directly for iframe elements
-  const t = document.elementFromPoint(cx, cy);
-  return !!t && t !== el && !el.contains(t) && !t.contains(el);
-}
-```
-
-**Do not change to `window.frameElement !== null`**: Chrome returns `null` for `window.frameElement` inside iframes under the `file://` protocol (security policy), causing false positives. `window.parent !== window` is a pure object comparison that is reliable across all protocols and origins.
-
-**Why iframe elements must be skipped**: `bounding_box()` returns main-viewport coordinates, while `document.elementFromPoint(cx, cy)` inside the iframe JS context uses iframe-local coordinates. The coordinate systems differ, so `elementFromPoint` finds the wrong element (typically the child iframe node), triggering a false "covered" report. After skipping, `locator.click()` lets Playwright handle coordinate transformation internally.
-
----
-
-### Nested iframes and frame_path
-
-`RefData.frame_path: Optional[List[int]]`:
-- `None` → main frame
-- `[0]` → first top-level iframe (local index 0)
-- `[0, 1]` → second iframe inside the first top-level iframe
-
-All three locator-building code paths (aria-ref fast path, `get_locator_from_ref_async`, recovery path) use the same chained call:
-```python
-scope = page
-for local_nth in frame_path:
-    scope = scope.frame_locator("iframe").nth(local_nth)
-```
-
-`_iframe_local_counters: Dict[tuple, int]` (`_snapshot.py:1229`) tracks the iframe count under each parent path, ensuring per-level nth values are independent across multiple nesting levels.
-
----
-
-### Interactive Element Detection — Small Icon Rule
-
-`_is_element_interactive()` (`_snapshot.py`) rule 9: small icon (10–50 px) is treated as interactive only when it carries **strong semantic signals**:
-
-- `data-action` attribute → explicit author intent
-- `aria-label` → screen-reader accessible name
-
-**`classAndId` is intentionally excluded**: almost every element carries a CSS class, so including it causes false positives for purely decorative elements (badges, avatars, dividers) that happen to be small. `cursor=pointer` is covered by rule 10 (separate check) and is a stronger signal.
-
-Impact on `get_snapshot(interactive=True)`: a small icon with only a CSS class (no `data-action`, no `aria-label`, no `cursor:pointer`) will **not** appear in the interactive snapshot. If an icon is missing, add `data-action` or `aria-label` to the element.
-
----
-
-### Debug Logging
+Key behaviors:
+- **Lazy start**: daemon creates `Browser()` but Playwright doesn't launch until the first command that needs a page (e.g. `navigate_to`).
+- **Config flags**: `--headed` merges `{"headless": false}` into `BRIDGIC_BROWSER_JSON`; `--clear-user-data` merges `{"clear_user_data": true}`; `--cdp` resolves CDP input via `resolve_cdp_input()` on the client side and passes the `ws://` URL to the daemon via `BRIDGIC_CDP` env var.
+- **Close fast-path**: daemon pre-allocates artifact paths, responds immediately, then runs `browser.close()` after the client disconnects. `close-report.json` records status and artifact paths.
+- **Cleanup ownership guard**: after close, the daemon compares the run-info `pid` to `os.getpid()` before deleting the socket — prevents a new daemon's socket from being deleted by an old daemon still shutting down.
+- **Socket path**: `BRIDGIC_SOCKET` env var (default `$BRIDGIC_HOME/bridgic-browser/run/bridgic-browser.sock`), directory created with `0o700` permissions.
+- **Home directory**: `BRIDGIC_HOME` env var (default `~/.bridgic`). All daemon state paths (run info, socket, logs, tmp, user config, user data) derive from this. Set different values to run multiple independent daemon instances.
+For detailed implementation notes on client/daemon/commands, see [`docs/INTERNALS.md` — CLI Architecture](docs/INTERNALS.md#cli-architecture--detailed-implementation).
+
+## Ref System Internals
+
+bridgic has **two co-existing ref systems**: the stable bridgic ref (`"8d4b03a9"`, SHA-256 based, stable across snapshots) and the ephemeral playwright_ref (`"e369"`, per-snapshot incrementing integer, used for O(1) DOM lookup). `get_element_by_ref()` uses a **two-phase lookup**: first tries the aria-ref fast path (O(1) Map lookup via playwright_ref), then falls back to a CSS rebuild path with 6 strategy tiers. All paths chain `frame_locator("iframe").nth(n)` per `frame_path` level for iframe support.
+
+Key constraints:
+- `frame_path` (per-level local indices) is unrelated to Playwright's `frame.seq` (page-level global counter).
+- **Covered-element check** uses `window.parent !== window` (not `window.frameElement !== null`) to detect iframes — the latter returns `null` under `file://` protocol. Iframe elements skip the check entirely because `bounding_box()` returns main-viewport coordinates while `elementFromPoint()` uses iframe-local coordinates.
+- **Small icon rule**: icons 10–50 px are interactive only with `data-action` or `aria-label` (not `classAndId` — too many false positives).
+
+For complete source-level documentation of Playwright internals, ref generation, lookup strategies, and iframe handling, see [`docs/INTERNALS.md`](docs/INTERNALS.md).
+
+## Debug Logging
 
 ```bash
 BRIDGIC_LOG_LEVEL=DEBUG bridgic-browser snapshot -i
@@ -526,14 +260,9 @@ BRIDGIC_LOG_LEVEL=DEBUG bridgic-browser click <ref>
 ```
 
 Key DEBUG log points (`_browser.py`):
-- `[get_element_by_ref] aria-ref fast-path hit: ref=... playwright_ref=... frame_path=...`
-- `[get_element_by_ref] aria-ref stale (count=N), falling through to CSS: ...`
-- `[get_element_by_ref] aria-ref exception (...), falling through to CSS: ...`
-- `[get_element_by_ref] CSS path: ref=... role=... name=... nth=... frame_path=...`
-- `[click_element_by_ref] covered at (x, y), clicking intercepting element`
-- `_click_checkable_target: covered at (x, y), clicking intercepting element`
-
----
+- `[get_element_by_ref] aria-ref fast-path hit/stale/exception` — ref lookup phase transitions
+- `[get_element_by_ref] CSS path: ref=... role=... name=... nth=... frame_path=...` — fallback strategy
+- `[click_element_by_ref] covered at (x, y), clicking intercepting element` — covered-element redirect
 
 ## Testing notes
 

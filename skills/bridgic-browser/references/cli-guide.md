@@ -9,8 +9,9 @@ Use this guide when the task should be executed directly from terminal commands 
 3. [Command Groups](#command-groups)
 4. [High-Frequency Examples](#high-frequency-examples)
 5. [Runtime and Configuration](#runtime-and-configuration)
-6. [Non-Obvious CLI Behavior](#non-obvious-cli-behavior)
-7. [When to Load Other References](#when-to-load-other-references)
+6. [CDP Mode (Connect to Existing Browser)](#cdp-mode-connect-to-existing-browser)
+7. [Non-Obvious CLI Behavior](#non-obvious-cli-behavior)
+8. [When to Load Other References](#when-to-load-other-references)
 
 ## Quick Start
 
@@ -113,23 +114,38 @@ Config precedence (low -> high):
 
 | Source | Notes |
 |---|---|
-| Defaults | `headless=True`, `clear_user_data=False` (persistent profile at `~/.bridgic/bridgic-browser/user_data/`) |
-| `~/.bridgic/bridgic-browser/bridgic-browser.json` | User-level persistent config |
+| Defaults | `headless=True`, `clear_user_data=False` (persistent profile at `$BRIDGIC_HOME/bridgic-browser/user_data/`) |
+| `$BRIDGIC_HOME/bridgic-browser/bridgic-browser.json` | User-level persistent config (default `~/.bridgic/...`) |
 | `./bridgic-browser.json` | Project-specific config (daemon startup cwd) |
 | `BRIDGIC_BROWSER_JSON` | Full JSON override for any Browser parameters (e.g. `{"headless":false}`) |
 
 Environment variables and login state persistence are documented in `env-vars.md`.
 
+## CDP Mode (Connect to Existing Browser)
+
+Connect to a running Chrome instead of launching a new one:
+
+```bash
+bridgic-browser open https://example.com --cdp 9222           # bare port
+bridgic-browser open https://example.com --cdp auto           # scan local Chromium-family profiles (Chrome / Canary / Beta / Chromium / Brave / Edge)
+bridgic-browser open https://example.com --cdp "ws://..."     # explicit WebSocket URL
+bridgic-browser open https://example.com --cdp "wss://cloud.example.com/?token=..."
+```
+
+`--cdp` is a startup-only flag (accepted by `open` and `search`; ignored after the daemon is running). `close` disconnects from the remote browser but does **not** kill the Chrome process.
+
+For how to enable CDP on the target Chrome (Chrome 144+ `chrome://inspect/#remote-debugging` UI vs. legacy `--remote-debugging-port` launch flag), the full input-format table, behavior limitations (stealth, viewport, `close()`), and reconnect strategy, read [`cdp-mode.md`](cdp-mode.md).
+
 ## Non-Obvious CLI Behavior
 
 - Refs come from the latest snapshot. If page changed, re-run `snapshot` before interaction.
-- When `snapshot` output exceeds `-l <limit>`, or `-s <path>` is provided, full content is saved to a file (auto-generated under `~/.bridgic/bridgic-browser/snapshot/` or the specified path).
+- When `snapshot` output exceeds `-l <limit>`, or `-s <path>` is provided, full content is saved to a file (auto-generated under `$BRIDGIC_HOME/bridgic-browser/snapshot/` or the specified path).
 - `snapshot -i` returns only clickable/editable elements — use for action selection, not full-page inspection.
 - CLI uses a persistent daemon/browser. State survives across commands until `close`.
-- **`open` and `search` accept `--headed` and `--clear-user-data`** (startup flags only — ignored when a daemon is already running):
+- **`open` and `search` accept `--headed`, `--clear-user-data`, and `--cdp`** (startup flags only — ignored when a daemon is already running):
   - `bridgic-browser open --headed https://example.com` — start in headed mode
   - `bridgic-browser open --clear-user-data https://example.com` — start with ephemeral session (no persistent profile)
-  - By default (no `--clear-user-data`), the browser uses a persistent profile saved at `~/.bridgic/bridgic-browser/user_data/`.
+  - By default (no `--clear-user-data`), the browser uses a persistent profile saved at `$BRIDGIC_HOME/bridgic-browser/user_data/`.
 - After local Python code changes, restart daemon to pick up new code:
   - `bridgic-browser close`
   - run `open` or `search` command to auto-start again.
@@ -151,3 +167,4 @@ Environment variables and login state persistence are documented in `env-vars.md
 - Need Python code instead of CLI commands: read `sdk-guide.md`.
 - Need CLI and SDK mapping / migration (for example, CLI steps -> Python code generation): read `cli-sdk-api-mapping.md`.
 - Need environment variables or login state persistence details: read `env-vars.md`.
+- Need to connect to an existing Chrome instance (chrome://inspect, `--remote-debugging-port`, cloud browser, Electron), or want the full CDP limitation / reconnect reference: read `cdp-mode.md`.

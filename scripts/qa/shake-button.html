@@ -1,0 +1,29 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>QA: shake button (sticky flap → forces actionability retry)</title>
+<style>
+  body { font-family: sans-serif; padding: 2em; }
+  @keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    25%      { transform: translateX(-3px); }
+    75%      { transform: translateX(3px); }
+  }
+  #shake {
+    padding: 12px 24px;
+    font-size: 16px;
+    animation: shake 80ms infinite;
+  }
+</style>
+<h1>Shake button</h1>
+<p>Button shakes continuously, so Playwright's stable-bounding-box
+   check will never succeed. click() should hit its 10 s cap and
+   fall back to dispatch_event.</p>
+<button id="shake" onclick="window._clicked = (window._clicked || 0) + 1; document.title='CLICKED ' + window._clicked;">Submit</button>
+<p id="state">Not clicked yet.</p>
+<script>
+  const obs = new MutationObserver(() => {
+    document.getElementById('state').textContent =
+      'click count: ' + (window._clicked || 0);
+  });
+  obs.observe(document.querySelector('title'), { childList: true });
+</script>
