@@ -2212,6 +2212,44 @@ class Browser:
                 except Exception as e:
                     errors.append(f"download_manager.detach: {e}")
 
+        # ── L3 restore + CDP download session teardown ──
+        # MUST run BEFORE the page.close() loop below.
+        # ``self._cdp_download_session`` was attached via
+        # ``BrowserContext.new_cdp_session(self._page)`` — it is a
+        # PAGE-scoped CDP session. Once ``self._page`` is closed, the
+        # session's target is destroyed and any subsequent
+        # ``session.send()`` fails with "Target page, context or browser
+        # has been closed". Running L3 here (page still alive) lets the
+        # restore actually succeed instead of always tripping the
+        # fallback warning.
+        #
+        # Chromium also auto-clears a page-scoped override when the page
+        # closes, so a missed L3 is a no-op for correctness — but doing
+        # it explicitly keeps the code intent honest and the logs clean.
+        if _is_cdp and self._browser and not self._cdp_context_owned:
+            try:
+                await self._set_cdp_download_behavior(
+                    "default", reason="pre-close",
+                    session=self._cdp_download_session,
+                )
+            except Exception as e:
+                errors.append(f"cdp.download_behavior_restore: {e}")
+            self._current_cdp_download_path = None
+
+            # Detach the renamer (also detaches the underlying session).
+            if self._cdp_download_renamer is not None:
+                try:
+                    await self._cdp_download_renamer.detach()
+                except Exception as e:
+                    errors.append(f"cdp.renamer_detach: {e}")
+                self._cdp_download_renamer = None
+            # If renamer didn't own the session (init failure path),
+            # make sure we still release it here.
+            if self._cdp_download_session is not None:
+                with suppress(Exception):
+                    await self._cdp_download_session.detach()
+                self._cdp_download_session = None
+
         # Close every page in parallel before tearing down the context.
         #
         # Page set selection:
@@ -2333,46 +2371,19 @@ class Browser:
             # CDP borrowed mode: release reference without closing.
             self._context = None
 
-        # ── L2 + L3: protect downloads before browser.close() destroys artifactsDir ──
+        # ── L2 rescue: protect orphan downloads before browser.close() ──
         # CDP-only: Playwright's `Disconnected` handler triggers
-        # `removeFolders([artifactsDir])` inside `browser.close()`. Anything
-        # still in that dir is gone. Two safeguards, both BEFORE close:
-        #   L2 rescue: scan playwright-artifacts-* and move orphan files
-        #              (downloads that landed there before our L1 override
-        #              took effect — ≤~100 ms race window) into ~/Downloads.
-        #   L3 restore: send Browser.setDownloadBehavior(default) on the
-        #              default context (borrowed mode only) so the user's
-        #              Chrome reverts to its own download prefs once bridgic
-        #              disconnects — e.g. ~/Downloads/tmp/ + Save-As dialog
-        #              for users who configured those.
+        # `removeFolders([artifactsDir])` inside `browser.close()`. Any
+        # download that landed in that dir before our L1 override took
+        # effect (≤~100 ms race window) is gone after close. Scan the
+        # `playwright-artifacts-*` tempdirs and move orphans into
+        # ~/Downloads while the dir still exists.
+        #
+        # L3 restore + CDP download session detach moved earlier — see
+        # the "L3 restore + CDP download session teardown" block above
+        # the page.close() loop. L3 must run while the page is alive
+        # because the CDP session is page-scoped.
         if _is_cdp and self._browser:
-            # Send L3 (restore) on the SAME page CDP session that received
-            # L1, before detaching anything. After this, Chrome reverts
-            # to its native download prefs for bridgic's tab.
-            if not self._cdp_context_owned:
-                try:
-                    await self._set_cdp_download_behavior(
-                        "default", reason="pre-close",
-                        session=self._cdp_download_session,
-                    )
-                except Exception as e:
-                    errors.append(f"cdp.download_behavior_restore: {e}")
-                self._current_cdp_download_path = None
-
-            # Detach the renamer (also detaches the underlying session).
-            if self._cdp_download_renamer is not None:
-                try:
-                    await self._cdp_download_renamer.detach()
-                except Exception as e:
-                    errors.append(f"cdp.renamer_detach: {e}")
-                self._cdp_download_renamer = None
-            # If renamer didn't own the session (init failure path), make
-            # sure we still release it here.
-            if self._cdp_download_session is not None:
-                with suppress(Exception):
-                    await self._cdp_download_session.detach()
-                self._cdp_download_session = None
-
             try:
                 rescued_paths = await self._rescue_cdp_orphan_downloads()
                 if rescued_paths:
