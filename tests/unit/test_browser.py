@@ -280,6 +280,39 @@ class TestBrowserLaunchOptions:
 
         assert options["headless"] is True
 
+    def test_launch_options_headed_auto_switches_to_system_chrome(self):
+        """Headed mode auto-switches to system Chrome when available.
+
+        Bundled Chrome for Testing is blocked by Google OAuth and has been
+        observed self-trapping (EXC_BREAKPOINT/SIGTRAP bug_type=309) in
+        headed mode. The switch must happen regardless of stealth setting.
+        """
+        with patch("bridgic.browser.session._browser._detect_system_chrome", return_value=True):
+            browser = Browser(headless=False, stealth=False)
+            options = browser._get_launch_options()
+            assert options.get("channel") == "chrome"
+
+    def test_launch_options_headless_no_auto_switch(self):
+        """Headless mode does NOT auto-switch — bundled Chromium is fine."""
+        with patch("bridgic.browser.session._browser._detect_system_chrome", return_value=True):
+            browser = Browser(headless=True, stealth=False)
+            options = browser._get_launch_options()
+            assert "channel" not in options
+
+    def test_launch_options_headed_user_channel_preserved(self):
+        """User-pinned channel wins over auto-switch (no override)."""
+        with patch("bridgic.browser.session._browser._detect_system_chrome", return_value=True):
+            browser = Browser(headless=False, stealth=False, channel="chrome-beta")
+            options = browser._get_launch_options()
+            assert options.get("channel") == "chrome-beta"
+
+    def test_launch_options_headed_no_system_chrome_no_switch(self):
+        """No system Chrome installed → no auto-switch (would fail with bad channel)."""
+        with patch("bridgic.browser.session._browser._detect_system_chrome", return_value=False):
+            browser = Browser(headless=False, stealth=False)
+            options = browser._get_launch_options()
+            assert "channel" not in options
+
 
 class TestBrowserContextOptions:
     """Tests for Browser context options generation."""
