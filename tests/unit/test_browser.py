@@ -4422,7 +4422,11 @@ class TestWrapJsForCdpEval:
             "  }"
             "})();"
         )
-        result = subprocess.run([node, "-e", probe], capture_output=True, text=True, timeout=10)
+        # timeout=30 (not 10) to absorb Windows GitHub Actions runner
+        # cold-start latency: Defender real-time scan + I/O contention can
+        # push the first `node.exe` spawn to 5-15s. Normal-path execution
+        # is still <500ms per case; the cap only matters on cold runners.
+        result = subprocess.run([node, "-e", probe], capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, f"wrapper crashed node for {name}: {result.stderr}"
         outcome = _json.loads(result.stdout.strip())
 
