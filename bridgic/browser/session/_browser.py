@@ -861,21 +861,27 @@ class Browser:
         # navigator.webdriver, plugins, chrome object, etc.).
         _is_system_chrome = bool(self._channel or self._executable_path)
 
-        # In headed mode, auto-switch to system Chrome to avoid Google blocking
-        # "Chrome for Testing" (the Playwright-bundled binary) for OAuth login.
-        # System Chrome shows as a normal browser in the Dock (no "test" label)
-        # and passes Google's browser safety checks.
+        # In headed mode, auto-switch to system Chrome when available.
+        # Reasons:
+        #   - Anti-detection: Google blocks Playwright's bundled "Chrome
+        #     for Testing" for OAuth login. System Chrome shows as a
+        #     normal browser in the Dock and passes the safety checks.
+        #   - Reliability: bundled Chrome for Testing has been observed
+        #     self-trapping (EXC_BREAKPOINT/SIGTRAP bug_type=309) shortly
+        #     after Playwright launches it in headed mode on some macOS
+        #     versions; Apple-notarized system Chrome has no such reports.
+        # Only triggered when the user hasn't pinned a channel /
+        # executable_path and the system Chrome binary is present.
         _auto_system_chrome = (
             not self._headless
-            and self.stealth_enabled
             and not _is_system_chrome
             and _detect_system_chrome()
         )
         if _auto_system_chrome:
             options["channel"] = "chrome"
             logger.info(
-                "Headed mode: auto-switching to system Chrome for anti-detection "
-                "(Chrome for Testing is blocked by Google OAuth)"
+                "Headed mode: auto-switching to system Chrome "
+                "(anti-detection + reliability; pass channel='chromium' to override)"
             )
 
         # Add stealth args first (if enabled).
