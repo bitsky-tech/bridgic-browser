@@ -12,8 +12,8 @@
 - **Python-based Tools** - Used for agent / workflow code generation; Easier integration with [Bridgic](https://github.com/bitsky-tech/bridgic) 
 - **Snapshot with Semantic Invariance** - A representation of page snapshot based on accessibility tree and a specially designed ref-generation algorithm that ensures element refs remain unchanged across page reloads
 - **Skills** - Used for guided exploration and code generation; Compatible with most of coding agents
-- **Stealth Mode (Enabled by Default)** - Mode-aware anti-detection: 50+ Chrome args + JS patches in headless mode; minimal ~11 flags in headed mode to match real Chrome fingerprint
-- **Persistent & Ephemeral Sessions** - Persistent profile by default (`~/.bridgic/bridgic-browser/user_data/`); pass `clear_user_data=True` for an ephemeral session with no profile
+- **Stealth Mode (Enabled by Default)** - Mode-aware anti-detection covering 24+ JS/CDP fingerprint vectors. Verified against the public bot-detection benchmark suite — see [Anti-Detection](#anti-detection) below
+- **Persistent & Ephemeral Sessions** - Persistent profile by default (`$BRIDGIC_HOME/bridgic-browser/user_data/`, default `~/.bridgic/...`); pass `clear_user_data=True` for an ephemeral session with no profile
 - **Nested iframe Support** - Supports DOM element operations within multi-level nested iframes
 
 ### Quick Start
@@ -177,7 +177,7 @@ Browser options are automatically loaded from the following sources (both CLI da
 | Source | Example |
 |--------|---------|
 | Defaults | `headless=True`, `clear_user_data=False` (persistent profile) |
-| `~/.bridgic/bridgic-browser/bridgic-browser.json` | User-level persistent config |
+| `$BRIDGIC_HOME/bridgic-browser/bridgic-browser.json` | User-level persistent config (default `~/.bridgic/...`) |
 | `./bridgic-browser.json` | Project-local config (in cwd at daemon start) |
 | Environment variables | See `skills/bridgic-browser/references/env-vars.md` |
 
@@ -187,6 +187,57 @@ When `headless=false` and stealth is enabled, bridgic auto-switches to system Ch
 To override, set:
 - `channel`: e.g. `”chrome”`, `”msedge”`
 - `executable_path`: absolute path to a browser binary
+
+### Anti-Detection
+
+bridgic includes an industrial-grade stealth layer that defeats most
+JS-fingerprint-based bot detection without a custom Chromium binary, proxy,
+or CAPTCHA solver. The strategy is **mode-aware** — headed mode leverages
+the real system Chrome's TLS authenticity, headless mode applies a fuller JS
++ CDP patch suite. See [`docs/INTERNALS.md#mode-aware-stealth-design`](docs/INTERNALS.md#mode-aware-stealth-design)
+for the architecture.
+
+#### Benchmark
+
+Last verified 2026-05-12 (Playwright Chromium 143 / system Chrome 147 on macOS).
+
+| Site | bridgic Result |
+|---|---|
+| `bot.sannysoft.com` | 0 / 57 fail (both modes) |
+| `bot.incolumitas.com` | 0 fail (both modes) |
+| `browserscan.net/bot-detection` | 0 abnormal / 19 normal (both modes) |
+| `demo.fingerprint.com/web-scraping` | Pass (headed mode) |
+| `recaptcha-demo.appspot.com` (reCAPTCHA v3) | score = 0.9 (both modes) |
+
+#### Coverage
+
+24+ detection vectors patched at the JS + CDP layer:
+
+- **Anti-introspection foundation** — `Function.prototype.toString`
+  interception defeats `.toString()` probes
+- **navigator** — `webdriver` (deleted from `Navigator.prototype` to match
+  `--disable-blink-features=AutomationControlled` semantics; `'webdriver' in
+  navigator` returns `false`), `plugins` & `mimeTypes` (with native
+  `PluginArray` / `MimeTypeArray` prototypes; `item(i)` truncates `i` to
+  uint32 per Web IDL §3.2.4), `languages`, `deviceMemory`,
+  `hardwareConcurrency`, `connection`, `permissions.query`
+- **window / document** — `chrome` (`runtime`/`csi`/`loadTimes`),
+  `outerWidth/Height`, `hasFocus`/`hidden`/`visibilityState`,
+  `Notification.permission`
+- **WebGL** — UNMASKED_VENDOR / UNMASKED_RENDERER (replaces SwiftShader /
+  generic-vendor leaks)
+- **UA / Sec-CH-UA** (headless-only via CDP `Emulation.setUserAgentOverride`)
+  — `navigator.userAgent`, `userAgentData.brands`
+- **Web Worker / SharedWorker / Service Worker** (race-proof injection via
+  constructor wrap + `importScripts`) — main↔worker consistency for
+  `deviceMemory`, `languages`, `vendor`, `productSub`, `vendorSub`, WebGL
+- **CDP-attach detection** — `Debugger.setSkipAllPauses`, `console.*` `Error`
+  pre-stringify (blocks `error.stack` getter probes)
+- **Anti devtools-detector** — `console.table` timing neutralization,
+  `devtoolsFormatters` lockout, `Function`-constructor `debugger` strip
+
+Per-vector implementation details:
+[`docs/INTERNALS.md#stealth-js-init-script--patched-properties`](docs/INTERNALS.md#stealth-js-init-script--patched-properties).
 
 The JSON sources accept any `Browser` constructor parameter:
 
@@ -205,6 +256,146 @@ The JSON sources accept any `Browser` constructor parameter:
 BRIDGIC_BROWSER_JSON='{"headless":false,"locale":"zh-CN"}' bridgic-browser open URL
 # One-shot ephemeral session (no persistent profile)
 BRIDGIC_BROWSER_JSON='{"clear_user_data":true}' bridgic-browser open URL
+```
+
+#### Multi-Instance Isolation (`BRIDGIC_HOME`)
+
+By default all state lives under `~/.bridgic`. Set `BRIDGIC_HOME` to run multiple independent daemon instances in parallel — each gets its own socket, logs, user data, and config:
+
+```bash
+# Instance 1 (default)
+bridgic-browser open https://site-a.com
+
+# Instance 2 (separate home)
+BRIDGIC_HOME=/tmp/b2 bridgic-browser open https://site-b.com
+
+# Each instance operates independently
+bridgic-browser snapshot                        # site-a snapshot
+BRIDGIC_HOME=/tmp/b2 bridgic-browser snapshot   # site-b snapshot
+
+# Close each instance separately
+bridgic-browser close
+BRIDGIC_HOME=/tmp/b2 bridgic-browser close
+```
+
+For SDK multi-instance isolation within the same process, use `Browser(user_data_dir=...)` per instance. For full process-level isolation, set `BRIDGIC_HOME` before spawning a subprocess. See `skills/bridgic-browser/references/env-vars.md` for details.
+
+#### Storage State (Cross-Instance Login Sharing)
+
+Export cookies and localStorage from one browser instance and import them into another — useful for sharing login sessions across instances or persisting auth state for later runs:
+
+```bash
+# 1. Log into a website in instance A
+bridgic-browser open https://github.com --headed
+# ... complete login in the browser ...
+
+# 2. Export storage state (cookies + localStorage)
+bridgic-browser storage-save /tmp/github-login.json
+
+# 3. Import into another instance (even with a different BRIDGIC_HOME)
+BRIDGIC_HOME=/tmp/b2 bridgic-browser open https://github.com --headed
+BRIDGIC_HOME=/tmp/b2 bridgic-browser storage-load /tmp/github-login.json
+BRIDGIC_HOME=/tmp/b2 bridgic-browser reload   # apply the imported cookies
+
+# Instance B is now logged in with the same session as instance A
+```
+
+The exported JSON file contains all cookies (including HttpOnly / Secure) and localStorage entries for every origin the browser has visited.
+
+The storage state file is **cross-mode compatible** — you can export from a headed session and import into a headless one (or vice versa), and the login session will carry over. This is especially useful for automating workflows that require authentication: log in once in headed mode where you can interact with CAPTCHAs and 2FA prompts, export the storage state, and then reuse it in headless automation runs.
+
+**SDK usage:**
+
+```python
+import asyncio
+from bridgic.browser.session import Browser
+
+async def main():
+    # 1. Export: log in interactively, then save storage state
+    async with Browser(headless=False) as browser:
+        await browser.navigate_to("https://github.com")
+        # ... complete login in the browser ...
+        await browser.save_storage_state("/tmp/github-login.json")
+
+    # 2. Import: reuse the login session in a new (headless) instance
+    async with Browser(headless=True, user_data_dir="/tmp/sdk-profile") as browser:
+        await browser.restore_storage_state("/tmp/github-login.json")
+        await browser.navigate_to("https://github.com")
+        snap = await browser.get_snapshot(interactive=True)
+        print(snap.tree)  # Dashboard — logged in
+
+asyncio.run(main())
+```
+
+#### CDP Mode (Connect to Existing Browser)
+
+Instead of launching a new browser, `bridgic-browser` can connect to an already-running Chrome/Chromium instance via the [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/).
+
+There are two ways to start Chrome with a remote debugging endpoint exposed.
+
+**Option A — Chrome 144+ in-browser UI (no relaunch).** Open `chrome://inspect/#remote-debugging` in your everyday Chrome window and follow the dialog to allow incoming debugging connections. Chrome opens a local endpoint and writes the connection info to a `DevToolsActivePort` file at the root of the user data directory:
+
+| Platform | Path |
+|----------|------|
+| macOS    | `~/Library/Application Support/Google/Chrome/DevToolsActivePort` |
+| Linux    | `~/.config/google-chrome/DevToolsActivePort` |
+| Windows  | `%LOCALAPPDATA%\Google\Chrome\User Data\DevToolsActivePort` |
+
+The file is exactly two lines — port and browser-level WebSocket path:
+
+```
+9222
+/devtools/browser/f8632266-41b6-4eb8-8239-d48a86bb44b1
+```
+
+Because bridgic's `--cdp auto` already scans these standard profile directories for `DevToolsActivePort`, you can connect immediately with no extra arguments:
+
+```bash
+bridgic-browser open https://example.com --cdp auto
+```
+
+While the session is active Chrome shows a *"Chrome is being controlled by automated test software"* banner, and Chrome may prompt you to confirm each new debugging session. Sources: [Chrome DevTools MCP blog post](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session), [chrome-devtools-mcp README](https://github.com/ChromeDevTools/chrome-devtools-mcp/). See [`docs/CDP_MODE.md`](docs/CDP_MODE.md) for more.
+
+**Option B — launch flag (Chrome <144, or a dedicated profile).** Start Chrome with `--remote-debugging-port`:
+
+```bash
+# macOS
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+    --remote-debugging-port=9222 --user-data-dir=/tmp/cdp-profile
+
+# Linux
+google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/cdp-profile
+```
+
+Then connect with `--cdp`:
+
+```bash
+bridgic-browser open https://example.com --cdp 9222
+bridgic-browser open https://example.com --cdp ws://localhost:9222/devtools/browser/...
+bridgic-browser open https://example.com --cdp wss://cloud.example.com/chromium?token=...
+bridgic-browser open https://example.com --cdp auto
+```
+
+| Format | Description |
+|--------|-------------|
+| `9222` | Bare port number -- queries `localhost:9222/json/version` to discover the WebSocket URL |
+| `ws://...` / `wss://...` | Direct WebSocket URL (raw CDP or Playwright WS protocol), passed through as-is |
+| `http://host:port` | HTTP discovery endpoint -- queries `/json/version` on that host |
+| `auto` | Auto-scan local Chrome/Chromium/Brave profile directories (+ Canary variants) for an active `DevToolsActivePort` file |
+
+**Tab visibility:** when attached to a user's running Chrome, bridgic only sees pages it itself opens — the brand-new tab created at attach time, anything spawned via `new-tab`, and popups triggered from those pages by a plain left-click on a `<a target="_blank">` link or by a JavaScript `window.open()` call (adopted via `Page.opener()`). **Tabs the user opens with Cmd+click (macOS) / Ctrl+click (Win/Linux) / middle-click / Cmd+T / address bar are *not* adopted** — for Cmd/Ctrl/middle-click Chromium clears the opener at the browser-process level (the "background tab" navigation path); Cmd+T and the address bar have no opener relationship to begin with. Either way bridgic cannot see them. **Your other tabs are deliberately invisible to bridgic's `tabs` / `switch-tab` / `close-tab`.** This is a privacy boundary that prevents an LLM driving bridgic from switching to or closing your private work tabs. To work with a page you already have open, navigate to that URL through bridgic instead. By default a popup whose opener is bridgic's current tab becomes the new active tab (`auto_follow_popups=True`); set `Browser(auto_follow_popups=False)` to keep the active pointer fixed. See [`docs/CDP_MODE.md#tab-ownership-in-cdp-mode`](docs/CDP_MODE.md#tab-ownership-in-cdp-mode) for the full adoption truth table.
+
+**Closing behavior:** `bridgic-browser close` disconnects from the remote browser but does **not** terminate the Chrome process. The browser keeps running and can be reconnected.
+
+**Use cases:**
+- Reuse an existing Chrome session with its login state and extensions
+- Connect to cloud browser services (Browserless, Steel.dev, etc.)
+- Automate Electron apps that expose a CDP port
+
+SDK equivalent:
+
+```python
+browser = Browser(cdp="ws://localhost:9222/devtools/browser/...")
 ```
 
 #### Command List
@@ -304,7 +495,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 - `go_back()` / `go_forward()` - Browser history navigation
 
 **Snapshot (1 tool):**
-- `get_snapshot_text(limit=10000, interactive=False, full_page=True, file=None)` - Get page state string for LLM (accessibility tree with refs). **limit** (default 10000) controls the maximum characters returned. When the snapshot exceeds limit or **file** is explicitly provided, full content is saved to **file** (auto-generated under `~/.bridgic/bridgic-browser/snapshot/` if `None` and over limit) and only a notice with the file path is returned. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default).
+- `get_snapshot_text(limit=10000, interactive=False, full_page=True, file=None)` - Get page state string for LLM (accessibility tree with refs). **limit** (default 10000) controls the maximum characters returned. When the snapshot exceeds limit or **file** is explicitly provided, full content is saved to **file** (auto-generated under `$BRIDGIC_HOME/bridgic-browser/snapshot/` if `None` and over limit) and only a notice with the file path is returned. **interactive** and **full_page** match `get_snapshot` (interactive-only or full-page by default).
 
 **Element Interaction (13 tools) - by ref:**
 - `click_element_by_ref(ref)` - Click element
@@ -364,7 +555,7 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 **Verify (6 tools):**
 - `verify_text_visible(text)` - Check text visibility
 - `verify_element_visible(role, accessible_name)` - Check element visibility by role and accessible name
-- `verify_url(pattern)` / `verify_title(pattern)` - URL/title verification
+- `verify_url(expected_url, exact=False)` / `verify_title(expected_title, exact=False)` - URL/title verification
 - `verify_element_state(ref, state)` - Check element state
 - `verify_value(ref, value)` - Check element value
 
@@ -460,7 +651,7 @@ The main class for browser automation with automatic launch mode selection:
 ```python
 from bridgic.browser.session import Browser
 
-# Persistent session (default — profile saved to ~/.bridgic/bridgic-browser/user_data/)
+# Persistent session (default — profile saved to $BRIDGIC_HOME/bridgic-browser/user_data/)
 browser = Browser(
     headless=True,
     viewport={"width": 1600, "height": 900},
@@ -489,9 +680,11 @@ browser = Browser(
 | `user_data_dir` | str/Path | None | Custom path for persistent profile (ignored when `clear_user_data=True`) |
 | `clear_user_data` | bool | False | If True, use ephemeral session (no profile); if False, use persistent profile |
 | `stealth` | bool/StealthConfig | True | Stealth mode configuration |
+| `cdp` | str | None | Connect to an existing Chrome via CDP (skips launch). Accepts port number, `ws://` / `wss://` URL, `http://host:port`, or `"auto"` — mirrors the CLI `--cdp` flag. |
+| `auto_follow_popups` | bool | True | When a bridgic-owned page spawns a popup (`<a target="_blank">` click, `window.open()`), automatically move `self._page` to the popup. Set False to keep the active-page pointer fixed; the popup is still adopted into the owned set. |
 | `channel` | str | None | Browser channel (chrome, msedge, etc.) |
 | `proxy` | dict | None | Proxy settings |
-| `downloads_path` | str/Path | None | Download directory |
+| `downloads_path` | str/Path | None | Download directory. Priority: explicit value > `bridgic-browser.json` > (CDP-borrowed CLI only) the CLI client's CWD > `~/Downloads`. See [Downloads](#downloads). |
 
 **Snapshot:** Use `get_snapshot(interactive=False, full_page=True)` to get an `EnhancedSnapshot` with `.tree` (accessibility tree string) and `.refs` (ref → locator data). By default `full_page=True` includes all elements regardless of viewport position. Pass `interactive=True` for clickable/editable elements only (flattened output), or `full_page=False` to limit to viewport-only elements. Use `get_element_by_ref(ref)` to get a Playwright Locator from a ref (e.g. "1f79fe5e") for click, fill, etc.
 
@@ -511,34 +704,54 @@ config = StealthConfig(
 browser = Browser(stealth=config, headless=False)
 ```
 
-#### DownloadManager
+#### Downloads
 
 `Browser` always creates a `DownloadManager` and always accepts downloads. Files are saved to `downloads_path` if configured, or `~/Downloads` by default.
 
+bridgic preserves the original filename, suppresses the "Save As" dialog, and keeps the API the same across modes. Internally there are two pipelines — `DownloadManager` for non-CDP / CDP-owned, and `CdpDownloadRenamer` for CDP-borrowed (page-level CDP routing of `setDownloadBehavior(allowAndName)`). See [CLAUDE.md → Downloads](CLAUDE.md#downloads) for the full design.
+
+##### Download path matrix
+
+| Caller | Mode | `downloads_path` explicit | Effective path |
+|---|---|---|---|
+| **CLI** (`bridgic-browser ...`) | non-CDP | yes | the explicit value |
+| **CLI** | non-CDP | no | `~/Downloads` (daemon auto-default) |
+| **CLI** | CDP (`--cdp ...`) | yes | the explicit value |
+| **CLI** | CDP | no | the CLI client's working directory at command time (`os.getcwd()`) — `curl -O`-style ergonomics |
+| **SDK** (`Browser(...)`) | non-CDP | yes | the explicit value |
+| **SDK** | non-CDP | no | `~/Downloads` (DownloadManager auto-default) |
+| **SDK** | CDP (`Browser(cdp=...)`) | yes | the explicit value |
+| **SDK** | CDP | no | `~/Downloads` (SDK has no CLI CWD hint) |
+
 ```python
-# Optional: configure a custom download directory
+# Non-CDP (DownloadManager pipeline)
 browser = Browser(downloads_path="./downloads", headless=True)
-await browser.navigate_to("https://example.com")  # lazy start triggers here
+await browser.navigate_to("https://example.com")
 
 # Trigger a download, then wait for it to complete
 await browser.click_element_by_ref("8d4b03a9")
 result = await browser.wait_for_next_download(timeout=30.0)
 # "Download complete: report.pdf — 261.0 KB — /home/user/Downloads/report.pdf"
 
-# List all downloads in the session
+# Get the formatted list of everything downloaded in this session
 print(await browser.get_downloaded_files_text())
 
 # Or access the raw list
-for file in browser.download_manager.downloaded_files:
-    print(f"Downloaded: {file.file_name} ({file.file_size} bytes)")
+for f in browser.download_manager.downloaded_files:
+    print(f"Downloaded: {f.file_name} ({f.file_size} bytes)")
+
+# CDP-borrowed (CdpDownloadRenamer pipeline; downloads land at downloads_path
+# with real filenames; download_manager is None — wait_for_download /
+# wait_for_next_download are unsupported here).
+browser = Browser(cdp="auto", downloads_path="./downloads")
 ```
 
 ### Stealth Mode
 
 Stealth mode is **enabled by default** and includes:
 
-- **Headless mode**: 50+ Chrome args + JS init script patching `navigator.webdriver`, `window.chrome`, WebGL, `document.hasFocus()`, `visibilityState`, and more. All patched functions spoof `Function.prototype.toString` to return `[native code]`.
-- **Headed mode**: minimal ~11 flags only (matching real Chrome); JS patches are skipped entirely so third-party challenge iframes (e.g. Cloudflare Turnstile) see unmodified native APIs.
+- **Headless mode**: 50+ Chrome args + JS init script + Web/Service/Shared Worker injection + CDP UA-CH override. See [Anti-Detection](#anti-detection) for the full coverage list.
+- **Headed mode**: minimal ~11 flags + system Chrome (`channel="chrome"`) for real TLS authenticity. The main JS init script is skipped entirely so cross-origin iframes (e.g. Cloudflare Turnstile) see unmodified native APIs. See [Anti-Detection](#anti-detection).
 
 ```python
 # Stealth is ON by default
@@ -603,3 +816,4 @@ MIT License
 - [Browser Tools Guide](docs/BROWSER_TOOLS_GUIDE.md) – Tool selection, ref vs coordinate, wait strategies, patterns.
 - [Snapshot and Page State](docs/SNAPSHOT_AND_STATE.md) – SnapshotOptions, EnhancedSnapshot, get_snapshot_text, get_element_by_ref.
 - [API Summary](docs/API.md) – Session and DownloadManager API reference.
+- [Known Limitations](docs/KNOWN_LIMITATIONS.md) – Known issues and upstream bugs (e.g. Chrome "Show in Folder" not working).

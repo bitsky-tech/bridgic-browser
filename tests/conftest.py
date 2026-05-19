@@ -83,14 +83,27 @@ def mock_page() -> MagicMock:
 
 
 @pytest.fixture
-def mock_context(mock_page: MagicMock) -> MagicMock:
+def mock_cdp_session() -> MagicMock:
+    """Create a mock Playwright CDPSession with a default Page.getLayoutMetrics response."""
+    session = MagicMock()
+    session.send = AsyncMock(return_value={
+        "cssLayoutViewport": {"clientWidth": 1920, "clientHeight": 1080, "pageX": 0, "pageY": 0},
+        "cssContentSize": {"width": 1920, "height": 3000},
+        "cssVisualViewport": {"clientWidth": 1920, "clientHeight": 1080},
+    })
+    session.detach = AsyncMock()
+    return session
+
+
+@pytest.fixture
+def mock_context(mock_page: MagicMock, mock_cdp_session: MagicMock) -> MagicMock:
     """Create a mock Playwright BrowserContext object."""
     context = MagicMock()
     context.pages = [mock_page]
     context.new_page = AsyncMock(return_value=mock_page)
     context.close = AsyncMock()
     context.browser = None  # Playwright persistent contexts return None for .browser
-    context.new_cdp_session = AsyncMock()
+    context.new_cdp_session = AsyncMock(return_value=mock_cdp_session)
     context.add_init_script = AsyncMock()
     return context
 

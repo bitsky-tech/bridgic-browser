@@ -6,7 +6,9 @@ Short reference for the main session and download APIs. For tool lists and selec
 
 | Method / property | Description |
 |------------------|-------------|
-| `Browser(...)` | Constructor. Key args: `headless`, `viewport`, `user_data_dir`, `clear_user_data`, `stealth`, `channel`, `proxy`, `downloads_path`, etc. |
+| `Browser(...)` | Constructor. Key args: `headless`, `viewport`, `user_data_dir`, `clear_user_data`, `stealth`, `cdp`, `channel`, `proxy`, `downloads_path`, etc. When `cdp` is set, connects to an existing Chrome via CDP (`connect_over_cdp`) instead of launching a new browser. Accepts the same inputs as the CLI `--cdp` flag: port number (`"9222"`), `ws://`/`wss://` URL, `http://host:port`, or `"auto"` (scan local Chrome profiles). **The constructor never performs network I/O** — values are stored as-is and resolved to a `ws://` URL lazily inside `await browser._start()` (safe to call from within an event loop). A malformed `cdp` value therefore surfaces as `InvalidInputError` on first use, not at construction. |
+| `find_cdp_url(mode, port, host, ...)` | Resolve a Chrome CDP WebSocket URL. `mode`: `"port"` (HTTP `/json/version`), `"file"` (read `DevToolsActivePort`), `"scan"` (auto-discover running Chrome/Chromium/Brave), `"service"` (return `ws_endpoint` as-is). Returns `ws://` URL. |
+| `resolve_cdp_input(value)` | Normalize user-supplied CDP input to a `ws://` URL. Accepts: bare port (`"9222"`), `ws://`/`wss://` URL, `http://host:port`, or `"auto"`/`"scan"`. |
 | `await browser._start()` | Launch browser and create context. Called automatically by `navigate_to` / `search` (lazy start); call directly only when you need explicit startup before any navigation. |
 | `await browser.close()` | Stop the browser, auto-cleans active capture listeners. No-op if never started. |
 | `await browser.navigate_to(url, wait_until="domcontentloaded", timeout=None)` | Navigate to URL with optional auto-prefix when missing protocol. `wait_until`: `"domcontentloaded"` (default), `"load"`, `"networkidle"`, or `"commit"`. `timeout` in seconds. |
@@ -17,9 +19,9 @@ Short reference for the main session and download APIs. For tool lists and selec
 | `browser.get_current_page_url()` | Get current page URL string, or `None` if no page is open. (sync) |
 | `browser.get_config()` | Return dict of all current browser configuration options. |
 | `await browser.get_downloaded_files_text()` | Numbered list of all files downloaded in this session, or `"No downloads in this session."` if none. Each line: `[N] filename — size — /path/to/file`. |
-| `await browser.wait_for_next_download(timeout=30.0)` | Block until the next download completes and return a one-line summary, or a timeout message. **Call immediately after the action that triggers the download.** Timeout unit is seconds. |
-| `browser.download_manager` | Always-created `DownloadManager` instance. Defaults to `~/Downloads` when `downloads_path` is not configured. |
-| `browser.downloaded_files` | Shortcut for `browser.download_manager.downloaded_files`. |
+| `await browser.wait_for_next_download(timeout=30.0)` | Block until the next download completes and return a one-line summary, or a timeout message. **Call immediately after the action that triggers the download.** Timeout unit is seconds. Not supported in CDP-borrowed mode (the manager isn't attached there). |
+| `browser.download_manager` | Always-created `DownloadManager` instance. Defaults to `~/Downloads` when `downloads_path` is not configured. In **CDP-borrowed** mode the manager is intentionally not attached to the borrowed context — `CdpDownloadRenamer` handles downloads instead. See [CdpDownloadRenamer](#cdp-borrowed-downloads-cdpdownloadrenamer). |
+| `browser.downloaded_files` | Shortcut for `browser.download_manager.downloaded_files`. Returns `[]` in CDP-borrowed mode because the manager isn't attached there. |
 | `browser.headless` | `bool` — whether the browser runs in headless mode. |
 | `browser.viewport` | `dict` or `None` — current viewport size configuration. |
 | `browser.channel` | `str` or `None` — browser distribution channel. |
@@ -28,16 +30,34 @@ Short reference for the main session and download APIs. For tool lists and selec
 | `browser.stealth_enabled` | `bool` — whether stealth mode is active. |
 | `browser.stealth_config` | `StealthConfig` or `None` — current stealth configuration. |
 | `browser.use_persistent_context` | `bool` — `True` when using `launch_persistent_context` (`clear_user_data=False`); `False` when using ephemeral `launch`+`new_context` (`clear_user_data=True`). |
+| `browser.last_close_artifacts` | `dict` — trace and video paths produced by the most recent `close()` call. Shape: `{"trace": [str, ...], "video": [str, ...]}`. Empty lists before the first close, or when no tracing/video was active. Returns a fresh shallow copy on every access — mutating it does not affect the browser's internal state. |
+| `browser.last_close_errors` | `list[str]` — warnings/errors collected during the most recent `close()` call (e.g. trace-stop timeouts, video-finalize failures). Empty list before the first close, or on a clean shutdown. Returns a fresh copy on every access. |
 
-## DownloadManager
+## Downloads
+
+bridgic has two download pipelines, picked by mode. The download path resolution is:
+
+| Mode | Pipeline | `downloads_path` unset → falls back to |
+|---|---|---|
+| non-CDP (`Browser()`) | `DownloadManager.save_as` from Playwright's `artifactsDir` | `~/Downloads` (DownloadManager auto-default). |
+| CDP-owned (rare — `Browser(cdp=...)` against a remote Chrome that has no contexts yet) | Same as non-CDP | Same as non-CDP. |
+| CDP-borrowed (`Browser(cdp=...)` against a user's running Chrome) | `CdpDownloadRenamer` (rename GUID → real name post-completion) via a page-level CDP session | `~/Downloads`. In daemon mode the CLI client's CWD (`os.getcwd()`) takes priority over the `~/Downloads` fallback — see [CLAUDE.md → Downloads](../CLAUDE.md#downloads). |
+
+### DownloadManager (non-CDP / CDP-owned modes)
 
 `Browser` always creates a `DownloadManager`. It saves files to the configured `downloads_path`, or `~/Downloads` by default. Access it via `browser.download_manager` after the browser has started.
 
 | Method / property | Description |
 |------------------|-------------|
-| `browser.download_manager` | The `DownloadManager` instance. Always non-`None` after `__init__`. |
+| `browser.download_manager` | The `DownloadManager` instance. Always non-`None` after `__init__`. In CDP-borrowed mode it is created but not attached to the context; downloads in that mode go through `CdpDownloadRenamer` instead. |
 | `browser.download_manager.downloaded_files` | List of `DownloadedFile` (`.url`, `.path`, `.file_name`, `.file_size`). |
 | `await browser.download_manager.wait_for_next_download(timeout=30.0)` | Wait up to *timeout* seconds for the next download to complete. Returns `DownloadedFile` or `None` on timeout. |
+
+`browser.wait_for_download(...)` is **not supported in CDP-borrowed mode** — Playwright's per-context `download` event does not fire when the file is routed away from `artifactsDir` by the page-session override.
+
+### CDP-borrowed downloads (CdpDownloadRenamer)
+
+In CDP-borrowed mode bridgic sends `Browser.setDownloadBehavior(allowAndName, downloadPath=<path>, eventsEnabled=true)` over a **page-level CDP session** attached to bridgic's tab (the only CDP form that bypasses Chrome's "Ask where to save each file" preference in Chrome 138+). Chrome saves files as `<path>/<guid>`; `CdpDownloadRenamer` subscribes to `Browser.downloadWillBegin/downloadProgress` on the same session and renames `<guid>` → real filename on completion. See [CLAUDE.md → Downloads](../CLAUDE.md#downloads) for the full design, including alternatives tried.
 
 ## Snapshot and state (see SNAPSHOT_AND_STATE.md)
 

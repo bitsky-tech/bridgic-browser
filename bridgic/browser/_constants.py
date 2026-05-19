@@ -3,11 +3,14 @@ Bridgic Browser — shared constants.
 
 Central place for values referenced across multiple modules.
 """
+import os
 from enum import Enum
 from pathlib import Path
 
-# Root directory for all Bridgic user data: ~/.bridgic
-BRIDGIC_HOME = Path.home() / ".bridgic"
+# Root directory for all Bridgic user data (overridable via BRIDGIC_HOME env var)
+BRIDGIC_HOME = Path(
+    os.environ.get("BRIDGIC_HOME", str(Path.home() / ".bridgic"))
+).expanduser()
 
 # Product-specific directory: ~/.bridgic/bridgic-browser
 BRIDGIC_BROWSER_HOME = BRIDGIC_HOME / "bridgic-browser"
@@ -20,6 +23,9 @@ BRIDGIC_SNAPSHOT_DIR = BRIDGIC_BROWSER_HOME / "snapshot"
 
 # Default persistent user data directory for browser sessions
 BRIDGIC_USER_DATA_DIR = BRIDGIC_BROWSER_HOME / "user_data"
+
+# Default directory for browser downloads (app-managed fallback)
+BRIDGIC_DOWNLOADS_DIR = BRIDGIC_BROWSER_HOME / "downloads"
 
 
 class ToolCategory(Enum):
