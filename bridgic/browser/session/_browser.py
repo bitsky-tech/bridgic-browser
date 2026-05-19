@@ -725,7 +725,20 @@ class Browser:
         return []
 
     async def get_downloaded_files_text(self) -> str:
-        """Return a human-readable summary of all downloads in this session."""
+        """Return a human-readable summary of all downloads in this session.
+
+        Returns an explanatory message in CDP-borrowed mode (where downloads
+        are renamed in place by ``CdpDownloadRenamer`` and never enter
+        ``DownloadManager``'s tracking list), so callers can tell "no downloads
+        happened" apart from "this mode doesn't track downloads".
+        """
+        if self._is_cdp_borrowed:
+            return (
+                "Download tracking is not available in CDP-borrowed mode. "
+                "Downloads in this mode are renamed in place by CdpDownloadRenamer "
+                "and do not pass through DownloadManager. Inspect downloads_path "
+                "directly to find the saved files."
+            )
         files = self.downloaded_files
         if not files:
             return "No downloads in this session."
@@ -740,7 +753,17 @@ class Browser:
         """Wait up to *timeout* seconds for the next download to complete.
 
         Returns a one-line summary of the downloaded file, or a timeout message.
+        Returns an explanatory message in CDP-borrowed mode — DownloadManager
+        is intentionally not attached there (downloads are handled by
+        ``CdpDownloadRenamer`` instead), so blocking on the completion queue
+        would always time out and confuse callers.
         """
+        if self._is_cdp_borrowed:
+            return (
+                "wait_for_next_download is not supported in CDP-borrowed mode. "
+                "Downloads in this mode are renamed in place by CdpDownloadRenamer "
+                "and do not go through DownloadManager."
+            )
         if not self._download_manager:
             return "Download manager not available."
         file = await self._download_manager.wait_for_next_download(timeout=timeout)

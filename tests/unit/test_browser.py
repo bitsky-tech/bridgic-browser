@@ -185,6 +185,55 @@ class TestBrowserInitialization:
         assert config["use_persistent_context"] is True
 
 
+class TestBrowserDownloadMethods:
+    """Tests for Browser.wait_for_next_download / get_downloaded_files_text
+    surface — in particular the explicit unsupported-in-CDP-borrowed-mode
+    behavior so callers can tell the modes apart instead of blocking until
+    timeout."""
+
+    @pytest.mark.asyncio
+    async def test_wait_for_next_download_in_cdp_borrowed_mode_returns_explanation(
+        self,
+    ):
+        browser = Browser()
+        # Force the CDP-borrowed state without actually starting Playwright:
+        # _is_cdp_borrowed == bool(_cdp_resolved) and not _cdp_context_owned.
+        browser._cdp_resolved = "ws://localhost:9222/devtools/browser/test"
+        assert browser._is_cdp_borrowed is True
+
+        result = await browser.wait_for_next_download(timeout=30.0)
+
+        assert "not supported in CDP-borrowed mode" in result
+        # The completion queue must NOT have been awaited (no blocking).
+        assert browser.download_manager._completed_queue.qsize() == 0
+
+    @pytest.mark.asyncio
+    async def test_get_downloaded_files_text_in_cdp_borrowed_mode_returns_explanation(
+        self,
+    ):
+        browser = Browser()
+        browser._cdp_resolved = "ws://localhost:9222/devtools/browser/test"
+        assert browser._is_cdp_borrowed is True
+
+        result = await browser.get_downloaded_files_text()
+
+        assert "not available in CDP-borrowed mode" in result
+        assert "CdpDownloadRenamer" in result
+
+    @pytest.mark.asyncio
+    async def test_get_downloaded_files_text_empty_session_message(self):
+        """Non-CDP-borrowed mode with zero downloads still uses the generic
+        'No downloads in this session.' message — the CDP-borrowed branch
+        must not short-circuit it."""
+        browser = Browser()
+        # Default fresh Browser: _cdp_resolved is None → _is_cdp_borrowed False.
+        assert browser._is_cdp_borrowed is False
+
+        result = await browser.get_downloaded_files_text()
+
+        assert result == "No downloads in this session."
+
+
 class TestBrowserLaunchOptions:
     """Tests for Browser launch options generation."""
 

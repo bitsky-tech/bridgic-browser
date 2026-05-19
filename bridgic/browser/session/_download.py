@@ -91,6 +91,26 @@ class DownloadManager:
     2. When a download starts, waits for it to complete
     3. Uses `download.suggested_filename` to get the original name
     4. Saves the file using `download.save_as()` with the correct name
+
+    Wait APIs (two distinct mechanisms — pick the one that matches your call
+    site, they are not interchangeable)
+    --------------------------------------------------------------------------
+    * ``wait_for_download(page, action, timeout)`` — **one-shot Future**, bound
+      to a specific trigger ``action`` you pass in. Concurrent callers each
+      get their own Future and are fulfilled FIFO. Times out silently and
+      leaves no residue. Use when you control both the click and the wait in
+      the same async scope.
+
+    * ``wait_for_next_download(timeout)`` — **persistent FIFO queue**,
+      independent of any trigger. Every successful download is pushed onto
+      the queue regardless of who (if anyone) is waiting; callers drain it
+      one item at a time. Cleared by :meth:`clear_history`. Use when the
+      trigger and the wait happen in separate calls (e.g. a CLI command
+      issues the click, a later CLI command waits for completion).
+
+    Both APIs coexist: a single completed download wakes the oldest
+    ``wait_for_download`` Future *and* lands on ``_completed_queue``. That is
+    intentional — the two surfaces have different lifetimes and audiences.
     """
 
     def __init__(

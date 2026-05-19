@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Bridgic Browser** is an LLM-driven browser automation library built on Playwright with built-in stealth mode. It provides 67 browser tools organized into categories, an accessibility tree-based snapshot system, a stable element reference system (refs like "1f79fe5e", "8d4b03a9", …) designed for reliable AI agent interactions, and a `bridgic-browser` CLI tool backed by a persistent daemon.
+**Bridgic Browser** is an LLM-driven browser automation library built on Playwright with built-in stealth mode. It provides 69 browser tools organized into categories, an accessibility tree-based snapshot system, a stable element reference system (refs like "1f79fe5e", "8d4b03a9", …) designed for reliable AI agent interactions, and a `bridgic-browser` CLI tool backed by a persistent daemon.
 
 ## Commands
 
@@ -57,7 +57,7 @@ bridgic/browser/
 ├── _redact.py        # Log redaction helpers
 ├── errors.py         # Public BridgicBrowserError hierarchy
 ├── session/          # Core browser session
-│   ├── _browser.py        # Browser class – main entry point (all 67 tool methods live here)
+│   ├── _browser.py        # Browser class – main entry point (all 69 tool methods live here)
 │   ├── _browser_model.py  # Data models
 │   ├── _snapshot.py       # SnapshotGenerator + EnhancedSnapshot + RefData
 │   ├── _stealth.py        # StealthConfig + StealthArgsBuilder (50+ Chrome args)
@@ -67,12 +67,12 @@ bridgic/browser/
 │   ├── _launch.py         # launch-mode helpers (retriable_launch, etc.)
 │   ├── _locator_utils.py  # _click_checkable_target and other locator helpers
 │   └── _errors.py         # session-internal error types
-├── tools/            # 67 automation tools (all implemented in _browser.py)
+├── tools/            # 69 automation tools (all implemented in _browser.py)
 │   ├── _browser_tool_set_builder.py  # BrowserToolSetBuilder (category/name selection)
 │   └── _browser_tool_spec.py         # BrowserToolSpec (wraps tool for agents)
 └── cli/              # CLI tool (bridgic-browser command)
     ├── __init__.py    # Exports main()
-    ├── _commands.py   # Click command definitions (67 commands, SectionedGroup)
+    ├── _commands.py   # Click command definitions (69 commands, SectionedGroup)
     ├── _client.py     # Socket client: send_command(), ensure_daemon_running()
     ├── _daemon.py     # Daemon: asyncio Unix socket server + Browser instance
     └── _transport.py  # Unix-socket transport layer (used by client and daemon)
