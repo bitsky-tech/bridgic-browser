@@ -741,8 +741,17 @@ for f in browser.download_manager.downloaded_files:
     print(f"Downloaded: {f.file_name} ({f.file_size} bytes)")
 
 # CDP-borrowed (CdpDownloadRenamer pipeline; downloads land at downloads_path
-# with real filenames; download_manager is None — wait_for_download /
-# wait_for_next_download are unsupported here).
+# with real filenames). CdpDownloadRenamer pipes completions back into
+# DownloadManager via record_external_download, so wait_for_next_download /
+# get_downloaded_files_text / downloaded_files work the same way as above
+# for downloads triggered on bridgic's primary tab. wait_for_download (the
+# action-bound, Playwright-event variant) remains unsupported in
+# CDP-borrowed mode — use wait_for_next_download.
+#
+# Edge case: downloads triggered from an auto-followed popup are NOT
+# routed through the renamer (setDownloadBehavior was bound to bridgic's
+# original page session, not the popup), so wait_for_next_download will
+# time out on those. See docs/KNOWN_LIMITATIONS.md.
 browser = Browser(cdp="auto", downloads_path="./downloads")
 ```
 

@@ -73,6 +73,44 @@ triggered by the CDP `setDownloadBehavior` command, not a bridgic-browser issue.
 
 ---
 
+## Popup-triggered Downloads in CDP-borrowed Mode Are Not Captured
+
+### Symptom
+
+In **CDP-borrowed** mode (`Browser(cdp=...)` against a user's running Chrome), if bridgic opens a popup (e.g. a `<a target="_blank">` click that auto-follows, or a `window.open()` flow) and the download is triggered **from that popup**, then:
+
+- `await browser.wait_for_next_download(timeout=N)` times out and returns the "No download completed within Ns timeout." message.
+- `await browser.get_downloaded_files_text()` does not list the file.
+- `browser.downloaded_files` does not contain the file.
+- Chrome may show its native "Save As" dialog (depending on the user's "Ask where to save each file" preference) or save silently to Chrome's configured Downloads directory.
+
+Downloads triggered from **bridgic's primary tab** (`self._page`) work normally and surface through all the APIs above.
+
+### Root Cause
+
+In CDP-borrowed mode bridgic takes over downloads by sending
+`Browser.setDownloadBehavior(behavior="allowAndName", downloadPath=..., eventsEnabled=true)` over a **page-level CDP session** attached to `self._page`. This is the only CDP form that bypasses Chrome's "Ask where to save each file" user preference (Chrome 138+); a browser-level session still pops the dialog.
+
+The trade-off: a page-level `setDownloadBehavior` scopes to **that target only**. When bridgic auto-follows a popup, `self._page` moves to the popup, but the CDP session and `CdpDownloadRenamer` stay bound to the original page session — they cannot observe download events fired on the popup target.
+
+### Workarounds
+
+1. **Avoid auto-follow**: trigger the download from a regular link in bridgic's primary tab, not a `target="_blank"` link.
+2. **Pre-arm the popup**: if you control the page, change `target="_blank"` to a same-page link, or download via `fetch()` + `URL.createObjectURL(...)` from bridgic's primary tab.
+3. **Switch modes**: use **CDP-owned** (`Browser(cdp=...)` against a remote Chrome with no contexts yet) or non-CDP mode — both attach `DownloadManager` to the whole context, so any tab's downloads are captured.
+
+### Verification
+
+`tests/integration/test_owned_pages.py::test_popup_follow_does_not_attach_download_manager` guards the invariant that DM stays unattached after popup follow in CDP-borrowed mode — confirming the limitation is by design, not an accidental wiring issue. (Earlier versions of the code attempted a page-scoped attach + migration; that approach was reverted after empirical testing showed it produced 0-byte placeholder files via Playwright `download` events that still fire in CDP-borrowed mode.)
+
+### References
+
+- [bridgic CLAUDE.md → Downloads](../CLAUDE.md#downloads) — full design including empirically-tried alternatives for CDP-borrowed downloads.
+- `bridgic/browser/session/_browser.py::_start()` — CDP-borrowed L1 override is sent on `await self._context.new_cdp_session(self._page)`, the page-scoped session.
+- `bridgic/browser/session/_cdp_download_renamer.py` — the renamer attaches to that single page session.
+
+---
+
 ## Stealth: TLS Fingerprint Cannot Be Matched in Headless Mode
 
 ### Symptom

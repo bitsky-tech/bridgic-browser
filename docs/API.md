@@ -18,10 +18,10 @@ Short reference for the main session and download APIs. For tool lists and selec
 | `await browser.get_current_page_title()` | Get current page title string, or `None` if no page is open. |
 | `browser.get_current_page_url()` | Get current page URL string, or `None` if no page is open. (sync) |
 | `browser.get_config()` | Return dict of all current browser configuration options. |
-| `await browser.get_downloaded_files_text()` | Numbered list of all files downloaded in this session, or `"No downloads in this session."` if none. Each line: `[N] filename — size — /path/to/file`. |
-| `await browser.wait_for_next_download(timeout=30.0)` | Block until the next download completes and return a one-line summary, or a timeout message. **Call immediately after the action that triggers the download.** Timeout unit is seconds. Not supported in CDP-borrowed mode (the manager isn't attached there). |
-| `browser.download_manager` | Always-created `DownloadManager` instance. Defaults to `~/Downloads` when `downloads_path` is not configured. In **CDP-borrowed** mode the manager is intentionally not attached to the borrowed context — `CdpDownloadRenamer` handles downloads instead. See [CdpDownloadRenamer](#cdp-borrowed-downloads-cdpdownloadrenamer). |
-| `browser.downloaded_files` | Shortcut for `browser.download_manager.downloaded_files`. Returns `[]` in CDP-borrowed mode because the manager isn't attached there. |
+| `await browser.get_downloaded_files_text()` | Numbered list of all files downloaded in this session (across all modes), or `"No downloads in this session."` if none. Each line: `[N] filename — size — /path/to/file`. |
+| `await browser.wait_for_next_download(timeout=30.0)` | Block until the next download completes and return a one-line summary, or a timeout message. Timeout unit is seconds. Works for downloads triggered on bridgic's primary tab across all modes — in CDP-borrowed mode the completion is piped in by `CdpDownloadRenamer` after the rename. **Caveat**: in CDP-borrowed mode, downloads triggered from an auto-followed popup are NOT routed through the renamer and will time out here — see [docs/KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md). |
+| `browser.download_manager` | Always-created `DownloadManager` instance. Defaults to `~/Downloads` when `downloads_path` is not configured. In **CDP-borrowed** mode the manager is NOT attached to any page or context — attaching would either hijack user tabs or cause duplicate-record bugs (Playwright still fires `download` events). Completions from `CdpDownloadRenamer` are pushed in via `record_external_download` so the tracking surface is unified. |
+| `browser.downloaded_files` | Shortcut for `browser.download_manager.downloaded_files`. Populated across all modes for primary-tab downloads (CDP-borrowed entries arrive via `record_external_download`); popup-triggered CDP-borrowed downloads are not included — see [docs/KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md). |
 | `browser.headless` | `bool` — whether the browser runs in headless mode. |
 | `browser.viewport` | `dict` or `None` — current viewport size configuration. |
 | `browser.channel` | `str` or `None` — browser distribution channel. |
@@ -43,17 +43,23 @@ bridgic has two download pipelines, picked by mode. The download path resolution
 | CDP-owned (rare — `Browser(cdp=...)` against a remote Chrome that has no contexts yet) | Same as non-CDP | Same as non-CDP. |
 | CDP-borrowed (`Browser(cdp=...)` against a user's running Chrome) | `CdpDownloadRenamer` (rename GUID → real name post-completion) via a page-level CDP session | `~/Downloads`. In daemon mode the CLI client's CWD (`os.getcwd()`) takes priority over the `~/Downloads` fallback — see [CLAUDE.md → Downloads](../CLAUDE.md#downloads). |
 
-### DownloadManager (non-CDP / CDP-owned modes)
+### DownloadManager (unified across all modes)
 
 `Browser` always creates a `DownloadManager`. It saves files to the configured `downloads_path`, or `~/Downloads` by default. Access it via `browser.download_manager` after the browser has started.
 
+The pipeline that *populates* it differs by mode:
+
+- **Non-CDP / CDP-owned**: Playwright's `download` event → `DownloadManager._handle_download` → `download.save_as()` copies the file to `downloads_path` with its real name.
+- **CDP-borrowed (bridgic's primary tab)**: `CdpDownloadRenamer` renames `<guid>` → real filename on the page CDP session, then calls back into `DownloadManager.record_external_download` to populate the same surfaces (`downloaded_files`, `_completed_queue`, `_pending_waiters`).
+- **CDP-borrowed (popup-triggered)**: Not captured — see [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
+
 | Method / property | Description |
 |------------------|-------------|
-| `browser.download_manager` | The `DownloadManager` instance. Always non-`None` after `__init__`. In CDP-borrowed mode it is created but not attached to the context; downloads in that mode go through `CdpDownloadRenamer` instead. |
+| `browser.download_manager` | The `DownloadManager` instance. Always non-`None` after `__init__`. In CDP-borrowed mode it is NOT attached anywhere (attach to context would hijack user tabs; attach to bridgic's page would cause duplicate-record bugs). CDP-borrowed completions flow in via `record_external_download` from `CdpDownloadRenamer`, so this instance is the single tracking surface across all modes. |
 | `browser.download_manager.downloaded_files` | List of `DownloadedFile` (`.url`, `.path`, `.file_name`, `.file_size`). |
 | `await browser.download_manager.wait_for_next_download(timeout=30.0)` | Wait up to *timeout* seconds for the next download to complete. Returns `DownloadedFile` or `None` on timeout. |
 
-`browser.wait_for_download(...)` is **not supported in CDP-borrowed mode** — Playwright's per-context `download` event does not fire when the file is routed away from `artifactsDir` by the page-session override.
+`browser.wait_for_download(page, action, timeout)` (the action-bound, Playwright-event variant) is **not supported in CDP-borrowed mode** — Playwright's per-context `download` event does not fire when the file is routed away from `artifactsDir` by the page-session override. Use `wait_for_next_download(timeout)` instead, which works uniformly across all modes (CDP-borrowed completions arrive via `CdpDownloadRenamer` → `DownloadManager.record_external_download`).
 
 ### CDP-borrowed downloads (CdpDownloadRenamer)
 

@@ -734,8 +734,16 @@ print(await browser.get_downloaded_files_text())
 for f in browser.download_manager.downloaded_files:
     print(f"已下载:{f.file_name}({f.file_size} 字节)")
 
-# CDP-borrowed(CdpDownloadRenamer 流水线;文件以真名落到 downloads_path,
-# download_manager 为 None —— wait_for_download / wait_for_next_download 在此模式不支持)
+# CDP-borrowed(CdpDownloadRenamer 流水线;文件以真名落到 downloads_path)
+# CdpDownloadRenamer 通过 record_external_download 把完成事件回灌到
+# DownloadManager,所以 wait_for_next_download / get_downloaded_files_text /
+# downloaded_files 在 bridgic 主 tab 触发的下载场景下与非 CDP 模式一致。
+# wait_for_download(基于触发动作的 Playwright 事件版本)在此模式仍不支持 ——
+# 请改用 wait_for_next_download。
+#
+# 边界:从 auto-follow popup 上触发的下载不走 renamer(setDownloadBehavior
+# 只绑定在 bridgic 原 page 的 CDP session),所以 wait_for_next_download 会
+# 超时。详见 docs/KNOWN_LIMITATIONS.md。
 browser = Browser(cdp="auto", downloads_path="./downloads")
 ```
 
