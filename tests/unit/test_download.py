@@ -162,6 +162,57 @@ class TestDownloadManager:
 
         assert len(manager.downloaded_files) == 0
 
+    @pytest.mark.asyncio
+    async def test_clear_history_drains_completed_queue(self, temp_downloads_dir):
+        """clear_history() must also drain _completed_queue so a subsequent
+        wait_for_next_download() does not immediately yield a stale completion
+        from before the clear."""
+        manager = DownloadManager(downloads_path=temp_downloads_dir)
+
+        # Seed the completion queue as if a download had finished earlier.
+        manager._completed_queue.put_nowait(
+            DownloadedFile(
+                url="https://example.com/old.pdf",
+                path="/test/old.pdf",
+                file_name="old.pdf",
+                file_size=1,
+            )
+        )
+        assert manager._completed_queue.qsize() == 1
+
+        manager.clear_history()
+
+        # Queue is empty → the next wait must time out, not return the stale file.
+        assert manager._completed_queue.qsize() == 0
+        result = await manager.wait_for_next_download(timeout=0.05)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_completed_queue_evicts_oldest_when_full(self, temp_downloads_dir):
+        """_enqueue_completed drops the oldest entry when the queue is at
+        maxsize, rather than blocking the download handler task. Production
+        uses maxsize=256; shrink it here so the test is fast."""
+        manager = DownloadManager(downloads_path=temp_downloads_dir)
+        manager._completed_queue = asyncio.Queue(maxsize=2)
+
+        def _mk(name):
+            return DownloadedFile(
+                url=f"https://example.com/{name}",
+                path=f"/tmp/{name}",
+                file_name=name,
+                file_size=1,
+            )
+
+        manager._enqueue_completed(_mk("a"))
+        manager._enqueue_completed(_mk("b"))
+        manager._enqueue_completed(_mk("c"))  # evicts "a"
+
+        assert manager._completed_queue.qsize() == 2
+        first = await manager.wait_for_next_download(timeout=0.05)
+        second = await manager.wait_for_next_download(timeout=0.05)
+        assert first is not None and second is not None
+        assert [first.file_name, second.file_name] == ["b", "c"]
+
     def test_get_downloads_by_type(self, temp_downloads_dir):
         """Test filtering downloads by file type."""
         manager = DownloadManager(downloads_path=temp_downloads_dir)

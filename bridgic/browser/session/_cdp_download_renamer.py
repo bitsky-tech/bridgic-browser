@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from bridgic.browser.session._download import DownloadedFile
+
 logger = logging.getLogger(__name__)
 
 
@@ -115,11 +117,14 @@ class _Pending:
     """Per-download state captured at ``downloadWillBegin`` time.
 
     ``target_dir`` is snapshotted so that a hot ``set_default_dir`` call does
-    not retarget downloads already in flight.
+    not retarget downloads already in flight. ``url`` is captured so the
+    completion callback can construct a fully-populated ``DownloadedFile``
+    record.
     """
 
     sanitized_name: str
     target_dir: Path
+    url: str = ""
 
 
 class CdpDownloadRenamer:
@@ -128,14 +133,28 @@ class CdpDownloadRenamer:
     Lifecycle: ``attach`` → ``set_default_dir`` (as many as needed) → ``detach``.
     Thread-safety: events arrive on the asyncio loop thread; all state
     mutation happens in the same thread, no locking required.
+
+    The optional ``on_completed`` callback is invoked once per successfully
+    renamed download with a fully-populated :class:`DownloadedFile`. This is
+    how CDP-borrowed-mode completions are surfaced to ``DownloadManager``'s
+    unified tracking lists (``downloaded_files`` / ``wait_for_next_download``)
+    — Playwright never fires ``download`` events in CDP-borrowed mode (the
+    path moved out of ``artifactsDir``) so this is the only available hook.
+    Callback exceptions are caught and logged; they cannot corrupt the
+    rename pipeline.
     """
 
-    def __init__(self, default_dir: Path) -> None:
+    def __init__(
+        self,
+        default_dir: Path,
+        on_completed: Optional[Callable[[DownloadedFile], None]] = None,
+    ) -> None:
         self._default_dir: Path = Path(default_dir)
         self._pending: Dict[str, _Pending] = {}
         self._session: Optional[Any] = None  # playwright CDPSession
         self._handlers: Dict[str, Callable[[dict], None]] = {}
         self._attached: bool = False
+        self._on_completed = on_completed
 
     @property
     def default_dir(self) -> Path:
@@ -204,9 +223,11 @@ class CdpDownloadRenamer:
             return
         suggested = params.get("suggestedFilename") or ""
         sanitized = sanitize_filename(str(suggested))
+        url = str(params.get("url") or "")
         self._pending[guid] = _Pending(
             sanitized_name=sanitized,
             target_dir=self._default_dir,
+            url=url,
         )
 
     def _on_progress(self, params: dict) -> None:
@@ -259,3 +280,30 @@ class CdpDownloadRenamer:
                 "(file left at its GUID path)",
                 src, final, exc,
             )
+            return
+
+        # Surface the completion to any registered consumer (typically
+        # `DownloadManager.record_external_download` so the unified
+        # downloaded_files / wait_for_next_download surface works in
+        # CDP-borrowed mode too). Callback exceptions are swallowed.
+        if self._on_completed is not None:
+            try:
+                try:
+                    file_size = final.stat().st_size
+                except OSError:
+                    file_size = 0
+                ext = final.suffix.lstrip(".").lower() or None
+                downloaded_file = DownloadedFile(
+                    url=pending.url,
+                    path=str(final),
+                    file_name=final.name,
+                    file_size=file_size,
+                    file_type=ext,
+                    suggested_filename=pending.sanitized_name,
+                )
+                self._on_completed(downloaded_file)
+            except Exception as exc:
+                logger.warning(
+                    "[CdpDownloadRenamer] on_completed callback failed: %s",
+                    exc,
+                )

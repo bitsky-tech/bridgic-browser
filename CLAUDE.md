@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Bridgic Browser** is an LLM-driven browser automation library built on Playwright with built-in stealth mode. It provides 67 browser tools organized into categories, an accessibility tree-based snapshot system, a stable element reference system (refs like "1f79fe5e", "8d4b03a9", …) designed for reliable AI agent interactions, and a `bridgic-browser` CLI tool backed by a persistent daemon.
+**Bridgic Browser** is an LLM-driven browser automation library built on Playwright with built-in stealth mode. It provides 69 browser tools organized into categories, an accessibility tree-based snapshot system, a stable element reference system (refs like "1f79fe5e", "8d4b03a9", …) designed for reliable AI agent interactions, and a `bridgic-browser` CLI tool backed by a persistent daemon.
 
 ## Commands
 
@@ -57,7 +57,7 @@ bridgic/browser/
 ├── _redact.py        # Log redaction helpers
 ├── errors.py         # Public BridgicBrowserError hierarchy
 ├── session/          # Core browser session
-│   ├── _browser.py        # Browser class – main entry point (all 67 tool methods live here)
+│   ├── _browser.py        # Browser class – main entry point (all 69 tool methods live here)
 │   ├── _browser_model.py  # Data models
 │   ├── _snapshot.py       # SnapshotGenerator + EnhancedSnapshot + RefData
 │   ├── _stealth.py        # StealthConfig + StealthArgsBuilder (50+ Chrome args)
@@ -67,12 +67,12 @@ bridgic/browser/
 │   ├── _launch.py         # launch-mode helpers (retriable_launch, etc.)
 │   ├── _locator_utils.py  # _click_checkable_target and other locator helpers
 │   └── _errors.py         # session-internal error types
-├── tools/            # 67 automation tools (all implemented in _browser.py)
+├── tools/            # 69 automation tools (all implemented in _browser.py)
 │   ├── _browser_tool_set_builder.py  # BrowserToolSetBuilder (category/name selection)
 │   └── _browser_tool_spec.py         # BrowserToolSpec (wraps tool for agents)
 └── cli/              # CLI tool (bridgic-browser command)
     ├── __init__.py    # Exports main()
-    ├── _commands.py   # Click command definitions (67 commands, SectionedGroup)
+    ├── _commands.py   # Click command definitions (69 commands, SectionedGroup)
     ├── _client.py     # Socket client: send_command(), ensure_daemon_running()
     ├── _daemon.py     # Daemon: asyncio Unix socket server + Browser instance
     └── _transport.py  # Unix-socket transport layer (used by client and daemon)
@@ -108,7 +108,7 @@ bridgic has two independent download pipelines, picked by mode:
 
 | Mode | Pipeline | Notes |
 |---|---|---|
-| non-CDP (launch / persistent_context) | Playwright's per-context `setDownloadBehavior(allowAndName, downloadPath=<artifactsDir>)` → `download` events fire → `DownloadManager.save_as()` copies to `downloads_path` with the real filename. | Files land at the real filename in `downloads_path`. If `downloads_path` is unset, DownloadManager is not attached and files are lost when Playwright deletes `artifactsDir` on close. |
+| non-CDP (launch / persistent_context) | Playwright's per-context `setDownloadBehavior(allowAndName, downloadPath=<artifactsDir>)` → `download` events fire → `DownloadManager.save_as()` copies to `downloads_path` with the real filename. | Files land at the real filename in `downloads_path`. If `downloads_path` is unset, `Browser.__init__` defaults the manager to `~/Downloads` (PR #28), so downloads are still captured — no more silently-lost files. |
 | CDP-owned (bridgic creates its own context on the remote Chrome) | Same as non-CDP: Playwright's per-context `allowAndName` routes through `artifactsDir`, DownloadManager copies. | Per-context override targets bridgic's own context, doesn't touch the user. |
 | **CDP-borrowed** (`Browser(cdp=...)` against a user's running Chrome) | bridgic's own override on bridgic's tab: `Browser.setDownloadBehavior(allowAndName, downloadPath=<effective>, eventsEnabled=true)` sent **via the page CDP session** (`BrowserContext.new_cdp_session(self._page)`). `CdpDownloadRenamer` subscribes to `Browser.downloadWillBegin/downloadProgress` on the same session and renames `<dir>/<guid>` → `<dir>/<real name>` on completion. | Page-session routing is the *only* form Chrome 138+ honors when the user has "Ask where to save each file" enabled — `Browser.setDownloadBehavior` over a browser-level session and `Page.setDownloadBehavior(allow, ...)` both still pop the dialog. See [empirically-tried alternatives](#empirically-tried-alternatives-for-cdp-borrowed-downloads) below. |
 
@@ -159,7 +159,8 @@ agent-browser's `Some(session_id)` argument is the same trick — page-level CDP
 #### Caveats
 
 - **bridgic's tab gets the override; user's tabs keep their normal Chrome UX** (intentional — the page-session scope is bridgic's tab only). User-initiated downloads in their other tabs still go to their Chrome's configured directory and obey their "Ask where to save" pref. This is by design and matches the "I gave you full control of *my agent's* tab via `--cdp`" semantics — user's private workspace is untouched.
-- **DownloadManager is not attached in CDP-borrowed mode.** Chrome writes directly to the final path; Playwright's per-context `download` event doesn't fire when the file is routed away from `artifactsDir`. `wait_for_download()` is correspondingly **unsupported in CDP-borrowed mode** — use CDP-owned or non-CDP for that.
+- **DownloadManager in CDP-borrowed mode is NOT attached to any page or context.** Attaching to the borrowed context would hijack user tabs (privacy boundary); attaching page-scoped to bridgic's own tab was empirically verified to cause duplicate-record bugs — Playwright STILL fires `download` events in CDP-borrowed mode (`setDownloadBehavior(allowAndName)` on a page session does not suppress them), and `_handle_download.save_as` writes a 0-byte placeholder while the real file is already produced by `CdpDownloadRenamer`. Instead, `CdpDownloadRenamer.on_completed → DownloadManager.record_external_download` pipes real completions back into DM, populating `downloaded_files` / `_completed_queue` / `_pending_waiters`. `downloaded_files` / `wait_for_next_download` / `get_downloaded_files_text` therefore work for **downloads triggered on bridgic's primary tab** across all modes. The action-bound `wait_for_download()` variant (which still needs Playwright's `download` event to fire on bridgic's tab) **remains unsupported in CDP-borrowed mode** — use `wait_for_next_download()` instead.
+- **Popup-triggered downloads in CDP-borrowed mode are not captured by the renamer.** `setDownloadBehavior(allowAndName, ...)` was sent on a single page-level CDP session bound to bridgic's original `self._page`; that override only scopes the originating target. Downloads triggered from an auto-followed popup fall back to Chrome's native UX (the user's "Ask where to save each file" preference governs) and `wait_for_next_download` will time out. See [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md).
 - **The renamer is best-effort.** If a CDP event is missed or the OS rename fails (cross-FS, permission, etc.) the file stays at its GUID path with a warning logged. It never deletes content.
 - **`last_close_artifacts()`** exposes a `rescued_downloads` list when L2 actually moved anything.
 - **"Show in Folder"** in Chrome's download bubble is broken whenever `setDownloadBehavior(allowAndName, eventsEnabled=true)` is active. This is a Chromium bug (`#324282051`) affecting all CDP-using tools. See [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md).

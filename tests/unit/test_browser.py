@@ -185,6 +185,112 @@ class TestBrowserInitialization:
         assert config["use_persistent_context"] is True
 
 
+class TestBrowserDownloadMethods:
+    """Tests for Browser.wait_for_next_download / get_downloaded_files_text.
+
+    Both APIs work uniformly across pipelines: non-CDP / CDP-owned downloads
+    arrive via Playwright's `download` event into DownloadManager;
+    CDP-borrowed downloads arrive via CdpDownloadRenamer →
+    DownloadManager.record_external_download. The Browser methods themselves
+    only see DownloadManager's unified state."""
+
+    @pytest.mark.asyncio
+    async def test_get_downloaded_files_text_empty_session_message(self):
+        """Zero downloads → generic message regardless of mode."""
+        browser = Browser()
+        assert browser._is_cdp_borrowed is False
+
+        result = await browser.get_downloaded_files_text()
+
+        assert result == "No downloads in this session."
+
+    @pytest.mark.asyncio
+    async def test_wait_for_next_download_returns_summary_string(self):
+        """Happy path: when a DownloadedFile is already on the completion
+        queue, wait_for_next_download returns the formatted 'Download
+        complete: ...' summary string (filename, KB/MB size, path)."""
+        from bridgic.browser.session._download import DownloadedFile
+        browser = Browser()
+
+        browser.download_manager._completed_queue.put_nowait(
+            DownloadedFile(
+                url="https://example.com/r.pdf",
+                path="/tmp/r.pdf",
+                file_name="r.pdf",
+                file_size=261_000,  # → 254.9 KB
+            )
+        )
+
+        result = await browser.wait_for_next_download(timeout=1.0)
+
+        assert result.startswith("Download complete:")
+        assert "r.pdf" in result
+        assert "/tmp/r.pdf" in result
+        assert "KB" in result
+
+    @pytest.mark.asyncio
+    async def test_wait_for_next_download_cdp_borrowed_via_record_external(self):
+        """CDP-borrowed mode now surfaces downloads via
+        DownloadManager.record_external_download. wait_for_next_download must
+        return the formatted summary just like in non-CDP modes — no
+        'not supported' fallback."""
+        from bridgic.browser.session._download import DownloadedFile
+        browser = Browser()
+        # Force CDP-borrowed state without launching Playwright.
+        browser._cdp_resolved = "ws://localhost:9222/devtools/browser/test"
+        assert browser._is_cdp_borrowed is True
+
+        # Simulate what CdpDownloadRenamer would do after a successful rename.
+        browser.download_manager.record_external_download(
+            DownloadedFile(
+                url="https://example.com/cdp.pdf",
+                path="/tmp/cdp.pdf",
+                file_name="cdp.pdf",
+                file_size=2048,  # 2 KB
+            )
+        )
+
+        result = await browser.wait_for_next_download(timeout=1.0)
+
+        assert result.startswith("Download complete:")
+        assert "cdp.pdf" in result
+        assert "/tmp/cdp.pdf" in result
+
+    @pytest.mark.asyncio
+    async def test_get_downloaded_files_text_cdp_borrowed_via_record_external(self):
+        """In CDP-borrowed mode, downloads injected via
+        record_external_download are listed by get_downloaded_files_text the
+        same way as Playwright-tracked downloads in other modes."""
+        from bridgic.browser.session._download import DownloadedFile
+        browser = Browser()
+        browser._cdp_resolved = "ws://localhost:9222/devtools/browser/test"
+        assert browser._is_cdp_borrowed is True
+
+        browser.download_manager.record_external_download(
+            DownloadedFile(
+                url="https://example.com/a.pdf",
+                path="/tmp/a.pdf",
+                file_name="a.pdf",
+                file_size=1024,
+            )
+        )
+        browser.download_manager.record_external_download(
+            DownloadedFile(
+                url="https://example.com/b.zip",
+                path="/tmp/b.zip",
+                file_name="b.zip",
+                file_size=5120,
+            )
+        )
+
+        result = await browser.get_downloaded_files_text()
+
+        assert "[1] a.pdf" in result
+        assert "[2] b.zip" in result
+        assert "/tmp/a.pdf" in result
+        assert "/tmp/b.zip" in result
+
+
 class TestBrowserLaunchOptions:
     """Tests for Browser launch options generation."""
 
@@ -2154,11 +2260,15 @@ class TestBrowserStartCdp:
     @pytest.mark.asyncio
     async def test_download_manager_NOT_attached_in_borrowed_context(self, tmp_path):
         """In CDP borrowed-context mode the download manager must NOT attach
-        anywhere. L1's revoke restored Chrome's native download path, so
-        Playwright never receives `Browser.downloadProgress(completed)`. A
-        page-scoped attach would leak a hung `save_as()` task per download.
-        Chrome handles downloads natively (potentially via its 'Save As'
-        dialog); programmatic capture requires owned mode."""
+        anywhere — neither to the borrowed context (would hijack user tabs)
+        nor page-scoped to bridgic's own tab. An empirically-verified
+        regression with page-scoped attach: Playwright STILL fires `download`
+        events in CDP-borrowed mode (`setDownloadBehavior(allowAndName)` on a
+        page session does not suppress them), so a registered handler runs
+        `save_as` and writes a 0-byte placeholder while the real file is
+        already produced by `CdpDownloadRenamer`. The renamer pipes real
+        completions back into DM via `record_external_download` instead — the
+        single, correct surface."""
         mock_pw, _, mock_ctx, mock_pg = self._make_cdp_mocks()
         downloads_dir = tmp_path / "dl"
         downloads_dir.mkdir()

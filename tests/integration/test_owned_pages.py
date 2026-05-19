@@ -431,29 +431,27 @@ async def test_close_owner_then_child_falls_back_to_focus_stack(cdp_browser):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# I10 — DownloadManager follows the popup (CDP borrowed only)
+# I10 — popup adoption in CDP-borrowed mode (no DownloadManager migration)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_download_manager_reattached_on_popup_follow(cdp_browser, tmp_path):
-    """When `_switch_self_page_to` moves `self._page` to a popup in
-    CDP-borrowed mode, the (page-scoped) DownloadManager must re-attach.
+async def test_popup_follow_does_not_attach_download_manager(cdp_browser):
+    """In CDP-borrowed mode the DownloadManager is intentionally NOT attached
+    to any page — `_start()` doesn't attach (avoiding Playwright `download`
+    event duplicate-record bugs), and `_switch_self_page_to` does not
+    attach on popup follow either. CdpDownloadRenamer handles bridgic's
+    primary tab via `record_external_download`; popup-triggered
+    CDP-borrowed downloads are a known limitation (see
+    docs/KNOWN_LIMITATIONS.md).
 
-    We don't trigger an actual download (data: URLs cannot drive Chrome's
-    download path); instead we verify the attachment bookkeeping in the
-    DownloadManager moved with self._page."""
-    # Inject a fresh DownloadManager so the assertion below has something to
-    # observe. The fixture's `Browser(downloads_path=None)` skips creating one.
-    from bridgic.browser.session._download import DownloadManager
-    if cdp_browser._download_manager is None:
-        cdp_browser._download_manager = DownloadManager(downloads_path=str(tmp_path))
-        cdp_browser._download_manager.attach_to_page(cdp_browser._page)
-
+    This test guards that invariant: after a popup is auto-followed, no
+    page in `_page_handlers` belongs to the DownloadManager."""
     dm = cdp_browser._download_manager
     old_page = cdp_browser._page
-    # Attachment is tracked internally via `_page_handlers` keyed by str(id(page)).
-    assert str(id(old_page)) in dm._page_handlers
+
+    # Initial state: DM has no page-scoped attachments in CDP-borrowed mode.
+    assert dm._page_handlers == {}
 
     await old_page.goto(LINK_TARGET_BLANK, wait_until="domcontentloaded")
     async with cdp_browser._context.expect_page() as info:
@@ -467,9 +465,9 @@ async def test_download_manager_reattached_on_popup_follow(cdp_browser, tmp_path
         await asyncio.sleep(0.05)
     assert cdp_browser._page is popup
 
-    # New attachment: popup is now handled; old attachment was detached.
-    assert str(id(popup)) in dm._page_handlers
-    assert str(id(old_page)) not in dm._page_handlers
+    # After follow: still no attachments. The DM remains a pure record
+    # sink populated only by CdpDownloadRenamer.record_external_download.
+    assert dm._page_handlers == {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
