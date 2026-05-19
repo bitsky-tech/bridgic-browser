@@ -2201,18 +2201,13 @@ class TestBrowserStartCdp:
         assert browser._page is mock_pg
 
     @pytest.mark.asyncio
-    async def test_download_manager_page_scoped_attach_in_borrowed_context(
-        self, tmp_path
-    ):
+    async def test_download_manager_NOT_attached_in_borrowed_context(self, tmp_path):
         """In CDP borrowed-context mode the download manager must NOT attach
-        to the whole context (that would hijack the user's other tabs —
-        disallowed by the borrowed-mode privacy boundary), but it SHOULD
-        attach page-scoped to bridgic's own tab. The registered handler is
-        effectively dormant — Playwright never fires `download` events in
-        CDP-borrowed mode (downloads route through CdpDownloadRenamer
-        instead) — but keeping `_page_handlers` in sync with `self._page`
-        gives the popup-follow migration in `_switch_self_page_to` a
-        well-defined initial state to detach from."""
+        anywhere. L1's revoke restored Chrome's native download path, so
+        Playwright never receives `Browser.downloadProgress(completed)`. A
+        page-scoped attach would leak a hung `save_as()` task per download.
+        Chrome handles downloads natively (potentially via its 'Save As'
+        dialog); programmatic capture requires owned mode."""
         mock_pw, _, mock_ctx, mock_pg = self._make_cdp_mocks()
         downloads_dir = tmp_path / "dl"
         downloads_dir.mkdir()
@@ -2227,7 +2222,7 @@ class TestBrowserStartCdp:
                  patch.object(browser._download_manager, "attach_to_page") as mock_attach_pg:
                 await browser._start()
         mock_attach_ctx.assert_not_called()
-        mock_attach_pg.assert_called_once_with(mock_pg)
+        mock_attach_pg.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_download_manager_attached_owned_context(self, tmp_path):

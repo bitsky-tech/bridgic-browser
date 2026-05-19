@@ -1712,22 +1712,15 @@ class Browser:
                 #   Playwright's per-context setDownloadBehavior(allowAndName)
                 #   still routes downloads through the artifactsDir, so
                 #   DownloadManager.save_as() can copy files to downloads_path.
-                # - Borrowed context: page-scoped attach to bridgic's own tab
-                #   only. Attaching to the whole borrowed context would hijack
-                #   the user's other tabs — disallowed by the borrowed-mode
-                #   privacy boundary. The L1 override above routed downloads
-                #   on bridgic's tab through CdpDownloadRenamer, so Playwright
-                #   does NOT fire `download` events here (the path moved out
-                #   of artifactsDir) and the registered handler stays dormant.
-                #   We attach anyway so `_page_handlers` is kept in sync with
-                #   `self._page` and the popup-follow migration in
-                #   `_switch_self_page_to` has a well-defined initial state
-                #   to detach from.
-                if self._download_manager:
-                    if self._cdp_context_owned:
-                        self._download_manager.attach_to_context(self._context)
-                    else:
-                        self._download_manager.attach_to_page(self._page)
+                # - Borrowed context: NOT attached. Our L1 override took the
+                #   default context to allow + downloadPath, so Chrome writes
+                #   directly to the final path; bridgic is not in the
+                #   file-transfer loop. Trying to `save_as` here would block
+                #   forever (Playwright no longer receives
+                #   Browser.downloadProgress(completed) once the path moved
+                #   out of artifactsDir).
+                if self._download_manager and self._cdp_context_owned:
+                    self._download_manager.attach_to_context(self._context)
 
                 logger.info("Playwright started (mode=cdp, stealth_js=%s)", self.stealth_enabled)
                 return
