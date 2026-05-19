@@ -527,6 +527,17 @@ async def _handle_resize(browser: "Browser", args: Dict[str, Any]) -> str:
     return await browser.browser_resize(args.get("width", 1280), args.get("height", 720))
 
 
+# ── Downloads ─────────────────────────────────────────────────────────────────
+
+async def _handle_downloads(browser: "Browser", _args: Dict[str, Any]) -> str:
+    return await browser.get_downloaded_files_text()
+
+
+async def _handle_wait_download(browser: "Browser", args: Dict[str, Any]) -> str:
+    timeout = float(args.get("timeout", 30.0))
+    return await browser.wait_for_next_download(timeout=timeout)
+
+
 _HANDLERS = {
     # Navigation
     "open": _handle_open,
@@ -611,6 +622,9 @@ _HANDLERS = {
     # ("close" is intercepted in the connection handler — see comment above
     # the lifecycle section.)
     "resize": _handle_resize,
+    # Downloads
+    "downloads": _handle_downloads,
+    "wait_download": _handle_wait_download,
 }
 
 

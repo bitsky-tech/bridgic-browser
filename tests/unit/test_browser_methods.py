@@ -30,6 +30,7 @@ EXPECTED_METHODS = [
     "verify_element_visible", "verify_text_visible", "verify_value",
     "verify_element_state", "verify_url", "verify_title",
     "start_tracing", "stop_tracing", "start_video", "stop_video", "add_trace_chunk",
+    "get_downloaded_files_text", "wait_for_next_download",
 ]
 
 

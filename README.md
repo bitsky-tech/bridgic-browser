@@ -8,7 +8,7 @@
 
 ### Features
 
-- **Comprehensive CLI Tools** - 67 tools organized into 15 categories; Designed to integrate with any AI agent
+- **Comprehensive CLI Tools** - 69 tools organized into 15 categories; Designed to integrate with any AI agent
 - **Python-based Tools** - Used for agent / workflow code generation; Easier integration with [Bridgic](https://github.com/bitsky-tech/bridgic) 
 - **Snapshot with Semantic Invariance** - A representation of page snapshot based on accessibility tree and a specially designed ref-generation algorithm that ensures element refs remain unchanged across page reloads
 - **Skills** - Used for guided exploration and code generation; Compatible with most of coding agents
@@ -168,7 +168,7 @@ if __name__ == "__main__":
 
 ### CLI Tools
 
-`bridgic-browser` ships with a command-line interface for controlling a browser from the terminal (67 tools organized into 15 categories). A persistent daemon process holds a browser instance; each CLI invocation connects over a Unix domain socket and exits immediately.
+`bridgic-browser` ships with a command-line interface for controlling a browser from the terminal (69 tools organized into 15 categories). A persistent daemon process holds a browser instance; each CLI invocation connects over a Unix domain socket and exits immediately.
 
 #### Configuration
 
@@ -410,7 +410,7 @@ browser = Browser(cdp="ws://localhost:9222/devtools/browser/...")
 | Wait | `wait [SECONDS] [TEXT] [--gone]` |
 | Tabs | `tabs`, `new-tab`, `switch-tab`, `close-tab` |
 | Evaluate | `eval`, `eval-on` |
-| Capture | `screenshot`, `pdf` |
+| Capture | `screenshot`, `pdf`, `downloads`, `wait-download` |
 | Network | `network-start`, `network-stop`, `network`, `wait-network` |
 | Dialog | `dialog-setup`, `dialog`, `dialog-remove` |
 | Storage | `storage-save`, `storage-load`, `cookies-clear`, `cookies`, `cookie-set` |
@@ -427,7 +427,7 @@ bridgic-browser scroll -h
 
 ### Python Tools
 
-Bridgic Browser provides 67 tools organized into 15 categories. Use `BrowserToolSetBuilder` with category/name selection for scenario-focused tool sets.
+Bridgic Browser provides 69 tools organized into 15 categories. Use `BrowserToolSetBuilder` with category/name selection for scenario-focused tool sets.
 
 #### Category-based Selection
 
@@ -533,9 +533,11 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 **Wait (1 tool):**
 - `wait_for(time_seconds, text, text_gone, selector, state, timeout)` - Wait for conditions
 
-**Capture (2 tools):**
+**Capture (4 tools):**
 - `take_screenshot(filename=None, ref=None, full_page=False, type="png")` - Capture screenshot
 - `save_pdf(filename)` - Save page as PDF
+- `get_downloaded_files_text()` - Numbered list of all files downloaded in this session
+- `wait_for_next_download(timeout=30.0)` - Block until next download completes; returns a one-line summary or a timeout message
 
 **Network (4 tools):**
 - `start_network_capture()` / `stop_network_capture()` / `get_network_requests()` - Network monitoring
@@ -609,6 +611,8 @@ tools = [*builder1.build()["tool_specs"], *builder2.build()["tool_specs"]]
 | `wait` | `wait_for` |
 | `screenshot` | `take_screenshot` |
 | `pdf` | `save_pdf` |
+| `downloads` | `get_downloaded_files_text` |
+| `wait-download` | `wait_for_next_download` |
 | `network-start` | `start_network_capture` |
 | `network` | `get_network_requests` |
 | `network-stop` | `stop_network_capture` |
@@ -702,6 +706,8 @@ browser = Browser(stealth=config, headless=False)
 
 #### Downloads
 
+`Browser` always creates a `DownloadManager` and always accepts downloads. Files are saved to `downloads_path` if configured, or `~/Downloads` by default.
+
 bridgic preserves the original filename, suppresses the "Save As" dialog, and keeps the API the same across modes. Internally there are two pipelines — `DownloadManager` for non-CDP / CDP-owned, and `CdpDownloadRenamer` for CDP-borrowed (page-level CDP routing of `setDownloadBehavior(allowAndName)`). See [CLAUDE.md → Downloads](CLAUDE.md#downloads) for the full design.
 
 ##### Download path matrix
@@ -713,7 +719,7 @@ bridgic preserves the original filename, suppresses the "Save As" dialog, and ke
 | **CLI** | CDP (`--cdp ...`) | yes | the explicit value |
 | **CLI** | CDP | no | the CLI client's working directory at command time (`os.getcwd()`) — `curl -O`-style ergonomics |
 | **SDK** (`Browser(...)`) | non-CDP | yes | the explicit value |
-| **SDK** | non-CDP | no | downloads not captured (Playwright wipes the temp dir on close — pass `downloads_path`) |
+| **SDK** | non-CDP | no | `~/Downloads` (DownloadManager auto-default) |
 | **SDK** | CDP (`Browser(cdp=...)`) | yes | the explicit value |
 | **SDK** | CDP | no | `~/Downloads` (SDK has no CLI CWD hint) |
 
@@ -721,13 +727,22 @@ bridgic preserves the original filename, suppresses the "Save As" dialog, and ke
 # Non-CDP (DownloadManager pipeline)
 browser = Browser(downloads_path="./downloads", headless=True)
 await browser.navigate_to("https://example.com")
-# Programmatic access to completed downloads
+
+# Trigger a download, then wait for it to complete
+await browser.click_element_by_ref("8d4b03a9")
+result = await browser.wait_for_next_download(timeout=30.0)
+# "Download complete: report.pdf — 261.0 KB — /home/user/Downloads/report.pdf"
+
+# Get the formatted list of everything downloaded in this session
+print(await browser.get_downloaded_files_text())
+
+# Or access the raw list
 for f in browser.download_manager.downloaded_files:
     print(f"Downloaded: {f.file_name} ({f.file_size} bytes)")
 
 # CDP-borrowed (CdpDownloadRenamer pipeline; downloads land at downloads_path
-# with real filenames; download_manager is None — wait_for_download is
-# unsupported here).
+# with real filenames; download_manager is None — wait_for_download /
+# wait_for_next_download are unsupported here).
 browser = Browser(cdp="auto", downloads_path="./downloads")
 ```
 

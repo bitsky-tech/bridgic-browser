@@ -18,8 +18,10 @@ Short reference for the main session and download APIs. For tool lists and selec
 | `await browser.get_current_page_title()` | Get current page title string, or `None` if no page is open. |
 | `browser.get_current_page_url()` | Get current page URL string, or `None` if no page is open. (sync) |
 | `browser.get_config()` | Return dict of all current browser configuration options. |
-| `browser.download_manager` | `DownloadManager` instance (after `start()`) when `downloads_path` is set **and** the active pipeline uses it (non-CDP / CDP-owned). In **CDP-borrowed** mode the download manager is intentionally not attached — see [CdpDownloadRenamer](#cdp-borrowed-downloads-cdpdownloadrenamer). |
-| `browser.downloaded_files` | Shortcut for `browser.download_manager.downloaded_files`. Returns `[]` if no download manager (including CDP-borrowed). |
+| `await browser.get_downloaded_files_text()` | Numbered list of all files downloaded in this session, or `"No downloads in this session."` if none. Each line: `[N] filename — size — /path/to/file`. |
+| `await browser.wait_for_next_download(timeout=30.0)` | Block until the next download completes and return a one-line summary, or a timeout message. **Call immediately after the action that triggers the download.** Timeout unit is seconds. Not supported in CDP-borrowed mode (the manager isn't attached there). |
+| `browser.download_manager` | Always-created `DownloadManager` instance. Defaults to `~/Downloads` when `downloads_path` is not configured. In **CDP-borrowed** mode the manager is intentionally not attached to the borrowed context — `CdpDownloadRenamer` handles downloads instead. See [CdpDownloadRenamer](#cdp-borrowed-downloads-cdpdownloadrenamer). |
+| `browser.downloaded_files` | Shortcut for `browser.download_manager.downloaded_files`. Returns `[]` in CDP-borrowed mode because the manager isn't attached there. |
 | `browser.headless` | `bool` — whether the browser runs in headless mode. |
 | `browser.viewport` | `dict` or `None` — current viewport size configuration. |
 | `browser.channel` | `str` or `None` — browser distribution channel. |
@@ -37,18 +39,19 @@ bridgic has two download pipelines, picked by mode. The download path resolution
 
 | Mode | Pipeline | `downloads_path` unset → falls back to |
 |---|---|---|
-| non-CDP (`Browser()`) | `DownloadManager.save_as` from Playwright's `artifactsDir` | DownloadManager is **not** attached; files are lost when Playwright wipes `artifactsDir` on close. Always pass `downloads_path` in non-CDP mode. |
-| CDP-owned (rare — `Browser(cdp=...)` against a remote Chrome that has no contexts yet) | Same as non-CDP | Same caveat as non-CDP. |
+| non-CDP (`Browser()`) | `DownloadManager.save_as` from Playwright's `artifactsDir` | `~/Downloads` (DownloadManager auto-default). |
+| CDP-owned (rare — `Browser(cdp=...)` against a remote Chrome that has no contexts yet) | Same as non-CDP | Same as non-CDP. |
 | CDP-borrowed (`Browser(cdp=...)` against a user's running Chrome) | `CdpDownloadRenamer` (rename GUID → real name post-completion) via a page-level CDP session | `~/Downloads`. In daemon mode the CLI client's CWD (`os.getcwd()`) takes priority over the `~/Downloads` fallback — see [CLAUDE.md → Downloads](../CLAUDE.md#downloads). |
 
 ### DownloadManager (non-CDP / CDP-owned modes)
 
-`Browser` creates and manages a `DownloadManager` automatically when `downloads_path` is provided. Access it via `browser.download_manager` after the browser has started (via `navigate_to()`, `search()`, or `_start()`).
+`Browser` always creates a `DownloadManager`. It saves files to the configured `downloads_path`, or `~/Downloads` by default. Access it via `browser.download_manager` after the browser has started.
 
 | Method / property | Description |
 |------------------|-------------|
-| `browser.download_manager` | The auto-created `DownloadManager` (None when `downloads_path` is unset, or in CDP-borrowed mode regardless of `downloads_path`). |
+| `browser.download_manager` | The `DownloadManager` instance. Always non-`None` after `__init__`. In CDP-borrowed mode it is created but not attached to the context; downloads in that mode go through `CdpDownloadRenamer` instead. |
 | `browser.download_manager.downloaded_files` | List of `DownloadedFile` (`.url`, `.path`, `.file_name`, `.file_size`). |
+| `await browser.download_manager.wait_for_next_download(timeout=30.0)` | Wait up to *timeout* seconds for the next download to complete. Returns `DownloadedFile` or `None` on timeout. |
 
 `browser.wait_for_download(...)` is **not supported in CDP-borrowed mode** — Playwright's per-context `download` event does not fire when the file is routed away from `artifactsDir` by the page-session override.
 

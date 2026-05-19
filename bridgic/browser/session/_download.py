@@ -147,6 +147,11 @@ class DownloadManager:
         # own Future; _handle_download fulfils the oldest pending waiter on
         # completion so callers do not stomp on each other's callbacks.
         self._pending_waiters: List[asyncio.Future[DownloadedFile]] = []
+        # Persistent FIFO of all successfully saved downloads. Drained by
+        # wait_for_next_download() — independent from _pending_waiters so the
+        # CLI's `wait-download` command can pick up completions that already
+        # happened before the agent asked.
+        self._completed_queue: asyncio.Queue[DownloadedFile] = asyncio.Queue()
 
     @property
     def downloads_path(self) -> Path:
@@ -348,6 +353,7 @@ class DownloadManager:
             )
 
             self._downloaded_files.append(downloaded_file)
+            self._completed_queue.put_nowait(downloaded_file)
             logger.info(f"Download saved: {target_path} ({file_size} bytes)")
 
             # Call complete callback if configured
@@ -546,9 +552,29 @@ class DownloadManager:
             if not waiter.done():
                 waiter.cancel()
 
+    async def wait_for_next_download(self, timeout: float = 30.0) -> Optional[DownloadedFile]:
+        """Wait up to *timeout* seconds for the next download to complete.
+
+        Returns the DownloadedFile when one arrives, or None on timeout.
+        """
+        try:
+            return await asyncio.wait_for(self._completed_queue.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+
     def clear_history(self) -> None:
-        """Clear the download history."""
+        """Clear the download history.
+
+        Also drains :attr:`_completed_queue` so a subsequent
+        :meth:`wait_for_next_download` won't immediately yield a stale
+        completion from before the clear.
+        """
         self._downloaded_files.clear()
+        while not self._completed_queue.empty():
+            try:
+                self._completed_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
     def get_downloads_by_type(self, file_type: str) -> List[DownloadedFile]:
         """Get all downloads of a specific file type.

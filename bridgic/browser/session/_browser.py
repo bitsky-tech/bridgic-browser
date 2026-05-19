@@ -588,10 +588,11 @@ class Browser:
         # than hit a misleading NO_ACTIVE_PAGE when `_page` is mid-teardown.
         self._closing: bool = False
 
-        # Download manager - handles saving files with correct filenames
-        self._download_manager: Optional[DownloadManager] = None
-        if self._downloads_path:
-            self._download_manager = DownloadManager(downloads_path=self._downloads_path)
+        # Download manager - always active so CLI can query/wait for downloads.
+        # Uses the configured path if provided, otherwise defaults to ~/Downloads.
+        self._download_manager: Optional[DownloadManager] = DownloadManager(
+            downloads_path=self._downloads_path or None
+        )
 
         # CDP-borrowed download infrastructure. Populated in `_start()` when
         # connecting via CDP without owning the context. The renamer is the
@@ -722,6 +723,32 @@ class Browser:
         if self._download_manager:
             return self._download_manager.downloaded_files
         return []
+
+    async def get_downloaded_files_text(self) -> str:
+        """Return a human-readable summary of all downloads in this session."""
+        files = self.downloaded_files
+        if not files:
+            return "No downloads in this session."
+        lines = []
+        for i, f in enumerate(files, 1):
+            size_kb = f.file_size / 1024
+            size_str = f"{size_kb / 1024:.2f} MB" if size_kb >= 1024 else f"{size_kb:.1f} KB"
+            lines.append(f"[{i}] {f.file_name} — {size_str} — {f.path}")
+        return "\n".join(lines)
+
+    async def wait_for_next_download(self, timeout: float = 30.0) -> str:
+        """Wait up to *timeout* seconds for the next download to complete.
+
+        Returns a one-line summary of the downloaded file, or a timeout message.
+        """
+        if not self._download_manager:
+            return "Download manager not available."
+        file = await self._download_manager.wait_for_next_download(timeout=timeout)
+        if file is None:
+            return f"No download completed within {timeout:.0f}s timeout."
+        size_kb = file.file_size / 1024
+        size_str = f"{size_kb / 1024:.2f} MB" if size_kb >= 1024 else f"{size_kb:.1f} KB"
+        return f"Download complete: {file.file_name} — {size_str} — {file.path}"
 
     @property
     def headless(self) -> bool:
@@ -1041,8 +1068,8 @@ class Browser:
         if self._color_scheme is not None:
             options["color_scheme"] = self._color_scheme
 
-        # Auto-enable downloads if downloads_path is configured
-        if self._downloads_path and "accept_downloads" not in self._extra_kwargs:
+        # Always accept downloads so DownloadManager can track them
+        if "accept_downloads" not in self._extra_kwargs:
             options["accept_downloads"] = True
 
         # Extract context-specific kwargs (user values override everything)
