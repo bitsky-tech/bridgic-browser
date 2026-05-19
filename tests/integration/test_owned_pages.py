@@ -443,11 +443,20 @@ async def test_download_manager_reattached_on_popup_follow(cdp_browser, tmp_path
     We don't trigger an actual download (data: URLs cannot drive Chrome's
     download path); instead we verify the attachment bookkeeping in the
     DownloadManager moved with self._page."""
-    # Inject a fresh DownloadManager so the assertion below has something to
-    # observe. The fixture's `Browser(downloads_path=None)` skips creating one.
+    # Wire up DownloadManager → bridgic's own page so the popup-follow
+    # re-attach logic in `_switch_self_page_to` has a state to migrate.
+    #
+    # Production code in CDP-borrowed mode intentionally does NOT attach
+    # DownloadManager at `_start()` (downloads in this mode go through
+    # CdpDownloadRenamer instead — see `_browser.py:_start()` comments).
+    # Since PR #28 a fresh `_download_manager` is always created, but
+    # since it's never wired to a page in this mode we attach manually
+    # here. The test verifies the *bookkeeping migration*, not the
+    # production decision to skip the initial attach.
     from bridgic.browser.session._download import DownloadManager
     if cdp_browser._download_manager is None:
         cdp_browser._download_manager = DownloadManager(downloads_path=str(tmp_path))
+    if str(id(cdp_browser._page)) not in cdp_browser._download_manager._page_handlers:
         cdp_browser._download_manager.attach_to_page(cdp_browser._page)
 
     dm = cdp_browser._download_manager
