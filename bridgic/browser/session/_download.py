@@ -13,6 +13,7 @@ import os
 import re
 import tempfile
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
@@ -167,11 +168,17 @@ class DownloadManager:
         # own Future; _handle_download fulfils the oldest pending waiter on
         # completion so callers do not stomp on each other's callbacks.
         self._pending_waiters: List[asyncio.Future[DownloadedFile]] = []
-        # Persistent FIFO of all successfully saved downloads. Drained by
+        # Sliding-window FIFO of recently saved downloads. Drained by
         # wait_for_next_download() — independent from _pending_waiters so the
         # CLI's `wait-download` command can pick up completions that already
         # happened before the agent asked.
-        self._completed_queue: asyncio.Queue[DownloadedFile] = asyncio.Queue()
+        #
+        # Bounded (maxsize=256) so long-lived daemon sessions with many
+        # downloads but no `wait-download` consumer don't accumulate
+        # DownloadedFile objects indefinitely. When full, the oldest entry
+        # is evicted via `_enqueue_completed`. Full history is still
+        # available via `_downloaded_files`.
+        self._completed_queue: asyncio.Queue[DownloadedFile] = asyncio.Queue(maxsize=256)
 
     @property
     def downloads_path(self) -> Path:
@@ -373,7 +380,7 @@ class DownloadManager:
             )
 
             self._downloaded_files.append(downloaded_file)
-            self._completed_queue.put_nowait(downloaded_file)
+            self._enqueue_completed(downloaded_file)
             logger.info(f"Download saved: {target_path} ({file_size} bytes)")
 
             # Call complete callback if configured
@@ -571,6 +578,44 @@ class DownloadManager:
                 self._pending_waiters.remove(waiter)
             if not waiter.done():
                 waiter.cancel()
+
+    def _enqueue_completed(self, downloaded_file: DownloadedFile) -> None:
+        """Push to the sliding-window completion queue.
+
+        If the queue is at maxsize (no consumer is draining it), drop the
+        oldest entry to keep memory bounded. Full history remains in
+        :attr:`_downloaded_files` — only the *recent-completions* surface
+        used by :meth:`wait_for_next_download` shrinks.
+        """
+        try:
+            self._completed_queue.put_nowait(downloaded_file)
+        except asyncio.QueueFull:
+            with suppress(asyncio.QueueEmpty):
+                self._completed_queue.get_nowait()
+            self._completed_queue.put_nowait(downloaded_file)
+
+    def record_external_download(self, downloaded_file: DownloadedFile) -> None:
+        """Inject a completion record from a non-Playwright pipeline.
+
+        Used in CDP-borrowed mode where :class:`CdpDownloadRenamer` handles
+        the actual rename (Playwright never sees these downloads because the
+        path moved out of ``artifactsDir``). The renamer calls this method
+        after a successful rename so the unified surfaces
+        (``downloaded_files`` / :meth:`wait_for_next_download` /
+        :meth:`wait_for_download`) work the same way as in non-CDP / CDP-owned
+        modes.
+
+        Mirrors the post-save bookkeeping of :meth:`_handle_download`:
+        appends to ``_downloaded_files``, enqueues into the sliding window,
+        and wakes the oldest pending Future waiter (if any).
+        """
+        self._downloaded_files.append(downloaded_file)
+        self._enqueue_completed(downloaded_file)
+        while self._pending_waiters:
+            waiter = self._pending_waiters.pop(0)
+            if not waiter.done():
+                waiter.set_result(downloaded_file)
+                break
 
     async def wait_for_next_download(self, timeout: float = 30.0) -> Optional[DownloadedFile]:
         """Wait up to *timeout* seconds for the next download to complete.
