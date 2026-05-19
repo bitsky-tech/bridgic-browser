@@ -724,54 +724,49 @@ class Browser:
             return self._download_manager.downloaded_files
         return []
 
+    @staticmethod
+    def _format_file_size(size_bytes: int) -> str:
+        """Format byte count as KB or MB with appropriate precision."""
+        size_kb = size_bytes / 1024
+        if size_kb >= 1024:
+            return f"{size_kb / 1024:.2f} MB"
+        return f"{size_kb:.1f} KB"
+
     async def get_downloaded_files_text(self) -> str:
         """Return a human-readable summary of all downloads in this session.
 
-        Returns an explanatory message in CDP-borrowed mode (where downloads
-        are renamed in place by ``CdpDownloadRenamer`` and never enter
-        ``DownloadManager``'s tracking list), so callers can tell "no downloads
-        happened" apart from "this mode doesn't track downloads".
+        Works across all pipelines:
+        - non-CDP / CDP-owned: entries come from Playwright's `download`
+          event via ``DownloadManager._handle_download``.
+        - CDP-borrowed: entries come from ``CdpDownloadRenamer`` via
+          ``DownloadManager.record_external_download``.
         """
-        if self._is_cdp_borrowed:
-            return (
-                "Download tracking is not available in CDP-borrowed mode. "
-                "Downloads in this mode are renamed in place by CdpDownloadRenamer "
-                "and do not pass through DownloadManager. Inspect downloads_path "
-                "directly to find the saved files."
-            )
         files = self.downloaded_files
         if not files:
             return "No downloads in this session."
-        lines = []
-        for i, f in enumerate(files, 1):
-            size_kb = f.file_size / 1024
-            size_str = f"{size_kb / 1024:.2f} MB" if size_kb >= 1024 else f"{size_kb:.1f} KB"
-            lines.append(f"[{i}] {f.file_name} — {size_str} — {f.path}")
+        lines = [
+            f"[{i}] {f.file_name} — {self._format_file_size(f.file_size)} — {f.path}"
+            for i, f in enumerate(files, 1)
+        ]
         return "\n".join(lines)
 
     async def wait_for_next_download(self, timeout: float = 30.0) -> str:
         """Wait up to *timeout* seconds for the next download to complete.
 
-        Returns a one-line summary of the downloaded file, or a timeout message.
-        Returns an explanatory message in CDP-borrowed mode — DownloadManager
-        is intentionally not attached there (downloads are handled by
-        ``CdpDownloadRenamer`` instead), so blocking on the completion queue
-        would always time out and confuse callers.
+        Returns a one-line summary of the downloaded file, or a timeout
+        message. Works across all pipelines — in CDP-borrowed mode the
+        completion record arrives via ``CdpDownloadRenamer`` →
+        ``DownloadManager.record_external_download`` after the rename.
         """
-        if self._is_cdp_borrowed:
-            return (
-                "wait_for_next_download is not supported in CDP-borrowed mode. "
-                "Downloads in this mode are renamed in place by CdpDownloadRenamer "
-                "and do not go through DownloadManager."
-            )
         if not self._download_manager:
             return "Download manager not available."
         file = await self._download_manager.wait_for_next_download(timeout=timeout)
         if file is None:
             return f"No download completed within {timeout:.0f}s timeout."
-        size_kb = file.file_size / 1024
-        size_str = f"{size_kb / 1024:.2f} MB" if size_kb >= 1024 else f"{size_kb:.1f} KB"
-        return f"Download complete: {file.file_name} — {size_str} — {file.path}"
+        return (
+            f"Download complete: {file.file_name} — "
+            f"{self._format_file_size(file.file_size)} — {file.path}"
+        )
 
     @property
     def headless(self) -> bool:
@@ -1687,8 +1682,18 @@ class Browser:
                         if override_ok:
                             self._current_cdp_download_path = take_over_path
                             try:
+                                # Pipe successful renames into DownloadManager
+                                # so CDP-borrowed downloads surface through the
+                                # same downloaded_files / wait_for_next_download
+                                # API as non-CDP / CDP-owned modes.
+                                on_completed = (
+                                    self._download_manager.record_external_download
+                                    if self._download_manager is not None
+                                    else None
+                                )
                                 self._cdp_download_renamer = CdpDownloadRenamer(
-                                    default_dir=take_over_path
+                                    default_dir=take_over_path,
+                                    on_completed=on_completed,
                                 )
                                 await self._cdp_download_renamer.attach(
                                     self._cdp_download_session
@@ -1712,13 +1717,19 @@ class Browser:
                 #   Playwright's per-context setDownloadBehavior(allowAndName)
                 #   still routes downloads through the artifactsDir, so
                 #   DownloadManager.save_as() can copy files to downloads_path.
-                # - Borrowed context: NOT attached. Our L1 override took the
-                #   default context to allow + downloadPath, so Chrome writes
-                #   directly to the final path; bridgic is not in the
-                #   file-transfer loop. Trying to `save_as` here would block
-                #   forever (Playwright no longer receives
-                #   Browser.downloadProgress(completed) once the path moved
-                #   out of artifactsDir).
+                # - Borrowed context: NOT attached anywhere. Attaching to the
+                #   whole context would hijack user tabs (privacy boundary);
+                #   attaching page-scoped to bridgic's own tab was empirically
+                #   verified to cause duplicate-record bugs — Playwright STILL
+                #   fires `download` events in CDP-borrowed mode (the
+                #   assumption that "path moved out of artifactsDir suppresses
+                #   the event" is wrong with `setDownloadBehavior(allowAndName)`
+                #   on a page session), and `_handle_download.save_as` writes a
+                #   0-byte placeholder to the DM default dir. Instead,
+                #   `CdpDownloadRenamer.on_completed` pipes the real completion
+                #   back into DM via `record_external_download`, which
+                #   populates `downloaded_files` / `_completed_queue` /
+                #   `_pending_waiters` without going through `_handle_download`.
                 if self._download_manager and self._cdp_context_owned:
                     self._download_manager.attach_to_context(self._context)
 
@@ -2981,21 +2992,15 @@ class Browser:
             await self._switch_video_to_page(new_page)
         except Exception as e:
             logger.debug("[_switch_self_page_to] video switch failed: %s", e)
-        # CDP-borrowed mode attaches DownloadManager per-page (not per-context)
-        # to avoid hijacking the user's private downloads. Migrate handlers so
-        # downloads triggered from the followed popup still land in bridgic's
-        # downloads_path.
-        if self._is_cdp_borrowed and self._download_manager and old is not None:
-            try:
-                self._download_manager.detach_from_page(old)
-            except Exception:
-                pass
-            try:
-                self._download_manager.attach_to_page(new_page)
-            except Exception as e:
-                logger.debug(
-                    "[_switch_self_page_to] download manager re-attach failed: %s", e
-                )
+        # No DownloadManager migration here: in CDP-borrowed mode the manager
+        # is intentionally NOT attached to any page (see `_start()` comments —
+        # attaching causes duplicate-record bugs because Playwright still
+        # fires `download` events even when allowAndName routes the file
+        # away from artifactsDir). CdpDownloadRenamer handles bridgic's
+        # primary tab via `record_external_download`; popup-triggered
+        # CDP-borrowed downloads are out of scope (see KNOWN_LIMITATIONS).
+        # In non-CDP / CDP-owned modes the global `attach_to_context` is the
+        # active pipeline, so no per-page migration is needed either.
 
     async def _select_fallback_page(self, closed_page: Page) -> Optional[Page]:
         """Pick the next `self._page` after `closed_page` is closed.

@@ -329,3 +329,96 @@ class TestRobustness:
         landed = [p for p in tmp_downloads.iterdir() if p.name != guid]
         assert len(landed) == 1
         assert tmp_downloads in landed[0].parents or landed[0].parent == tmp_downloads
+
+
+@pytest.mark.asyncio
+class TestOnCompletedCallback:
+    """The on_completed callback wires CdpDownloadRenamer into
+    DownloadManager so CDP-borrowed downloads surface uniformly through
+    downloaded_files / wait_for_next_download in the rest of bridgic."""
+
+    async def test_callback_receives_populated_downloaded_file(
+        self, tmp_downloads: Path
+    ) -> None:
+        captured: list = []
+        renamer = CdpDownloadRenamer(
+            default_dir=tmp_downloads,
+            on_completed=lambda df: captured.append(df),
+        )
+        session = FakeCDPSession()
+        await renamer.attach(session)  # type: ignore[arg-type]
+
+        guid = "abc-123"
+        (tmp_downloads / guid).write_bytes(b"some-pdf-content-here")
+        session.fire(
+            "Browser.downloadWillBegin",
+            {
+                "guid": guid,
+                "suggestedFilename": "report.pdf",
+                "url": "https://example.com/report.pdf",
+            },
+        )
+        session.fire(
+            "Browser.downloadProgress",
+            {"guid": guid, "state": "completed"},
+        )
+
+        assert len(captured) == 1
+        df = captured[0]
+        assert df.file_name == "report.pdf"
+        assert df.path.endswith("report.pdf")
+        assert df.url == "https://example.com/report.pdf"
+        assert df.file_size == len(b"some-pdf-content-here")
+        assert df.file_type == "pdf"
+        assert df.suggested_filename == "report.pdf"
+
+    async def test_no_callback_when_not_registered(self, tmp_downloads: Path) -> None:
+        """Renamer constructed without on_completed must still rename the
+        file — only the callback step is skipped."""
+        renamer = CdpDownloadRenamer(default_dir=tmp_downloads)  # no callback
+        session = FakeCDPSession()
+        await renamer.attach(session)  # type: ignore[arg-type]
+
+        guid = "no-cb"
+        (tmp_downloads / guid).write_bytes(b"x")
+        session.fire(
+            "Browser.downloadWillBegin",
+            {"guid": guid, "suggestedFilename": "x.bin"},
+        )
+        session.fire(
+            "Browser.downloadProgress",
+            {"guid": guid, "state": "completed"},
+        )
+
+        # Rename still succeeded
+        assert (tmp_downloads / "x.bin").exists()
+
+    async def test_callback_exception_does_not_break_renamer(
+        self, tmp_downloads: Path
+    ) -> None:
+        """A buggy on_completed callback must not corrupt the rename
+        pipeline — exception is swallowed and logged."""
+        def bad_callback(_df):
+            raise RuntimeError("simulated downstream failure")
+
+        renamer = CdpDownloadRenamer(
+            default_dir=tmp_downloads, on_completed=bad_callback
+        )
+        session = FakeCDPSession()
+        await renamer.attach(session)  # type: ignore[arg-type]
+
+        guid = "boom"
+        (tmp_downloads / guid).write_bytes(b"payload")
+        session.fire(
+            "Browser.downloadWillBegin",
+            {"guid": guid, "suggestedFilename": "ok.bin"},
+        )
+        # Must not raise.
+        session.fire(
+            "Browser.downloadProgress",
+            {"guid": guid, "state": "completed"},
+        )
+
+        # Rename completed despite callback exception.
+        assert (tmp_downloads / "ok.bin").read_bytes() == b"payload"
+        assert not (tmp_downloads / guid).exists()
